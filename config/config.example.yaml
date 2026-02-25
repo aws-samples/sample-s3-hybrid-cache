@@ -1,0 +1,326 @@
+# S3 Proxy Configuration Example
+# This file demonstrates all available configuration options
+
+server:
+  http_port: 80
+  https_port: 443
+  https_mode: "passthrough"  # Only option: "passthrough" (TCP passthrough)
+  # Maximum concurrent requests (default: 200)
+  # Tuning guide:
+  #   Small deployments (< 50 users): 50-100
+  #   Medium deployments (50-500 users): 100-300
+  #   Large deployments (500+ users): 300-1000+
+  #   High-throughput scenarios: 1000+
+  max_concurrent_requests: 200
+  request_timeout: "30s"
+  # Add Referer header for proxy identification in S3 Server Access Logs (default: true)
+  # Format: s3-hybrid-cache/{version} ({hostname})
+  add_referer_header: true
+
+cache:
+  cache_dir: "./tmp/cache"  # Local development; use "/mnt/efs/cache" for EFS deployments
+  max_cache_size: 524288000  # 500MB in bytes
+  ram_cache_enabled: true
+  max_ram_cache_size: 104857600  # 100MB in bytes
+  eviction_algorithm: "tinylfu"  # Options: "lru" (default), "tinylfu" - unified for both RAM and disk caches
+  
+  # Write-through caching for PUT operations and multipart uploads
+  # When enabled, PUT operations and multipart uploads are cached so subsequent
+  # GET requests can be served from cache immediately without fetching from S3
+  # Write cache TTL is refreshed when objects are accessed via GET
+  # When disabled, PUT operations are forwarded directly to S3 without caching
+  write_cache_enabled: true  # Enable write-through caching (enabled by default)
+  
+  # Percentage of total disk cache reserved for write cache (default: 10%)
+  # Valid range: 1.0 to 50.0
+  # Write cache is limited to this percentage to prevent starving read cache
+  write_cache_percent: 10.0
+  
+  # Maximum object size for write caching (default: 256MB)
+  # Objects larger than this are not cached on PUT
+  write_cache_max_object_size: 268435456  # 256MB in bytes
+  
+  # TTL for write-cached objects (default: 1 day)
+  # Write cache TTL is refreshed when objects are accessed via GET
+  # Valid range: 1 minute ("1m") to 30 days ("30d")
+  put_ttl: "1d"  # 1 day
+  
+  # TTL for incomplete multipart uploads before automatic cleanup (default: 1 day)
+  # Valid range: 1 hour ("1h") to 7 days ("7d")
+  # Incomplete uploads that exceed this TTL are automatically evicted
+  # This prevents abandoned uploads from consuming cache space indefinitely
+  incomplete_upload_ttl: "1d"  # 1 day
+  get_ttl: "315360000s"  # ~10 years (infinite caching - cache forever unless explicit headers)
+  head_ttl: "60s"  # 1 minute - validates object freshness via HEAD without re-downloading
+  actively_remove_cached_data: false  # false = lazy expiration (default), true = active background removal
+  
+  # RAM-Disk Cache Coherency Settings
+  # When RAM cache is enabled, these settings control how RAM cache accesses
+  # are propagated to disk metadata for accurate eviction decisions
+  ram_cache_flush_interval: "60s"
+  ram_cache_flush_threshold: 100
+  ram_cache_flush_on_eviction: false
+  ram_cache_verification_interval: "1s"
+  
+  # ============================================================================
+  # SHARED STORAGE CONFIGURATION
+  # ============================================================================
+  # Controls coordination features for multi-instance deployments where multiple
+  # proxy instances share a cache volume (EFS, NFS, shared PersistentVolume).
+  #
+  # Journal-based metadata writes and distributed eviction locking are always
+  # enabled for consistency across all deployment modes. This ensures reliable
+  # cache coordination whether running single-instance or multi-instance.
+  #
+  # ============================================================================
+  shared_storage:
+    
+    # --------------------------------------------------------------------------
+    # LOCK TIMING CONFIGURATION
+    # --------------------------------------------------------------------------
+    
+    # Maximum time to wait when acquiring a file lock before giving up.
+    # Longer values handle slow storage; shorter values fail faster on contention.
+    # Valid range: 10-300 seconds
+    lock_timeout: "60s"
+    
+    # How often to refresh held locks to prevent expiration.
+    # Must be less than lock_timeout to maintain lock ownership.
+    # Valid range: 5-120 seconds
+    lock_refresh_interval: "30s"
+    
+    # --------------------------------------------------------------------------
+    # DISTRIBUTED EVICTION LOCK CONFIGURATION
+    # --------------------------------------------------------------------------
+    # When cache exceeds size limits, only one instance should perform eviction
+    # at a time to prevent over-eviction and cache thrashing.
+    
+    # Maximum time an instance can hold the global eviction lock before it's
+    # considered stale. Other instances can forcibly acquire stale locks to
+    # prevent deadlocks from crashed instances.
+    #
+    # Valid range: 30-3600 seconds (30 seconds to 1 hour)
+    #
+    # RECOMMENDED VALUES:
+    #   - Small caches (<10GB): 60s (default) - fast recovery from crashes
+    #   - Medium caches (10-100GB): 120s - allows time for larger evictions
+    #   - Large caches (>100GB): 300s - prevents premature lock takeover
+    #   - Very slow storage (high-latency NFS): 600s - accounts for I/O delays
+    #
+    # If eviction consistently takes longer than this timeout, increase the value
+    # to prevent other instances from forcibly acquiring the lock mid-eviction.
+    eviction_lock_timeout: "60s"
+    
+    # --------------------------------------------------------------------------
+    # VALIDATION THRESHOLDS
+    # --------------------------------------------------------------------------
+    
+    # Cache inconsistency percentage that triggers a warning log.
+    # Helps identify emerging issues before they become critical.
+    # Valid range: 0.0-100.0, must be less than validation_threshold_error
+    validation_threshold_warn: 5.0
+    
+    # Cache inconsistency percentage that triggers an error log.
+    # Indicates significant coordination problems requiring attention.
+    # Valid range: 0.0-100.0, must be greater than validation_threshold_warn
+    validation_threshold_error: 20.0
+    
+    # --------------------------------------------------------------------------
+    # RECOVERY CONFIGURATION
+    # --------------------------------------------------------------------------
+    
+    # Maximum number of orphaned ranges to recover simultaneously.
+    # Higher values speed up recovery but increase I/O load.
+    # Valid range: 1-16
+    recovery_max_concurrent: 4
+    
+    # --------------------------------------------------------------------------
+    # JOURNAL CONSOLIDATION SETTINGS
+    # --------------------------------------------------------------------------
+    
+    # How often to consolidate journal entries into final metadata files.
+    # Shorter intervals improve cross-instance cache visibility.
+    # Valid range: 1-60 seconds
+    consolidation_interval: "5s"
+    
+    # When journal file exceeds this size, trigger immediate consolidation.
+    # Valid range: 100KB-10MB
+    consolidation_size_threshold: 1048576  # 1MB in bytes
+    
+    # Maximum duration for the per-key processing phase of a consolidation cycle (default: 30s)
+    # Prevents one slow NFS operation from blocking the next cycle or holding locks indefinitely.
+    # Keys not processed due to timeout are retried in the next cycle.
+    consolidation_cycle_timeout: "30s"
+    
+    # Number of times to retry lock acquisition before giving up.
+    # Valid range: 1-20
+    lock_max_retries: 5
+    
+    # How often to run background validation of metadata consistency.
+    # Valid range: 1-168 hours
+    validation_frequency: "23h"
+  
+  # ============================================================================
+  # DOWNLOAD COORDINATION CONFIGURATION
+  # ============================================================================
+  # Controls request coalescing for concurrent cache misses. When multiple requests
+  # arrive for the same uncached resource, only one request fetches from S3 while
+  # others wait. This reduces redundant S3 fetches and improves cache efficiency.
+  # ============================================================================
+  download_coordination:
+    # Enable download coordination/coalescing (default: true)
+    # When enabled, concurrent requests for the same uncached resource are coalesced.
+    # When disabled, each cache miss independently fetches from S3.
+    enabled: true
+    
+    # Maximum time a waiter will wait for the fetcher to complete (default: 30s)
+    # If the fetcher takes longer than this, the waiter falls back to its own S3 fetch.
+    # Valid range: 5-120 seconds (values outside this range are clamped with a warning)
+    wait_timeout_secs: 30
+  
+  # Range merge gap threshold for intelligent range consolidation (default: 1048576 bytes = 1MiB)
+  range_merge_gap_threshold: 1048576  # 1MiB in bytes
+  
+  # Eviction buffer percentage (default: 5)
+  eviction_buffer_percent: 5
+  
+  # Cache initialization configuration
+  initialization:
+    parallel_scan: true
+    scan_timeout: "30s"
+    progress_logging: true
+  
+  # ============================================================================
+  # SIZE TRACKING BUFFER CONFIGURATION
+  # ============================================================================
+  # NOTE: Size tracking is now handled by the JournalConsolidator.
+  # The consolidator calculates size deltas from journal entries during each
+  # consolidation cycle (every 5 seconds by default). Size state is persisted
+  # to size_tracking/size_state.json after each cycle.
+  #
+  # The following deprecated options have been removed:
+  # - size_tracking_flush_interval (replaced by shared_storage.consolidation_interval)
+  # - size_tracking_buffer_size (no longer needed - journal entries are processed directly)
+  # ============================================================================
+  
+  # ============================================================================
+  # RAM METADATA CACHE CONFIGURATION
+  # ============================================================================
+  # Controls the in-memory cache for NewCacheMetadata objects, reducing disk I/O
+  # for both HEAD and GET requests. Uses simple LRU eviction since all metadata
+  # entries are similar size (~1-2KB).
+  #
+  # This cache sits between the proxy and disk storage:
+  # - On cache hit: metadata served from RAM (microseconds)
+  # - On cache miss/stale: metadata read from disk and cached in RAM
+  #
+  # Memory usage: ~1.5-2.5KB per entry
+  # Example: 10,000 entries ≈ 15-25MB RAM
+  # ============================================================================
+  metadata_cache:
+    # Enable/disable the RAM metadata cache (default: true)
+    # When disabled, all metadata reads go directly to disk
+    enabled: true
+    
+    # How often to re-read from disk to check for changes (default: 5s)
+    # This is the staleness threshold - entries older than this are refreshed.
+    # Lower values = fresher data but more disk I/O
+    # Higher values = less disk I/O but potentially stale data
+    # Valid range: 1-300 seconds
+    refresh_interval: "5s"
+    
+    # Maximum number of entries in the cache (default: 10000)
+    # Each entry is ~1-2KB, so 10000 entries uses ~15-25MB of RAM.
+    # Increase for workloads with many unique objects.
+    # Valid range: 100-1000000
+    max_entries: 10000
+    
+    # Maximum retries for stale file handle errors (default: 3)
+    # On shared storage (EFS/NFS), stale file handles can occur when files
+    # are modified by other instances. This controls retry behavior.
+    # Valid range: 1-10
+    stale_handle_max_retries: 3
+
+  # Content-length threshold above which range requests skip the full-object cache check (default: 64 MiB)
+  # Large files are unlikely to be cached as a single full-object range, so skipping the check
+  # avoids scanning hundreds of cached ranges unnecessarily.
+  full_object_check_threshold: 67108864  # 64 MiB in bytes
+
+  # Enable/disable read caching for GET responses globally (default: true)
+  # When false, no buckets are read-cached unless explicitly enabled via bucket _settings.json.
+  # This allows an "allowlist" pattern where only specific buckets have caching enabled.
+  read_cache_enabled: true
+
+  # How long cached bucket settings (_settings.json) are considered fresh before re-reading from disk (default: 60s)
+  # Controls lazy reload — settings changes take effect after this threshold expires.
+  bucket_settings_staleness_threshold: "60s"
+
+  # Disk streaming threshold for cached range data (default: 1 MiB)
+  # Ranges at or above this size are streamed from disk in chunks instead of loaded fully into memory.
+  # Reduces memory usage for large range responses under high concurrency.
+  disk_streaming_threshold: 1048576  # 1 MiB in bytes
+
+logging:
+  access_log_dir: "./tmp/logs/access"  # Use "/mnt/efs/logs/access" for EFS deployments
+  app_log_dir: "./tmp/logs/app"        # Use "/mnt/efs/logs/app" for EFS deployments
+  access_log_enabled: true
+  access_log_mode: "all"  # Options: "all" (default), "cached_only"
+  log_level: "info"
+  
+  # Buffered access log settings (reduces disk I/O on shared storage)
+  # Access log entries are buffered in RAM and flushed periodically
+  access_log_flush_interval: "5s"  # How often to flush buffered entries (default: 5s)
+  access_log_buffer_size: 1000     # Max entries before forced flush (default: 1000)
+
+connection_pool:
+  max_connections_per_ip: 50
+  dns_refresh_interval: "60s"  # 1 minute
+  connection_timeout: "10s"
+  idle_timeout: "60s"
+  keepalive_enabled: true
+  max_idle_per_host: 10  # More idle connections = more memory, fewer TLS handshakes during bursts
+  max_lifetime: "300s"
+  pool_check_interval: "10s"
+  # endpoint_overrides: Static hostname-to-IP mappings that bypass DNS resolution.
+  # Useful for S3 PrivateLink where the proxy cannot use DNS to resolve S3 endpoints
+  # to PrivateLink ENI IPs (e.g., on-prem deployments without Route 53 Resolver).
+  # Each hostname maps to a list of IP addresses. The proxy load-balances across them.
+  # endpoint_overrides:
+  #   "s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
+  #   "s3.eu-west-1.amazonaws.com": ["10.0.3.100", "10.0.4.100"]
+
+compression:
+  enabled: true
+  threshold: 4096  # 4KB minimum size for compression
+  preferred_algorithm: "lz4"
+  content_aware: true
+
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  check_interval: "30s"
+
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 9090
+  collection_interval: "60s"
+  include_cache_stats: true
+  include_compression_stats: true
+  include_connection_stats: true
+  otlp:
+    enabled: false
+    endpoint: "http://localhost:4318"
+    export_interval: "60s"
+    timeout: "10s"
+    compression: "none"
+    headers: {}
+
+dashboard:
+  enabled: true
+  port: 8081
+  bind_address: "0.0.0.0"
+  cache_stats_refresh_interval: "5s"
+  logs_refresh_interval: "10s"
+  max_log_entries: 100

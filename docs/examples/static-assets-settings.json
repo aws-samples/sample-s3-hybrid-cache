@@ -1,0 +1,10 @@
+{
+  "$schema": "../bucket-settings-schema.json",
+  "get_ttl": "7d",
+  "head_ttl": "1h",
+  "put_ttl": "7d",
+  "read_cache_enabled": true,
+  "write_cache_enabled": true,
+  "compression_enabled": true,
+  "ram_cache_eligible": true
+}

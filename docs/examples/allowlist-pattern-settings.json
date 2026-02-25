@@ -1,0 +1,4 @@
+{
+  "$schema": "../bucket-settings-schema.json",
+  "read_cache_enabled": true
+}

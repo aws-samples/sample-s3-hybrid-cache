@@ -1,0 +1,268 @@
+** bytes v1.11.0 - https://github.com/tokio-rs/bytes
+** hyper v1.8.1 - https://github.com/hyperium/hyper
+** tokio v1.48.0 - https://github.com/tokio-rs/tokio
+** tracing v0.1.44 - https://github.com/tokio-rs/tracing
+** http-body-util v0.1.3 - https://github.com/hyperium/http-body
+** httpdate v1.0.3 - https://github.com/pyfisch/httpdate
+** hyper-util v0.1.18 - https://github.com/hyperium/hyper-util
+** hostname v0.3.1 - https://github.com/fengsp/hostname
+** lz4_flex v0.11.5 - https://github.com/PSeitz/lz4_flex
+** tracing-appender v0.2.4 - https://github.com/tokio-rs/tracing
+** tracing-subscriber v0.3.22 - https://github.com/tokio-rs/tracing
+** urlencoding v2.1.3 - https://github.com/kornelski/rust-url-encoding
+** h2 v0.4.12 - https://github.com/hyperium/h2
+** http-body v1.0.1 - https://github.com/hyperium/http-body
+** want v0.3.1 - https://github.com/seanmonstar/want
+** try-lock v0.2.5 - https://github.com/seanmonstar/try-lock
+** tower-service v0.3.3 - https://github.com/tower-rs/tower
+** tower-layer v0.3.3 - https://github.com/tower-rs/tower
+** tower v0.5.2 - https://github.com/tower-rs/tower
+** tower v0.4.13 - https://github.com/tower-rs/tower
+** tower-http v0.6.6 - https://github.com/tower-rs/tower-http
+** tokio-util v0.7.17 - https://github.com/tokio-rs/tokio
+** tokio-stream v0.1.17 - https://github.com/tokio-rs/tokio
+** tokio-test v0.4.4 - https://github.com/tokio-rs/tokio
+** tonic v0.12.3 - https://github.com/hyperium/tonic
+** axum v0.7.9 - https://github.com/tokio-rs/axum
+** axum-core v0.4.5 - https://github.com/tokio-rs/axum
+** async-stream v0.3.6 - https://github.com/tokio-rs/async-stream
+** async-stream-impl v0.3.6 - https://github.com/tokio-rs/async-stream
+** tokio-macros v2.6.0 - https://github.com/tokio-rs/tokio
+** tracing-attributes v0.1.30 - https://github.com/tokio-rs/tracing
+** tracing-core v0.1.34 - https://github.com/tokio-rs/tracing
+** slab v0.4.11 - https://github.com/carllerche/slab
+** pin-utils v0.1.0 - https://github.com/rust-lang-nursery/pin-utils
+** mio v1.1.0 - https://github.com/tokio-rs/mio
+** strsim v0.11.1 - https://github.com/dguo/strsim-rs
+** nu-ansi-term v0.50.3 - https://github.com/nushell/nu-ansi-term
+** sharded-slab v0.1.7 - https://github.com/hawkw/sharded-slab
+** matchers v0.2.0 - https://github.com/hawkw/matchers
+** tracing-log v0.2.0 - https://github.com/tokio-rs/tracing
+** data-encoding v2.9.0 - https://github.com/ia0/data-encoding
+** pem v3.0.6 - https://github.com/jcreekmore/pem-rs
+** fs_extra v1.3.0 - https://github.com/webdesus/fs_extra
+** synstructure v0.13.2 - https://github.com/mystor/synstructure
+** twox-hash v2.1.2 - https://github.com/shepmaster/twox-hash
+** unsafe-libyaml v0.2.11 - https://github.com/dtolnay/unsafe-libyaml
+** dashmap v6.1.0 - https://github.com/xacrimon/dashmap
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Apache-2.0 Licensed Dependencies
+
+The following dependencies are licensed under the Apache License, Version 2.0:
+
+- opentelemetry v0.24.0
+- opentelemetry-otlp v0.17.0
+- opentelemetry-semantic-conventions v0.16.0
+- opentelemetry_sdk v0.24.1
+- opentelemetry-proto v0.7.0
+- opentelemetry-http v0.13.0
+- gethostname v0.4.3
+- prost v0.13.5
+- prost-derive v0.13.5
+- sync_wrapper v1.0.2
+
+Apache License, Version 2.0:
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+## MIT OR Apache-2.0 Dual Licensed Dependencies
+
+The following dependencies are dual licensed under MIT OR Apache-2.0:
+
+- anyhow v1.0.100
+- chrono v0.4.42
+- serde v1.0.228
+- serde_json v1.0.146
+- serde_yaml v0.9.34+deprecated
+- clap v4.5.53
+- futures v0.3.31
+- hex v0.4.3
+- thiserror v1.0.69
+- time v0.3.44
+- tokio-rustls v0.26.4
+- trust-dns-resolver v0.23.2
+- uuid v1.18.1
+- rcgen v0.13.2
+- pin-project v1.1.10
+- tempfile v3.23.0
+- rustls-pemfile v2.2.0
+- rand v0.8.5
+- rayon v1.11.0
+- regex v1.12.2
+- scopeguard v1.2.0
+- fastrand v2.3.0
+- And many others...
+
+For dual licensed dependencies, we choose the MIT license terms as stated above.
+
+## ISC Licensed Dependencies
+
+The following dependencies are licensed under the ISC License:
+
+- ring v0.17.14 (ISC)
+- rustls-webpki v0.103.8
+- untrusted v0.9.0
+
+ISC License:
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+## BSD Licensed Dependencies
+
+The following dependencies are licensed under BSD licenses:
+
+- subtle v2.6.1 (BSD-3-Clause)
+- zerocopy v0.8.27 (BSD-2-Clause OR Apache-2.0 OR MIT)
+
+BSD 3-Clause License:
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## Unlicense / Public Domain Dependencies
+
+The following dependencies are in the public domain:
+
+- memchr v2.7.6 (Unlicense OR MIT)
+- quickcheck v1.0.3 (Unlicense/MIT)
+- quickcheck_macros v1.1.0 (Unlicense OR MIT)
+- aho-corasick v1.1.4 (Unlicense OR MIT)
+- walkdir v2.5.0 (MIT OR Unlicense)
+
+For these dependencies, we choose the MIT license terms as stated above.
+
+## Unicode License Dependencies
+
+The following dependencies use Unicode licenses:
+
+- unicode-ident v1.0.22 ((MIT OR Apache-2.0) AND Unicode-3.0)
+- Various ICU crates (Unicode-3.0)
+
+Unicode License Agreement - Data Files and Software (2016):
+
+See: https://www.unicode.org/license.txt
+
+## Other Licenses
+
+### BSL-1.0 (Boost Software License)
+- ryu v1.0.20 (Apache-2.0 OR BSL-1.0)
+
+Boost Software License - Version 1.0:
+
+Permission is hereby granted, free of charge, to any person or organization
+obtaining a copy of the software and accompanying documentation covered by
+this license (the "Software") to use, reproduce, display, distribute,
+execute, and transmit the Software, and to prepare derivative works of the
+Software, and to permit third-parties to whom the Software is furnished to
+do so, all subject to the following:
+
+The copyright notices in the Software and this entire statement, including
+the above license grant, this restriction and the following disclaimer,
+must be included in all copies of the Software, in whole or in part, and
+all derivative works of the Software, unless such copies or derivative
+works are solely in the form of machine-executable object code generated by
+a source language processor.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
+FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+### Zlib License
+- tinyvec v1.10.0 (Zlib OR Apache-2.0 OR MIT)
+
+For this dependency, we choose the MIT license terms as stated above.
+
+### CC0-1.0 (Creative Commons Zero)
+- dunce v1.0.5 (CC0-1.0 OR MIT-0 OR Apache-2.0)
+
+For this dependency, we choose the Apache-2.0 license terms as stated above.
+
+### MIT-0 (MIT No Attribution)
+- dunce v1.0.5 (CC0-1.0 OR MIT-0 OR Apache-2.0)
+
+For this dependency, we choose the Apache-2.0 license terms as stated above.
+
+### Complex License Combinations
+
+#### ring
+- ring v0.17.14 (ISC)
+
+This dependency uses the ISC license as stated above.
+
+#### rustix
+- rustix v1.1.2 (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+
+For this dependency, we choose the MIT license terms as stated above.
+
+#### matchit
+- matchit v0.7.3 (MIT AND BSD-3-Clause)
+
+This dependency requires compliance with both MIT and BSD-3-Clause licenses as stated above.
+
+---
+
+This software complies with all applicable open source licenses. For the complete license text of any dependency, please refer to the original source code repository or the license files included with the dependency.

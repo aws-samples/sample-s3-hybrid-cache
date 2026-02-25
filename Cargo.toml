@@ -1,0 +1,111 @@
+[package]
+name = "s3-proxy"
+version = "1.6.6"
+edition = "2021"
+
+[dependencies]
+# Async runtime and HTTP server
+tokio = { version = "1.0", features = ["full"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Property-based testing
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+
+# TLS support
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+ring = "0.17"
+rustls-pemfile = "2.0"
+rustls-native-certs = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = "0.13"
+time = { version = "0.3", features = ["macros"] }
+webpki-roots = "0.26"
+
+# Service abstraction for connection pooling
+tower = "0.4"
+
+# Compression
+lz4_flex = "0.11"
+
+# Hashing
+blake3 = "1.5"
+
+# File locking for shared cache coordination
+fs2 = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+tracing-appender = "0.2"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Networking and DNS
+trust-dns-resolver = "0.23"
+
+# Configuration
+clap = { version = "4.0", features = ["derive"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# RAII guard for cleanup
+scopeguard = "1.2"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+bytes = "1.0"
+futures = "0.3"
+pin-project = "1.0"
+gethostname = "0.4"
+hostname = "0.3"
+libc = "0.2"
+hex = "0.4"
+httpdate = "1.0"
+urlencoding = "2.1"
+sha2 = "0.10"
+percent-encoding = "2.3"
+regex = "1.0"
+fastrand = "2.0"
+
+# Cache size tracking
+rand = "0.8"
+rayon = "1.8"
+walkdir = "2.4"
+
+# Concurrent data structures
+dashmap = "6.0"
+
+# OpenTelemetry for OTLP metrics export
+opentelemetry = { version = "0.24", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.24", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", features = ["http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = "0.16"
+
+# Platform-specific dependencies
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "handleapi", "winnt"] }
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio-test = "0.4"
+filetime = "0.2"
+ureq = "2.9"  # For health check HTTP requests in tests
+
+[[example]]
+name = "compression_demo"
+path = "examples/compression_demo.rs"
+
+[[example]]
+name = "cache_consistency_demo"
+path = "examples/cache_consistency_demo.rs"
