@@ -627,7 +627,7 @@ impl HttpProxy {
 
     /// Handle a single HTTP request
     pub async fn handle_request(
-        mut req: Request<hyper::body::Incoming>,
+        req: Request<hyper::body::Incoming>,
         client_addr: SocketAddr,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
