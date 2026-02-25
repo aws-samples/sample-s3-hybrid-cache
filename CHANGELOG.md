@@ -5,6 +5,12 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.7] - 2026-02-25
+
+### Security
+- Updated `bytes` 1.11.0 → 1.11.1 (CVE-2026-25541: integer overflow in `BytesMut::reserve`)
+- Updated `time` 0.3.44 → 0.3.47 (CVE-2026-25727: stack exhaustion in RFC 2822 parsing)
+
 ## [1.6.6] - 2026-02-25
 
 ### Added
