@@ -143,6 +143,8 @@ cache:
   eviction_algorithm: "tinylfu"   # Options: lru, tinylfu
 ```
 
+**Sizing `max_cache_size`**: Set `max_cache_size` to no more than 90% of available storage capacity. The cache is designed to temporarily exceed the configured limit during high load — writes are non-blocking and eviction runs asynchronously, so burst traffic can push usage above the limit before eviction reclaims space. A 10% headroom buffer prevents disk exhaustion during these transient spikes. For example, on a 100 GB volume, set `max_cache_size` to 90 GB or less.
+
 **Cache Directory**: See [CACHING.md](CACHING.md) for detailed directory structure
 
 **Eviction Algorithms**
