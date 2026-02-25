@@ -1,0 +1,81 @@
+cache/
+*.log
+tmp/
+
+# Rust
+/target
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ProbeScan exports
+ProbeScanExport*.csv
+
+# Config files (keep example)
+config.yaml
+
+# Test artifacts
+*.tmp
+test_cache/
+
+# Docker artifacts
+docker-compose.override.yml
+.env
+.env.local
+
+# Docker volumes and data
+logs/
+prometheus-data/
+grafana-data/
+
+# Backup files
+*.backup
+*.tar.gz
+cache-backup.tar.gz
+
+# Temporary test/debug files
+*.json
+!config/*.json
+!nonpublic/**/*.json
+
+# Archived deployment scripts
+nonpublic/deploy/archive/
+
+# Test platform results (downloaded per-run, not committed)
+nonpublic/test-platform/results/
+
+# Temporary deployment files
+docker-compose.local.yml
+
+# Dashboard development files
+dashboard-dev/
+*.html.tmp
+*.css.tmp
+*.js.tmp
+
+# Kiro artifacts
+.kiro/specs/.DS_Store
+
+# Rust build artifacts (additional)
+*.rlib
+*.rmeta
+*.d
+
+# Coverage reports
+coverage/
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# Benchmark results
+criterion/
+benches/target/
