@@ -178,7 +178,6 @@ cache:
 **Default**: `315360000s` (~10 years, effectively infinite)
 
 **Behavior**:
-- Matches S3's immutable object model
 - Objects don't change unless explicitly overwritten
 - Expiration checked lazily on access (unless `actively_remove_cached_data: true`)
 
@@ -929,9 +928,13 @@ logging:
   access_log_buffer_size: 1000       # Max entries before forced flush
 ```
 
+**Access Log Format**:
+
+The proxy writes access logs in [S3 Server Access Log format](https://docs.aws.amazon.com/AmazonS3/latest/userguide/LogFormat.html), so existing log analysis tools, Athena queries, and scripts that parse S3 Server Access Logs work without modification.
+
 **Access Log Modes**:
-- **all**: Log all requests (cache hits and misses)
-- **cached_only**: Log only cache hits
+- **all**: Log all requests (cache hits and misses). Provides a complete audit trail of every request the proxy handles.
+- **cached_only**: Log only requests served from cache. These requests never reach S3, so they don't appear in S3 Server Access Logs. This mode captures the requests that would otherwise have no audit trail, and is useful when you already have S3 Server Access Logging enabled and want to avoid duplicating entries for cache misses (which S3 logs directly).
 
 **Log Levels**:
 - **error**: Only errors
