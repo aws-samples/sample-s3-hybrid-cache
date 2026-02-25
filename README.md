@@ -175,8 +175,6 @@ Warm cache delivers 22% higher throughput and 2.4× lower p95 latency than direc
 
 **Security Considerations**: HTTP access requires trusted network environments, and read caching cannot provide access control between clients. See [Security Considerations](docs/ARCHITECTURE.md#security-considerations) for detailed guidance on appropriate deployment scenarios.
 
-**v1.5** — Stable core with multi-instance shared-storage coordination, streaming disk cache, download coordination, parallel NFS operations, per-bucket cache settings with hot reload, and comprehensive observability. Validate for your specific use case before production deployment.
-
 ## FAQ
 
 **Q: What security concerns should I consider?**
