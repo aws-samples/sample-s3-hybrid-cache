@@ -160,10 +160,6 @@ Endpoints:
 
 See [Security Considerations](docs/ARCHITECTURE.md#security-considerations) for detailed guidance on the shared cache access model, deployment guidelines, and appropriate use cases.
 
-## Configuration Files
-
-- `config/config.example.yaml` - Complete configuration with all options documented
-
 ## Performance
 
 Tested with 100 concurrent clients (c7gn.large) downloading 100 files (0.1–100 MB each, ~1.4 GB total per client) through 3 proxy instances (m6in.2xlarge) with shared EFS cache.
