@@ -89,7 +89,8 @@ echo "127.0.0.1 s3.<region>.amazonaws.com" | sudo tee -a /etc/hosts
 sudo cargo run --release -- -c config/config.example.yaml
 ```
 
-**Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to automatically route AWS CLI S3 traffic through the proxy for buckets in that region. See [Getting Started](docs/GETTING_STARTED.md) for details.
+**Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to automatically route AWS CLI S3 traffic through the proxy for buckets in that region. DNS zones are preferable to hosts file entries - see the limitations and details at docs/GETTING_STARTED.md#3-configure-dns-routing
+**Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to automatically route AWS CLI S3 traffic through the proxy for buckets in that region. DNS zones are preferable to hosts file entries - see the [limitations and details](docs/GETTING_STARTED.md#3-configure-dns-routing).
 
 **Next Steps**: See [Getting Started Guide](docs/GETTING_STARTED.md) for detailed installation and configuration.
 
