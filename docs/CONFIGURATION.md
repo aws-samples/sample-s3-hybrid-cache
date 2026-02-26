@@ -161,6 +161,8 @@ cache:
 
 ## Time-To-Live (TTL) Configuration
 
+TTL (Time-To-Live) controls how long cached data is served to clients without revalidating against S3. While a cached object's TTL has not expired, the proxy serves it directly from cache — S3 is not contacted, and the requesting client's IAM credentials are not checked by S3 for that request. When TTL expires, the next request triggers [revalidation](CACHING.md#time-to-live-ttl-configuration): the proxy sends a conditional request to S3 using the client's credentials, and S3 performs its normal authentication and authorization checks. Setting TTL to zero forces revalidation on every request, ensuring S3 checks every client's credentials while still saving bandwidth via 304 Not Modified responses. See [Security Considerations](ARCHITECTURE.md#security-considerations) for the access control implications of TTL settings.
+
 ### TTL Types
 
 S3 Proxy uses three independent TTL values:

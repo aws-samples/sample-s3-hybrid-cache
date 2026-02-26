@@ -146,7 +146,19 @@ Endpoints:
 - **Metrics**: `localhost:9090/metrics`
 - **Dashboard**: `localhost:8081`
 
-**Security Note**: All communication between the proxy and Amazon S3 uses HTTPS encryption, regardless of whether clients connect to the proxy via HTTP or HTTPS. Client-to-proxy HTTP traffic should be secured by network controls (VPC, security groups, etc.).
+## Security
+
+> **Your Responsibility**: You are responsible for restricting network access to the proxy to only clients authorized to access all objects that may be cached, and for securing file system access to the shared cache volume. This is the same security model as any shared cache — the proxy does not weaken S3's security, but depending on [TTL configuration](docs/CONFIGURATION.md#time-to-live-ttl-configuration), cached data may be accessible without S3 authorization checks.
+
+**Network access**: With [TTL](docs/CACHING.md#time-to-live-ttl-configuration) > 0, cache hits bypass S3 entirely — any client that can reach the proxy over the network can read any cached object without IAM authorization checks. Restrict proxy access using security groups, firewalls, or network segmentation.
+
+**Cache storage access**: Cached data is stored unencrypted (LZ4 compressed) on the shared volume. Restrict file system access to authorized proxy instances only. Encryption at rest can be provided by the storage layer if required.
+
+**Per-request authorization (TTL=0)**: For environments requiring per-request IAM authorization, [set TTL to zero](docs/ARCHITECTURE.md#shared-cache-access-model). Every request revalidates with S3 via conditional headers — bandwidth savings from 304 responses, with full IAM enforcement on every access.
+
+**HTTPS**: Supported only for [passthrough](#architecture) (TCP tunneling to S3). AWS CLI and SDKs use HTTPS by default, so all requests are authenticated by S3 unless clients explicitly opt into HTTP endpoints for caching. All proxy-to-S3 communication uses HTTPS regardless of client connection protocol. See the [FAQ](#faq) below for why caching requires HTTP.
+
+See [Security Considerations](docs/ARCHITECTURE.md#security-considerations) for detailed guidance on the shared cache access model, deployment guidelines, and appropriate use cases.
 
 ## Configuration Files
 
@@ -164,7 +176,7 @@ Tested with 100 concurrent clients (c7gn.large) downloading 100 files (0.1–100
 
 Warm cache delivers 22% higher throughput and 2.4× lower p95 latency than direct S3 access. Download coordination coalesced 94% of concurrent cache-miss requests during the cold-cache run (4,323 of ~4,600 requests served from cache after waiting, only 272 actual S3 fetches). CloudWatch confirmed 95% S3 data transfer savings: 6.3 GB pulled from S3 to serve 137 GB to 100 clients (22× amplification). Zero errors across 30,000+ requests.
 
-## Status and Limitations
+## Status
 
 **Beta Status**: This is sample code demonstrating S3 caching concepts. Not recommended for production use without thorough testing and validation for your specific use case.
 
@@ -173,13 +185,7 @@ Warm cache delivers 22% higher throughput and 2.4× lower p95 latency than direc
 - HTTPS mode provides passthrough only (no caching)
 - Cannot initiate requests to S3 (no AWS credentials, transparent forwarder only)
 
-**Security Considerations**: HTTP access requires trusted network environments, and read caching cannot provide access control between clients. See [Security Considerations](docs/ARCHITECTURE.md#security-considerations) for detailed guidance on appropriate deployment scenarios.
-
 ## FAQ
-
-**Q: What security concerns should I consider?**
-
-A: Three main considerations: 1) Data stored by the proxy on the filesystem is not encrypted by the proxy and must be secured from access (like Mountpoint for Amazon S3's cache). Encryption at rest can be provided by the filesystem if desired. 2) Unless the proxy is configured to authenticate every request, any client that can access the proxy over the network can read cached data, regardless of encryption at rest. Control network access to the proxy appropriately. 3) HTTPS is supported only for passthrough – clients must use HTTP to benefit from the cache. **However, all proxy-to-S3 communication uses HTTPS encryption regardless of the client connection protocol.**
 
 **Q: Why HTTP instead of HTTPS for caching?**
 

@@ -412,25 +412,30 @@ Each instance operates independently - the shared storage is the only integratio
 
 ## Security Considerations
 
+> **Your Responsibility**: You are responsible for securing both network access to the proxy and file system access to the shared cache storage. Any client that can reach the proxy over the network can read any cached object with TTL > 0, because cache hits are served without contacting S3. Similarly, anyone with access to the cache storage volume can read cached data directly. Restrict access those clients and systems authorized to access the cached data.
+
 ### Network Security Requirements
 
 **HTTP Traffic is Unencrypted**: All communication between clients and the proxy uses HTTP (port 80) for caching functionality. This means:
 
 - **Trusted Network Required**: Deploy only in secured network environments (VPCs, internal networks, isolated subnets)
-- **Data in Transit**: All S3 data flows unencrypted between client and proxy
-- **Not Suitable for**: Public networks, untrusted environments, or multi-tenant scenarios with sensitive data
+- **Data in Transit**: S3 data flows unencrypted between client and proxy (proxy-to-S3 communication always uses HTTPS)
+- **Network Controls**: Use security groups, firewalls, or network segmentation to restrict proxy access to authorized clients only
 
 ### Shared Cache Access Model
 
-**No Authentication or Authorization**: The proxy does not authenticate clients or authorize requests. It operates as a shared cache without access control:
+The proxy is a shared cache. It does not authenticate clients or authorize requests — S3 handles both, but only when requests reach S3. With TTL > 0, cache hits bypass S3 entirely.
 
-- **Authentication (AuthN)**: The proxy does not verify client identity. It forwards the client's `Authorization` header to S3, but only on cache misses or revalidation.
-- **Authorization (AuthZ)**: The proxy does not check permissions. S3 performs authorization checks, but only when requests reach S3.
-- **With TTL > 0**: Cache hits bypass S3 entirely. A user whose access was revoked can still retrieve cached data until TTL expires. Different users share the same cached responses.
+**What this means in practice**:
+- Any client with network access to the proxy can read any cached object until its TTL expires
+- A user whose S3 access was revoked can still retrieve cached data until TTL expires
+- Different users share the same cached responses — there is no per-user isolation
 
-- **Any Client Can Read Any Cached Data**: All clients with network access can retrieve any cached object until its TTL expires (authentication and authorization are bypassed for cache hits)
-- **Cross-Client Data Exposure**: In multi-tenant environments, one client's cached data is accessible to all other clients
-- **Persistent Cache**: Cached data remains accessible across client sessions and proxy restarts until expiration
+**This is the same security model as any shared cache** (CDN edge cache, Mountpoint for Amazon S3's local cache, or a shared NFS export of downloaded files). The proxy does not weaken S3's security — it requires you to control who can access the cache, just as you would for any local copy of S3 data.
+
+**Two access paths to secure**:
+1. **Network access to the proxy** — restrict to authorized clients using security groups, firewalls, or network segmentation
+2. **File system access to the cache volume** — restrict to authorized proxy instances only, using file permissions and mount controls
 
 **Mitigation - Always-Revalidate Mode (TTL=0)**: For environments requiring per-request authentication and authorization enforcement, TTL values can be set to zero:
 
@@ -484,17 +489,21 @@ This is an inherent limitation of the S3 API design, not a proxy implementation 
 
 ### Deployment Guidelines
 
+**Before deploying, ensure**:
+1. Network access to the proxy is restricted to clients authorized to access all objects that may be cached
+2. File system access to the cache volume is restricted to authorized proxy instances
+3. TTL values reflect your tolerance for serving stale data after access revocation (use TTL=0 for per-request authorization)
+
 **Appropriate Use Cases**:
-- Internal corporate networks with trusted clients
+- Internal networks where all clients are authorized to access the same S3 data
 - Development and testing environments
-- Single-tenant deployments with controlled access
-- Scenarios where performance outweighs confidentiality concerns
+- Single-tenant deployments with controlled network access
+- On-premises environments with network segmentation between trust zones
 
 **Not Recommended For**:
-- Multi-tenant SaaS environments
-- Public-facing deployments
-- Environments with strict data isolation requirements
-- Scenarios involving sensitive or regulated data (unless network is properly secured)
+- Multi-tenant environments where clients should not see each other's data
+- Public-facing or untrusted network deployments
+- Environments requiring per-object access control between clients (unless using TTL=0)
 
 ## Observability
 

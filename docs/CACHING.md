@@ -776,6 +776,7 @@ cache:
   - On next request, proxy revalidates with S3 using conditional requests (see below)
 - **Active mode** (actively_remove_cached_data: true): Background process actively removes expired entries
   - Intended for elastic shared storage where immediate space reclamation is valuable
+  - Not compatible with TTL=0 — active mode deletes expired entries, and TTL=0 entries expire immediately after caching
 
 **Cache Revalidation:**
 When an expired entry is accessed in lazy mode, the proxy uses HTTP conditional requests to validate freshness:
@@ -4308,6 +4309,7 @@ cache:
 **Active Expiration** (`actively_remove_cached_data: true`):
 - Validation scan actively removes expired GET cache entries
 - Frees disk space immediately when GET_TTL expires
+- Not compatible with TTL=0 (entries expire immediately and are deleted before they can be revalidated)
 - Useful when disk space is constrained
 - Adds background CPU/IO overhead during validation
 

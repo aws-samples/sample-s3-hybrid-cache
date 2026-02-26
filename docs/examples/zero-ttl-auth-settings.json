@@ -1,0 +1,7 @@
+{
+  "$schema": "../bucket-settings-schema.json",
+  "get_ttl": "0s",
+  "head_ttl": "0s",
+  "put_ttl": "1h",
+  "write_cache_enabled": true
+}
