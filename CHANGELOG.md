@@ -5,6 +5,11 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.8] - 2026-02-27
+
+### Changed
+- **Access log `source_region` field**: Added `source_region` as the 25th field in S3 server access log records, matching the current AWS S3 log format spec. Always emits `-` since the proxy cannot determine request origin region (PrivateLink, Direct Connect, and non-AWS IPs are also `-` in real S3 logs).
+
 ## [1.6.7] - 2026-02-25
 
 ### Security

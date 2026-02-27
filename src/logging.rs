@@ -43,6 +43,7 @@ pub struct AccessLogEntry {
     pub tls_version: Option<String>,
     pub access_point_arn: Option<String>,
     pub acl_required: Option<String>,
+    pub source_region: Option<String>,
 }
 
 /// Buffered access log writer that batches log entries in RAM before flushing to disk.
@@ -363,7 +364,7 @@ impl AccessLogBuffer {
     fn format_entry(entry: &AccessLogEntry) -> String {
         // S3 Server Access Log format (version_id field removed)
         format!(
-            "{} {} [{}] {} {} {} {} \"{}\" {} {} {} {} {} {} \"{}\" \"{}\" {} {} {} {} {} {} {}",
+            "{} {} [{}] {} {} {} {} \"{}\" {} {} {} {} {} {} \"{}\" \"{}\" {} {} {} {} {} {} {} {} {}",
             entry.bucket_owner,
             entry.bucket,
             entry.time.format("%d/%b/%Y:%H:%M:%S %z"),
@@ -387,6 +388,8 @@ impl AccessLogBuffer {
             entry.host_header.as_deref().unwrap_or("-"),
             entry.tls_version.as_deref().unwrap_or("-"),
             entry.access_point_arn.as_deref().unwrap_or("-"),
+            entry.acl_required.as_deref().unwrap_or("-"),
+            entry.source_region.as_deref().unwrap_or("-"),
         )
     }
 
@@ -733,6 +736,7 @@ impl LoggerManager {
             tls_version: None,
             access_point_arn: None,
             acl_required: None,
+            source_region: None,
         }
     }
 
@@ -802,6 +806,7 @@ mod tests {
             tls_version: None,
             access_point_arn: None,
             acl_required: None,
+            source_region: None,
         }
     }
 
@@ -882,6 +887,7 @@ mod tests {
             tls_version: Some("TLSv1.2".to_string()),
             access_point_arn: None,
             acl_required: None,
+            source_region: None,
         };
 
         buffer.log(entry.clone()).await.unwrap();

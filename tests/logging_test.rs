@@ -53,6 +53,7 @@ async fn test_access_log_creation() {
         tls_version: None,
         access_point_arn: None,
         acl_required: None,
+        source_region: None,
     };
 
     // Log the entry
@@ -215,6 +216,7 @@ async fn test_log_filename_format_compliance() {
         tls_version: None,
         access_point_arn: None,
         acl_required: None,
+        source_region: None,
     };
 
     // Log the entry and flush
