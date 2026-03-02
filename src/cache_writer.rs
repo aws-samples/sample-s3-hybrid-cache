@@ -413,11 +413,6 @@ impl CacheWriter {
     pub fn capacity_limit(&self) -> Option<u64> {
         self.capacity_limit
     }
-
-    /// Check if the writer has been finalized (committed or discarded)
-    pub fn is_finalized(&self) -> bool {
-        self.finalized
-    }
 }
 
 /// Ensure cleanup happens even if commit/discard is not called

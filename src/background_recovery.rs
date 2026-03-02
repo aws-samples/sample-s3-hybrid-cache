@@ -98,17 +98,6 @@ struct PrioritizedOrphan {
     /// Calculated based on file size, access patterns, and recency.
     priority_score: u64,
 }
-
-/// Recovery operation status
-#[derive(Debug, Clone)]
-pub enum RecoveryOperationStatus {
-    Queued,
-    Processing,
-    Completed(RecoveryResult),
-    Failed(String),
-    Skipped(String),
-}
-
 impl Default for BackgroundRecoveryConfig {
     fn default() -> Self {
         Self {
@@ -248,42 +237,6 @@ impl BackgroundRecoverySystem {
             processing_count: queue.processing.len(),
         }
     }
-
-    /// Manually trigger a recovery scan (non-blocking)
-    pub async fn trigger_scan(&self) -> Result<()> {
-        if !self.is_running() {
-            return Err(ProxyError::CacheError(
-                "Background recovery system is not running".to_string(),
-            ));
-        }
-
-        // Spawn a one-off scan task
-        let orphaned_recovery = self.orphaned_recovery.clone();
-        let config = self.config.clone();
-        let metrics = self.metrics.clone();
-        let recovery_queue = self.recovery_queue.clone();
-        let operation_semaphore = self.operation_semaphore.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = Self::run_recovery_cycle(
-                &orphaned_recovery,
-                &config,
-                &metrics,
-                &recovery_queue,
-                &operation_semaphore,
-            )
-            .await
-            {
-                error!("Manual recovery scan failed: {}", e);
-                metrics
-                    .background_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-
-        Ok(())
-    }
-
     /// Main recovery cycle implementation using sharded scanning for scalability
     async fn run_recovery_cycle(
         orphaned_recovery: &Arc<OrphanedRangeRecovery>,
@@ -710,39 +663,6 @@ impl BackgroundRecoveryMetrics {
         self.recovery_cycles_completed
             .load(std::sync::atomic::Ordering::Relaxed)
     }
-
-    /// Get average scan time in milliseconds
-    pub fn get_average_scan_time(&self) -> u64 {
-        let total_time = self
-            .total_scan_time
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let cycles = self.get_scan_cycles_completed();
-        if cycles > 0 {
-            total_time / cycles
-        } else {
-            0
-        }
-    }
-
-    /// Get average recovery time in milliseconds
-    pub fn get_average_recovery_time(&self) -> u64 {
-        let total_time = self
-            .total_recovery_time
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let cycles = self.get_recovery_cycles_completed();
-        if cycles > 0 {
-            total_time / cycles
-        } else {
-            0
-        }
-    }
-
-    /// Get peak concurrent operations
-    pub fn get_concurrent_operations_peak(&self) -> u64 {
-        self.concurrent_operations_peak
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Get total background failures
     pub fn get_background_failures(&self) -> u64 {
         self.background_failures

@@ -11,6 +11,7 @@ use hyper_util::client::legacy::connect::{Connected, Connection};
 use rustls::pki_types::ServerName;
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -127,65 +128,109 @@ impl Service<Uri> for CustomHttpsConnector {
 
         Box::pin(async move {
             // Extract hostname from URI
-            let hostname = uri
+            let uri_host = uri
                 .host()
                 .ok_or_else(|| ProxyError::ConfigError("No host in URI".to_string()))?;
 
-            debug!(
-                "[HTTPS_CONNECTOR] Establishing connection to hostname: {}",
-                hostname
-            );
+            // Detect whether the URI host is an IP address (from IpDistributor rewriting)
+            // or a regular hostname. When it's an IP, we need to:
+            // 1. Use the IP directly for TCP connection (skip ConnectionPoolManager IP selection)
+            // 2. Look up the original hostname for TLS SNI (Requirement 2.1)
+            let (connect_ip, tls_hostname) = if let Ok(ip) = uri_host.parse::<IpAddr>() {
+                // URI host is an IP — IpDistributor already selected it.
+                // Look up the original S3 hostname for TLS SNI.
+                let hostname = {
+                    let pm = pool_manager.lock().await;
+                    pm.get_hostname_for_ip(&ip)
+                };
 
-            // Get IP address from ConnectionPoolManager (handles load balancing)
-            let connection = {
-                let mut pm = pool_manager.lock().await;
-                pm.get_connection(hostname, None).await?
+                match hostname {
+                    Some(h) => {
+                        debug!(
+                            "[HTTPS_CONNECTOR] URI host is IP {}, using hostname '{}' for TLS SNI",
+                            ip, h
+                        );
+                        (ip, h)
+                    }
+                    None => {
+                        // Fallback: no hostname mapping found. This shouldn't happen in normal
+                        // operation since the IpDistributor populated the mapping. Log a warning
+                        // and attempt to use the IP as-is (TLS will likely fail).
+                        warn!(
+                            "[HTTPS_CONNECTOR] No hostname mapping found for IP {}, TLS SNI may fail",
+                            ip
+                        );
+                        (ip, uri_host.to_string())
+                    }
+                }
+            } else {
+                // URI host is a regular hostname — use existing ConnectionPoolManager path
+                debug!(
+                    "[HTTPS_CONNECTOR] Establishing connection to hostname: {}",
+                    uri_host
+                );
+
+                let connection = {
+                    let mut pm = pool_manager.lock().await;
+                    pm.get_connection(uri_host, None).await?
+                };
+
+                let ip = connection.ip_address;
+                debug!(
+                    "[HTTPS_CONNECTOR] Selected IP {} for hostname {}",
+                    ip, uri_host
+                );
+                (ip, uri_host.to_string())
             };
 
-            let ip = connection.ip_address;
-            debug!(
-                "[HTTPS_CONNECTOR] Selected IP {} for hostname {}",
-                ip, hostname
-            );
-
             // Establish TCP connection to selected IP
-            let tcp = TcpStream::connect((ip, 443)).await.map_err(|e| {
+            let tcp = TcpStream::connect((connect_ip, 443)).await.map_err(|e| {
                 warn!(
                     "[HTTPS_CONNECTOR] TCP connection failed to {}:{}: {}",
-                    ip, 443, e
+                    connect_ip, 443, e
                 );
-                ProxyError::ConnectionError(format!("Failed to connect to {}:{}: {}", ip, 443, e))
+                ProxyError::ConnectionError(format!(
+                    "Failed to connect to {}:{}: {}",
+                    connect_ip, 443, e
+                ))
             })?;
 
             // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
             if let Err(e) = tcp.set_nodelay(true) {
                 warn!(
                     "[HTTPS_CONNECTOR] Failed to set TCP_NODELAY for {}:{}: {}",
-                    ip, 443, e
+                    connect_ip, 443, e
                 );
             }
 
-            debug!("[HTTPS_CONNECTOR] TCP connection established to {}:443", ip);
+            debug!(
+                "[HTTPS_CONNECTOR] TCP connection established to {}:443",
+                connect_ip
+            );
 
-            // Perform TLS handshake
-            let server_name = ServerName::try_from(hostname.to_string()).map_err(|e| {
-                ProxyError::TlsError(format!("Invalid server name '{}': {}", hostname, e))
-            })?;
+            // Perform TLS handshake using the original hostname for SNI (Requirement 2.1)
+            let server_name =
+                ServerName::try_from(tls_hostname.clone()).map_err(|e| {
+                    ProxyError::TlsError(format!(
+                        "Invalid server name '{}': {}",
+                        tls_hostname, e
+                    ))
+                })?;
 
             let tls = tls_connector.connect(server_name, tcp).await.map_err(|e| {
                 warn!(
                     "[HTTPS_CONNECTOR] TLS handshake failed to {} ({}): {}",
-                    hostname, ip, e
+                    tls_hostname, connect_ip, e
                 );
                 ProxyError::TlsError(format!(
                     "TLS handshake failed to {} ({}): {}",
-                    hostname, ip, e
+                    tls_hostname, connect_ip, e
                 ))
             })?;
 
             debug!(
-                "[HTTPS_CONNECTOR] TLS connection established to {} ({}) - conn_id: {}",
-                hostname, ip, connection.id
+                "[HTTPS_CONNECTOR] TLS connection established to {} ({})",
+                tls_hostname, connect_ip
             );
 
             // Record connection creation in metrics
@@ -194,11 +239,11 @@ impl Service<Uri> for CustomHttpsConnector {
                 metrics
                     .read()
                     .await
-                    .record_connection_created(hostname)
+                    .record_connection_created(&tls_hostname)
                     .await;
                 debug!(
                     "[HTTPS_CONNECTOR] Recorded connection creation for endpoint: {}",
-                    hostname
+                    tls_hostname
                 );
             }
 
@@ -240,6 +285,8 @@ mod tests {
             pool_check_interval: Duration::from_secs(10),
             dns_servers: Vec::new(),
             endpoint_overrides: std::collections::HashMap::new(),
+            ip_distribution_enabled: false,
+            max_idle_per_ip: 10,
         };
 
         let pool_manager = Arc::new(tokio::sync::Mutex::new(

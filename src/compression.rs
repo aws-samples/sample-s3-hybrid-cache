@@ -417,25 +417,40 @@ impl CompressionHandler {
 
     /// Decompress data using LZ4 frame format
     pub fn decompress_data(&self, compressed_data: &[u8]) -> Result<Vec<u8>> {
-        let mut decoder = FrameDecoder::new(compressed_data);
+        use std::io::Cursor;
+
         let mut decompressed = Vec::new();
-        match decoder.read_to_end(&mut decompressed) {
-            Ok(_) => {
-                debug!(
-                    "Decompressed {} bytes to {} bytes",
-                    compressed_data.len(),
-                    decompressed.len()
-                );
-                Ok(decompressed)
+        let mut cursor = Cursor::new(compressed_data);
+        let total_len = compressed_data.len() as u64;
+
+        // Loop to handle concatenated LZ4 frames (produced by incremental writes).
+        // FrameDecoder::read_to_end stops at the end of each frame, so we create
+        // a new decoder for each frame until the cursor is exhausted.
+        loop {
+            if cursor.position() >= total_len {
+                break;
             }
-            Err(e) => {
-                error!("Decompression failed: {}", e);
-                Err(ProxyError::CompressionError(format!(
-                    "Failed to decompress cached data: {}",
-                    e
-                )))
+
+            let mut decoder = FrameDecoder::new(&mut cursor);
+            match decoder.read_to_end(&mut decompressed) {
+                Ok(0) => break, // No more data
+                Ok(_) => continue,
+                Err(e) => {
+                    error!("Decompression failed: {}", e);
+                    return Err(ProxyError::CompressionError(format!(
+                        "Failed to decompress cached data: {}",
+                        e
+                    )));
+                }
             }
         }
+
+        debug!(
+            "Decompressed {} bytes to {} bytes",
+            compressed_data.len(),
+            decompressed.len()
+        );
+        Ok(decompressed)
     }
 
     /// Get compression statistics
@@ -447,12 +462,6 @@ impl CompressionHandler {
     pub async fn get_compression_statistics(&self) -> Result<CompressionStats> {
         Ok(self.stats.clone())
     }
-
-    /// Reset compression statistics
-    pub fn reset_stats(&mut self) {
-        self.stats = CompressionStats::default();
-    }
-
     /// Get compression threshold
     pub fn get_compression_threshold(&self) -> usize {
         self.compression_threshold
@@ -477,12 +486,6 @@ impl CompressionHandler {
     pub fn is_content_aware_compression_enabled(&self) -> bool {
         self.content_aware_compression
     }
-
-    /// Enable or disable content-aware compression
-    pub fn set_content_aware_compression(&mut self, enabled: bool) {
-        self.content_aware_compression = enabled;
-    }
-
     /// Get preferred compression algorithm
     pub fn get_preferred_algorithm(&self) -> &CompressionAlgorithm {
         &self.preferred_algorithm
@@ -573,26 +576,38 @@ impl CompressionHandler {
 
     /// Try to decompress data, return error if decompression fails
     pub fn decompress_data_with_fallback(&self, data: &[u8]) -> Result<Vec<u8>> {
-        // Use frame decoder directly — it handles empty/small inputs
-        let mut decoder = FrameDecoder::new(data);
+        use std::io::Cursor;
+
+        // Use frame decoder with concatenated frame support — handles empty/small inputs
         let mut decompressed = Vec::new();
-        match decoder.read_to_end(&mut decompressed) {
-            Ok(_) => {
-                debug!(
-                    "Decompressed {} bytes to {} bytes",
-                    data.len(),
-                    decompressed.len()
-                );
-                Ok(decompressed)
+        let mut cursor = Cursor::new(data);
+        let total_len = data.len() as u64;
+
+        loop {
+            if cursor.position() >= total_len {
+                break;
             }
-            Err(e) => {
-                error!("Decompression failed: {}", e);
-                Err(ProxyError::CompressionError(format!(
-                    "Failed to decompress cached data: {}",
-                    e
-                )))
+
+            let mut decoder = FrameDecoder::new(&mut cursor);
+            match decoder.read_to_end(&mut decompressed) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    error!("Decompression failed: {}", e);
+                    return Err(ProxyError::CompressionError(format!(
+                        "Failed to decompress cached data: {}",
+                        e
+                    )));
+                }
             }
         }
+
+        debug!(
+            "Decompressed {} bytes to {} bytes",
+            data.len(),
+            decompressed.len()
+        );
+        Ok(decompressed)
     }
 
     /// Calculate compression ratio for given data sizes

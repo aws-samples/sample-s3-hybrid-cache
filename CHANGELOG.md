@@ -5,6 +5,92 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] - 2026-03-02
+
+### Fixed
+- **PERF logging actually moved to DEBUG**: Fixed v1.7.9 sed command that failed to match multiline `info!(\n    "PERF` pattern. All 9 PERF log lines now correctly use `debug!` macro.
+
+### Changed
+- **Idle consolidation detection**: Consolidation cycle skips entirely when no pending work (zero accumulator deltas and no journal files). Reduces EFS metadata IOPS from ~90 to near-zero during idle periods across 3 instances.
+
+## [1.8.1] - 2026-03-01
+
+### Fixed
+- **Backpressure-aware TeeStream**: Replaced `try_send` (non-blocking, drops chunks when channel full) with `send().await` via stored future in `poll_next`. When the cache write channel is full, the stream applies backpressure to the S3 response, slowing the client download to match disk write speed. Guarantees zero dropped chunks — every range is fully cached on first download. Client speed is unaffected when disk can keep up.
+
+## [1.8.0] - 2026-03-01
+
+### Fixed
+- **Large file cache regression**: Reverted signed range and unsigned range cache write paths from IncrementalRangeWriter (chunk-by-chunk with RwLock contention) back to buffered accumulation (Vec + single store_range). Fixes 5GB files caching 0-32% of ranges on first download. Root cause: hundreds of concurrent tokio::spawn tasks contending for the DiskCacheManager write lock during commit, causing task starvation. Full GET path retains IncrementalRangeWriter (single task, no contention).
+
+## [1.7.9] - 2026-03-01
+
+### Changed
+- **PERF logging moved to DEBUG level**: Request-level PERF timing lines now log at DEBUG instead of INFO. Set `log_level: "debug"` to enable. Reduces log noise in production while keeping the diagnostic capability available.
+
+## [1.7.8] - 2026-03-01
+
+### Changed
+- **IP distribution enabled by default**: `ip_distribution_enabled` now defaults to `true`. Per-IP connection pools are active out of the box.
+- **Cache backpressure logging**: Replaced per-chunk "Cache channel full" warnings with a single summary at stream end showing dropped chunks/bytes count. Size mismatch commit failures downgraded to DEBUG (the backpressure warning already covers it). Error message now explains the root cause.
+
+## [1.7.7] - 2026-03-01
+
+### Added
+- **Per-IP connection pool distribution**: New `ip_distribution_enabled` config option rewrites request URI authorities to individual S3 IP addresses, causing hyper to create separate connection pools per IP. Distributes load across all DNS-resolved IPs using round-robin selection. Preserves TLS SNI and Host header for SigV4 compatibility. Falls back to hostname-based routing when no IPs are available.
+- **IP distribution observability**: Per-IP connection counts in health check endpoint, info-level logging for IP lifecycle events (DNS refresh, health exclusion, exclusion expiry), debug-level logging of selected IP per request.
+- **IP distribution configuration**: `max_idle_per_ip` (default 10, range 1-100) controls idle connections per IP pool. Works with both DNS-resolved IPs and static `endpoint_overrides`.
+
+## [1.7.6] - 2026-03-01
+
+### Changed
+- **Always stream S3 responses**: Removed 1 MiB streaming threshold — all S3 responses now stream regardless of size. Default `allow_streaming` changed from `false` to `true`. Eliminates buffering delay for all response sizes.
+
+## [1.7.5] - 2026-03-01
+
+### Fixed
+- **Signed range streaming**: Signed range requests (AWS CLI) now stream S3 responses directly to client instead of buffering the entire range in memory. This was the root cause of ~200 MB/s cache miss throughput — each 8 MiB range was fully downloaded before any bytes reached the client.
+
+## [1.7.4] - 2026-02-28
+
+### Added
+- **Request-level PERF timing**: INFO-level `PERF` log lines on every GET data path showing timing breakdown (ram_lookup_ms, metadata_ms, disk_open_ms, stream_setup_ms, s3_fetch_ms, data_load_ms). Grep with `journalctl -u s3-proxy | grep PERF` to diagnose throughput bottlenecks.
+
+## [1.7.3] - 2026-02-28
+
+### Fixed
+- **Dashboard active requests**: Read active connections counter directly from the atomic instead of cached metrics, so the dashboard shows real-time values immediately.
+
+## [1.7.2] - 2026-02-28
+
+### Added
+- **Concurrent requests metric**: Active requests counter (`active_requests / max_concurrent_requests`) exposed on dashboard header, `/api/system-info`, `/metrics` JSON, and OTLP/CloudWatch.
+
+## [1.7.1] - 2026-02-28
+
+### Changed
+- **Streaming decompression for cache hits**: `stream_range_data` now uses `FrameDecoder` with chunked reads in a `spawn_blocking` task, yielding decompressed data through an mpsc channel instead of materializing the full range in memory.
+- **Stream-to-disk caching for cache misses**: Background cache writes use new `IncrementalRangeWriter` to compress and write chunks as they arrive from S3, eliminating full-range accumulation in memory.
+- **Async file I/O**: `load_range_data` uses `tokio::fs::read()` instead of blocking `std::fs::read()`, preventing NFS latency from stalling tokio worker threads.
+- **Connection pool default increase**: `max_idle_per_host` default raised from 10 to 100, validation range widened from 1–50 to 1–500.
+- **Streaming chunk size**: Default chunk size increased from 512 KiB to 1 MiB for better throughput.
+
+### Added
+- **Per-request memory documentation**: `config.example.yaml` and `docs/CONFIGURATION.md` document per-request memory usage (~5 MiB) with sizing formula and example calculations for `max_concurrent_requests`.
+
+## [1.7.0] - 2026-02-28
+
+### Added
+- **Configurable log retention**: Separate `access_log_retention_days` and `app_log_retention_days` settings (default 30, range 1–365) allow independent control over access log and application log disk usage.
+- **Background log cleanup task**: Spawns a periodic cleanup task at startup (`log_cleanup_interval`, default 24h, range 1h–7d). Runs immediately on startup, then at each interval. Deletes expired files, removes empty date-partition directories, logs results, and continues on I/O errors. Application log cleanup is hostname-scoped for safe multi-instance shared storage.
+- **Access log file rotation**: `access_log_file_rotation_interval` (default 5m, range 1m–60m) consolidates access log flushes within a time window into the same file, reducing small file proliferation under low traffic.
+
+## [1.6.9] - 2026-02-28
+
+### Removed
+- **Dead code cleanup**: Removed ~4,000 lines of unreachable code across 20 modules — 147 public functions, 2 enums, and cascading private functions/types/imports that were only called by the removed code. No behavioral changes; all removed code was verified unreachable from both `main.rs` and the test suite.
+- **`start_max_lifetime_task`**: Removed unwired background task for connection max lifetime enforcement. Updated CONNECTION_POOLING.md to reflect that `max_lifetime` config is accepted but not actively enforced (Hyper's idle timeout handles connection rotation).
+
 ## [1.6.8] - 2026-02-27
 
 ### Changed

@@ -414,37 +414,6 @@ impl ObjectMetadata {
             write_cache_last_accessed: None,
         }
     }
-
-    /// Create a new ObjectMetadata with compression information
-    pub fn new_with_compression(
-        etag: String,
-        last_modified: String,
-        content_length: u64,
-        content_type: Option<String>,
-        compression_algorithm: CompressionAlgorithm,
-        compressed_size: u64,
-    ) -> Self {
-        Self {
-            etag,
-            last_modified,
-            content_length,
-            content_type,
-            response_headers: HashMap::new(),
-            upload_state: UploadState::Complete,
-            cumulative_size: content_length,
-            parts: Vec::new(),
-            compression_algorithm,
-            compressed_size,
-            parts_count: None,
-            part_ranges: HashMap::new(),
-            upload_id: None,
-            is_write_cached: false,
-            write_cache_expires_at: None,
-            write_cache_created_at: None,
-            write_cache_last_accessed: None,
-        }
-    }
-
     /// Create a new ObjectMetadata with compression information and complete headers
     pub fn new_with_compression_and_headers(
         etag: String,
@@ -475,41 +444,6 @@ impl ObjectMetadata {
             write_cache_last_accessed: None,
         }
     }
-
-    /// Create a new ObjectMetadata for write-cached objects (PUT operations)
-    /// Sets is_write_cached=true and initializes write cache TTL fields
-    pub fn new_write_cached(
-        etag: String,
-        last_modified: String,
-        content_length: u64,
-        content_type: Option<String>,
-        response_headers: HashMap<String, String>,
-        compression_algorithm: CompressionAlgorithm,
-        compressed_size: u64,
-        write_ttl: std::time::Duration,
-    ) -> Self {
-        let now = SystemTime::now();
-        Self {
-            etag,
-            last_modified,
-            content_length,
-            content_type,
-            response_headers,
-            upload_state: UploadState::Complete,
-            cumulative_size: content_length,
-            parts: Vec::new(),
-            compression_algorithm,
-            compressed_size,
-            parts_count: None,
-            part_ranges: HashMap::new(),
-            upload_id: None,
-            is_write_cached: true,
-            write_cache_expires_at: Some(now + write_ttl),
-            write_cache_created_at: Some(now),
-            write_cache_last_accessed: Some(now),
-        }
-    }
-
     /// Check if write cache entry is expired
     pub fn is_write_cache_expired(&self) -> bool {
         if !self.is_write_cached {

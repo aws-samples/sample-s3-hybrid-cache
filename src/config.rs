@@ -862,10 +862,10 @@ impl ConnectionPoolConfig {
             ));
         }
 
-        // Validate max_idle_per_host (1-50)
-        if self.max_idle_per_host < 1 || self.max_idle_per_host > 50 {
+        // Validate max_idle_per_host (1-500)
+        if self.max_idle_per_host < 1 || self.max_idle_per_host > 500 {
             return Err(format!(
-                "Max idle connections per host must be between 1 and 50, got {}",
+                "Max idle connections per host must be between 1 and 500, got {}",
                 self.max_idle_per_host
             ));
         }
@@ -885,6 +885,14 @@ impl ConnectionPoolConfig {
             return Err(format!(
                 "Pool check interval must be between 1 and 60 seconds, got {}",
                 pool_check_interval_secs
+            ));
+        }
+
+        // Validate max_idle_per_ip (1-100)
+        if self.max_idle_per_ip < 1 || self.max_idle_per_ip > 100 {
+            return Err(format!(
+                "Max idle connections per IP must be between 1 and 100, got {}",
+                self.max_idle_per_ip
             ));
         }
 
@@ -1078,7 +1086,7 @@ pub enum EvictionAlgorithm {
     #[serde(rename = "lru")]
     LRU, // Least Recently Used (default)
     #[serde(rename = "tinylfu")]
-    TinyLFU, // Window-based TinyLFU
+    TinyLFU, // Simplified frequency-recency hybrid inspired by TinyLFU
 }
 
 impl Default for EvictionAlgorithm {
@@ -1115,6 +1123,27 @@ fn default_access_log_buffer_size() -> usize {
     1000
 }
 
+/// Default retention period for access log files (30 days)
+fn default_access_log_retention_days() -> u32 {
+    30
+}
+
+/// Default retention period for application log files (30 days)
+fn default_app_log_retention_days() -> u32 {
+    30
+}
+
+/// Default interval between log cleanup cycles (24 hours)
+fn default_log_cleanup_interval() -> Duration {
+    Duration::from_secs(24 * 3600)
+}
+
+/// Default rotation interval for access log files (5 minutes)
+fn default_access_log_file_rotation_interval() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
+
 /// Logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
@@ -1139,6 +1168,24 @@ pub struct LoggingConfig {
     /// of the flush interval. Valid range: 100-100000
     #[serde(default = "default_access_log_buffer_size")]
     pub access_log_buffer_size: usize,
+    /// Days to retain access log files (default: 30, range: 1-365)
+    #[serde(default = "default_access_log_retention_days")]
+    pub access_log_retention_days: u32,
+    /// Days to retain application log files (default: 30, range: 1-365)
+    #[serde(default = "default_app_log_retention_days")]
+    pub app_log_retention_days: u32,
+    /// Interval between cleanup cycles (default: 24h, range: 1h-7d)
+    #[serde(
+        default = "default_log_cleanup_interval",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub log_cleanup_interval: Duration,
+    /// Time window for appending to same access log file (default: 5m, range: 1m-60m)
+    #[serde(
+        default = "default_access_log_file_rotation_interval",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub access_log_file_rotation_interval: Duration,
 }
 
 /// Access logging mode
@@ -1156,6 +1203,46 @@ impl Default for AccessLogMode {
     }
 }
 
+impl LoggingConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        // Validate access_log_retention_days (1-365)
+        if self.access_log_retention_days < 1 || self.access_log_retention_days > 365 {
+            return Err(format!(
+                "access_log_retention_days must be between 1 and 365, got {}",
+                self.access_log_retention_days
+            ));
+        }
+
+        // Validate app_log_retention_days (1-365)
+        if self.app_log_retention_days < 1 || self.app_log_retention_days > 365 {
+            return Err(format!(
+                "app_log_retention_days must be between 1 and 365, got {}",
+                self.app_log_retention_days
+            ));
+        }
+
+        // Validate log_cleanup_interval (1h-7d)
+        let cleanup_secs = self.log_cleanup_interval.as_secs();
+        if cleanup_secs < 3600 || cleanup_secs > 7 * 24 * 3600 {
+            return Err(format!(
+                "log_cleanup_interval must be between 1 hour and 7 days, got {}s",
+                cleanup_secs
+            ));
+        }
+
+        // Validate access_log_file_rotation_interval (1m-60m)
+        let rotation_secs = self.access_log_file_rotation_interval.as_secs();
+        if rotation_secs < 60 || rotation_secs > 3600 {
+            return Err(format!(
+                "access_log_file_rotation_interval must be between 1 and 60 minutes, got {}s",
+                rotation_secs
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -1166,6 +1253,10 @@ impl Default for LoggingConfig {
             log_level: "info".to_string(),
             access_log_flush_interval: default_access_log_flush_interval(),
             access_log_buffer_size: default_access_log_buffer_size(),
+            access_log_retention_days: default_access_log_retention_days(),
+            app_log_retention_days: default_app_log_retention_days(),
+            log_cleanup_interval: default_log_cleanup_interval(),
+            access_log_file_rotation_interval: default_access_log_file_rotation_interval(),
         }
     }
 }
@@ -1183,7 +1274,7 @@ pub struct ConnectionPoolConfig {
     /// Enable HTTP connection keepalive (persistent connections) (default: true)
     #[serde(default = "default_keepalive_enabled")]
     pub keepalive_enabled: bool,
-    /// Maximum idle connections per host (IP address) (default: 10)
+    /// Maximum idle connections per host (IP address) (default: 100)
     #[serde(default = "default_max_idle_per_host")]
     pub max_idle_per_host: usize,
     /// Maximum connection lifetime (default: 300s)
@@ -1210,6 +1301,16 @@ pub struct ConnectionPoolConfig {
     /// Example: {"s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]}
     #[serde(default)]
     pub endpoint_overrides: std::collections::HashMap<String, Vec<String>>,
+    /// Enable per-IP connection pool distribution (default: true)
+    /// When enabled, the proxy rewrites request URI authorities to individual S3 IP addresses,
+    /// causing hyper to create separate connection pools per IP for better load distribution.
+    #[serde(default = "default_ip_distribution_enabled")]
+    pub ip_distribution_enabled: bool,
+    /// Maximum idle connections per IP when IP distribution is enabled (default: 10)
+    /// With 8 S3 IPs, this results in ~80 total idle connections.
+    /// Valid range: 1-100
+    #[serde(default = "default_max_idle_per_ip")]
+    pub max_idle_per_ip: usize,
 }
 
 fn default_dns_servers() -> Vec<String> {
@@ -1221,7 +1322,7 @@ fn default_keepalive_enabled() -> bool {
 }
 
 fn default_max_idle_per_host() -> usize {
-    10
+    100
 }
 
 fn default_max_lifetime() -> Duration {
@@ -1231,6 +1332,15 @@ fn default_max_lifetime() -> Duration {
 fn default_pool_check_interval() -> Duration {
     Duration::from_secs(10) // 10 seconds
 }
+
+fn default_max_idle_per_ip() -> usize {
+    10
+}
+
+fn default_ip_distribution_enabled() -> bool {
+    true
+}
+
 
 impl Default for ConnectionPoolConfig {
     fn default() -> Self {
@@ -1245,6 +1355,8 @@ impl Default for ConnectionPoolConfig {
             pool_check_interval: default_pool_check_interval(),
             dns_servers: default_dns_servers(),
             endpoint_overrides: std::collections::HashMap::new(),
+            ip_distribution_enabled: true,
+            max_idle_per_ip: default_max_idle_per_ip(),
         }
     }
 }
@@ -1430,6 +1542,10 @@ impl Default for Config {
                 log_level: "info".to_string(),
                 access_log_flush_interval: default_access_log_flush_interval(),
                 access_log_buffer_size: default_access_log_buffer_size(),
+                access_log_retention_days: default_access_log_retention_days(),
+                app_log_retention_days: default_app_log_retention_days(),
+                log_cleanup_interval: default_log_cleanup_interval(),
+                access_log_file_rotation_interval: default_access_log_file_rotation_interval(),
             },
             connection_pool: ConnectionPoolConfig {
                 max_connections_per_ip: 10,
@@ -1442,6 +1558,7 @@ impl Default for Config {
                 pool_check_interval: Duration::from_secs(10), // 10 seconds
                 dns_servers: Vec::new(),                // Default: Google DNS + Cloudflare DNS
                 endpoint_overrides: std::collections::HashMap::new(),
+                ip_distribution_enabled: true,                max_idle_per_ip: default_max_idle_per_ip(),
             },
             compression: CompressionConfig {
                 enabled: true,
@@ -1523,6 +1640,14 @@ impl Config {
         if let Err(e) = config.dashboard.validate() {
             return Err(ProxyError::ConfigError(format!(
                 "Invalid dashboard configuration: {}",
+                e
+            )));
+        }
+
+        // Validate logging configuration
+        if let Err(e) = config.logging.validate() {
+            return Err(ProxyError::ConfigError(format!(
+                "Invalid logging configuration: {}",
                 e
             )));
         }
@@ -3199,7 +3324,7 @@ metrics:
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
         assert_eq!(config.idle_timeout, Duration::from_secs(30));
         assert_eq!(config.keepalive_enabled, true);
-        assert_eq!(config.max_idle_per_host, 10);
+        assert_eq!(config.max_idle_per_host, 100);
         assert_eq!(config.max_lifetime, Duration::from_secs(300));
         assert_eq!(config.pool_check_interval, Duration::from_secs(10));
     }
@@ -3245,6 +3370,8 @@ pool_check_interval: "20s"
             pool_check_interval: Duration::from_secs(5),
             dns_servers: Vec::new(),
             endpoint_overrides: std::collections::HashMap::new(),
+            ip_distribution_enabled: false,
+            max_idle_per_ip: 10,
         };
 
         // Verify values are within reasonable ranges
@@ -3252,9 +3379,112 @@ pool_check_interval: "20s"
         assert!(config.dns_refresh_interval >= Duration::from_secs(10));
         assert!(config.connection_timeout >= Duration::from_secs(1));
         assert!(config.idle_timeout >= Duration::from_secs(10));
-        assert!(config.max_idle_per_host > 0 && config.max_idle_per_host <= 50);
+        assert!(config.max_idle_per_host > 0 && config.max_idle_per_host <= 500);
         assert!(config.max_lifetime >= Duration::from_secs(60));
         assert!(config.pool_check_interval >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_connection_pool_yaml_without_max_idle_per_host_uses_default() {
+        // Requirement 4.4: When max_idle_per_host is not specified in YAML, default to 100
+        let yaml = r#"
+max_connections_per_ip: 15
+dns_refresh_interval: "60s"
+connection_timeout: "10s"
+idle_timeout: "30s"
+keepalive_enabled: true
+max_lifetime: "300s"
+pool_check_interval: "10s"
+"#;
+
+        let config: ConnectionPoolConfig =
+            serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+
+        assert_eq!(config.max_idle_per_host, 100, "max_idle_per_host should default to 100 when not specified");
+    }
+
+    #[test]
+    fn test_ip_distribution_defaults() {
+        // Requirement 5.2, 5.3: ip_distribution_enabled defaults to true, max_idle_per_ip defaults to 10
+        let config = ConnectionPoolConfig::default();
+        assert_eq!(config.ip_distribution_enabled, true);
+        assert_eq!(config.max_idle_per_ip, 10);
+    }
+
+    #[test]
+    fn test_ip_distribution_yaml_parsing() {
+        // Requirement 5.2, 5.3: Parse ip_distribution_enabled and max_idle_per_ip from YAML
+        let yaml = r#"
+max_connections_per_ip: 10
+dns_refresh_interval: "60s"
+connection_timeout: "10s"
+idle_timeout: "30s"
+ip_distribution_enabled: true
+max_idle_per_ip: 25
+"#;
+
+        let config: ConnectionPoolConfig =
+            serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+
+        assert_eq!(config.ip_distribution_enabled, true);
+        assert_eq!(config.max_idle_per_ip, 25);
+    }
+
+    #[test]
+    fn test_ip_distribution_yaml_defaults_when_omitted() {
+        // Requirement 5.2, 5.3: Fields default correctly when omitted from YAML
+        let yaml = r#"
+max_connections_per_ip: 10
+dns_refresh_interval: "60s"
+connection_timeout: "10s"
+idle_timeout: "30s"
+"#;
+
+        let config: ConnectionPoolConfig =
+            serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+
+        assert_eq!(config.ip_distribution_enabled, true, "ip_distribution_enabled should default to true");
+        assert_eq!(config.max_idle_per_ip, 10, "max_idle_per_ip should default to 10");
+    }
+
+    #[test]
+    fn test_ip_distribution_validation_rejects_zero_max_idle_per_ip() {
+        // Requirement 5.4: max_idle_per_ip must be >= 1
+        let config = ConnectionPoolConfig {
+            max_idle_per_ip: 0,
+            ..ConnectionPoolConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err(), "Validation should reject max_idle_per_ip of 0");
+        assert!(result.unwrap_err().contains("Max idle connections per IP"));
+    }
+
+    #[test]
+    fn test_ip_distribution_validation_rejects_over_100_max_idle_per_ip() {
+        // Requirement 5.4: max_idle_per_ip must be <= 100
+        let config = ConnectionPoolConfig {
+            max_idle_per_ip: 101,
+            ..ConnectionPoolConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err(), "Validation should reject max_idle_per_ip > 100");
+        assert!(result.unwrap_err().contains("Max idle connections per IP"));
+    }
+
+    #[test]
+    fn test_ip_distribution_validation_accepts_valid_max_idle_per_ip() {
+        // Requirement 5.4: max_idle_per_ip of 1 and 100 are valid boundary values
+        let config_min = ConnectionPoolConfig {
+            max_idle_per_ip: 1,
+            ..ConnectionPoolConfig::default()
+        };
+        assert!(config_min.validate().is_ok(), "max_idle_per_ip of 1 should be valid");
+
+        let config_max = ConnectionPoolConfig {
+            max_idle_per_ip: 100,
+            ..ConnectionPoolConfig::default()
+        };
+        assert!(config_max.validate().is_ok(), "max_idle_per_ip of 100 should be valid");
     }
 
     #[test]
@@ -3456,6 +3686,18 @@ metrics:
         // Validation thresholds are now in shared_storage
         assert_eq!(config.cache.shared_storage.validation_threshold_warn, 5.0);
         assert_eq!(config.cache.shared_storage.validation_threshold_error, 20.0);
+
+        // Verify log lifecycle fields are present with expected values
+        assert_eq!(config.logging.access_log_retention_days, 30);
+        assert_eq!(config.logging.app_log_retention_days, 30);
+        assert_eq!(
+            config.logging.log_cleanup_interval,
+            Duration::from_secs(86400)
+        );
+        assert_eq!(
+            config.logging.access_log_file_rotation_interval,
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -4366,3 +4608,143 @@ mod dashboard_property_tests {
         TestResult::from_bool(validation_result.is_ok() && defaults_correct)
     }
 }
+
+#[cfg(test)]
+mod log_lifecycle_property_tests {
+    use super::*;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+
+    // Feature: log-lifecycle, Property 1: Config defaults are correct
+    // **Validates: Requirements 1.1, 1.3, 2.1, 2.3, 3.1, 3.3, 9.1, 9.3**
+    //
+    // For any YAML configuration string that omits access_log_retention_days,
+    // app_log_retention_days, log_cleanup_interval, and access_log_file_rotation_interval,
+    // deserializing it into LoggingConfig should produce the correct defaults:
+    //   access_log_retention_days = 30
+    //   app_log_retention_days = 30
+    //   log_cleanup_interval = 24h (86400s)
+    //   access_log_file_rotation_interval = 5m (300s)
+    #[quickcheck]
+    fn prop_config_defaults_are_correct(
+        access_dir_suffix: u8,
+        app_dir_suffix: u8,
+        enabled: bool,
+        use_cached_only: bool,
+    ) -> TestResult {
+        let access_log_mode = if use_cached_only { "cached_only" } else { "all" };
+        let log_levels = ["info", "debug", "warn", "error", "trace"];
+        let log_level = log_levels[(access_dir_suffix as usize) % log_levels.len()];
+
+        // Build YAML with required fields only — omit the four lifecycle fields
+        let yaml = format!(
+            r#"
+access_log_dir: "/tmp/access_logs_{}"
+app_log_dir: "/tmp/app_logs_{}"
+access_log_enabled: {}
+access_log_mode: "{}"
+log_level: "{}"
+"#,
+            access_dir_suffix, app_dir_suffix, enabled, access_log_mode, log_level,
+        );
+
+        let config: LoggingConfig = match serde_yaml::from_str(&yaml) {
+            Ok(c) => c,
+            Err(_) => return TestResult::discard(),
+        };
+
+        // Assert all four lifecycle defaults are correct
+        let defaults_correct = config.access_log_retention_days == 30
+            && config.app_log_retention_days == 30
+            && config.log_cleanup_interval == Duration::from_secs(86400)
+            && config.access_log_file_rotation_interval == Duration::from_secs(300);
+
+        TestResult::from_bool(defaults_correct)
+    }
+
+    // Feature: log-lifecycle, Property 2: Config round-trip preserves values
+    // **Validates: Requirements 1.2, 2.2, 3.2, 9.2**
+    //
+    // For any valid access_log_retention_days in [1, 365], app_log_retention_days in [1, 365],
+    // log_cleanup_interval in [1h, 7d], and access_log_file_rotation_interval in [1m, 60m],
+    // serializing these values into a YAML string and deserializing back should produce the same values.
+    #[quickcheck]
+    fn prop_config_round_trip_preserves_values(
+        access_ret_raw: u16,
+        app_ret_raw: u16,
+        cleanup_hours_raw: u8,
+        rotation_minutes_raw: u8,
+    ) -> TestResult {
+        // Map random values into valid ranges
+        let access_retention = (access_ret_raw % 365) as u32 + 1; // [1, 365]
+        let app_retention = (app_ret_raw % 365) as u32 + 1; // [1, 365]
+        let cleanup_hours = (cleanup_hours_raw % 168) as u64 + 1; // [1h, 168h = 7d]
+        let rotation_minutes = (rotation_minutes_raw % 60) as u64 + 1; // [1m, 60m]
+
+        let cleanup_secs = cleanup_hours * 3600;
+        let rotation_secs = rotation_minutes * 60;
+
+        let yaml = format!(
+            r#"
+access_log_dir: "/tmp/access"
+app_log_dir: "/tmp/app"
+access_log_enabled: true
+access_log_mode: "all"
+log_level: "info"
+access_log_retention_days: {}
+app_log_retention_days: {}
+log_cleanup_interval: "{}s"
+access_log_file_rotation_interval: "{}s"
+"#,
+            access_retention, app_retention, cleanup_secs, rotation_secs,
+        );
+
+        let config: LoggingConfig = match serde_yaml::from_str(&yaml) {
+            Ok(c) => c,
+            Err(_) => return TestResult::discard(),
+        };
+
+        let round_trip_correct = config.access_log_retention_days == access_retention
+            && config.app_log_retention_days == app_retention
+            && config.log_cleanup_interval == Duration::from_secs(cleanup_secs)
+            && config.access_log_file_rotation_interval == Duration::from_secs(rotation_secs);
+
+        TestResult::from_bool(round_trip_correct)
+    }
+
+    // Feature: log-lifecycle, Property 3: Config validation accepts in-range and rejects out-of-range
+    // **Validates: Requirements 1.4, 2.4, 3.5, 9.4**
+    //
+    // For any u32 value for retention days and any Duration value for intervals,
+    // LoggingConfig::validate() should return Ok if and only if all four fields are in range:
+    //   access_log_retention_days in [1, 365]
+    //   app_log_retention_days in [1, 365]
+    //   log_cleanup_interval in [1h (3600s), 7d (604800s)]
+    //   access_log_file_rotation_interval in [1m (60s), 60m (3600s)]
+    #[quickcheck]
+    fn prop_config_validation_accepts_in_range_rejects_out_of_range(
+        access_ret: u32,
+        app_ret: u32,
+        cleanup_secs_raw: u32,
+        rotation_secs_raw: u32,
+    ) -> TestResult {
+        let cleanup_secs = cleanup_secs_raw as u64;
+        let rotation_secs = rotation_secs_raw as u64;
+
+        let mut config = LoggingConfig::default();
+        config.access_log_retention_days = access_ret;
+        config.app_log_retention_days = app_ret;
+        config.log_cleanup_interval = Duration::from_secs(cleanup_secs);
+        config.access_log_file_rotation_interval = Duration::from_secs(rotation_secs);
+
+        let result = config.validate();
+
+        let all_in_range = (1..=365).contains(&access_ret)
+            && (1..=365).contains(&app_ret)
+            && (3600..=604800).contains(&cleanup_secs)
+            && (60..=3600).contains(&rotation_secs);
+
+        TestResult::from_bool(result.is_ok() == all_in_range)
+    }
+}
+

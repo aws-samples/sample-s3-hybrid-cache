@@ -10,13 +10,13 @@
 //! - Requirement 4.2, 4.3: Incomplete upload eviction after TTL
 
 use crate::cache::CacheEvictionAlgorithm;
-use crate::disk_cache::DiskCacheManager;
+
 use crate::{ProxyError, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+
 use std::time::{Duration, SystemTime};
-use tokio::sync::RwLock;
+
 use tracing::{debug, error, info, warn};
 
 /// Write cache manager for capacity tracking and eviction
@@ -49,7 +49,6 @@ pub struct WriteCacheManager {
     cache_dir: PathBuf,
 
     /// Reference to disk cache manager for storage operations
-    disk_cache: Option<Arc<RwLock<DiskCacheManager>>>,
 
     /// Maximum object size for write caching (objects larger than this bypass cache)
     max_object_size: u64,
@@ -100,7 +99,6 @@ impl WriteCacheManager {
             incomplete_upload_ttl,
             eviction_algorithm,
             cache_dir,
-            disk_cache: None,
             max_object_size,
         }
     }
@@ -124,12 +122,6 @@ impl WriteCacheManager {
             256 * 1024 * 1024, // 256MB
         )
     }
-
-    /// Set the disk cache manager reference
-    pub fn set_disk_cache(&mut self, disk_cache: Arc<RwLock<DiskCacheManager>>) {
-        self.disk_cache = Some(disk_cache);
-    }
-
     /// Get the maximum write cache size
     pub fn max_size(&self) -> u64 {
         self.max_size
@@ -781,103 +773,6 @@ impl WriteCacheManager {
         Ok(total_freed)
     }
 
-    /// Start the incomplete upload scanner background task
-    ///
-    /// This method starts a background task that runs every hour to scan for
-    /// incomplete multipart uploads that have exceeded the TTL and evicts them.
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.2, 4.3, 8.4
-    pub fn start_incomplete_upload_scanner(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600)); // 1 hour
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            info!("Started incomplete upload scanner (runs every hour)");
-
-            loop {
-                interval.tick().await;
-
-                debug!("Running incomplete upload scanner");
-
-                // Acquire distributed eviction lock to prevent concurrent cleanup across nodes
-                match self.acquire_distributed_eviction_lock().await {
-                    Ok(Some(_lock_guard)) => {
-                        // Run the eviction
-                        match self.evict_incomplete_uploads().await {
-                            Ok(freed) => {
-                                if freed > 0 {
-                                    info!("Incomplete upload scanner freed {} bytes", freed);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Incomplete upload scanner failed: {}", e);
-                            }
-                        }
-                        // Lock is automatically released when _lock_guard is dropped
-                    }
-                    Ok(None) => {
-                        debug!("Incomplete upload scanner skipped (another instance is running)");
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to acquire eviction lock for incomplete upload scanner: {}",
-                            e
-                        );
-                    }
-                }
-            }
-        })
-    }
-
-    /// Acquire distributed eviction lock to prevent concurrent cleanup across nodes
-    ///
-    /// Uses file locking to coordinate between multiple proxy instances sharing
-    /// the same cache volume.
-    ///
-    /// # Returns
-    /// * `Ok(Some(lock_guard))` - Lock acquired successfully
-    /// * `Ok(None)` - Lock is held by another instance
-    /// * `Err` - Failed to acquire lock
-    async fn acquire_distributed_eviction_lock(&self) -> Result<Option<DistributedLockGuard>> {
-        use fs2::FileExt;
-        use std::fs::OpenOptions;
-
-        let lock_dir = self.cache_dir.join("locks");
-        tokio::fs::create_dir_all(&lock_dir).await.map_err(|e| {
-            ProxyError::CacheError(format!("Failed to create locks directory: {}", e))
-        })?;
-
-        let lock_file_path = lock_dir.join("incomplete_upload_eviction.lock");
-
-        // Try to acquire lock with timeout
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_file_path)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
-
-        // Try non-blocking lock first
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => {
-                debug!("Acquired distributed eviction lock");
-                Ok(Some(DistributedLockGuard {
-                    _file: lock_file,
-                    _path: lock_file_path,
-                }))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Lock is held by another instance
-                Ok(None)
-            }
-            Err(e) => Err(ProxyError::CacheError(format!(
-                "Failed to acquire lock: {}",
-                e
-            ))),
-        }
-    }
-
     /// Run incomplete upload cleanup on startup
     ///
     /// This method should be called during cache manager initialization to
@@ -902,19 +797,6 @@ impl WriteCacheManager {
                 Err(e)
             }
         }
-    }
-}
-
-/// Guard for distributed eviction lock
-struct DistributedLockGuard {
-    _file: std::fs::File,
-    _path: PathBuf,
-}
-
-impl Drop for DistributedLockGuard {
-    fn drop(&mut self) {
-        debug!("Released distributed eviction lock");
-        // File lock is automatically released when file is dropped
     }
 }
 

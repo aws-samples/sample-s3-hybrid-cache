@@ -69,6 +69,8 @@ struct Instruments {
     req_failed: Gauge<u64>,
     req_avg_latency_ms: Gauge<u64>,
     req_per_second: Gauge<f64>,
+    req_active: Gauge<u64>,
+    req_max_concurrent: Gauge<u64>,
     // -- top-level --
     uptime_seconds: Gauge<u64>,
     // -- process --
@@ -164,6 +166,8 @@ impl OtlpExporter {
             req_failed:         g_u64!("request_metrics.failed_requests"),
             req_avg_latency_ms: g_u64!("request_metrics.average_response_time_ms"),
             req_per_second:     g_f64!("request_metrics.requests_per_second"),
+            req_active:         g_u64!("request_metrics.active_requests"),
+            req_max_concurrent: g_u64!("request_metrics.max_concurrent_requests"),
 
             uptime_seconds:      g_u64!("uptime_seconds"),
             memory_usage_bytes:  g_u64!("process.memory_usage_bytes"),
@@ -230,6 +234,8 @@ impl OtlpExporter {
         i.req_failed.record(rm.failed_requests, a);
         i.req_avg_latency_ms.record(rm.average_response_time_ms, a);
         i.req_per_second.record(rm.requests_per_second as f64, a);
+        i.req_active.record(rm.active_requests, a);
+        i.req_max_concurrent.record(rm.max_concurrent_requests, a);
 
         i.uptime_seconds.record(metrics.uptime_seconds, a);
 

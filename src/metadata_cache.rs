@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Configuration for the MetadataCache
 #[derive(Debug, Clone)]
@@ -159,12 +159,6 @@ impl MetadataCache {
             metrics: MetadataCacheMetrics::default(),
         }
     }
-
-    /// Create a new MetadataCache with default configuration
-    pub fn new_default() -> Self {
-        Self::new(MetadataCacheConfig::default())
-    }
-
     /// Check if the cache is enabled
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
@@ -382,60 +376,6 @@ impl MetadataCache {
             }
         }
     }
-
-    /// Load metadata with full retry logic for stale file handles
-    ///
-    /// This is a more comprehensive retry wrapper that can be used when
-    /// the caller wants automatic retry behavior.
-    pub async fn load_with_stale_handle_retry<F, Fut>(
-        &self,
-        cache_key: &str,
-        mut loader_factory: F,
-    ) -> Result<NewCacheMetadata>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<(NewCacheMetadata, Option<SystemTime>)>>,
-    {
-        let mut attempts = 0u32;
-
-        loop {
-            match loader_factory().await {
-                Ok((metadata, disk_mtime)) => {
-                    self.put_with_mtime(cache_key, metadata.clone(), disk_mtime)
-                        .await;
-                    return Ok(metadata);
-                }
-                Err(e) if Self::is_stale_file_handle(&e) => {
-                    attempts += 1;
-                    self.metrics
-                        .stale_handle_errors
-                        .fetch_add(1, Ordering::Relaxed);
-
-                    if attempts >= self.config.stale_handle_max_retries {
-                        self.invalidate(cache_key).await;
-                        error!(
-                            cache_key = %cache_key,
-                            attempts = attempts,
-                            "Stale file handle persisted after retries"
-                        );
-                        return Err(e);
-                    }
-
-                    warn!(
-                        cache_key = %cache_key,
-                        attempt = attempts,
-                        max_retries = self.config.stale_handle_max_retries,
-                        "Stale file handle error, retrying"
-                    );
-
-                    // Exponential backoff: 10ms, 20ms, 30ms...
-                    tokio::time::sleep(Duration::from_millis(10 * attempts as u64)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     /// Check if an error is a stale file handle error (ESTALE)
     fn is_stale_file_handle(error: &ProxyError) -> bool {
         match error {

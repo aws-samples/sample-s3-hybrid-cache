@@ -143,6 +143,10 @@ async fn main() -> Result<()> {
         // Task 4.3: Pass config values for buffered access logging
         access_log_flush_interval: config.logging.access_log_flush_interval,
         access_log_buffer_size: config.logging.access_log_buffer_size,
+        access_log_retention_days: config.logging.access_log_retention_days,
+        app_log_retention_days: config.logging.app_log_retention_days,
+        log_cleanup_interval: config.logging.log_cleanup_interval,
+        access_log_file_rotation_interval: config.logging.access_log_file_rotation_interval,
     };
 
     let mut logger = LoggerManager::new(logging_config);
@@ -258,6 +262,12 @@ async fn main() -> Result<()> {
     // Set metrics manager reference on HTTP proxy for signed PUT caching metrics
     http_proxy.set_metrics_manager(metrics_manager.clone());
 
+    // Wire active connections counter into metrics manager for concurrent request tracking
+    metrics_manager.write().await.set_active_connections(
+        http_proxy.get_active_connections(),
+        config.server.max_concurrent_requests,
+    );
+
     // Start background cache hit update buffer flush task (for journal-based cache-hit updates)
     let cache_hit_update_buffer = cache_manager_ref.get_cache_hit_update_buffer().await;
     if let Some(buffer) = cache_hit_update_buffer {
@@ -354,6 +364,55 @@ async fn main() -> Result<()> {
     } else {
         debug!("Journal consolidation disabled (shared storage mode not enabled)");
     }
+
+    // Start background log cleanup task
+    let cleanup_logger = logger_manager.clone();
+    let cleanup_interval = config.logging.log_cleanup_interval;
+    let access_retention = config.logging.access_log_retention_days;
+    let app_retention = config.logging.app_log_retention_days;
+    let mut cleanup_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+
+    info!(
+        "Starting log cleanup background task (interval: {}s, access_retention: {}d, app_retention: {}d)",
+        cleanup_interval.as_secs(), access_retention, app_retention
+    );
+
+    let _log_cleanup_task = tokio::spawn(async move {
+        // Run cleanup once immediately at startup
+        {
+            let logger = cleanup_logger.lock().await;
+            match logger.rotate_logs(access_retention, app_retention) {
+                Ok(result) => info!("Startup log cleanup: {} access files, {} app files deleted",
+                    result.access_files_deleted, result.app_files_deleted),
+                Err(e) => warn!("Startup log cleanup failed: {}", e),
+            }
+        }
+
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // consume the immediate first tick
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let logger = cleanup_logger.lock().await;
+                    match logger.rotate_logs(access_retention, app_retention) {
+                        Ok(result) => {
+                            if result.access_files_deleted > 0 || result.app_files_deleted > 0 || result.errors > 0 {
+                                info!("Log cleanup: {} access files, {} app files deleted, {} errors",
+                                    result.access_files_deleted, result.app_files_deleted, result.errors);
+                            }
+                        }
+                        Err(e) => warn!("Log cleanup failed: {}", e),
+                    }
+                }
+                _ = cleanup_shutdown.wait_for_shutdown() => {
+                    info!("Log cleanup task received shutdown signal");
+                    break;
+                }
+            }
+        }
+    });
 
     // Start background orphan recovery system
     // This recovers orphaned .bin files that aren't tracked in metadata due to journal consolidation lag
@@ -457,6 +516,9 @@ async fn main() -> Result<()> {
             .set_metrics_manager(metrics_manager.clone())
             .await;
         dashboard_server.set_logger_manager(logger_manager.clone());
+        dashboard_server
+            .set_active_connections(http_proxy.get_active_connections(), config.server.max_concurrent_requests)
+            .await;
 
         // Get shutdown signal for dashboard
         let dashboard_shutdown = shutdown_coordinator.subscribe();

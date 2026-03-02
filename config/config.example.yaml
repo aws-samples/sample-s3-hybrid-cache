@@ -6,6 +6,11 @@ server:
   https_port: 443
   https_mode: "passthrough"  # Only option: "passthrough" (TCP passthrough)
   # Maximum concurrent requests (default: 200)
+  # Each concurrent request uses approximately 5 MiB of memory:
+  #   - Cache hit: ~1 MiB streaming decompression buffer + ~4 MiB channel backpressure
+  #   - Cache miss: ~1 MiB TeeStream buffer + ~4 MiB incremental write buffer
+  # Formula: total_proxy_memory ≈ base (~200 MiB) + max_concurrent_requests × 5 MiB
+  # Examples: 200 requests ≈ 1.2 GB, 500 ≈ 2.7 GB, 1000 ≈ 5.2 GB, 2000 ≈ 10.2 GB
   # Tuning guide:
   #   Small deployments (< 50 users): 50-100
   #   Medium deployments (50-500 users): 100-300
@@ -18,7 +23,7 @@ server:
   add_referer_header: true
 
 cache:
-  cache_dir: "./tmp/cache"  # Local development; use "/mnt/efs/cache" for EFS deployments
+  cache_dir: "./tmp/cache"  # Local development; use absolute path for production (e.g., "/mnt/cache")
   max_cache_size: 524288000  # 500MB in bytes
   ram_cache_enabled: true
   max_ram_cache_size: 104857600  # 100MB in bytes
@@ -66,7 +71,7 @@ cache:
   # SHARED STORAGE CONFIGURATION
   # ============================================================================
   # Controls coordination features for multi-instance deployments where multiple
-  # proxy instances share a cache volume (EFS, NFS, shared PersistentVolume).
+  # proxy instances share a cache volume (NFS, shared PersistentVolume).
   #
   # Journal-based metadata writes and distributed eviction locking are always
   # enabled for consistency across all deployment modes. This ensures reliable
@@ -236,7 +241,7 @@ cache:
     max_entries: 10000
     
     # Maximum retries for stale file handle errors (default: 3)
-    # On shared storage (EFS/NFS), stale file handles can occur when files
+    # On shared storage (NFS), stale file handles can occur when files
     # are modified by other instances. This controls retry behavior.
     # Valid range: 1-10
     stale_handle_max_retries: 3
@@ -261,8 +266,8 @@ cache:
   disk_streaming_threshold: 1048576  # 1 MiB in bytes
 
 logging:
-  access_log_dir: "./tmp/logs/access"  # Use "/mnt/efs/logs/access" for EFS deployments
-  app_log_dir: "./tmp/logs/app"        # Use "/mnt/efs/logs/app" for EFS deployments
+  access_log_dir: "./tmp/logs/access"  # Local development; use absolute path for production (e.g., "/mnt/logs/access")
+  app_log_dir: "./tmp/logs/app"        # Local development; use absolute path for production (e.g., "/mnt/logs/app")
   access_log_enabled: true
   access_log_mode: "all"  # Options: "all" (default), "cached_only"
   log_level: "info"
@@ -271,6 +276,14 @@ logging:
   # Access log entries are buffered in RAM and flushed periodically
   access_log_flush_interval: "5s"  # How often to flush buffered entries (default: 5s)
   access_log_buffer_size: 1000     # Max entries before forced flush (default: 1000)
+  
+  # Log lifecycle management
+  # Each proxy instance manages its own log cleanup independently.
+  # No inter-instance coordination is needed on shared storage.
+  access_log_retention_days: 30              # Days to retain access log files (default: 30, range: 1-365)
+  app_log_retention_days: 30                 # Days to retain application log files (default: 30, range: 1-365)
+  log_cleanup_interval: "24h"                # How often the background cleanup task runs (default: 24h, range: 1h-7d)
+  access_log_file_rotation_interval: "5m"    # Time window for appending to same access log file before rotating (default: 5m, range: 1m-60m)
 
 connection_pool:
   max_connections_per_ip: 50
@@ -278,7 +291,7 @@ connection_pool:
   connection_timeout: "10s"
   idle_timeout: "60s"
   keepalive_enabled: true
-  max_idle_per_host: 10  # More idle connections = more memory, fewer TLS handshakes during bursts
+  max_idle_per_host: 100  # More idle connections = more memory, fewer TLS handshakes during bursts
   max_lifetime: "300s"
   pool_check_interval: "10s"
   # endpoint_overrides: Static hostname-to-IP mappings that bypass DNS resolution.
@@ -288,6 +301,18 @@ connection_pool:
   # endpoint_overrides:
   #   "s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
   #   "s3.eu-west-1.amazonaws.com": ["10.0.3.100", "10.0.4.100"]
+  # IP Distribution: create separate hyper connection pools per S3 IP address.
+  # When enabled, the proxy rewrites request URI authorities from hostname to individual
+  # IP addresses, causing hyper to maintain per-IP connection pools. This distributes
+  # connections across all S3 frontend servers instead of concentrating on a subset.
+  # Improves reliability by avoiding per-IP throttling and follows aws-c-s3 best practices.
+  # TLS SNI and Host headers are preserved for AWS SigV4 compatibility.
+  ip_distribution_enabled: false  # Enable per-IP connection pool distribution (default: false)
+  # Maximum idle connections per IP when IP distribution is enabled (default: 10)
+  # With N S3 IPs (typically ~8), total idle connections ≈ N × max_idle_per_ip (~80).
+  # When IP distribution is disabled, max_idle_per_host (above) is used instead.
+  # Valid range: 1-100
+  max_idle_per_ip: 10
 
 compression:
   enabled: true

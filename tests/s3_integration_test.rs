@@ -90,6 +90,10 @@ fn create_test_config() -> Config {
             log_level: "info".to_string(),
             access_log_flush_interval: Duration::from_secs(5),
             access_log_buffer_size: 1000,
+            access_log_retention_days: 30,
+            app_log_retention_days: 30,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
         },
         connection_pool: ConnectionPoolConfig {
             max_connections_per_ip: 10,
@@ -102,6 +106,8 @@ fn create_test_config() -> Config {
             pool_check_interval: Duration::from_secs(10),
             dns_servers: Vec::new(),
             endpoint_overrides: std::collections::HashMap::new(),
+            ip_distribution_enabled: false,
+            max_idle_per_ip: 10,
         },
         compression: CompressionConfig {
             enabled: true,

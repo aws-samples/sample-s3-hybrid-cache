@@ -18,6 +18,7 @@ Complete configuration guide for S3 Proxy including cache behavior, TTL manageme
 - [Cache Size Tracking Configuration](#cache-size-tracking-configuration)
 - [Compression Configuration](#compression-configuration)
 - [Connection Pooling](#connection-pooling)
+- [IP Distribution](#ip-distribution)
 - [Logging Configuration](#logging-configuration)
 - [Metrics Configuration](#metrics-configuration)
 - [Dashboard Configuration](#dashboard-configuration)
@@ -80,6 +81,23 @@ server:
 - Medium deployments (50-500 users): 100-300
 - Large deployments (500+ users): 300-1000+
 - High-throughput scenarios: 1000+
+
+**Memory Impact**
+
+Each concurrent request uses approximately 5 MiB of memory for streaming buffers:
+- Cache hit path: 1 MiB decompression chunk buffer + up to 4 MiB channel backpressure (4 × 1 MiB chunks)
+- Cache miss path: 1 MiB TeeStream receive buffer + up to 4 MiB incremental cache write buffer
+
+Estimate total proxy memory: `base (~200 MiB) + max_concurrent_requests × 5 MiB`
+
+| max_concurrent_requests | Estimated Memory |
+|------------------------|-----------------|
+| 200 (default)          | ~1.2 GB         |
+| 500                    | ~2.7 GB         |
+| 1000                   | ~5.2 GB         |
+| 2000                   | ~10.2 GB        |
+
+RAM cache (`max_ram_cache_size`) is additional. For example, a 1 GB RAM cache with 1000 concurrent requests uses ~6.2 GB total.
 
 ### Proxy Identification
 
@@ -917,6 +935,58 @@ Creates new connections for every request. Useful for:
 - Testing without connection reuse
 - Specific deployment scenarios
 
+## IP Distribution
+
+Distributes outgoing S3 connections across all resolved IP addresses for an endpoint. By default, hyper pools connections by hostname, so all requests share one pool regardless of how many IPs DNS returns. IP distribution rewrites each request's URI authority to a specific IP, causing hyper to create separate per-IP connection pools.
+
+```yaml
+connection_pool:
+  ip_distribution_enabled: false  # Enable per-IP connection pools (default: false)
+  max_idle_per_ip: 10             # Idle connections per IP pool (default: 10, range: 1-100)
+```
+
+### When to Enable
+
+Enable for high-throughput workloads where you want to spread load across S3 frontend servers. Each HTTP/1.1 connection to S3 is capped at ~90 MB/s, so distributing across multiple IPs increases aggregate throughput. Also reduces the risk of per-IP throttling.
+
+### How It Works
+
+1. The `ConnectionPoolManager` resolves S3 endpoint IPs via DNS (or uses `endpoint_overrides`)
+2. The `IpDistributor` selects a target IP using round-robin for each outgoing request
+3. The request URI authority is rewritten from hostname to IP (e.g., `s3.eu-west-1.amazonaws.com` → `52.92.17.224`)
+4. Hyper creates a separate connection pool for each distinct IP
+5. TLS SNI and the Host header retain the original hostname, preserving AWS SigV4 signature validity
+
+### Connection Capacity
+
+When IP distribution is enabled, `max_idle_per_ip` replaces `max_idle_per_host` for the hyper client. Total idle connections across all IPs:
+
+```
+total_idle = number_of_IPs × max_idle_per_ip
+```
+
+S3 typically returns ~8 IPs per endpoint, so the default of 10 yields ~80 total idle connections. Adjust `max_idle_per_ip` based on your throughput needs:
+
+| IPs | max_idle_per_ip | Total Idle |
+|-----|-----------------|------------|
+| 4   | 10              | 40         |
+| 8   | 10              | 80         |
+| 8   | 25              | 200        |
+| 16  | 5               | 80         |
+
+### Graceful Degradation
+
+- If no IPs are available (DNS not yet resolved, all IPs unhealthy), the proxy falls back to hostname-based routing matching the default behavior
+- If URI rewriting fails for a request, the proxy forwards using the original hostname and logs a warning
+- During startup before the first DNS resolution completes, requests use hostname-based routing
+
+### Compatibility
+
+- Works with both DNS-resolved IPs and static `endpoint_overrides` (PrivateLink)
+- Preserves TLS SNI (original hostname) for successful TLS handshakes
+- Preserves Host header for AWS SigV4 signature validity
+- IP set updates automatically on DNS refresh; stale IPs are removed within one refresh cycle
+
 ## Logging Configuration
 
 ```yaml
@@ -1347,7 +1417,7 @@ cache:
 
 connection_pool:
   keepalive_enabled: true
-  max_idle_per_host: 10
+  max_idle_per_host: 100
   max_lifetime: "600s"
 
 compression:

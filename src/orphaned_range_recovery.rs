@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-use walkdir::WalkDir;
+
 
 /// Orphaned range recovery manager
 pub struct OrphanedRangeRecovery {
@@ -287,71 +287,6 @@ impl OrphanedRangeRecovery {
             }
         }
     }
-
-    /// Scan for orphaned ranges across all cache keys (background operation)
-    pub async fn scan_all_orphans(&self) -> Result<HashMap<String, Vec<OrphanedRange>>> {
-        debug!("Starting comprehensive orphaned range scan");
-
-        let mut all_orphans = HashMap::new();
-        let ranges_dir = self.cache_dir.join("ranges");
-
-        if !ranges_dir.exists() {
-            return Ok(all_orphans);
-        }
-
-        // Walk through all range files
-        for entry in WalkDir::new(&ranges_dir).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let file_path = entry.path();
-            let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name,
-                None => continue,
-            };
-
-            if !file_name.ends_with(".bin") {
-                continue;
-            }
-
-            // Extract cache key from file path
-            let cache_key = match self.extract_cache_key_from_path(file_path) {
-                Ok(key) => key,
-                Err(e) => {
-                    warn!(
-                        "Failed to extract cache key from path {:?}: {}",
-                        file_path, e
-                    );
-                    continue;
-                }
-            };
-
-            // Check if we've already scanned this cache key
-            if all_orphans.contains_key(&cache_key) {
-                continue;
-            }
-
-            // Scan for orphans for this cache key
-            match self.scan_for_orphans(&cache_key).await {
-                Ok(orphans) => {
-                    if !orphans.is_empty() {
-                        all_orphans.insert(cache_key, orphans);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to scan orphans for cache key {}: {}", cache_key, e);
-                }
-            }
-        }
-
-        info!(
-            "Comprehensive scan found orphaned ranges for {} cache keys",
-            all_orphans.len()
-        );
-        Ok(all_orphans)
-    }
-
     /// Scan a single shard for orphaned ranges (scalable approach for large caches)
     ///
     /// Instead of scanning all files at once, this scans one shard (XX/YYY directory)
@@ -636,37 +571,6 @@ impl OrphanedRangeRecovery {
             }
         }
     }
-
-    /// Recover orphaned ranges with priority-based processing
-    pub async fn recover_with_priority(
-        &self,
-        orphans: &mut [OrphanedRange],
-    ) -> Result<Vec<RecoveryResult>> {
-        // Sort by priority: access frequency (desc), then file size (desc)
-        orphans.sort_by(|a, b| {
-            b.access_frequency
-                .cmp(&a.access_frequency)
-                .then_with(|| b.file_size.cmp(&a.file_size))
-        });
-
-        let mut results = Vec::new();
-
-        for orphan in orphans {
-            match self.recover_orphan(orphan).await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    error!(
-                        "Failed to recover orphan {:?}: {}",
-                        orphan.range_file_path, e
-                    );
-                    results.push(RecoveryResult::Failed(e.to_string()));
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
     // Private helper methods
 
     /// Parse cache key into bucket and object key
@@ -996,24 +900,6 @@ impl RecoveryMetrics {
     /// Get total orphans cleaned
     pub fn get_orphans_cleaned(&self) -> u64 {
         self.orphans_cleaned
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Get total bytes recovered
-    pub fn get_bytes_recovered(&self) -> u64 {
-        self.bytes_recovered
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Get total bytes cleaned
-    pub fn get_bytes_cleaned(&self) -> u64 {
-        self.bytes_cleaned
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Get total recovery failures
-    pub fn get_recovery_failures(&self) -> u64 {
-        self.recovery_failures
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }

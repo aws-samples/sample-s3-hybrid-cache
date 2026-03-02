@@ -9,7 +9,8 @@ use crate::compression::CompressionHandler;
 use crate::hybrid_metadata_writer::{HybridMetadataWriter, WriteMode};
 use crate::{ProxyError, Result};
 use fs2::FileExt;
-use futures::stream::{self, StreamExt};
+use futures::stream;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,6 +20,32 @@ use tracing::{debug, error, info, warn};
 
 /// Maximum concurrent file deletes within a single batch_delete_ranges() call
 const FILE_CONCURRENCY_LIMIT: usize = 32;
+
+/// State for an in-progress incremental range write to disk cache.
+/// Created by `begin_incremental_range_write()`, consumed by `commit_incremental_range()` or `abort_incremental_range()`.
+pub struct IncrementalRangeWriter {
+    /// Path to the temporary file being written
+    tmp_path: PathBuf,
+    /// Final destination path (.bin file)
+    final_path: PathBuf,
+    /// Open file handle for the .tmp file
+    file: std::fs::File,
+    /// Total uncompressed bytes written so far
+    pub bytes_written: u64,
+    /// Total compressed bytes written so far
+    pub compressed_bytes_written: u64,
+    /// Cache key for this range
+    cache_key: String,
+    /// Range start byte
+    start: u64,
+    /// Range end byte (inclusive)
+    end: u64,
+    /// Whether compression is enabled for this write
+    compression_enabled: bool,
+    /// Path extracted from cache key for content-aware compression decisions
+    #[allow(dead_code)]
+    content_path: String,
+}
 
 /// Disk cache manager for file-based cache operations
 pub struct DiskCacheManager {
@@ -887,48 +914,6 @@ impl DiskCacheManager {
             sanitized
         }
     }
-
-    /// Validate cache key format consistency
-    ///
-    /// This method checks if a cache key would be transformed differently
-    /// between storage and lookup operations, which could cause cache misses.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key to validate
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the key is consistent
-    /// * `Err(ProxyError)` - If the key format is invalid or inconsistent
-    ///
-    /// # Requirements
-    /// Implements Requirements 2.5, 5.3, 5.4
-    pub fn validate_cache_key_format(&self, cache_key: &str) -> Result<()> {
-        // Normalize the key
-        let normalized = normalize_cache_key(cache_key);
-
-        // Check if normalization changed the key
-        if normalized != cache_key {
-            warn!(
-                "[CACHE_KEY_VALIDATION] Cache key format mismatch detected: original={}, normalized={}. \
-                This may cause cache misses if storage and lookup use different formats.",
-                cache_key, normalized
-            );
-        }
-
-        // Try to parse the normalized key
-        let (bucket, object_key) = parse_cache_key(&normalized)?;
-
-        // Sanitize the key
-        let sanitized = self.sanitize_cache_key_new(&normalized);
-
-        debug!(
-            "[CACHE_KEY_VALIDATION] Cache key validation: original={}, normalized={}, sanitized={}, bucket={}, object_key={}",
-            cache_key, normalized, sanitized, bucket, object_key
-        );
-
-        Ok(())
-    }
-
     /// Store a range with atomic operations
     /// Implements Requirements 1.1, 3.1, 3.2, 3.4, 3.5
     ///
@@ -1522,6 +1507,261 @@ impl DiskCacheManager {
         // Direct mode is no longer used (shared_storage.enabled is always true).
 
         Ok(())
+    }
+
+    /// Begin an incremental range write. Creates a `.tmp` file with a random suffix
+    /// for concurrent write safety and returns an `IncrementalRangeWriter`.
+    ///
+    /// Each chunk written via `write_range_chunk` is independently compressed as its own
+    /// LZ4 frame and appended to the `.tmp` file (concatenated frames approach).
+    /// `FrameDecoder` handles concatenated frames transparently on read.
+    pub async fn begin_incremental_range_write(
+        &self,
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        compression_enabled: bool,
+    ) -> Result<IncrementalRangeWriter> {
+        if start > end {
+            return Err(ProxyError::CacheError(format!(
+                "Invalid range: start ({}) > end ({})",
+                start, end
+            )));
+        }
+
+        let range_file_path = self.get_new_range_file_path(cache_key, start, end);
+
+        // Ensure parent directory exists
+        if let Some(parent) = range_file_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProxyError::CacheError(format!("Failed to create ranges directory: {}", e))
+            })?;
+        }
+
+        // Unique .tmp filename with random suffix for concurrent write safety
+        let random_suffix: u32 = rand::random();
+        let stem = range_file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let tmp_filename = format!("{}.{:08x}.tmp", stem, random_suffix);
+        let tmp_path = range_file_path.with_file_name(tmp_filename);
+
+        let file = std::fs::File::create(&tmp_path).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to create incremental tmp file {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+
+        let content_path = self.extract_path_from_cache_key(cache_key);
+
+        debug!(
+            "Begin incremental range write: key={}, range={}-{}, tmp={:?}, compression={}",
+            cache_key, start, end, tmp_path, compression_enabled
+        );
+
+        Ok(IncrementalRangeWriter {
+            tmp_path,
+            final_path: range_file_path,
+            file,
+            bytes_written: 0,
+            compressed_bytes_written: 0,
+            cache_key: cache_key.to_string(),
+            start,
+            end,
+            compression_enabled,
+            content_path,
+        })
+    }
+
+    /// Write a chunk to the incremental range writer.
+    ///
+    /// When compression is enabled, each chunk is independently compressed into its own
+    /// LZ4 frame and appended to the `.tmp` file. The resulting file contains multiple
+    /// concatenated LZ4 frames, which `FrameDecoder` reads through transparently.
+    ///
+    /// When compression is disabled, the raw chunk bytes are appended directly.
+    pub fn write_range_chunk(
+        writer: &mut IncrementalRangeWriter,
+        chunk: &[u8],
+    ) -> Result<()> {
+        use std::io::Write;
+
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        if writer.compression_enabled {
+            // Compress this chunk as an independent LZ4 frame
+            use lz4_flex::frame::{BlockMode, FrameEncoder, FrameInfo};
+
+            let mut frame_info = FrameInfo::new();
+            frame_info.content_checksum = true;
+            frame_info.block_mode = BlockMode::Independent;
+
+            let mut frame_buf = Vec::new();
+            let mut encoder = FrameEncoder::with_frame_info(frame_info, &mut frame_buf);
+            encoder.write_all(chunk).map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to compress chunk in incremental write: {}",
+                    e
+                ))
+            })?;
+            encoder.finish().map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to finish LZ4 frame in incremental write: {}",
+                    e
+                ))
+            })?;
+
+            // Append compressed frame to .tmp file
+            writer.file.write_all(&frame_buf).map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to write compressed chunk to tmp file: {}",
+                    e
+                ))
+            })?;
+            writer.compressed_bytes_written += frame_buf.len() as u64;
+        } else {
+            // No compression — write raw bytes
+            writer.file.write_all(chunk).map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to write chunk to tmp file: {}",
+                    e
+                ))
+            })?;
+            writer.compressed_bytes_written += chunk.len() as u64;
+        }
+
+        writer.bytes_written += chunk.len() as u64;
+        Ok(())
+    }
+
+    /// Validate total size, flush file, atomic rename `.tmp` → `.bin`, and write journal entry.
+    ///
+    /// Returns an error (and cleans up the `.tmp` file) if `bytes_written != end - start + 1`.
+    pub async fn commit_incremental_range(
+        &mut self,
+        writer: IncrementalRangeWriter,
+        object_metadata: crate::cache_types::ObjectMetadata,
+        ttl: Duration,
+    ) -> Result<()> {
+        use crate::cache_types::RangeSpec;
+        use std::io::Write;
+
+        let expected_size = writer.end - writer.start + 1;
+        if writer.bytes_written != expected_size {
+            // Size mismatch — clean up and return error
+            let _ = std::fs::remove_file(&writer.tmp_path);
+            return Err(ProxyError::CacheError(format!(
+                "Incremental write size mismatch: expected {} bytes, got {} (likely caused by cache channel backpressure — disk I/O slower than S3 download)",
+                expected_size, writer.bytes_written
+            )));
+        }
+
+        // Flush file to ensure all data is written
+        let mut file = writer.file;
+        file.flush().map_err(|e| {
+            let _ = std::fs::remove_file(&writer.tmp_path);
+            ProxyError::CacheError(format!("Failed to flush incremental tmp file: {}", e))
+        })?;
+        drop(file);
+
+        let compression_algorithm = if writer.compression_enabled {
+            crate::compression::CompressionAlgorithm::Lz4
+        } else {
+            crate::compression::CompressionAlgorithm::None
+        };
+
+        // Atomic rename .tmp → .bin
+        let range_already_existed = writer.final_path.exists();
+        std::fs::rename(&writer.tmp_path, &writer.final_path).map_err(|e| {
+            let _ = std::fs::remove_file(&writer.tmp_path);
+            ProxyError::CacheError(format!(
+                "Failed to rename incremental tmp file to final: {}",
+                e
+            ))
+        })?;
+
+        debug!(
+            "Committed incremental range: key={}, range={}-{}, uncompressed={}, compressed={}, path={:?}",
+            writer.cache_key, writer.start, writer.end,
+            writer.bytes_written, writer.compressed_bytes_written, writer.final_path
+        );
+
+        // Build RangeSpec for metadata/journal
+        let ranges_dir = self.cache_dir.join("ranges");
+        let range_file_relative_path = writer
+            .final_path
+            .strip_prefix(&ranges_dir)
+            .map_err(|e| {
+                ProxyError::CacheError(format!("Failed to compute relative path: {}", e))
+            })?
+            .to_string_lossy()
+            .to_string();
+
+        let range_spec = RangeSpec::new(
+            writer.start,
+            writer.end,
+            range_file_relative_path,
+            compression_algorithm,
+            writer.compressed_bytes_written,
+            writer.bytes_written,
+        );
+
+        // Write journal entry (same pattern as store_range)
+        if let Some(hybrid_writer) = &self.hybrid_metadata_writer {
+            let mut hw = hybrid_writer.lock().await;
+            if let Err(e) = hw
+                .write_range_metadata(
+                    &writer.cache_key,
+                    range_spec,
+                    WriteMode::JournalOnly,
+                    Some(object_metadata.clone()),
+                    ttl,
+                )
+                .await
+            {
+                error!(
+                    "Journal write failed for incremental range (range file exists, will be orphaned): key={}, range={}-{}, error={}",
+                    writer.cache_key, writer.start, writer.end, e
+                );
+                return Err(e);
+            }
+
+            // Track size via in-memory accumulator
+            if let Some(consolidator) = &self.journal_consolidator {
+                if !range_already_existed {
+                    consolidator.size_accumulator().add_range(
+                        &writer.cache_key,
+                        writer.start,
+                        writer.end,
+                        writer.compressed_bytes_written,
+                    );
+                    if object_metadata.is_write_cached {
+                        consolidator
+                            .size_accumulator()
+                            .add_write_cache(writer.compressed_bytes_written);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Abort an incremental write, cleaning up the `.tmp` file.
+    pub fn abort_incremental_range(writer: IncrementalRangeWriter) {
+        let tmp_path = writer.tmp_path.clone();
+        // Drop the file handle first to release the fd
+        drop(writer);
+        if let Err(e) = std::fs::remove_file(&tmp_path) {
+            warn!(
+                "Failed to clean up aborted incremental tmp file {:?}: {}",
+                tmp_path, e
+            );
+        }
     }
 
     /// Get metadata for a cache entry without loading range data
@@ -2779,9 +3019,9 @@ impl DiskCacheManager {
             )));
         }
 
-        // Read compressed data from file
+        // Read compressed data from file — async I/O to avoid blocking tokio worker thread (Requirement 3.1)
         let read_start = std::time::Instant::now();
-        let compressed_data = match std::fs::read(&range_file_path) {
+        let compressed_data = match tokio::fs::read(&range_file_path).await {
             Ok(data) => {
                 let read_duration = read_start.elapsed();
                 debug!(
@@ -2954,8 +3194,6 @@ impl DiskCacheManager {
         range_spec: &crate::cache_types::RangeSpec,
         chunk_size: usize,
     ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes>>> {
-        use futures::stream::{self, StreamExt};
-
         let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
         debug!(
@@ -2979,24 +3217,106 @@ impl DiskCacheManager {
             )));
         }
 
-        // For compressed data, read full file, decompress, then stream decompressed output in chunks.
-        // LZ4 frame format requires the full compressed frame to decompress (Requirement 5.4).
-        // All cached data uses frame format now.
-        debug!(
-            "Loading frame-encoded data for streaming: file={}, algorithm={:?}",
-            range_spec.file_path, range_spec.compression_algorithm
-        );
+        let expected_size = range_spec.uncompressed_size;
+        let compression_algorithm = range_spec.compression_algorithm.clone();
 
-        // Load and decompress the data
-        let data = self.load_range_data(range_spec).await?;
+        // Async file open — does not block tokio worker thread (Requirement 3.1)
+        let file = tokio::fs::File::open(&range_file_path).await.map_err(|e| {
+            ProxyError::CacheError(format!("Failed to open range file: {}", e))
+        })?;
 
-        // Convert to stream of chunks
-        let chunks: Vec<Result<bytes::Bytes>> = data
-            .chunks(chunk_size)
-            .map(|chunk| Ok(bytes::Bytes::copy_from_slice(chunk)))
-            .collect();
+        // Convert to std::fs::File for FrameDecoder (sync Read trait)
+        let std_file = file.into_std().await;
 
-        Ok(stream::iter(chunks).boxed())
+        // Channel capacity of 4 provides backpressure: blocking task pauses when
+        // 4 chunks are buffered, bounding memory to 4 × chunk_size per request.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes>>(4);
+
+        tokio::task::spawn_blocking(move || {
+            use crate::compression::CompressionAlgorithm;
+            use lz4_flex::frame::FrameDecoder;
+            use std::io::Read;
+
+            let mut buf = vec![0u8; chunk_size];
+            let mut total_read = 0u64;
+
+            match compression_algorithm {
+                CompressionAlgorithm::Lz4 => {
+                    // Use BufReader for the underlying file, then loop creating
+                    // new FrameDecoders to handle concatenated LZ4 frames
+                    // (produced by incremental writes).
+                    let mut buf_reader = std::io::BufReader::new(std_file);
+
+                    'outer: loop {
+                        // Check if there's more data in the underlying reader
+                        {
+                            use std::io::BufRead;
+                            match buf_reader.fill_buf() {
+                                Ok(b) if b.is_empty() => break, // True EOF
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(ProxyError::CacheError(
+                                        format!("Decompression error mid-stream: {}", e),
+                                    )));
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        let mut decoder = FrameDecoder::new(&mut buf_reader);
+                        loop {
+                            match decoder.read(&mut buf) {
+                                Ok(0) => break, // End of this LZ4 frame
+                                Ok(n) => {
+                                    total_read += n as u64;
+                                    let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                                    if tx.blocking_send(Ok(chunk)).is_err() {
+                                        break 'outer; // Receiver dropped
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(ProxyError::CacheError(
+                                        format!("Decompression error mid-stream: {}", e),
+                                    )));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+                CompressionAlgorithm::None => {
+                    let mut reader = std::io::BufReader::new(std_file);
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                total_read += n as u64;
+                                let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                                if tx.blocking_send(Ok(chunk)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.blocking_send(Err(ProxyError::CacheError(
+                                    format!("Decompression error mid-stream: {}", e),
+                                )));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Validate total decompressed size matches expected
+            if total_read != expected_size {
+                let _ = tx.blocking_send(Err(ProxyError::CacheError(format!(
+                    "Decompressed size mismatch: expected {} bytes, got {}",
+                    expected_size, total_read
+                ))));
+            }
+        });
+
+        Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 
     /// Store full object as a range (0 to content_length-1)
@@ -6046,129 +6366,6 @@ impl DiskCacheManager {
 
         Ok(false)
     }
-
-    /// Validate metadata file during read operations with enhanced error handling
-    ///
-    /// This method wraps metadata reading with comprehensive validation and
-    /// automatic corruption recovery. It should be used instead of direct
-    /// metadata file reading for better error handling.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key to read and validate
-    ///
-    /// # Returns
-    /// * `Ok(Some(metadata))` - Valid metadata found
-    /// * `Ok(None)` - No metadata found or metadata expired
-    /// * `Err(ProxyError)` - Unrecoverable error
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.3
-    pub async fn read_and_validate_metadata(
-        &self,
-        cache_key: &str,
-    ) -> Result<Option<crate::cache_types::NewCacheMetadata>> {
-        let _operation_start = std::time::Instant::now();
-        debug!(
-            "[METADATA_READ_VALIDATE] Starting validated metadata read: cache_key={}",
-            cache_key
-        );
-
-        // First attempt normal metadata read
-        match self.get_metadata(cache_key).await {
-            Ok(Some(metadata)) => {
-                // Validate the metadata we just read
-                match self.validate_metadata_integrity(cache_key).await {
-                    Ok(true) => {
-                        debug!(
-                            "[METADATA_READ_VALIDATE] Metadata read and validated successfully: cache_key={}, ranges={}",
-                            cache_key, metadata.ranges.len()
-                        );
-                        return Ok(Some(metadata));
-                    }
-                    Ok(false) => {
-                        warn!(
-                            "[METADATA_READ_VALIDATE] Metadata inconsistency detected during read: cache_key={}, attempting_recovery=true",
-                            cache_key
-                        );
-
-                        // Attempt recovery
-                        match self.detect_and_recover_corruption(cache_key).await {
-                            Ok(true) => {
-                                info!(
-                                    "[METADATA_READ_VALIDATE] Recovery successful, re-reading metadata: cache_key={}",
-                                    cache_key
-                                );
-                                // Re-read after recovery
-                                return self.get_metadata(cache_key).await;
-                            }
-                            Ok(false) => {
-                                debug!(
-                                    "[METADATA_READ_VALIDATE] No recovery performed: cache_key={}",
-                                    cache_key
-                                );
-                                return Ok(Some(metadata));
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[METADATA_READ_VALIDATE] Recovery failed: cache_key={}, error={}",
-                                    cache_key, e
-                                );
-                                return Ok(None); // Treat as cache miss
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "[METADATA_READ_VALIDATE] Metadata validation failed: cache_key={}, error={}",
-                            cache_key, e
-                        );
-
-                        // Record corruption and invalidate
-                        if let Some(metrics_manager) = &self.metrics_manager {
-                            metrics_manager
-                                .read()
-                                .await
-                                .record_corrupted_metadata_simple()
-                                .await;
-                        }
-
-                        self.invalidate_cache_entry(cache_key).await?;
-                        return Ok(None); // Treat as cache miss
-                    }
-                }
-            }
-            Ok(None) => {
-                debug!(
-                    "[METADATA_READ_VALIDATE] No metadata found: cache_key={}, result=cache_miss",
-                    cache_key
-                );
-                return Ok(None);
-            }
-            Err(e) => {
-                error!(
-                    "[METADATA_READ_VALIDATE] Metadata read failed: cache_key={}, error={}",
-                    cache_key, e
-                );
-
-                // Attempt corruption recovery
-                match self.detect_and_recover_corruption(cache_key).await {
-                    Ok(true) => {
-                        info!(
-                            "[METADATA_READ_VALIDATE] Recovery successful after read failure: cache_key={}",
-                            cache_key
-                        );
-                        // Re-attempt read after recovery
-                        return self.get_metadata(cache_key).await;
-                    }
-                    _ => {
-                        // Recovery failed or not needed, treat as cache miss
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-    }
-
     // ============================================================================
     // Enhanced Concurrent Access Safety Methods
     // ============================================================================
@@ -6344,168 +6541,6 @@ impl DiskCacheManager {
                 "[LOCK_CLEANUP] Lock file is not stale: path={:?}, age={:?}, max_age={:?}",
                 lock_file_path, file_age, max_age
             );
-        }
-
-        Ok(())
-    }
-
-    /// Perform atomic metadata update with enhanced locking
-    ///
-    /// This method provides atomic metadata updates with:
-    /// - Timeout-based lock acquisition
-    /// - Automatic cleanup on failures
-    /// - Comprehensive error handling
-    /// - Proper lock cleanup
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key for the metadata
-    /// * `update_fn` - Function to update the metadata
-    /// * `operation_name` - Name of the operation for logging
-    ///
-    /// # Requirements
-    /// Implements Requirements 3.5, 4.4
-    pub async fn atomic_metadata_update<F>(
-        &self,
-        cache_key: &str,
-        update_fn: F,
-        operation_name: &str,
-    ) -> Result<()>
-    where
-        F: FnOnce(&mut crate::cache_types::NewCacheMetadata) -> Result<()>,
-    {
-        let operation_start = std::time::Instant::now();
-        debug!(
-            "[ATOMIC_UPDATE] Starting atomic metadata update: cache_key={}, operation={}",
-            cache_key, operation_name
-        );
-
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-        let metadata_tmp_path = metadata_file_path.with_extension("meta.tmp");
-        let lock_file_path = metadata_file_path.with_extension("meta.lock");
-
-        // Acquire lock with timeout
-        let lock_timeout = Duration::from_secs(30); // 30 second timeout
-        let _lock_guard = self
-            .acquire_exclusive_lock_with_timeout(&lock_file_path, lock_timeout, operation_name)
-            .await?;
-
-        // Read existing metadata or create new
-        let mut metadata = if metadata_file_path.exists() {
-            let content = std::fs::read_to_string(&metadata_file_path).map_err(|e| {
-                error!(
-                    "[ATOMIC_UPDATE] Failed to read metadata: cache_key={}, operation={}, error={}",
-                    cache_key, operation_name, e
-                );
-                ProxyError::CacheError(format!("Failed to read metadata: {}", e))
-            })?;
-
-            serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content)
-                .map_err(|e| {
-                    error!(
-                        "[ATOMIC_UPDATE] Failed to parse metadata: cache_key={}, operation={}, error={}",
-                        cache_key, operation_name, e
-                    );
-                    ProxyError::CacheError(format!("Corrupted metadata: {}", e))
-                })?
-        } else {
-            // Create new metadata structure
-            let now = SystemTime::now();
-            crate::cache_types::NewCacheMetadata {
-                cache_key: cache_key.to_string(),
-                object_metadata: crate::cache_types::ObjectMetadata::default(),
-                ranges: Vec::new(),
-                created_at: now,
-                expires_at: now + Duration::from_secs(3600), // 1 hour default
-                compression_info: crate::cache_types::CompressionInfo::default(),
-                ..Default::default()
-            }
-        };
-
-        // Apply the update function
-        update_fn(&mut metadata).map_err(|e| {
-            error!(
-                "[ATOMIC_UPDATE] Update function failed: cache_key={}, operation={}, error={}",
-                cache_key, operation_name, e
-            );
-            e
-        })?;
-
-        // Write to temporary file
-        let metadata_json = serde_json::to_string_pretty(&metadata)
-            .map_err(|e| {
-                error!(
-                    "[ATOMIC_UPDATE] Failed to serialize metadata: cache_key={}, operation={}, error={}",
-                    cache_key, operation_name, e
-                );
-                ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
-            })?;
-
-        std::fs::write(&metadata_tmp_path, &metadata_json)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&metadata_tmp_path);
-                error!(
-                    "[ATOMIC_UPDATE] Failed to write temp metadata: cache_key={}, operation={}, error={}",
-                    cache_key, operation_name, e
-                );
-                ProxyError::CacheError(format!("Failed to write temp metadata: {}", e))
-            })?;
-
-        // Atomic rename
-        std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
-            let _ = std::fs::remove_file(&metadata_tmp_path);
-            error!(
-                "[ATOMIC_UPDATE] Failed to rename metadata: cache_key={}, operation={}, error={}",
-                cache_key, operation_name, e
-            );
-            ProxyError::CacheError(format!("Failed to rename metadata: {}", e))
-        })?;
-
-        let update_duration = operation_start.elapsed();
-        debug!(
-            "[ATOMIC_UPDATE] Atomic update completed: cache_key={}, operation={}, duration={:.2}ms",
-            cache_key,
-            operation_name,
-            update_duration.as_secs_f64() * 1000.0
-        );
-
-        Ok(())
-    }
-
-    /// Clean up all lock files for a specific cache key
-    ///
-    /// This method removes all lock files associated with a cache key,
-    /// useful for cleanup after operations complete or fail.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key to clean up locks for
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.4
-    pub async fn cleanup_locks_for_key(&self, cache_key: &str) -> Result<()> {
-        debug!(
-            "[LOCK_CLEANUP] Cleaning up locks for cache key: cache_key={}",
-            cache_key
-        );
-
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-        let lock_file_path = metadata_file_path.with_extension("meta.lock");
-
-        if lock_file_path.exists() {
-            match std::fs::remove_file(&lock_file_path) {
-                Ok(()) => {
-                    debug!(
-                        "[LOCK_CLEANUP] Lock file removed: cache_key={}, path={:?}",
-                        cache_key, lock_file_path
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "[LOCK_CLEANUP] Failed to remove lock file: cache_key={}, path={:?}, error={}",
-                        cache_key, lock_file_path, e
-                    );
-                    // Don't fail the operation if lock cleanup fails
-                }
-            }
         }
 
         Ok(())
@@ -6766,282 +6801,6 @@ impl DiskCacheManager {
         });
 
         Ok(())
-    }
-
-    /// Perform cache operation with automatic fallback handling
-    ///
-    /// This method wraps cache operations with comprehensive error handling
-    /// and automatic fallback mechanisms. It should be used for critical
-    /// cache operations that need robust error handling.
-    ///
-    /// # Arguments
-    /// * `operation_name` - Name of the operation for logging
-    /// * `cache_key` - The cache key for the operation
-    /// * `operation_fn` - The cache operation to perform
-    ///
-    /// # Returns
-    /// * `Ok(CacheOperationResult<T>)` - Operation result with fallback info
-    /// * `Err(ProxyError)` - Unrecoverable error
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.2, 4.5
-    pub async fn perform_cache_operation_with_fallback<T, F, Fut>(
-        &self,
-        operation_name: &str,
-        cache_key: &str,
-        operation_fn: F,
-    ) -> Result<CacheOperationResult<T>>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        let operation_start = std::time::Instant::now();
-        debug!(
-            "[CACHE_OPERATION] Starting cache operation with fallback: operation={}, cache_key={}",
-            operation_name, cache_key
-        );
-
-        // Attempt the cache operation
-        match operation_fn().await {
-            Ok(result) => {
-                let operation_duration = operation_start.elapsed();
-                debug!(
-                    "[CACHE_OPERATION] Cache operation succeeded: operation={}, cache_key={}, duration={:.2}ms",
-                    operation_name, cache_key, operation_duration.as_secs_f64() * 1000.0
-                );
-
-                Ok(CacheOperationResult {
-                    result: Some(result),
-                    fallback_action: FallbackAction::None,
-                    operation_duration,
-                    error_context: None,
-                })
-            }
-            Err(error) => {
-                let operation_duration = operation_start.elapsed();
-                warn!(
-                    "[CACHE_OPERATION] Cache operation failed: operation={}, cache_key={}, duration={:.2}ms, error={}",
-                    operation_name, cache_key, operation_duration.as_secs_f64() * 1000.0, error
-                );
-
-                // Handle the failure and determine fallback action
-                let fallback_action = self
-                    .handle_cache_operation_failure(
-                        operation_name,
-                        cache_key,
-                        &error,
-                        "cache_operation_with_fallback",
-                    )
-                    .await?;
-
-                Ok(CacheOperationResult {
-                    result: None,
-                    fallback_action,
-                    operation_duration,
-                    error_context: Some(error.to_string()),
-                })
-            }
-        }
-    }
-
-    /// Validate cache directory health and perform recovery if needed
-    ///
-    /// This method checks the health of the cache directory and performs
-    /// recovery operations if issues are detected:
-    /// - Checks disk space availability
-    /// - Validates directory permissions
-    /// - Cleans up corrupted files
-    /// - Repairs directory structure
-    ///
-    /// # Returns
-    /// * `Ok(CacheHealthStatus)` - Health status and any recovery actions taken
-    /// * `Err(ProxyError)` - Unrecoverable health issues
-    ///
-    /// # Requirements
-    /// Implements Requirements 4.2, 4.5
-    pub async fn validate_cache_health(&self) -> Result<CacheHealthStatus> {
-        let operation_start = std::time::Instant::now();
-        info!(
-            "[CACHE_HEALTH] Starting cache health validation: cache_dir={:?}",
-            self.cache_dir
-        );
-
-        let mut health_status = CacheHealthStatus {
-            is_healthy: true,
-            issues_found: Vec::new(),
-            recovery_actions: Vec::new(),
-            disk_space_available: 0,
-            directory_permissions_ok: false,
-            corrupted_files_found: 0,
-            corrupted_files_cleaned: 0,
-        };
-
-        // Check disk space
-        match std::fs::metadata(&self.cache_dir) {
-            Ok(_) => {
-                // Try to get available disk space (platform-specific)
-                // For now, we'll just check if we can write a test file
-                let test_file = self.cache_dir.join(".health_check");
-                match std::fs::write(&test_file, b"health_check") {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&test_file);
-                        health_status.directory_permissions_ok = true;
-                        debug!(
-                            "[CACHE_HEALTH] Directory permissions OK: cache_dir={:?}",
-                            self.cache_dir
-                        );
-                    }
-                    Err(e) => {
-                        health_status.is_healthy = false;
-                        health_status.directory_permissions_ok = false;
-                        health_status
-                            .issues_found
-                            .push(format!("Permission error: {}", e));
-                        error!(
-                            "[CACHE_HEALTH] Directory permission check failed: cache_dir={:?}, error={}",
-                            self.cache_dir, e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                health_status.is_healthy = false;
-                health_status
-                    .issues_found
-                    .push(format!("Cache directory inaccessible: {}", e));
-                error!(
-                    "[CACHE_HEALTH] Cache directory check failed: cache_dir={:?}, error={}",
-                    self.cache_dir, e
-                );
-            }
-        }
-
-        // Check for corrupted files (sample check)
-        let metadata_dir = self.cache_dir.join("metadata");
-        if metadata_dir.exists() {
-            match self.scan_for_corrupted_files(&metadata_dir).await {
-                Ok((found, cleaned)) => {
-                    health_status.corrupted_files_found = found;
-                    health_status.corrupted_files_cleaned = cleaned;
-
-                    if found > 0 {
-                        health_status
-                            .recovery_actions
-                            .push(format!("Cleaned {} corrupted metadata files", cleaned));
-                    }
-
-                    debug!(
-                        "[CACHE_HEALTH] Corruption scan completed: found={}, cleaned={}",
-                        found, cleaned
-                    );
-                }
-                Err(e) => {
-                    health_status
-                        .issues_found
-                        .push(format!("Corruption scan failed: {}", e));
-                    warn!("[CACHE_HEALTH] Corruption scan failed: error={}", e);
-                }
-            }
-        }
-
-        let health_duration = operation_start.elapsed();
-        if health_status.is_healthy {
-            info!(
-                "[CACHE_HEALTH] Cache health validation completed: status=healthy, duration={:.2}ms",
-                health_duration.as_secs_f64() * 1000.0
-            );
-        } else {
-            warn!(
-                "[CACHE_HEALTH] Cache health validation completed: status=unhealthy, issues={}, duration={:.2}ms",
-                health_status.issues_found.len(), health_duration.as_secs_f64() * 1000.0
-            );
-        }
-
-        Ok(health_status)
-    }
-
-    /// Scan for corrupted files in a directory
-    ///
-    /// This method scans a directory for corrupted metadata files and
-    /// attempts to clean them up automatically.
-    ///
-    /// # Arguments
-    /// * `directory` - Directory to scan for corrupted files
-    ///
-    /// # Returns
-    /// * `Ok((found, cleaned))` - Number of corrupted files found and cleaned
-    /// * `Err(ProxyError)` - Scan operation failed
-    async fn scan_for_corrupted_files(&self, directory: &PathBuf) -> Result<(u64, u64)> {
-        let mut found = 0u64;
-        let mut cleaned = 0u64;
-
-        debug!(
-            "[CORRUPTION_SCAN] Starting corruption scan: directory={:?}",
-            directory
-        );
-
-        // Walk through directory structure
-        let walker = walkdir::WalkDir::new(directory)
-            .max_depth(5) // Limit depth to prevent excessive scanning
-            .into_iter();
-
-        for entry in walker {
-            match entry {
-                Ok(entry) => {
-                    let path = entry.path();
-
-                    // Check only .meta files
-                    if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                        match std::fs::read_to_string(path) {
-                            Ok(content) => {
-                                // Try to parse as JSON
-                                if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                                    found += 1;
-                                    warn!(
-                                        "[CORRUPTION_SCAN] Corrupted metadata file found: path={:?}",
-                                        path
-                                    );
-
-                                    // Attempt to clean up
-                                    if let Ok(()) = std::fs::remove_file(path) {
-                                        cleaned += 1;
-                                        info!(
-                                            "[CORRUPTION_SCAN] Corrupted file cleaned: path={:?}",
-                                            path
-                                        );
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // File is unreadable, consider it corrupted
-                                found += 1;
-                                if let Ok(()) = std::fs::remove_file(path) {
-                                    cleaned += 1;
-                                    info!(
-                                        "[CORRUPTION_SCAN] Unreadable file cleaned: path={:?}",
-                                        path
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "[CORRUPTION_SCAN] Directory walk error (non-critical): error={}",
-                        e
-                    );
-                    // Continue scanning despite individual file errors
-                }
-            }
-        }
-
-        debug!(
-            "[CORRUPTION_SCAN] Corruption scan completed: directory={:?}, found={}, cleaned={}",
-            directory, found, cleaned
-        );
-
-        Ok((found, cleaned))
     }
 }
 
@@ -7374,47 +7133,6 @@ impl CacheKeyValidator {
             metadata_path,
             range_path,
         })
-    }
-
-    /// Log all key components for debugging
-    ///
-    /// This method logs all transformations and paths for diagnostic purposes.
-    /// Use this to identify where cache key format mismatches occur.
-    ///
-    /// # Requirements
-    /// Implements Requirements 2.5, 5.1, 5.2, 5.4
-    pub fn log_diagnostics(&self) {
-        debug!(
-            "[CACHE_KEY_VALIDATION] Cache key transformations:\n\
-             - original_key: {}\n\
-             - normalized_key: {}\n\
-             - sanitized_key: {}\n\
-             - bucket: {}\n\
-             - object_key: {}\n\
-             - metadata_path: {:?}\n\
-             - range_path: {:?}",
-            self.original_key,
-            self.normalized_key,
-            self.sanitized_key,
-            self.bucket,
-            self.object_key,
-            self.metadata_path,
-            self.range_path
-        );
-    }
-
-    /// Check if the original key matches the normalized key
-    ///
-    /// Returns true if normalization changed the key (e.g., removed leading slash)
-    pub fn was_normalized(&self) -> bool {
-        self.original_key != self.normalized_key
-    }
-
-    /// Check if the sanitized key differs from the normalized key
-    ///
-    /// Returns true if sanitization changed the key (e.g., percent-encoded characters)
-    pub fn was_sanitized(&self) -> bool {
-        self.normalized_key != self.sanitized_key
     }
 }
 
@@ -12806,6 +12524,459 @@ mod tests {
         assert!(
             !metadata_path.exists(),
             "Metadata file should be deleted when all ranges are evicted"
+        );
+    }
+
+    // ============================================================================
+    // Tests for Streaming Decompression Edge Cases (Task 1.5)
+    // ============================================================================
+
+    /// Test that corrupt/truncated LZ4 data produces a decompression error mid-stream.
+    /// Validates: Requirement 1.4
+    #[tokio::test]
+    async fn test_stream_range_data_corrupt_lz4_error() {
+        use futures::StreamExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        cache_manager.initialize().await.unwrap();
+
+        // Write random/corrupt bytes that are not valid LZ4
+        let file_path = "test-bucket/corrupt-object_0-1023.bin";
+        let range_file_path = temp_dir.path().join("ranges").join(file_path);
+        if let Some(parent) = range_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        let corrupt_data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        tokio::fs::write(&range_file_path, &corrupt_data).await.unwrap();
+
+        // Create a RangeSpec pointing to the corrupt file with Lz4 compression
+        let range_spec = crate::cache_types::RangeSpec::new(
+            0,
+            1023,
+            file_path.to_string(),
+            CompressionAlgorithm::Lz4,
+            corrupt_data.len() as u64,
+            1024, // expected uncompressed size
+        );
+
+        // stream_range_data should succeed (file exists), but the stream should yield an error
+        let stream = cache_manager
+            .stream_range_data(&range_spec, 4096)
+            .await
+            .unwrap();
+
+        let mut stream = std::pin::pin!(stream);
+        let mut got_error = false;
+
+        while let Some(result) = stream.next().await {
+            if let Err(e) = result {
+                got_error = true;
+                let error_msg = format!("{}", e);
+                assert!(
+                    error_msg.contains("Decompression error mid-stream")
+                        || error_msg.contains("Decompressed size mismatch"),
+                    "Expected decompression error, got: {}",
+                    error_msg
+                );
+                break;
+            }
+        }
+
+        assert!(got_error, "Stream should have yielded a decompression error for corrupt LZ4 data");
+    }
+
+    /// Test that streaming a 0-byte range produces no data items and no errors.
+    /// Validates: Requirement 1.4 (edge case)
+    #[tokio::test]
+    async fn test_stream_range_data_empty_range() {
+        use crate::compression::CompressionHandler;
+        use futures::StreamExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        cache_manager.initialize().await.unwrap();
+
+        // Compress 0 bytes with LZ4 to get a valid empty compressed file
+        let mut compression_handler = CompressionHandler::new(0, true);
+        let compression_result = compression_handler
+            .compress_with_algorithm(&[], CompressionAlgorithm::Lz4)
+            .unwrap();
+        let compressed_data = &compression_result.data;
+
+        // Write the valid empty compressed file
+        let file_path = "test-bucket/empty-object_0-0.bin";
+        let range_file_path = temp_dir.path().join("ranges").join(file_path);
+        if let Some(parent) = range_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(&range_file_path, compressed_data).await.unwrap();
+
+        // Create a RangeSpec with uncompressed_size=0
+        let range_spec = crate::cache_types::RangeSpec::new(
+            0,
+            0,
+            file_path.to_string(),
+            CompressionAlgorithm::Lz4,
+            compressed_data.len() as u64,
+            0, // uncompressed_size = 0
+        );
+
+        let stream = cache_manager
+            .stream_range_data(&range_spec, 4096)
+            .await
+            .unwrap();
+
+        let mut stream = std::pin::pin!(stream);
+        let mut items = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            items.push(result);
+        }
+
+        // All items should be Ok (no errors), and no data should be produced
+        for (i, item) in items.iter().enumerate() {
+            assert!(
+                item.is_ok(),
+                "Item {} should be Ok, got error: {:?}",
+                i,
+                item.as_ref().unwrap_err()
+            );
+        }
+
+        let total_bytes: usize = items
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|b| b.len())
+            .sum();
+        assert_eq!(total_bytes, 0, "Empty range should produce 0 bytes of data");
+    }
+
+    /// Test that stream_range_data for a missing file returns the same "Range file not found"
+    /// error as the current blocking load_range_data implementation.
+    /// Validates: Requirement 3.3
+    #[tokio::test]
+    async fn test_stream_range_data_missing_file_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        cache_manager.initialize().await.unwrap();
+
+        // Create a RangeSpec pointing to a non-existent file
+        let range_spec = crate::cache_types::RangeSpec::new(
+            0,
+            1023,
+            "nonexistent_file_0-1023.bin".to_string(),
+            CompressionAlgorithm::Lz4,
+            1024,
+            1024,
+        );
+
+        // stream_range_data should return an error (not a stream that yields errors)
+        let stream_result = cache_manager.stream_range_data(&range_spec, 4096).await;
+        assert!(stream_result.is_err(), "Should fail when range file is missing");
+
+        let stream_error_msg = match stream_result {
+            Err(e) => format!("{}", e),
+            Ok(_) => panic!("Expected error for missing file"),
+        };
+
+        // load_range_data should also return an error for the same missing file
+        let load_result = cache_manager.load_range_data(&range_spec).await;
+        assert!(load_result.is_err(), "load_range_data should also fail for missing file");
+
+        let load_error_msg = format!("{}", load_result.unwrap_err());
+
+        // Both should contain "not found" — same error pattern
+        assert!(
+            stream_error_msg.contains("not found"),
+            "stream_range_data error should mention 'not found': {}",
+            stream_error_msg
+        );
+        assert!(
+            load_error_msg.contains("not found"),
+            "load_range_data error should mention 'not found': {}",
+            load_error_msg
+        );
+
+        // Both should be CacheError variants with the same file reference
+        assert!(
+            stream_error_msg.contains("nonexistent_file_0-1023.bin"),
+            "stream error should reference the missing file: {}",
+            stream_error_msg
+        );
+        assert!(
+            load_error_msg.contains("nonexistent_file_0-1023.bin"),
+            "load error should reference the missing file: {}",
+            load_error_msg
+        );
+    }
+
+    // ============================================================================
+    // Tests for Incremental Write Error Handling (Requirement 2.3)
+    // ============================================================================
+
+    /// Test that abort_incremental_range cleans up the .tmp file.
+    /// Begin an incremental write, write some chunks, abort, verify no .tmp files remain.
+    /// Validates: Requirement 2.3
+    #[tokio::test]
+    async fn test_incremental_write_abort_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/abort-test-object";
+        let start = 0u64;
+        let end = 2047u64;
+
+        // Begin incremental write
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // Write a couple of chunks
+        let chunk1 = vec![0xAAu8; 1024];
+        let chunk2 = vec![0xBBu8; 512];
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk1).unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk2).unwrap();
+
+        // Verify the .tmp file exists before abort
+        assert!(writer.tmp_path.exists(), ".tmp file should exist before abort");
+
+        // Abort the write
+        DiskCacheManager::abort_incremental_range(writer);
+
+        // Verify no .tmp files remain anywhere under the cache directory
+        fn find_tmp_files(dir: &std::path::Path) -> Vec<PathBuf> {
+            let mut results = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        results.extend(find_tmp_files(&path));
+                    } else if path.extension().map_or(false, |ext| ext == "tmp") {
+                        results.push(path);
+                    }
+                }
+            }
+            results
+        }
+
+        let tmp_files = find_tmp_files(temp_dir.path());
+        assert!(
+            tmp_files.is_empty(),
+            "No .tmp files should remain after abort, found: {:?}",
+            tmp_files
+        );
+    }
+
+    /// Test that commit_incremental_range returns an error when fewer bytes than expected
+    /// are written, and cleans up both .tmp and .bin files.
+    /// Validates: Requirement 2.3
+    #[tokio::test]
+    async fn test_incremental_write_size_mismatch_on_commit() {
+        use crate::cache_types::ObjectMetadata;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/size-mismatch-object";
+        let start = 0u64;
+        let end = 1023u64; // Expecting 1024 bytes
+
+        // Begin incremental write
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // Write only 512 bytes (half of expected)
+        let short_data = vec![0xCCu8; 512];
+        DiskCacheManager::write_range_chunk(&mut writer, &short_data).unwrap();
+
+        let object_metadata = ObjectMetadata {
+            etag: "test-etag".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 10240,
+            content_type: Some("application/octet-stream".to_string()),
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 10240,
+            parts: Vec::new(),
+            ..Default::default()
+        };
+
+        // Commit should fail due to size mismatch
+        let result = cache_manager
+            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .await;
+        assert!(result.is_err(), "Commit should fail when bytes_written != expected size");
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("size mismatch"),
+            "Error should mention size mismatch: {}",
+            err_msg
+        );
+
+        // Verify no .tmp or .bin files remain
+        fn find_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
+            let mut results = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        results.extend(find_files_in(&path));
+                    } else {
+                        results.push(path);
+                    }
+                }
+            }
+            results
+        }
+
+        let ranges_dir = temp_dir.path().join("ranges");
+        let leftover_files = find_files_in(&ranges_dir);
+        assert!(
+            leftover_files.is_empty(),
+            "No .tmp or .bin files should remain after size mismatch, found: {:?}",
+            leftover_files
+        );
+    }
+
+    /// Test single-byte range round-trip via incremental write.
+    /// Write a single byte (start=0, end=0), commit, read back, verify match.
+    #[tokio::test]
+    async fn test_incremental_write_single_byte_round_trip() {
+        use crate::cache_types::{ObjectMetadata, RangeSpec};
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/single-byte-object";
+        let start = 0u64;
+        let end = 0u64; // Single byte range
+
+        // Begin incremental write
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // Write exactly 1 byte
+        let single_byte = vec![0x42u8];
+        DiskCacheManager::write_range_chunk(&mut writer, &single_byte).unwrap();
+
+        // Capture compressed size before commit consumes writer
+        let compressed_bytes = writer.compressed_bytes_written;
+
+        let object_metadata = ObjectMetadata {
+            etag: "test-etag".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 1,
+            content_type: Some("application/octet-stream".to_string()),
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 1,
+            parts: Vec::new(),
+            ..Default::default()
+        };
+
+        // Commit
+        cache_manager
+            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        // Construct RangeSpec manually to read back
+        let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+        let ranges_dir = temp_dir.path().join("ranges");
+        let relative_path = final_path
+            .strip_prefix(&ranges_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let range_spec = RangeSpec::new(
+            start,
+            end,
+            relative_path,
+            CompressionAlgorithm::Lz4,
+            compressed_bytes,
+            1, // 1 byte uncompressed
+        );
+
+        // Read back and verify
+        let loaded_data = cache_manager.load_range_data(&range_spec).await.unwrap();
+        assert_eq!(loaded_data, single_byte, "Single byte should round-trip correctly");
+        assert_eq!(loaded_data.len(), 1);
+    }
+
+    /// Test that two concurrent incremental writes for the same cache_key and range
+    /// produce unique .tmp filenames.
+    #[tokio::test]
+    async fn test_incremental_write_concurrent_unique_tmp_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/concurrent-object";
+        let start = 0u64;
+        let end = 1023u64;
+
+        // Begin two incremental writes for the same key and range
+        let writer1 = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+        let writer2 = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // Verify the two writers have different tmp_path values
+        assert_ne!(
+            writer1.tmp_path, writer2.tmp_path,
+            "Concurrent writers should have unique .tmp paths: {:?} vs {:?}",
+            writer1.tmp_path, writer2.tmp_path
+        );
+
+        // Both .tmp files should exist
+        assert!(writer1.tmp_path.exists(), "Writer 1 .tmp file should exist");
+        assert!(writer2.tmp_path.exists(), "Writer 2 .tmp file should exist");
+
+        // Abort both writers
+        DiskCacheManager::abort_incremental_range(writer1);
+        DiskCacheManager::abort_incremental_range(writer2);
+
+        // Verify cleanup — reuse the helper from abort test
+        fn find_tmp_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
+            let mut results = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        results.extend(find_tmp_files_in(&path));
+                    } else if path.extension().map_or(false, |ext| ext == "tmp") {
+                        results.push(path);
+                    }
+                }
+            }
+            results
+        }
+
+        let tmp_files = find_tmp_files_in(temp_dir.path());
+        assert!(
+            tmp_files.is_empty(),
+            "No .tmp files should remain after aborting both writers, found: {:?}",
+            tmp_files
         );
     }
 }

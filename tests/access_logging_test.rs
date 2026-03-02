@@ -21,6 +21,10 @@ async fn test_access_logging_all_mode() {
         log_level: "info".to_string(),
         access_log_flush_interval: std::time::Duration::from_secs(5),
         access_log_buffer_size: 1000,
+        access_log_retention_days: 30,
+        app_log_retention_days: 30,
+        log_cleanup_interval: std::time::Duration::from_secs(86400),
+        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
     };
 
     let mut logger = LoggerManager::new(logging_config);
@@ -76,6 +80,10 @@ async fn test_access_logging_cached_only_mode() {
         log_level: "info".to_string(),
         access_log_flush_interval: std::time::Duration::from_secs(5),
         access_log_buffer_size: 1000,
+        access_log_retention_days: 30,
+        app_log_retention_days: 30,
+        log_cleanup_interval: std::time::Duration::from_secs(86400),
+        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
     };
 
     let mut logger = LoggerManager::new(logging_config);
@@ -129,6 +137,10 @@ async fn test_access_log_entry_format() {
         log_level: "info".to_string(),
         access_log_flush_interval: std::time::Duration::from_secs(5),
         access_log_buffer_size: 1000,
+        access_log_retention_days: 30,
+        app_log_retention_days: 30,
+        log_cleanup_interval: std::time::Duration::from_secs(86400),
+        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
     };
 
     let mut logger = LoggerManager::new(logging_config);

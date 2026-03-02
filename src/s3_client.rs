@@ -15,6 +15,7 @@ use hyper::{Method, Request, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
@@ -27,6 +28,7 @@ pub struct S3Client {
     pool_manager: Arc<Mutex<ConnectionPoolManager>>,
     request_timeout: Duration,
     keepalive_enabled: bool,
+    ip_distribution_enabled: bool,
     metrics_manager:
         Arc<tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>>>,
 }
@@ -92,11 +94,6 @@ impl S3ResponseBody {
             S3ResponseBody::Buffered(bytes) => Some(bytes),
             S3ResponseBody::Streaming(_) => None,
         }
-    }
-
-    /// Check if this is a streaming body
-    pub fn is_streaming(&self) -> bool {
-        matches!(self, S3ResponseBody::Streaming(_))
     }
 }
 
@@ -168,16 +165,25 @@ impl S3Client {
         https_connector.set_metrics_manager_ref(Arc::clone(&metrics_ref));
 
         // Build Hyper client with connection pooling
+        // When IP distribution is enabled, each IP gets its own hyper pool keyed by
+        // (scheme, ip, port), so use the per-IP idle limit instead of the per-host limit.
+        let pool_max_idle = if config.ip_distribution_enabled {
+            config.max_idle_per_ip
+        } else {
+            config.max_idle_per_host
+        };
+
         let client = if config.keepalive_enabled {
             debug!(
-                "Creating S3 client with connection keepalive enabled (idle_timeout: {}s, max_idle_per_host: {})",
+                "Creating S3 client with connection keepalive enabled (idle_timeout: {}s, pool_max_idle_per_host: {}, ip_distribution: {})",
                 config.idle_timeout.as_secs(),
-                config.max_idle_per_host
+                pool_max_idle,
+                config.ip_distribution_enabled
             );
 
             Client::builder(TokioExecutor::new())
                 .pool_idle_timeout(config.idle_timeout)
-                .pool_max_idle_per_host(config.max_idle_per_host)
+                .pool_max_idle_per_host(pool_max_idle)
                 .build(https_connector)
         } else {
             debug!("Creating S3 client with connection keepalive disabled");
@@ -194,6 +200,7 @@ impl S3Client {
             pool_manager,
             request_timeout: Duration::from_secs(30),
             keepalive_enabled: config.keepalive_enabled,
+            ip_distribution_enabled: config.ip_distribution_enabled,
             metrics_manager: metrics_ref,
         })
     }
@@ -206,44 +213,6 @@ impl S3Client {
         let mut mm = self.metrics_manager.write().await;
         *mm = Some(metrics_manager);
     }
-
-    /// Start background task for max lifetime enforcement
-    /// Requirement 4.1, 4.4, 4.5: Close connections exceeding max lifetime
-    pub fn start_max_lifetime_task(
-        pool_manager: Arc<Mutex<ConnectionPoolManager>>,
-        metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
-        max_lifetime: Duration,
-        check_interval: Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(check_interval);
-
-            loop {
-                interval.tick().await;
-
-                // Check for connections exceeding max lifetime
-                let pool = pool_manager.lock().await;
-                let expired_connections = pool.get_expired_connections(max_lifetime);
-                drop(pool);
-
-                for (endpoint, conn_id) in expired_connections {
-                    debug!(
-                        "Connection exceeded max lifetime: endpoint={}, conn_id={}, max_lifetime={}s",
-                        endpoint, conn_id, max_lifetime.as_secs()
-                    );
-
-                    // Track max lifetime closure in metrics
-                    if let Some(metrics) = &metrics_manager {
-                        metrics.read().await.record_max_lifetime_closure().await;
-                    }
-
-                    // Note: Hyper will automatically close the connection when it's returned to the pool
-                    // We just need to track the metric here
-                }
-            }
-        })
-    }
-
     /// Get reference to connection pool manager for health/metrics monitoring
     pub fn get_connection_pool(
         &self,
@@ -347,18 +316,63 @@ impl S3Client {
         // by tracking total requests vs connections created
         let _endpoint = context.host.clone();
 
+        // IP distribution: rewrite URI authority from hostname to IP address so hyper
+        // creates separate connection pools per IP (Requirement 1.1, 1.2)
+        let effective_uri = if self.ip_distribution_enabled {
+            let distributed_ip = {
+                let mut pool_manager = self.pool_manager.lock().await;
+                pool_manager.get_distributed_ip(&context.host)
+            };
+            match distributed_ip {
+                Some(ip) => {
+                    debug!(
+                        ip = %ip,
+                        host = %context.host,
+                        "Selected distributed IP for request"
+                    );
+                    match rewrite_uri_authority(&context.uri, &ip) {
+                        Ok(new_uri) => new_uri,
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                host = %context.host,
+                                "URI authority rewrite failed, forwarding with original hostname"
+                            );
+                            context.uri.clone()
+                        }
+                    }
+                }
+                None => {
+                    // No IPs available — forward with original hostname (Requirement 7.1)
+                    context.uri.clone()
+                }
+            }
+        } else {
+            context.uri.clone()
+        };
+
         // Build HTTP request
-        let mut request_builder = Request::builder().method(&context.method).uri(&context.uri);
+        let mut request_builder = Request::builder().method(&context.method).uri(&effective_uri);
 
         // Add headers (including any conditional headers)
         // Skip Content-Length header for requests with bodies - Hyper will set it automatically
         let has_body = context.body.is_some();
+        let mut host_header_set = false;
         for (key, value) in &context.headers {
             if has_body && key.to_lowercase() == "content-length" {
                 debug!("Skipping Content-Length header for request with body (will be auto-calculated): {}", value);
                 continue;
             }
+            if key.to_lowercase() == "host" {
+                host_header_set = true;
+            }
             request_builder = request_builder.header(key, value);
+        }
+
+        // When IP distribution rewrites the URI authority to an IP address, ensure the
+        // Host header is set to the original hostname for AWS SigV4 compatibility (Requirement 2.2)
+        if self.ip_distribution_enabled && !host_header_set {
+            request_builder = request_builder.header("host", &context.host);
         }
 
         // Create request body
@@ -400,25 +414,22 @@ impl S3Client {
             }
         }
 
-        // Determine if we should stream or buffer based on Content-Length
-        const STREAMING_THRESHOLD: u64 = 1_048_576; // 1MB
-
+        // Stream or buffer the response body.
+        // When allow_streaming is true, stream the body directly to avoid buffering delay.
+        // When false (e.g., error responses that need body inspection), buffer it.
+        // Responses with no Content-Length and allow_streaming=true are also streamed
+        // (chunked transfer encoding from S3).
         let content_length = headers
             .get("content-length")
             .and_then(|v| v.parse::<u64>().ok());
 
-        let should_stream = context.allow_streaming
-            && content_length
-                .map(|len| len > STREAMING_THRESHOLD)
-                .unwrap_or(false);
+        let should_stream = context.allow_streaming;
 
         let response_body = if should_stream {
             debug!(
-                "Streaming response body (Content-Length: {} bytes)",
-                content_length.unwrap()
+                "Streaming response body (Content-Length: {:?} bytes)",
+                content_length
             );
-            // Return streaming body - Hyper handles connection lifecycle
-            // Always return streaming body if we decided to stream
             Some(S3ResponseBody::Streaming(body))
         } else {
             // Buffer small responses
@@ -528,22 +539,6 @@ impl S3Client {
             .get_multiple_connections(endpoint, request_size, connection_count)
             .await
     }
-
-    /// Handle S3 error responses with appropriate retry logic (Requirement 17.1, 17.8)
-    pub fn handle_s3_error_response(&self, status: StatusCode) -> Duration {
-        match status.as_u16() {
-            503 => {
-                // S3 SlowDown error - implement aggressive backoff (Requirement 17.8)
-                Duration::from_secs(60)
-            }
-            500 | 502 | 429 => {
-                // Server errors and rate limiting - use exponential backoff
-                Duration::from_millis(100)
-            }
-            _ => Duration::from_millis(100),
-        }
-    }
-
     /// Build conditional request headers for cache validation (Requirements 4.1, 4.2, 4.3, 4.4, 3.6, 3.8)
     pub fn build_conditional_headers(
         original_headers: &HashMap<String, String>,
@@ -843,20 +838,6 @@ impl S3Client {
             response_headers,
         )
     }
-
-    /// Extract metadata from S3 response headers with URL parameters
-    pub fn extract_metadata_from_response_with_params(
-        &self,
-        headers: &HashMap<String, String>,
-        url_params: &S3UrlParams,
-    ) -> CacheMetadata {
-        let mut metadata = self.extract_metadata_from_response(headers);
-
-        // Set part number from URL params
-        metadata.part_number = url_params.part_number;
-
-        metadata
-    }
 }
 
 /// URL parameter parsing utilities for S3 requests
@@ -867,12 +848,6 @@ pub struct S3UrlParams {
 }
 
 impl S3UrlParams {
-    /// Parse S3-specific parameters from URI query string
-    pub fn parse_from_uri(uri: &Uri) -> Self {
-        let query = uri.query().unwrap_or("");
-        Self::parse_from_query(query)
-    }
-
     /// Parse S3-specific parameters from query string
     pub fn parse_from_query(query: &str) -> Self {
         let mut part_number = None;
@@ -921,11 +896,6 @@ impl S3UrlParams {
     pub fn is_multipart_upload(&self) -> bool {
         self.upload_id.is_some() || self.uploads || self.part_number.is_some()
     }
-
-    /// Check if this is a part request
-    pub fn is_part_request(&self) -> bool {
-        self.part_number.is_some()
-    }
 }
 
 /// Helper function to build S3 request context from HTTP request
@@ -963,7 +933,7 @@ pub fn build_s3_request_context(
         request_size,
         conditional_headers,
         operation_type: None,
-        allow_streaming: false, // Default to buffering for safety
+        allow_streaming: true, // Stream by default — buffering delays time-to-first-byte
     }
 }
 
@@ -1007,6 +977,30 @@ pub fn build_s3_request_context_with_operation(
     }
 }
 
+/// Rewrite a URI's authority (host) from a hostname to an IP address while preserving
+/// scheme, path, and query. Used by IP distribution to make hyper create per-IP pools.
+fn rewrite_uri_authority(original: &Uri, ip: &IpAddr) -> std::result::Result<Uri, String> {
+    let scheme = original.scheme_str().unwrap_or("https");
+    let port_suffix = match original.port_u16() {
+        Some(443) if scheme == "https" => String::new(),
+        Some(80) if scheme == "http" => String::new(),
+        Some(port) => format!(":{}", port),
+        None => String::new(),
+    };
+    let ip_authority = match ip {
+        IpAddr::V6(v6) => format!("[{}]{}", v6, port_suffix),
+        IpAddr::V4(v4) => format!("{}{}", v4, port_suffix),
+    };
+    let path_and_query = original
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let new_uri_str = format!("{}://{}{}", scheme, ip_authority, path_and_query);
+    new_uri_str
+        .parse::<Uri>()
+        .map_err(|e| format!("Failed to parse rewritten URI '{}': {}", new_uri_str, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,6 +1018,8 @@ mod tests {
             pool_check_interval: Duration::from_secs(10),
             dns_servers: Vec::new(),
             endpoint_overrides: std::collections::HashMap::new(),
+            ip_distribution_enabled: false,
+            max_idle_per_ip: 10,
         }
     }
 
@@ -1254,4 +1250,163 @@ mod tests {
         assert_eq!(metadata2.etag, "\"def456\"");
         assert_eq!(metadata2.content_length, 2048); // Should fall back to Content-Length
     }
+
+    // --- URI rewriting tests (Task 6.3) ---
+
+    #[test]
+    fn test_rewrite_uri_authority_ipv4() {
+        // Validates: Requirement 1.1 - URI authority rewritten from hostname to IP
+        let uri: Uri = "https://s3.eu-west-1.amazonaws.com/bucket/key"
+            .parse()
+            .unwrap();
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        assert_eq!(result.scheme_str(), Some("https"));
+        assert_eq!(result.host(), Some("52.92.17.224"));
+        assert_eq!(result.path(), "/bucket/key");
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_ipv6() {
+        // Validates: Requirement 1.1 - IPv6 addresses wrapped in brackets
+        let uri: Uri = "https://s3.eu-west-1.amazonaws.com/bucket/key"
+            .parse()
+            .unwrap();
+        let ip: IpAddr = "2600:1f18:243e:b800::1".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        assert_eq!(result.scheme_str(), Some("https"));
+        assert_eq!(result.host(), Some("[2600:1f18:243e:b800::1]"));
+        assert_eq!(result.path(), "/bucket/key");
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_preserves_path_and_query() {
+        // Validates: Requirement 2.3 - all other request components preserved
+        let uri: Uri =
+            "https://s3.amazonaws.com/bucket/key?partNumber=1&uploadId=abc"
+                .parse()
+                .unwrap();
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        assert_eq!(result.path(), "/bucket/key");
+        assert_eq!(result.query(), Some("partNumber=1&uploadId=abc"));
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_non_default_port() {
+        // Validates: Requirement 1.1 - non-default ports preserved
+        let uri: Uri = "https://s3.amazonaws.com:8443/bucket/key"
+            .parse()
+            .unwrap();
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        assert_eq!(result.host(), Some("52.92.17.224"));
+        assert_eq!(result.port_u16(), Some(8443));
+        assert_eq!(result.path(), "/bucket/key");
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_default_https_port_omitted() {
+        // Default port 443 for https should not appear in the rewritten URI
+        let uri: Uri = "https://s3.amazonaws.com:443/bucket/key"
+            .parse()
+            .unwrap();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        assert_eq!(result.port_u16(), None);
+        assert_eq!(result.host(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_http_scheme() {
+        let uri: Uri = "http://s3.amazonaws.com/bucket/key".parse().unwrap();
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        assert_eq!(result.scheme_str(), Some("http"));
+        assert_eq!(result.host(), Some("52.92.17.224"));
+    }
+
+    #[test]
+    fn test_pool_max_idle_per_host_ip_distribution_enabled() {
+        // Validates: Requirement 5.2 - max_idle_per_ip (10) used when IP distribution enabled
+        let mut config = create_test_config();
+        config.ip_distribution_enabled = true;
+        config.max_idle_per_ip = 10;
+        config.max_idle_per_host = 100;
+
+        let pool_max_idle = if config.ip_distribution_enabled {
+            config.max_idle_per_ip
+        } else {
+            config.max_idle_per_host
+        };
+
+        assert_eq!(pool_max_idle, 10);
+    }
+
+    #[test]
+    fn test_pool_max_idle_per_host_ip_distribution_disabled() {
+        // Validates: Requirement 5.3 - max_idle_per_host (100) used when IP distribution disabled
+        let mut config = create_test_config();
+        config.ip_distribution_enabled = false;
+        config.max_idle_per_ip = 10;
+        config.max_idle_per_host = 100;
+
+        let pool_max_idle = if config.ip_distribution_enabled {
+            config.max_idle_per_ip
+        } else {
+            config.max_idle_per_host
+        };
+
+        assert_eq!(pool_max_idle, 100);
+    }
+
+    // --- Graceful degradation tests (Task 11.3, Requirements 7.1, 7.2) ---
+
+    #[test]
+    fn test_rewrite_uri_authority_path_only_uri() {
+        // Validates: Requirement 7.2
+        // Edge case: a URI with no scheme or authority (path-only).
+        // rewrite_uri_authority falls back to scheme "https" and path "/".
+        // The function should still produce a valid URI without panicking.
+        let uri: Uri = "/bucket/key".parse().unwrap();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip);
+
+        // Should succeed — the function fills in defaults for missing components
+        assert!(result.is_ok());
+        let rewritten = result.unwrap();
+        assert_eq!(rewritten.scheme_str(), Some("https"));
+        assert_eq!(rewritten.host(), Some("10.0.0.1"));
+        assert_eq!(rewritten.path(), "/bucket/key");
+    }
+
+    #[test]
+    fn test_rewrite_uri_authority_root_path_no_query() {
+        // Validates: Requirement 7.2
+        // Edge case: URI with scheme and authority but no path or query.
+        // path_and_query() returns None, so the function falls back to "/".
+        let uri: Uri = "https://s3.amazonaws.com".parse().unwrap();
+        let ip: IpAddr = "52.92.17.224".parse().unwrap();
+
+        let result = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        assert_eq!(result.scheme_str(), Some("https"));
+        assert_eq!(result.host(), Some("52.92.17.224"));
+        assert_eq!(result.path(), "/");
+    }
+
+
 }

@@ -66,12 +66,6 @@ impl HybridMetadataWriter {
             consolidation_trigger,
         }
     }
-
-    /// Get journal manager reference for metadata reconstruction
-    pub fn get_journal_manager(&self) -> Option<&Arc<JournalManager>> {
-        Some(&self.journal_manager)
-    }
-
     /// Write range metadata using the specified write mode
     ///
     /// # Arguments

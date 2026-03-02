@@ -8,6 +8,7 @@ use crate::{
     cache::CacheManager,
     cache_types::{CacheMetadata, ObjectExpirationResult},
     config::Config,
+    disk_cache::DiskCacheManager,
     inflight_tracker::{FetchRole, InFlightTracker},
     logging::LoggerManager,
     range_handler::{RangeHandler, RangeParseResult, RangeSpec},
@@ -31,8 +32,9 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
@@ -444,6 +446,11 @@ impl HttpProxy {
     /// Get reference to compression handler for health/metrics monitoring
     pub fn get_compression_handler(&self) -> Arc<crate::compression::CompressionHandler> {
         self.cache_manager.get_compression_handler()
+    }
+
+    /// Get active connections counter for metrics reporting
+    pub fn get_active_connections(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.active_connections)
     }
 
     /// Start the HTTP proxy server
@@ -1123,6 +1130,7 @@ impl HttpProxy {
                     cache_key,
                     cache_manager,
                     s3_client,
+                    range_handler,
                     proxy_referer,
                 )
                 .await;
@@ -1420,6 +1428,7 @@ impl HttpProxy {
                         cache_manager,
                         s3_client,
                         inflight_tracker,
+                        range_handler.clone(),
                         config.cache.download_coordination.enabled,
                         config.cache.download_coordination.wait_timeout(),
                         metrics_manager,
@@ -1459,6 +1468,7 @@ impl HttpProxy {
                         cache_manager,
                         s3_client,
                         inflight_tracker,
+                        range_handler,
                         config.cache.download_coordination.enabled,
                         config.cache.download_coordination.wait_timeout(),
                         metrics_manager,
@@ -1580,6 +1590,7 @@ impl HttpProxy {
                         cache_key,
                         cache_manager,
                         s3_client,
+                        range_handler.clone(),
                         proxy_referer,
                     )
                     .await
@@ -1597,6 +1608,7 @@ impl HttpProxy {
                         cache_key,
                         cache_manager,
                         s3_client,
+                        range_handler,
                         proxy_referer,
                     )
                     .await
@@ -2693,6 +2705,8 @@ impl HttpProxy {
                 let end = range_spec.end;
                 let ttl = config.cache.get_ttl;
                 let s3_client_clone = s3_client.clone();
+                let disk_cache = Arc::clone(range_handler.get_disk_cache_manager());
+                let cache_manager = Arc::clone(range_handler.get_cache_manager());
                 tokio::spawn(async move {
                     let mut accumulated = Vec::new();
                     while let Some(chunk) = cache_rx.recv().await {
@@ -2700,7 +2714,6 @@ impl HttpProxy {
                     }
 
                     if !accumulated.is_empty() {
-                        // Use the new method to create ObjectMetadata with all S3 response headers
                         let mut object_metadata =
                             s3_client_clone.extract_object_metadata_from_response(&headers_clone);
                         object_metadata.upload_state = crate::cache_types::UploadState::Complete;
@@ -2709,14 +2722,24 @@ impl HttpProxy {
                             crate::compression::CompressionAlgorithm::Lz4;
                         object_metadata.compressed_size = 0;
 
-                        if let Err(e) = range_handler
-                            .store_range_new_storage(
+                        // Check capacity and evict if needed before caching
+                        if let Err(e) =
+                            cache_manager.evict_if_needed(accumulated.len() as u64).await
+                        {
+                            warn!("Eviction failed before caching range: {}", e);
+                        }
+
+                        let mut disk_cache_guard = disk_cache.write().await;
+                        let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
+                        if let Err(e) = disk_cache_guard
+                            .store_range(
                                 &cache_key_clone,
                                 start,
                                 end,
                                 &accumulated,
                                 object_metadata,
                                 ttl,
+                                resolved.compression_enabled,
                             )
                             .await
                         {
@@ -2724,9 +2747,7 @@ impl HttpProxy {
                         } else {
                             debug!(
                                 "Successfully cached streamed range {}-{} ({} bytes)",
-                                start,
-                                end,
-                                accumulated.len()
+                                start, end, accumulated.len()
                             );
                         }
                     }
@@ -3374,6 +3395,7 @@ impl HttpProxy {
                     cache_key,
                     cache_manager,
                     s3_client,
+                    range_handler,
                     proxy_referer,
                 )
                 .await
@@ -3406,6 +3428,8 @@ impl HttpProxy {
         config: Arc<Config>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Get the cached data using the same logic as range requests
+        let perf_start = Instant::now();
+        let data_load_start = Instant::now();
         let (range_data, _merge_metrics, is_ram_hit) = match Self::get_cached_range_data(
             range_spec,
             overlap,
@@ -3423,6 +3447,7 @@ impl HttpProxy {
             Ok(result) => result,
             Err(error_response) => return Ok(error_response),
         };
+        let data_load_ms = data_load_start.elapsed().as_millis();
 
         // Refresh write cache TTL if this is a write-cached object (Requirements 1.4, 5.2)
         // This is done asynchronously to not block the response
@@ -3495,6 +3520,7 @@ impl HttpProxy {
         }
 
         // For HEAD requests, don't include body
+        let range_data_size = range_data.len();
         let body = if method == Method::HEAD {
             Full::new(Bytes::new())
                 .map_err(|never| match never {})
@@ -3510,6 +3536,14 @@ impl HttpProxy {
         // Log cache hit at INFO level for observability
         let cache_tier = if is_ram_hit { "RAM" } else { "Disk" };
         info!("GET {} cache HIT for {}", cache_tier, uri);
+
+        if method != Method::HEAD {
+            let total_ms = perf_start.elapsed().as_millis();
+            debug!(
+                "PERF cache_hit path={} range={}-{} size={} data_load_ms={} total_ms={} source=disk_buffered",
+                uri, range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
+            );
+        }
 
         Ok(response)
     }
@@ -3580,11 +3614,14 @@ impl HttpProxy {
         let streaming_threshold = config.cache.disk_streaming_threshold;
 
         // Check RAM cache before the streaming/buffered decision (Requirements 3.1, 3.2, 3.3, 4.1, 4.2)
+        let perf_start = Instant::now();
+        let ram_lookup_start = Instant::now();
         if let Some(ram_data) = cache_manager.get_range_from_ram_cache(
             cache_key,
             range_spec.start,
             range_spec.end,
         ) {
+            let ram_lookup_ms = ram_lookup_start.elapsed().as_millis();
             debug!(
                 "RAM cache hit for range {}-{}, serving buffered response",
                 range_spec.start, range_spec.end
@@ -3635,6 +3672,7 @@ impl HttpProxy {
             );
 
             // For HEAD requests, don't include body
+            let ram_data_len = ram_data.len();
             let body = if method == Method::HEAD {
                 Full::new(Bytes::new())
                     .map_err(|never| match never {})
@@ -3651,6 +3689,14 @@ impl HttpProxy {
                 "GET RAM range cache HIT for {} range {}-{}",
                 uri, range_spec.start, range_spec.end
             );
+
+            if method != Method::HEAD {
+                let total_ms = perf_start.elapsed().as_millis();
+                debug!(
+                    "PERF cache_hit path={} range={}-{} size={} ram_lookup_ms={} total_ms={} source=ram",
+                    uri, range_spec.start, range_spec.end, ram_data_len, ram_lookup_ms, total_ms
+                );
+            }
 
             // Record cache hit statistics
             cache_manager.update_statistics(true, range_size, method == Method::HEAD);
@@ -3689,12 +3735,14 @@ impl HttpProxy {
             });
 
             // Resolve metadata for headers (Requirement 5.6)
+            let metadata_start = Instant::now();
             let cached_metadata = Self::resolve_cached_metadata(
                 preloaded_metadata,
                 &cache_manager,
                 cache_key,
             )
             .await;
+            let metadata_ms = metadata_start.elapsed().as_millis();
 
             let total_object_size = cached_metadata.content_length;
 
@@ -3804,13 +3852,15 @@ impl HttpProxy {
                 }
             };
 
-            // Stream range data from disk in 512 KiB chunks (Requirement 5.1)
-            const DEFAULT_CHUNK_SIZE: usize = 524_288; // 512 KiB
+            // Stream range data from disk in 1 MiB chunks (was 512 KiB)
+            const DEFAULT_CHUNK_SIZE: usize = 1_048_576; // 1 MiB
+            let disk_open_start = Instant::now();
             match disk_cache
                 .stream_range_data(&disk_range_spec, DEFAULT_CHUNK_SIZE)
                 .await
             {
                 Ok(data_stream) => {
+                    let disk_open_ms = disk_open_start.elapsed().as_millis();
                     drop(disk_cache);
 
                     // Record range access asynchronously
@@ -3945,6 +3995,15 @@ impl HttpProxy {
                         "GET Disk (streaming) range cache HIT for {} range {}-{}",
                         uri, range_spec.start, range_spec.end
                     );
+
+                    {
+                        let stream_setup_ms = disk_open_start.elapsed().as_millis();
+                        let total_ms = perf_start.elapsed().as_millis();
+                        debug!(
+                            "PERF cache_hit path={} range={}-{} size={} metadata_ms={} disk_open_ms={} stream_setup_ms={} total_ms={} source=disk_streaming",
+                            uri, range_spec.start, range_spec.end, range_size, metadata_ms, disk_open_ms, stream_setup_ms, total_ms
+                        );
+                    }
 
                     // Record cache hit statistics for streaming path
                     cache_manager.update_statistics(true, range_size, false);
@@ -4151,6 +4210,8 @@ impl HttpProxy {
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Get the cached data using the common logic
+        let perf_start = Instant::now();
+        let data_load_start = Instant::now();
         let (range_data, _merge_metrics, is_ram_hit) = match Self::get_cached_range_data(
             range_spec,
             overlap,
@@ -4168,6 +4229,7 @@ impl HttpProxy {
             Ok(result) => result,
             Err(error_response) => return Ok(error_response),
         };
+        let data_load_ms = data_load_start.elapsed().as_millis();
 
         // Refresh write cache TTL if this is a write-cached object (Requirements 1.4, 5.2)
         // This is done asynchronously to not block the response
@@ -4216,7 +4278,8 @@ impl HttpProxy {
         );
 
         // Calculate size before moving range_data
-        let _size_mib = range_data.len() as f64 / 1_048_576.0;
+        let range_data_size = range_data.len();
+        let _size_mib = range_data_size as f64 / 1_048_576.0;
 
         // For HEAD requests, don't include body
         let body = if method == Method::HEAD {
@@ -4237,6 +4300,21 @@ impl HttpProxy {
             "GET {} range cache HIT for {} range {}-{}",
             cache_tier, uri, range_spec.start, range_spec.end
         );
+
+        if method != Method::HEAD {
+            let total_ms = perf_start.elapsed().as_millis();
+            if is_ram_hit {
+                debug!(
+                    "PERF cache_hit path={} range={}-{} size={} ram_lookup_ms={} total_ms={} source=ram",
+                    uri, range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
+                );
+            } else {
+                debug!(
+                    "PERF cache_hit path={} range={}-{} size={} data_load_ms={} total_ms={} source=disk_buffered",
+                    uri, range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
+                );
+            }
+        }
 
         Ok(response)
     }
@@ -4887,6 +4965,7 @@ impl HttpProxy {
                 cache_key,
                 cache_manager,
                 s3_client,
+                range_handler,
                 proxy_referer,
             )
             .await;
@@ -4917,6 +4996,7 @@ impl HttpProxy {
                     cache_key,
                     cache_manager,
                     s3_client,
+                    range_handler,
                     proxy_referer,
                 )
                 .await;
@@ -5019,6 +5099,7 @@ impl HttpProxy {
                             cache_key,
                             cache_manager,
                             s3_client,
+                            range_handler.clone(),
                             proxy_referer,
                         )
                         .await
@@ -5044,6 +5125,7 @@ impl HttpProxy {
                             cache_key,
                             cache_manager,
                             s3_client,
+                            range_handler.clone(),
                             proxy_referer,
                         )
                         .await
@@ -5071,6 +5153,7 @@ impl HttpProxy {
                             cache_key,
                             cache_manager,
                             s3_client,
+                            range_handler,
                             proxy_referer,
                         )
                         .await
@@ -5094,6 +5177,7 @@ impl HttpProxy {
         cache_manager: Arc<CacheManager>,
         s3_client: Arc<S3Client>,
         inflight_tracker: Arc<InFlightTracker>,
+        range_handler: Arc<RangeHandler>,
         coordination_enabled: bool,
         wait_timeout: std::time::Duration,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
@@ -5109,6 +5193,7 @@ impl HttpProxy {
                 cache_key,
                 cache_manager,
                 s3_client,
+                range_handler,
                 proxy_referer,
             )
             .await;
@@ -5133,6 +5218,7 @@ impl HttpProxy {
                     cache_key,
                     cache_manager,
                     s3_client,
+                    range_handler,
                     proxy_referer,
                 )
                 .await;
@@ -5204,7 +5290,7 @@ impl HttpProxy {
                                 cache_manager.update_statistics(false, 0, false);
                                 cache_manager.record_bucket_cache_access(&cache_key, false).await;
                                 Self::forward_get_head_to_s3_and_cache(
-                                    method, uri, host, headers, cache_key, cache_manager, s3_client, proxy_referer,
+                                    method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
                                 )
                                 .await
                             }
@@ -5219,7 +5305,7 @@ impl HttpProxy {
                             error, cache_key, part_number
                         );
                         Self::forward_get_head_to_s3_and_cache(
-                            method, uri, host, headers, cache_key, cache_manager, s3_client, proxy_referer,
+                            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler.clone(), proxy_referer,
                         )
                         .await
                     }
@@ -5232,7 +5318,7 @@ impl HttpProxy {
                             cache_key, part_number
                         );
                         Self::forward_get_head_to_s3_and_cache(
-                            method, uri, host, headers, cache_key, cache_manager, s3_client, proxy_referer,
+                            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler.clone(), proxy_referer,
                         )
                         .await
                     }
@@ -5247,7 +5333,7 @@ impl HttpProxy {
                             cache_key, part_number
                         );
                         Self::forward_get_head_to_s3_and_cache(
-                            method, uri, host, headers, cache_key, cache_manager, s3_client, proxy_referer,
+                            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
                         )
                         .await
                     }
@@ -5554,7 +5640,7 @@ impl HttpProxy {
         cache_manager.update_statistics(false, 0, false);
         cache_manager.record_bucket_cache_access(&cache_key, false).await;
         Self::forward_get_head_to_s3_and_cache(
-            method, uri, host, headers, cache_key, cache_manager, s3_client, proxy_referer,
+            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
         )
         .await
     }
@@ -5572,6 +5658,7 @@ impl HttpProxy {
         cache_key: String,
         cache_manager: Arc<CacheManager>,
         s3_client: Arc<S3Client>,
+        range_handler: Arc<RangeHandler>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         if method == Method::GET {
@@ -5599,12 +5686,22 @@ impl HttpProxy {
             host.clone(),
         );
 
+        let s3_fetch_start = Instant::now();
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
+                let s3_fetch_ms = s3_fetch_start.elapsed().as_millis();
                 debug!(
                     "Successfully received response from S3: {}",
                     s3_response.status
                 );
+
+                // Log PERF for full-object cache miss (GET only, not HEAD)
+                if method == Method::GET && s3_response.status.is_success() {
+                    debug!(
+                        "PERF cache_miss path={} s3_fetch_ms={} source=s3_full_object",
+                        uri.path(), s3_fetch_ms
+                    );
+                }
 
                 // Extract metadata from S3 response
                 let metadata = s3_client.extract_metadata_from_response(&s3_response.headers);
@@ -5665,45 +5762,118 @@ impl HttpProxy {
                             // Create channel for cache data
                             let (cache_tx, mut cache_rx) = mpsc::channel::<Bytes>(100);
 
-                            // Spawn background task to collect and cache data
+                            // Spawn background task to incrementally write cache data as chunks arrive
                             let cache_key_clone = cache_key.clone();
                             let cache_manager_clone = Arc::clone(&cache_manager);
                             let headers_for_cache = response_headers.clone();
                             let metadata_for_cache = metadata.clone();
                             let uri_clone = uri.clone();
+                            let range_handler_clone = Arc::clone(&range_handler);
+                            let s3_client_clone = Arc::clone(&s3_client);
+
+                            // Extract content_length for incremental write range bounds
+                            let content_length: Option<u64> = response_headers
+                                .get("content-length")
+                                .and_then(|v| v.parse::<u64>().ok());
 
                             tokio::spawn(async move {
-                                let mut accumulated = Vec::new();
-                                while let Some(chunk) = cache_rx.recv().await {
-                                    accumulated.extend_from_slice(&chunk);
-                                }
+                                // Check if this is a part-number request (needs special handling)
+                                let is_part_request = uri_clone
+                                    .query()
+                                    .map(|q| q.contains("partNumber"))
+                                    .unwrap_or(false);
 
-                                if !accumulated.is_empty() {
-                                    let body_size = accumulated.len() as u64;
-                                    debug!(
-                                        "Caching streamed GET response: cache_key={}, content_length={} bytes",
-                                        cache_key_clone, body_size
-                                    );
+                                // Use incremental writes for regular GET responses with known content_length
+                                if !is_part_request && content_length.is_some() && content_length.unwrap() > 0 {
+                                    let total_size = content_length.unwrap();
+                                    let start = 0u64;
+                                    let end = total_size - 1;
 
-                                    if let Err(e) = Self::cache_response_appropriately(
-                                        &cache_manager_clone,
-                                        &cache_key_clone,
-                                        &uri_clone,
-                                        &accumulated,
-                                        &headers_for_cache,
-                                        &metadata_for_cache,
-                                    )
-                                    .await
-                                    {
-                                        warn!(
-                                            "Failed to cache streamed response: cache_key={}, error={}",
-                                            cache_key_clone, e
+                                    // Begin incremental write
+                                    let disk_cache = range_handler_clone.get_disk_cache_manager().read().await;
+                                    let resolved = cache_manager_clone.resolve_settings(&cache_key_clone).await;
+                                    let mut writer = match disk_cache.begin_incremental_range_write(
+                                        &cache_key_clone, start, end, resolved.compression_enabled,
+                                    ).await {
+                                        Ok(w) => w,
+                                        Err(e) => {
+                                            warn!("Failed to begin incremental cache write for GET response: cache_key={}, error={}", cache_key_clone, e);
+                                            return;
+                                        }
+                                    };
+                                    drop(disk_cache);
+
+                                    // Write chunks as they arrive
+                                    while let Some(chunk) = cache_rx.recv().await {
+                                        if let Err(e) = DiskCacheManager::write_range_chunk(&mut writer, &chunk) {
+                                            warn!("Failed to write cache chunk for GET response: cache_key={}, error={}", cache_key_clone, e);
+                                            DiskCacheManager::abort_incremental_range(writer);
+                                            return;
+                                        }
+                                    }
+
+                                    // Build object metadata for commit
+                                    let mut object_metadata =
+                                        s3_client_clone.extract_object_metadata_from_response(
+                                            &headers_for_cache,
                                         );
+                                    object_metadata.upload_state = crate::cache_types::UploadState::Complete;
+                                    object_metadata.cumulative_size = object_metadata.content_length;
+
+                                    // Commit incremental write
+                                    let mut disk_cache = range_handler_clone.get_disk_cache_manager().write().await;
+                                    if let Err(e) = disk_cache.commit_incremental_range(writer, object_metadata, resolved.get_ttl).await {
+                                        if e.to_string().contains("size mismatch") {
+                                            debug!(
+                                                "Incremental cache write incomplete for GET response: cache_key={}, error={}",
+                                                cache_key_clone, e
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Failed to commit incremental cache write for GET response: cache_key={}, error={}",
+                                                cache_key_clone, e
+                                            );
+                                        }
                                     } else {
                                         debug!(
-                                            "Cached streamed response: cache_key={}, size={} bytes",
+                                            "Cached streamed GET response via incremental write: cache_key={}, size={} bytes",
+                                            cache_key_clone, total_size
+                                        );
+                                    }
+                                } else {
+                                    // Fallback: part-number requests or unknown content_length — accumulate then cache
+                                    let mut accumulated = Vec::new();
+                                    while let Some(chunk) = cache_rx.recv().await {
+                                        accumulated.extend_from_slice(&chunk);
+                                    }
+
+                                    if !accumulated.is_empty() {
+                                        let body_size = accumulated.len() as u64;
+                                        debug!(
+                                            "Caching streamed GET response (fallback): cache_key={}, content_length={} bytes",
                                             cache_key_clone, body_size
                                         );
+
+                                        if let Err(e) = Self::cache_response_appropriately(
+                                            &cache_manager_clone,
+                                            &cache_key_clone,
+                                            &uri_clone,
+                                            &accumulated,
+                                            &headers_for_cache,
+                                            &metadata_for_cache,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                "Failed to cache streamed response: cache_key={}, error={}",
+                                                cache_key_clone, e
+                                            );
+                                        } else {
+                                            debug!(
+                                                "Cached streamed response: cache_key={}, size={} bytes",
+                                                cache_key_clone, body_size
+                                            );
+                                        }
                                     }
                                 }
                             });
@@ -5839,6 +6009,7 @@ impl HttpProxy {
         config: Arc<Config>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let perf_s3_start = Instant::now();
         info!(
             "Forwarding signed range request to S3: range={}-{} missing_ranges={} cache_key={}",
             range_spec.start,
@@ -5854,13 +6025,14 @@ impl HttpProxy {
 
         // Build S3 request context with original headers (Requirement 2.2)
         // All headers are preserved exactly as received to maintain signature validity
-        let context = crate::s3_client::build_s3_request_context(
+        let mut context = crate::s3_client::build_s3_request_context(
             method.clone(),
             uri.clone(),
             client_headers.clone(),
             None, // No body for GET requests
             host.clone(),
         );
+        context.allow_streaming = true; // Stream S3 response directly to client
 
         // Forward request to S3 with retry on transient failures (Requirement 2.1, 2.3)
         const MAX_RETRIES: u32 = 2;
@@ -5878,16 +6050,25 @@ impl HttpProxy {
                 );
 
                 // Rebuild context for retry (connection may have been reset)
-                let retry_context = crate::s3_client::build_s3_request_context(
+                let mut retry_context = crate::s3_client::build_s3_request_context(
                     method.clone(),
                     uri.clone(),
                     client_headers.clone(),
                     None,
                     host.clone(),
                 );
+                retry_context.allow_streaming = true;
 
                 match s3_client.forward_request(retry_context).await {
                     Ok(s3_response) => {
+                        if method != Method::HEAD {
+                            let s3_fetch_ms = perf_s3_start.elapsed().as_millis();
+                            let range_size = range_spec.end - range_spec.start + 1;
+                            debug!(
+                                "PERF cache_miss path={} range={}-{} size={} s3_fetch_ms={} total_ms={} source=s3_signed_range",
+                                uri.path(), range_spec.start, range_spec.end, range_size, s3_fetch_ms, s3_fetch_ms
+                            );
+                        }
                         return Self::handle_signed_range_s3_response(
                             s3_response,
                             cache_key,
@@ -5913,6 +6094,14 @@ impl HttpProxy {
                 // First attempt
                 match s3_client.forward_request(context.clone()).await {
                     Ok(s3_response) => {
+                        if method != Method::HEAD {
+                            let s3_fetch_ms = perf_s3_start.elapsed().as_millis();
+                            let range_size = range_spec.end - range_spec.start + 1;
+                            debug!(
+                                "PERF cache_miss path={} range={}-{} size={} s3_fetch_ms={} total_ms={} source=s3_signed_range",
+                                uri.path(), range_spec.start, range_spec.end, range_size, s3_fetch_ms, s3_fetch_ms
+                            );
+                        }
                         return Self::handle_signed_range_s3_response(
                             s3_response,
                             cache_key,
@@ -6543,14 +6732,23 @@ impl HttpProxy {
             build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host.clone());
         context.allow_streaming = true; // Enable streaming for immediate byte flow
 
+        let perf_start = Instant::now();
+        let s3_fetch_start = Instant::now();
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
+                let s3_fetch_ms = s3_fetch_start.elapsed().as_millis();
                 debug!(
                     "Received S3 response for streaming: status={}",
                     s3_response.status
                 );
 
                 if s3_response.status == StatusCode::PARTIAL_CONTENT {
+                    let range_size = range_spec.end - range_spec.start + 1;
+                    let total_ms = perf_start.elapsed().as_millis();
+                    debug!(
+                        "PERF cache_miss path={} range={}-{} size={} s3_fetch_ms={} total_ms={} source=s3_streaming",
+                        uri.path(), range_spec.start, range_spec.end, range_size, s3_fetch_ms, total_ms
+                    );
                     // Use the streaming with caching function
                     Self::convert_s3_response_to_http_with_caching(
                         s3_response,

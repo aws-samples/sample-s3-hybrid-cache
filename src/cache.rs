@@ -5,7 +5,7 @@
 //! and write-through caching for PUT operations.
 
 use crate::cache_types::CacheMetadata;
-use crate::compression::{CompressionAlgorithm, CompressionHandler, CompressionStats};
+use crate::compression::{CompressionAlgorithm, CompressionHandler};
 use crate::ram_cache::RamCache;
 use crate::{ProxyError, Result};
 
@@ -357,7 +357,7 @@ pub struct RamCacheManager {
 pub enum CacheEvictionAlgorithm {
     #[default]
     LRU, // Least Recently Used (default)
-    TinyLFU, // Window-based TinyLFU with bloom filters
+    TinyLFU, // Simplified frequency-recency hybrid inspired by TinyLFU
 }
 
 /// Cache entry size information
@@ -911,17 +911,6 @@ impl CacheManager {
         };
         (max_cache_size as f32 * self.write_cache_percent / 100.0) as u64
     }
-
-    /// Check if write caching is enabled
-    pub fn is_write_caching_enabled(&self) -> bool {
-        self.write_cache_enabled
-    }
-
-    /// Get the incomplete upload TTL
-    pub fn get_incomplete_upload_ttl(&self) -> std::time::Duration {
-        self.incomplete_upload_ttl
-    }
-
     /// Create a new cache manager with specified eviction algorithm (same for RAM and disk)
     pub fn new_with_eviction_algorithm(
         cache_dir: PathBuf,
@@ -939,27 +928,6 @@ impl CacheManager {
             std::time::Duration::from_secs(315360000), // ~10 years (infinite caching)
         )
     }
-
-    /// Create a new cache manager with specific RAM cache eviction algorithm
-    pub fn new_with_ram_eviction(
-        cache_dir: PathBuf,
-        ram_cache_enabled: bool,
-        max_ram_cache_size: u64,
-        eviction_algorithm: CacheEvictionAlgorithm,
-        compression_threshold: usize,
-        compression_enabled: bool,
-    ) -> Self {
-        Self::new_with_ram_eviction_and_ttl(
-            cache_dir,
-            ram_cache_enabled,
-            max_ram_cache_size,
-            eviction_algorithm,
-            compression_threshold,
-            compression_enabled,
-            std::time::Duration::from_secs(315360000), // ~10 years (infinite caching)
-        )
-    }
-
     /// Create a new cache manager with unified eviction algorithm and TTL (legacy method)
     pub fn new_with_ram_eviction_and_ttl(
         cache_dir: PathBuf,
@@ -2008,45 +1976,6 @@ impl CacheManager {
 
         Ok(true)
     }
-
-    /// Validate range ETag against cached object metadata ETag
-    /// Returns true if ETags match or if no validation is needed, false if mismatch detected
-    /// Requirements: 2.1, 2.5 - ETag validation for range requests
-    pub async fn validate_range_etag(&self, cache_key: &str, range_etag: &str) -> Result<bool> {
-        debug!(
-            "Validating range ETag: cache_key={}, range_etag={}",
-            cache_key, range_etag
-        );
-
-        // Get object metadata from disk
-        let metadata = match self.get_metadata_from_disk(cache_key).await? {
-            Some(meta) => meta,
-            None => {
-                debug!(
-                    "No object metadata found for cache_key: {}, treating range as invalid",
-                    cache_key
-                );
-                return Ok(false);
-            }
-        };
-
-        // Compare range ETag with object metadata ETag
-        let object_etag = &metadata.object_metadata.etag;
-        if range_etag == object_etag {
-            debug!(
-                "ETag validation passed: cache_key={}, etag={}",
-                cache_key, range_etag
-            );
-            Ok(true)
-        } else {
-            warn!(
-                "ETag validation failed: cache_key={}, range_etag={}, object_etag={}, range is stale",
-                cache_key, range_etag, object_etag
-            );
-            Ok(false)
-        }
-    }
-
     /// Get object ETag from cached metadata
     /// Returns the ETag if object metadata exists, None otherwise
     /// Requirements: 2.1, 2.4 - ETag retrieval for validation
@@ -2068,111 +1997,6 @@ impl CacheManager {
             }
         }
     }
-
-    /// Clean up orphaned ranges without object metadata
-    /// Requirements: 2.4 - Orphaned range cleanup
-    pub async fn cleanup_orphaned_ranges(&self, cache_key: &str) -> Result<()> {
-        debug!("Cleaning up orphaned ranges for cache_key: {}", cache_key);
-
-        // Check if object metadata exists
-        match self.get_metadata_from_disk(cache_key).await? {
-            Some(_) => {
-                debug!(
-                    "Object metadata exists for cache_key: {}, no orphaned ranges to clean",
-                    cache_key
-                );
-                return Ok(());
-            }
-            None => {
-                info!(
-                    "No object metadata found for cache_key: {}, checking for orphaned ranges",
-                    cache_key
-                );
-            }
-        }
-
-        // Look for range files that might exist without metadata
-        let ranges_dir = self.cache_dir.join("ranges");
-        if !ranges_dir.exists() {
-            debug!("Ranges directory does not exist, no orphaned ranges to clean");
-            return Ok(());
-        }
-
-        // Use the sharded path structure to look for potential range files
-        use crate::disk_cache::get_sharded_path;
-        let sharded_path = match get_sharded_path(&ranges_dir, cache_key, "") {
-            Ok(path) => path,
-            Err(e) => {
-                warn!(
-                    "Failed to get sharded path for cache_key: {}, error={}",
-                    cache_key, e
-                );
-                return Ok(());
-            }
-        };
-
-        if !sharded_path.exists() {
-            debug!(
-                "No sharded directory exists for cache_key: {}, no orphaned ranges",
-                cache_key
-            );
-            return Ok(());
-        }
-
-        // Look for .bin files in the sharded directory that match this cache key
-        let mut orphaned_files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&sharded_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Check if this is a range file for our cache key
-                    if file_name.starts_with(&format!("{}_", cache_key.replace('/', "_")))
-                        && file_name.ends_with(".bin")
-                    {
-                        orphaned_files.push(path);
-                    }
-                }
-            }
-        }
-
-        if orphaned_files.is_empty() {
-            debug!("No orphaned range files found for cache_key: {}", cache_key);
-            return Ok(());
-        }
-
-        // Remove orphaned range files
-        let mut removed_count = 0;
-        let mut failed_count = 0;
-
-        for file_path in orphaned_files {
-            match std::fs::remove_file(&file_path) {
-                Ok(()) => {
-                    removed_count += 1;
-                    debug!(
-                        "Removed orphaned range file: cache_key={}, file={:?}",
-                        cache_key, file_path
-                    );
-                }
-                Err(e) => {
-                    failed_count += 1;
-                    warn!(
-                        "Failed to remove orphaned range file: cache_key={}, file={:?}, error={}",
-                        cache_key, file_path, e
-                    );
-                }
-            }
-        }
-
-        if removed_count > 0 {
-            info!(
-                "Orphaned range cleanup completed: cache_key={}, removed_files={}, failed_removals={}",
-                cache_key, removed_count, failed_count
-            );
-        }
-
-        Ok(())
-    }
-
     /// Force invalidate cached entry (for shared cache coordination)
     /// This method immediately removes cache files causing other instances to receive transient errors
     pub async fn force_invalidate_cache(&self, cache_key: &str) -> Result<()> {
@@ -2192,97 +2016,6 @@ impl CacheManager {
         info!("Force invalidated cache entry for key: {}", cache_key);
         Ok(())
     }
-
-    /// Handle cache eviction with coordination for shared volumes
-    /// This method waits for other instances to finish reading before deletion
-    pub async fn coordinate_cache_eviction(&self, cache_key: &str) -> Result<bool> {
-        debug!("Coordinating cache eviction for key: {}", cache_key);
-
-        // Check if entry is actively being used by other instances
-        if self.is_cache_entry_active(cache_key).await? {
-            debug!(
-                "Cache entry {} is actively being used, selecting alternative for eviction",
-                cache_key
-            );
-            return Ok(false); // Don't evict this entry, select alternative
-        }
-
-        // Try to acquire write lock to ensure exclusive access during eviction
-        let lock_acquired = self
-            .acquire_write_lock_with_timeout(
-                cache_key,
-                std::time::Duration::from_secs(2), // Short timeout for eviction
-            )
-            .await?;
-
-        if !lock_acquired {
-            debug!(
-                "Could not acquire lock for eviction of {}, selecting alternative",
-                cache_key
-            );
-            return Ok(false); // Select alternative entry for eviction
-        }
-
-        // Perform eviction
-        let result = self.invalidate_cache(cache_key).await;
-
-        // Release lock
-        self.release_write_lock(cache_key).await?;
-
-        match result {
-            Ok(_) => {
-                info!("Successfully evicted cache entry: {}", cache_key);
-                Ok(true)
-            }
-            Err(e) => {
-                warn!("Failed to evict cache entry {}: {}", cache_key, e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Handle transient read errors when cache files are removed during read
-    /// Returns a 503 Service Unavailable error that clients can retry
-    pub fn handle_cache_read_transient_error(&self, cache_key: &str) -> ProxyError {
-        warn!(
-            "Cache file for {} was removed during read by another instance",
-            cache_key
-        );
-        ProxyError::ServiceUnavailable(format!(
-            "Cache temporarily unavailable for {}, please retry",
-            cache_key
-        ))
-    }
-
-    /// Check if cache entry exists and is readable (for coordination)
-    pub async fn is_cache_entry_readable(&self, cache_key: &str) -> Result<bool> {
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        // Check if metadata file exists
-        if !metadata_file_path.exists() {
-            return Ok(false);
-        }
-
-        // Try to read metadata to ensure file is not corrupted
-        match std::fs::read_to_string(&metadata_file_path) {
-            Ok(metadata_content) => {
-                match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
-                    &metadata_content,
-                ) {
-                    Ok(cache_metadata) => {
-                        // Check if entry is expired
-                        if SystemTime::now() > cache_metadata.expires_at {
-                            return Ok(false);
-                        }
-                        Ok(true)
-                    }
-                    Err(_) => Ok(false), // Corrupted metadata
-                }
-            }
-            Err(_) => Ok(false), // Can't read metadata
-        }
-    }
-
     /// Get cache coordination statistics
     pub fn get_coordination_stats(&self) -> HashMap<String, u64> {
         let mut stats = HashMap::new();
@@ -2312,36 +2045,6 @@ impl CacheManager {
 
         stats
     }
-
-    /// Perform coordinated cache operation with proper filesystem communication
-    /// This ensures instances communicate only through the shared cache volume filesystem
-    pub async fn perform_coordinated_operation<F, T>(
-        &self,
-        cache_key: &str,
-        operation: F,
-    ) -> Result<T>
-    where
-        F: FnOnce() -> Result<T>,
-    {
-        // Try to acquire write lock for coordination
-        let lock_acquired = self.acquire_write_lock(cache_key).await?;
-
-        if !lock_acquired {
-            return Err(ProxyError::LockError(format!(
-                "Could not acquire coordination lock for cache key: {}",
-                cache_key
-            )));
-        }
-
-        // Perform the operation
-        let result = operation();
-
-        // Always release the lock
-        self.release_write_lock(cache_key).await?;
-
-        result
-    }
-
     /// Check cache consistency across instances
     /// This method helps detect when cache entries might be inconsistent
     pub async fn check_cache_consistency(&self, cache_key: &str) -> Result<bool> {
@@ -2353,107 +2056,6 @@ impl CacheManager {
             Err(_) => Ok(false),
         }
     }
-
-    /// Invalidate all cache entries for an object (including ranges and parts) - Requirement 6.6
-    pub async fn invalidate_object_cache(
-        &self,
-        path: &str,
-        _version_id: Option<&str>,
-    ) -> Result<()> {
-        debug!("Invalidating all cache entries for object: {}", path);
-
-        // Generate base cache key (version_id is ignored as versioning support has been removed)
-        let base_key = Self::generate_cache_key(path, None);
-
-        // Invalidate main object cache
-        self.invalidate_cache_hierarchy(&base_key).await?;
-
-        // Invalidate all related cache entries by scanning cache directories
-        self.invalidate_related_cache_entries(path).await?;
-
-        info!("Invalidated all cache entries for object: {}", path);
-        Ok(())
-    }
-
-    /// Comprehensive invalidation of all related cache entries - Requirement 6.6
-    async fn invalidate_related_cache_entries(&self, path: &str) -> Result<()> {
-        debug!("Invalidating related cache entries for object: {}", path);
-
-        let mut invalidated_count = 0u64;
-
-        // Define cache types to scan
-        let cache_types = ["metadata", "ranges", "mpus_in_progress"];
-
-        for cache_type in &cache_types {
-            let cache_type_dir = self.cache_dir.join(cache_type);
-            if !cache_type_dir.exists() {
-                continue;
-            }
-
-            if let Ok(entries) = std::fs::read_dir(&cache_type_dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let _file_path = entry.path();
-                        let file_name = entry.file_name();
-                        let file_name_str = file_name.to_string_lossy();
-
-                        // Only process metadata files
-                        if !file_name_str.ends_with(".meta") {
-                            continue;
-                        }
-
-                        // Extract cache key from filename
-                        if let Some(cache_key) =
-                            self.extract_cache_key_from_filename(&file_name_str)
-                        {
-                            // Check if this cache entry belongs to our object
-                            if self.cache_key_belongs_to_object(&cache_key, path) {
-                                debug!("Invalidating related cache entry: {}", cache_key);
-
-                                // Invalidate this cache entry
-                                if let Err(e) = self.invalidate_cache_hierarchy(&cache_key).await {
-                                    warn!(
-                                        "Failed to invalidate related cache entry {}: {}",
-                                        cache_key, e
-                                    );
-                                } else {
-                                    invalidated_count += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if invalidated_count > 0 {
-            info!(
-                "Invalidated {} related cache entries for object: {}",
-                invalidated_count, path
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Check if a cache key belongs to a specific object - Requirement 6.6
-    fn cache_key_belongs_to_object(&self, cache_key: &str, path: &str) -> bool {
-        // Parse cache key components
-        // Format: path or path:range:start-end or path:part:N
-        let parts: Vec<&str> = cache_key.split(':').collect();
-        if parts.is_empty() {
-            return false;
-        }
-
-        // Check path matches (path is now the first component)
-        if parts[0] != path {
-            return false;
-        }
-
-        // All non-versioned entries for this path should be invalidated
-        return true;
-    }
-
     /// Store multipart object part in cache - Requirements 7.1, 7.2
     /// Store multipart part (NEW ARCHITECTURE)
     /// Implements Requirements 5.1, 5.2, 5.3, 5.4, 5.5
@@ -2828,68 +2430,6 @@ impl CacheManager {
 
         Ok(cached_part)
     }
-
-    /// Check if request should bypass caching for multipart uploads - Requirements 7.3, 7.4, 7.5
-    pub fn should_bypass_cache_for_multipart(
-        &self,
-        url_params: &crate::s3_client::S3UrlParams,
-        method: &str,
-    ) -> bool {
-        // Bypass caching for multipart upload operations
-        if url_params.is_multipart_upload() {
-            debug!("Bypassing cache for multipart upload operation: method={}, uploadId={:?}, partNumber={:?}, uploads={}",
-                   method, url_params.upload_id, url_params.part_number, url_params.uploads);
-            return true;
-        }
-
-        // Don't bypass for GET requests with partNumber (these are part retrievals, not uploads)
-        if method == "GET" && url_params.part_number.is_some() {
-            debug!(
-                "Allowing cache for GET request with partNumber: {}",
-                url_params.part_number.unwrap()
-            );
-            return false;
-        }
-
-        false
-    }
-
-    /// Handle multipart upload passthrough decision - Requirements 7.3, 7.4, 7.5
-    pub fn should_passthrough_multipart_upload(
-        &self,
-        method: &str,
-        url_params: &crate::s3_client::S3UrlParams,
-        headers: &HashMap<String, String>,
-    ) -> bool {
-        // Always passthrough multipart upload operations
-        if url_params.is_multipart_upload() {
-            info!("Passthrough multipart upload: method={}, uploadId={:?}, partNumber={:?}, uploads={}",
-                  method, url_params.upload_id, url_params.part_number, url_params.uploads);
-            return true;
-        }
-
-        // Check for multipart content type
-        if let Some(content_type) = headers.get("content-type") {
-            if content_type.starts_with("multipart/") {
-                info!("Passthrough multipart content type: {}", content_type);
-                return true;
-            }
-        }
-
-        // Check for specific multipart headers
-        if headers.contains_key("x-amz-content-sha256")
-            && headers
-                .get("x-amz-content-sha256")
-                .map(|v| v.contains("STREAMING"))
-                == Some(true)
-        {
-            info!("Passthrough streaming multipart upload");
-            return true;
-        }
-
-        false
-    }
-
     /// Clear multipart metadata fields from ObjectMetadata - Requirements 7.4, 7.5
     fn clear_multipart_metadata_fields(object_metadata: &mut crate::cache_types::ObjectMetadata) {
         let had_parts_count = object_metadata.parts_count.is_some();
@@ -2907,58 +2447,6 @@ impl CacheManager {
             );
         }
     }
-
-    /// Invalidate multipart object parts - Requirements 7.1, 7.2
-    /// Note: host parameter is unused (kept for API compatibility)
-    pub async fn invalidate_multipart_parts(&self, _host: &str, path: &str) -> Result<u64> {
-        debug!("Invalidating multipart parts for object: {}", path);
-
-        let mut invalidated_count = 0u64;
-
-        // Scan mpus_in_progress cache directory
-        let parts_cache_dir = self.cache_dir.join("mpus_in_progress");
-        if !parts_cache_dir.exists() {
-            return Ok(0);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&parts_cache_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let file_name = entry.file_name();
-                    let file_name_str = file_name.to_string_lossy();
-
-                    // Only process metadata files
-                    if !file_name_str.ends_with(".meta") {
-                        continue;
-                    }
-
-                    // Extract cache key from filename
-                    if let Some(cache_key) = self.extract_cache_key_from_filename(&file_name_str) {
-                        // Check if this is a part cache entry for our object
-                        if self.is_part_cache_key_for_object(&cache_key, path) {
-                            debug!("Invalidating multipart part cache entry: {}", cache_key);
-
-                            if let Err(e) = self.invalidate_cache_hierarchy(&cache_key).await {
-                                warn!("Failed to invalidate part cache entry {}: {}", cache_key, e);
-                            } else {
-                                invalidated_count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if invalidated_count > 0 {
-            info!(
-                "Invalidated {} multipart part cache entries for object: {}",
-                invalidated_count, path
-            );
-        }
-
-        Ok(invalidated_count)
-    }
-
     /// Check if cache key is a part cache key for specific object
     fn is_part_cache_key_for_object(&self, cache_key: &str, path: &str) -> bool {
         // Part cache keys contain ":part:" pattern
@@ -3054,38 +2542,6 @@ impl CacheManager {
         );
         Ok(part_numbers)
     }
-
-    /// Get multipart object statistics - for monitoring
-    /// Note: host parameter is unused (kept for API compatibility)
-    pub async fn get_multipart_cache_stats(
-        &self,
-        host: &str,
-        path: &str,
-    ) -> Result<MultipartCacheStats> {
-        let part_numbers = self.list_multipart_parts(host, path).await?;
-        let total_parts = part_numbers.len() as u64;
-
-        let mut total_size = 0u64;
-        let mut cached_parts_count = 0u64;
-
-        // Calculate total size of cached parts
-        for part_number in &part_numbers {
-            if let Some(part_entry) = self.get_multipart_part(host, path, *part_number).await? {
-                if let Some(body) = &part_entry.body {
-                    total_size += body.len() as u64;
-                    cached_parts_count += 1;
-                }
-            }
-        }
-
-        Ok(MultipartCacheStats {
-            total_parts,
-            cached_parts_count,
-            total_cached_size: total_size,
-            part_numbers,
-        })
-    }
-
     /// Initiate multipart upload
     /// Implements Requirements 4.1, 4.2, 4.3, 4.4, 4.5
     ///
@@ -3199,13 +2655,6 @@ impl CacheManager {
         let mut inner = self.inner.lock().unwrap();
         inner.statistics.total_cache_size = size;
     }
-
-    /// Update write cache max percent (for testing and configuration)
-    pub fn update_write_cache_max_percent(&self, percent: f32) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.write_cache_tracker.max_percent = percent;
-    }
-
     /// Set metrics manager reference for eviction coordination metrics
     /// Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
     pub async fn set_metrics_manager(
@@ -3215,17 +2664,6 @@ impl CacheManager {
         let mut mm = self.metrics_manager.write().await;
         *mm = Some(metrics_manager);
     }
-
-    /// Get write cache size tracker
-    pub fn get_write_cache_tracker(&self) -> WriteCacheSizeTracker {
-        self.inner.lock().unwrap().write_cache_tracker.clone()
-    }
-
-    /// Get RAM cache manager
-    pub fn get_ram_cache_manager(&self) -> RamCacheManager {
-        self.inner.lock().unwrap().ram_cache_manager.clone()
-    }
-
     /// Update cache statistics
     pub fn update_statistics(&self, hit: bool, entry_size: u64, is_head: bool) {
         let mut inner = self.inner.lock().unwrap();
@@ -3502,42 +2940,6 @@ impl CacheManager {
         let mut inner = self.inner.lock().unwrap();
         Self::compress_cache_entry_with_handler(&mut inner.compression_handler, entry)
     }
-
-    /// Compress cache entry data (legacy method for backward compatibility)
-    pub fn compress_cache_entry_mut(&self, entry: &mut CacheEntry) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut compressed_any = false;
-
-        // Extract path from cache key for content-aware compression
-        let path = Self::extract_path_from_cache_key(&entry.cache_key);
-        let file_extension = Self::extract_file_extension(&path);
-
-        // Compress body if present
-        if let Some(body) = &entry.body {
-            let result = inner
-                .compression_handler
-                .compress_content_aware_with_metadata(body, &path);
-            entry.body = Some(result.data);
-            entry.compression_info.body_algorithm = result.algorithm;
-            entry.compression_info.original_size = Some(result.original_size);
-            entry.compression_info.compressed_size = Some(result.compressed_size);
-            entry.compression_info.file_extension = Some(file_extension.clone());
-            compressed_any |= result.was_compressed;
-        }
-
-        // Compress range data
-        for range in &mut entry.ranges {
-            let result = inner
-                .compression_handler
-                .compress_content_aware_with_metadata(&range.data, &path);
-            range.data = result.data;
-            range.compression_algorithm = result.algorithm;
-            compressed_any |= result.was_compressed;
-        }
-
-        Ok(compressed_any)
-    }
-
     /// Decompress cache entry data using stored algorithm metadata with external handler
     pub fn decompress_cache_entry_with_handler(
         compression_handler: &mut CompressionHandler,
@@ -3587,105 +2989,6 @@ impl CacheManager {
         let mut inner = self.inner.lock().unwrap();
         Self::decompress_cache_entry_with_handler(&mut inner.compression_handler, entry)
     }
-
-    /// Decompress cache entry data using stored algorithm metadata (legacy method)
-    pub fn decompress_cache_entry_mut(&self, entry: &mut CacheEntry) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
-
-        // Decompress body using stored algorithm
-        if let Some(body) = &entry.body {
-            match inner
-                .compression_handler
-                .decompress_with_algorithm(body, entry.compression_info.body_algorithm.clone())
-            {
-                Ok(decompressed_body) => {
-                    entry.body = Some(decompressed_body);
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to decompress cache entry body with algorithm {:?}: {}",
-                        entry.compression_info.body_algorithm, e
-                    );
-                    return Err(e);
-                }
-            }
-        }
-
-        // Decompress range data using stored algorithm
-        for range in &mut entry.ranges {
-            match inner
-                .compression_handler
-                .decompress_with_algorithm(&range.data, range.compression_algorithm.clone())
-            {
-                Ok(decompressed_data) => {
-                    range.data = decompressed_data;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to decompress range data with algorithm {:?}: {}",
-                        range.compression_algorithm, e
-                    );
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Compress write cache entry data
-    pub fn compress_write_cache_entry(&self, entry: &mut WriteCacheEntry) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
-        let path = Self::extract_path_from_cache_key(&entry.cache_key);
-        let file_extension = Self::extract_file_extension(&path);
-
-        let result = inner
-            .compression_handler
-            .compress_content_aware_with_metadata(&entry.body, &path);
-        entry.body = result.data;
-
-        // Update compression metadata
-        entry.compression_info.body_algorithm = result.algorithm;
-        entry.compression_info.original_size = Some(result.original_size);
-        entry.compression_info.compressed_size = Some(result.compressed_size);
-        entry.compression_info.file_extension = Some(file_extension);
-
-        Ok(result.was_compressed)
-    }
-
-    /// Decompress write cache entry data using stored algorithm metadata
-    pub fn decompress_write_cache_entry(&self, entry: &mut WriteCacheEntry) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
-        match inner
-            .compression_handler
-            .decompress_with_algorithm(&entry.body, entry.compression_info.body_algorithm.clone())
-        {
-            Ok(decompressed_body) => {
-                entry.body = decompressed_body;
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    "Failed to decompress write cache entry with algorithm {:?}: {}",
-                    entry.compression_info.body_algorithm, e
-                );
-                Err(e)
-            }
-        }
-    }
-
-    /// Compress RAM cache entry data
-    pub fn compress_ram_cache_entry(&self, entry: &mut RamCacheEntry) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
-        let path = Self::extract_path_from_cache_key(&entry.cache_key);
-        let (compressed_data, was_compressed) = inner
-            .compression_handler
-            .compress_data_content_aware_with_fallback(&entry.data, &path);
-        entry.data = compressed_data;
-        entry.compressed = was_compressed;
-        Ok(was_compressed)
-    }
-
     /// Decompress RAM cache entry data
     pub fn decompress_ram_cache_entry(&self, entry: &mut RamCacheEntry) -> Result<()> {
         if entry.compressed {
@@ -3712,13 +3015,6 @@ impl CacheManager {
             Ok(())
         }
     }
-
-    /// Get compression statistics
-    pub fn get_compression_stats(&self) -> CompressionStats {
-        let inner = self.inner.lock().unwrap();
-        inner.compression_handler.get_stats().clone()
-    }
-
     /// Get compression handler (for testing, configuration, and health/metrics monitoring)
     pub fn get_compression_handler(&self) -> Arc<CompressionHandler> {
         let inner = self.inner.lock().unwrap();
@@ -3731,14 +3027,6 @@ impl CacheManager {
     ) -> Option<Arc<crate::cache_size_tracker::CacheSizeTracker>> {
         self.size_tracker.read().await.clone()
     }
-
-    /// Get write cache manager
-    pub async fn get_write_cache_manager(
-        &self,
-    ) -> Option<Arc<tokio::sync::RwLock<crate::write_cache_manager::WriteCacheManager>>> {
-        self.write_cache_manager.read().await.clone()
-    }
-
     /// Get cache size metrics
     pub async fn get_cache_size_metrics(
         &self,
@@ -3749,84 +3037,6 @@ impl CacheManager {
             None
         }
     }
-
-    /// Configure compression handler settings
-    pub fn configure_compression(&self, enabled: bool, threshold: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.compression_handler.set_compression_enabled(enabled);
-        inner
-            .compression_handler
-            .set_compression_threshold(threshold);
-    }
-
-    /// Update compression statistics in cache statistics
-    pub fn update_compression_statistics(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        let compression_stats = inner.compression_handler.get_stats();
-        inner.statistics.compression_ratio = compression_stats.average_compression_ratio;
-    }
-
-    /// Calculate cache entry size with compression information
-    pub fn calculate_entry_size_with_compression(
-        entry: &CacheEntry,
-        compressed: bool,
-        original_size: Option<u64>,
-    ) -> CacheEntrySize {
-        let header_size = entry
-            .headers
-            .iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum::<usize>() as u64;
-
-        let body_size = entry.body.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
-
-        let ranges_size = entry.ranges.iter().map(|r| r.data.len()).sum::<usize>() as u64;
-
-        let metadata_size = std::mem::size_of::<CacheMetadata>() as u64;
-
-        let total_size = header_size + body_size + ranges_size + metadata_size;
-
-        let compression_ratio = if compressed && original_size.is_some() {
-            let orig_size = original_size.unwrap();
-            if orig_size > 0 {
-                Some(total_size as f32 / orig_size as f32)
-            } else {
-                Some(1.0)
-            }
-        } else {
-            None
-        };
-
-        CacheEntrySize {
-            cache_key: entry.cache_key.clone(),
-            header_size,
-            body_size: body_size + ranges_size,
-            metadata_size,
-            total_size,
-            compressed,
-            compression_ratio,
-        }
-    }
-
-    /// Track compression statistics for cache operations
-    pub fn track_compression_stats(
-        &self,
-        original_size: u64,
-        compressed_size: u64,
-        was_compressed: bool,
-    ) {
-        if was_compressed {
-            // Update cache usage breakdown
-            // This would be called when storing entries
-            let bytes_saved = original_size.saturating_sub(compressed_size);
-            debug!(
-                "Compression saved {} bytes ({:.2}% reduction)",
-                bytes_saved,
-                (bytes_saved as f32 / original_size as f32) * 100.0
-            );
-        }
-    }
-
     /// Get cache usage breakdown with compression statistics
     /// Updated to support new range storage architecture with range count breakdown
     pub async fn get_cache_usage_breakdown(&self) -> CacheUsageBreakdown {
@@ -5320,78 +4530,6 @@ impl CacheManager {
 
         Ok(stats)
     }
-
-    /// Perform coordinated cache maintenance across all layers
-    pub async fn perform_cache_maintenance(&self) -> Result<CacheMaintenanceResult> {
-        debug!("Starting coordinated cache maintenance");
-        let mut result = CacheMaintenanceResult {
-            ram_evicted: 0,
-            disk_cleaned: 0,
-            errors: Vec::new(),
-        };
-
-        // First, clean up expired entries
-        match self.cleanup_expired_entries_comprehensive().await {
-            Ok(cleanup_result) => {
-                result.ram_evicted += cleanup_result.ram_evicted;
-                result.disk_cleaned += cleanup_result.disk_cleaned;
-                result.errors.extend(cleanup_result.errors);
-            }
-            Err(e) => {
-                let error_msg = format!("Expired entries cleanup failed: {}", e);
-                warn!("{}", error_msg);
-                result.errors.push(error_msg);
-            }
-        }
-
-        // Then, enforce size limits
-        match self.monitor_and_enforce_cache_limits().await {
-            Ok(limit_result) => {
-                result.ram_evicted += limit_result.ram_evicted;
-                result.disk_cleaned += limit_result.disk_cleaned;
-                result.errors.extend(limit_result.errors);
-            }
-            Err(e) => {
-                let error_msg = format!("Cache limit enforcement failed: {}", e);
-                warn!("{}", error_msg);
-                result.errors.push(error_msg);
-            }
-        }
-
-        let total_affected = result.ram_evicted + result.disk_cleaned;
-        if total_affected > 0 {
-            info!(
-                "Cache maintenance completed: {} RAM evicted, {} disk cleaned, {} errors",
-                result.ram_evicted,
-                result.disk_cleaned,
-                result.errors.len()
-            );
-        }
-
-        Ok(result)
-    }
-
-    /// Apply compression to range data specifically
-    pub fn compress_range_data(&self, range: &mut Range, path: &str) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
-        let original_size = range.data.len();
-        let (compressed_data, was_compressed) = inner
-            .compression_handler
-            .compress_data_content_aware_with_fallback(&range.data, path);
-        range.data = compressed_data;
-
-        if was_compressed {
-            debug!(
-                "Compressed range data from {} to {} bytes for {}",
-                original_size,
-                range.data.len(),
-                path
-            );
-        }
-
-        Ok(was_compressed)
-    }
-
     /// Extract path from cache key for content-aware compression
     fn extract_path_from_cache_key(cache_key: &str) -> String {
         // Cache keys are in new format: path or path:version:id or path:part:num etc.
@@ -5814,68 +4952,6 @@ impl CacheManager {
             }
         }
     }
-
-    /// Acquire global eviction lock for distributed cache eviction coordination
-    ///
-    /// Returns true if lock was acquired, false if another instance holds the lock.
-    /// If the existing lock is stale (not refreshed within timeout), it will be broken
-    /// and acquisition will be retried.
-    ///
-    /// Refresh the global eviction lock timestamp to prevent it from becoming stale
-    ///
-    /// This should be called periodically during long-running eviction operations
-    /// to signal that the lock holder is still active.
-    ///
-    /// # Requirements
-    ///
-    /// - Requirement 5.4: Lock holder periodically refreshes lock during eviction
-    pub async fn refresh_global_eviction_lock(&self) -> Result<()> {
-        let lock_path = self.cache_dir.join("locks").join("global_eviction.lock");
-
-        if !lock_path.exists() {
-            return Err(ProxyError::CacheError(
-                "Cannot refresh eviction lock: lock file does not exist".to_string(),
-            ));
-        }
-
-        // Read existing lock to preserve instance information
-        let lock_content = std::fs::read_to_string(&lock_path).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to read lock file for refresh: {}", e))
-        })?;
-
-        let mut lock_data: GlobalEvictionLock =
-            serde_json::from_str(&lock_content).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to parse lock file for refresh: {}", e))
-            })?;
-
-        // Verify this instance owns the lock
-        let current_instance_id = self.get_instance_id();
-        if lock_data.instance_id != current_instance_id {
-            return Err(ProxyError::CacheError(format!(
-                "Cannot refresh eviction lock: owned by different instance (owner: {}, current: {})",
-                lock_data.instance_id, current_instance_id
-            )));
-        }
-
-        // Update timestamp
-        lock_data.acquired_at = SystemTime::now();
-
-        // Write updated lock
-        let lock_json = serde_json::to_string_pretty(&lock_data)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to serialize lock data: {}", e)))?;
-
-        std::fs::write(&lock_path, lock_json).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to write refreshed lock: {}", e))
-        })?;
-
-        debug!(
-            "Refreshed global eviction lock (instance: {})",
-            lock_data.instance_id
-        );
-
-        Ok(())
-    }
-
     /// Release the global eviction lock
     ///
     /// This should be called when eviction completes or fails to allow other
@@ -6555,13 +5631,6 @@ impl CacheManager {
 
         Ok((start, end, total_size))
     }
-
-    /// Format Content-Range header from start, end, and total size
-    /// Returns "bytes START-END/TOTAL" format
-    pub fn format_content_range(&self, start: u64, end: u64, total_size: u64) -> String {
-        format!("bytes {}-{}/{}", start, end, total_size)
-    }
-
     /// Look up cached part by part number
     /// Load ObjectMetadata for cache key
     /// Look up byte range directly from part_ranges map
@@ -6939,14 +6008,6 @@ impl CacheManager {
 
         false
     }
-
-    /// Get compression statistics including algorithm breakdown
-    pub fn get_compression_algorithm_stats(&self) -> HashMap<String, u64> {
-        // This would be populated by actual cache operations
-        // For now, return empty - will be implemented when cache storage is added
-        HashMap::new()
-    }
-
     /// Extract multipart information from S3 response headers
     /// Validates: Requirements 2.1, 2.3
     ///
@@ -6973,89 +6034,6 @@ impl CacheManager {
             part_number,
         }
     }
-
-    /// Handle part caching errors with comprehensive logging and metrics
-    /// Requirements: 8.5, 11.1, 11.2, 11.3, 11.4, 11.5
-    ///
-    /// This helper function provides centralized error handling for part caching operations.
-    /// It logs errors appropriately and records metrics for monitoring.
-    pub async fn handle_part_cache_error(
-        &self,
-        cache_key: &str,
-        part_number: u32,
-        operation: &str,
-        error: &dyn std::fmt::Display,
-        should_invalidate: bool,
-    ) -> Result<()> {
-        // Log the error with appropriate context
-        match operation {
-            "parse_content_range" => {
-                // Content-Range parsing failures - log and pass through (Requirement 11.1)
-                warn!(
-                    "Content-Range parsing failed for cache_key={}, part_number={}: {}",
-                    cache_key, part_number, error
-                );
-            }
-            "store_range" | "metadata_update" => {
-                // Storage and metadata update failures - log and continue (Requirements 11.2, 11.4)
-                warn!(
-                    "Part caching operation '{}' failed for cache_key={}, part_number={}: {}",
-                    operation, cache_key, part_number, error
-                );
-            }
-            "load_range_data" | "find_ranges" | "metadata_read" => {
-                // Read failures - log and fall back to S3 (Requirement 11.3)
-                warn!(
-                    "Part cache read operation '{}' failed for cache_key={}, part_number={}: {}",
-                    operation, cache_key, part_number, error
-                );
-            }
-            "data_corruption" => {
-                // Cache corruption - log and invalidate (Requirement 11.5)
-                error!(
-                    "Cache corruption detected during '{}' for cache_key={}, part_number={}: {}",
-                    operation, cache_key, part_number, error
-                );
-            }
-            _ => {
-                // Generic error logging
-                warn!(
-                    "Part cache operation '{}' failed for cache_key={}, part_number={}: {}",
-                    operation, cache_key, part_number, error
-                );
-            }
-        }
-
-        // Record part cache error metric (Requirement 8.5)
-        if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
-            metrics_manager
-                .read()
-                .await
-                .record_part_cache_error(cache_key, part_number, operation, &error.to_string())
-                .await;
-        }
-
-        // Handle cache corruption by invalidating the cache entry (Requirement 11.5)
-        if should_invalidate {
-            match self.invalidate_cache_hierarchy(cache_key).await {
-                Ok(()) => {
-                    info!(
-                        "Successfully invalidated corrupted cache entry for cache_key={}",
-                        cache_key
-                    );
-                }
-                Err(invalidate_err) => {
-                    error!(
-                        "Failed to invalidate corrupted cache entry for cache_key={}: {}",
-                        cache_key, invalidate_err
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Store GetObjectPart response as range with comprehensive error handling
     /// Requirements: 3.1, 3.3, 3.4, 3.5, 8.2, 11.1, 11.2
     ///
@@ -7300,27 +6278,6 @@ impl CacheManager {
             Ok(())
         }
     }
-
-    /// Migrate cache entry to new compression algorithm if beneficial
-    pub fn migrate_cache_entry_compression(&self, entry: &mut CacheEntry) -> Result<bool> {
-        if !self.should_recompress_entry(&entry.compression_info) {
-            return Ok(false); // No migration needed
-        }
-
-        info!(
-            "Migrating cache entry {} to new compression algorithm",
-            entry.cache_key
-        );
-
-        // Decompress first
-        self.decompress_cache_entry(entry)?;
-
-        // Recompress with current settings
-        self.compress_cache_entry(entry)?;
-
-        Ok(true)
-    }
-
     /// Get cached entry from RAM cache
     async fn get_from_ram_cache(&self, cache_key: &str) -> Result<Option<RamCacheEntry>> {
         if !self.ram_cache_enabled {
@@ -7945,109 +6902,6 @@ impl CacheManager {
         debug!("Invalidated HEAD cache entry for key: {}", cache_key);
         Ok(())
     }
-
-    /// Check if cache entry is valid based on conditional headers
-    pub async fn is_cache_valid(
-        &self,
-        cache_key: &str,
-        conditions: &HashMap<String, String>,
-    ) -> Result<bool> {
-        if let Some(cache_entry) = self.get_cached_response(cache_key).await? {
-            // Check If-Match condition
-            if let Some(if_match) = conditions.get("if-match") {
-                if !cache_entry.metadata.etag.is_empty() && if_match != &cache_entry.metadata.etag {
-                    return Ok(false);
-                }
-            }
-
-            // Check If-None-Match condition
-            if let Some(if_none_match) = conditions.get("if-none-match") {
-                if !cache_entry.metadata.etag.is_empty()
-                    && if_none_match == &cache_entry.metadata.etag
-                {
-                    return Ok(false);
-                }
-            }
-
-            // Check If-Modified-Since condition (Requirement 1.3)
-            // Returns false (not modified) if cache date <= client date
-            if let Some(if_modified_since) = conditions.get("if-modified-since") {
-                if !cache_entry.metadata.last_modified.is_empty() {
-                    match httpdate::parse_http_date(if_modified_since) {
-                        Ok(client_date) => {
-                            match httpdate::parse_http_date(&cache_entry.metadata.last_modified) {
-                                Ok(cache_date) => {
-                                    if cache_date <= client_date {
-                                        debug!(
-                                            "If-Modified-Since condition not met: cache_date={:?} <= client_date={:?}",
-                                            cache_date, client_date
-                                        );
-                                        return Ok(false); // Not modified
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to parse cache last_modified date '{}': {}",
-                                        cache_entry.metadata.last_modified, e
-                                    );
-                                    // Continue with other conditions
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to parse If-Modified-Since header '{}': {}",
-                                if_modified_since, e
-                            );
-                            // Continue with other conditions
-                        }
-                    }
-                }
-            }
-
-            // Check If-Unmodified-Since condition (Requirement 1.3)
-            // Returns false (precondition failed) if cache date > client date
-            if let Some(if_unmodified_since) = conditions.get("if-unmodified-since") {
-                if !cache_entry.metadata.last_modified.is_empty() {
-                    match httpdate::parse_http_date(if_unmodified_since) {
-                        Ok(client_date) => {
-                            match httpdate::parse_http_date(&cache_entry.metadata.last_modified) {
-                                Ok(cache_date) => {
-                                    if cache_date > client_date {
-                                        debug!(
-                                            "If-Unmodified-Since condition not met: cache_date={:?} > client_date={:?}",
-                                            cache_date, client_date
-                                        );
-                                        return Ok(false); // Precondition failed
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to parse cache last_modified date '{}': {}",
-                                        cache_entry.metadata.last_modified, e
-                                    );
-                                    // Continue with other conditions
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to parse If-Unmodified-Since header '{}': {}",
-                                if_unmodified_since, e
-                            );
-                            // Continue with other conditions
-                        }
-                    }
-                }
-            }
-
-            return Ok(true);
-        }
-
-        // No cache entry found, conditions can't be validated
-        Ok(false)
-    }
-
     /// Store response with headers for full HTTP response caching
     pub async fn store_response_with_headers(
         &self,
@@ -8118,23 +6972,6 @@ impl CacheManager {
 
         Ok(())
     }
-
-    /// Get cache hit/miss statistics for monitoring
-    pub fn get_cache_hit_ratio(&self) -> f32 {
-        let inner = self.inner.lock().unwrap();
-        let total_requests = inner.statistics.cache_hits + inner.statistics.cache_misses;
-        if total_requests > 0 {
-            inner.statistics.cache_hits as f32 / total_requests as f32
-        } else {
-            0.0
-        }
-    }
-
-    /// Clean up expired cache entries (delegates to coordinated cleanup)
-    pub async fn cleanup_expired_entries(&self) -> Result<u64> {
-        self.coordinate_cleanup().await
-    }
-
     /// Perform comprehensive cache expiration cleanup across all cache layers - Requirements 5.1, 5.2, 5.3, 5.4, 5.5
     pub async fn cleanup_expired_entries_comprehensive(&self) -> Result<CacheMaintenanceResult> {
         debug!("Starting comprehensive cache expiration cleanup");
@@ -8309,39 +7146,6 @@ impl CacheManager {
             Ok(0)
         }
     }
-
-    /// Check if cache entry is expired based on current time and cache headers
-    pub fn is_cache_entry_expired(&self, cache_entry: &CacheEntry) -> bool {
-        self.should_expire_cache_entry(cache_entry)
-    }
-
-    /// Get cache entry with automatic expiration check - Requirements 5.5
-    pub async fn get_cached_response_with_expiration_check(
-        &self,
-        cache_key: &str,
-    ) -> Result<Option<CacheEntry>> {
-        if let Some(cache_entry) = self.get_cached_response(cache_key).await? {
-            // Check if entry should be expired
-            if self.should_expire_cache_entry(&cache_entry) {
-                debug!("Cache entry expired, removing: {}", cache_key);
-                // Remove expired entry from all cache layers
-                let _ = self.invalidate_cache_hierarchy(cache_key).await;
-
-                // Update expired entries statistics
-                {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner.statistics.expired_entries += 1;
-                }
-
-                return Ok(None);
-            }
-
-            Ok(Some(cache_entry))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Get RAM cache statistics
     pub fn get_ram_cache_stats(&self) -> Option<crate::ram_cache::RamCacheStats> {
         if !self.ram_cache_enabled {
@@ -8351,22 +7155,6 @@ impl CacheManager {
         let inner = self.inner.lock().unwrap();
         inner.ram_cache.as_ref().map(|cache| cache.get_stats())
     }
-
-    /// Clear RAM cache
-    pub fn clear_ram_cache(&self) -> Result<()> {
-        if !self.ram_cache_enabled {
-            return Ok(());
-        }
-
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ram_cache) = &mut inner.ram_cache {
-            ram_cache.clear();
-            info!("Cleared RAM cache");
-        }
-
-        Ok(())
-    }
-
     /// Get RAM cache utilization percentage
     pub fn get_ram_cache_utilization(&self) -> f32 {
         if !self.ram_cache_enabled {
@@ -8385,22 +7173,6 @@ impl CacheManager {
     pub fn is_ram_cache_enabled(&self) -> bool {
         self.ram_cache_enabled
     }
-
-    /// Check if a specific range is present in RAM cache (without loading data)
-    /// Used by streaming path to decide whether to stream from disk or serve from RAM
-    pub fn is_range_in_ram_cache(&self, cache_key: &str, start: u64, end: u64) -> bool {
-        if !self.ram_cache_enabled {
-            return false;
-        }
-        let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
-        let inner = self.inner.lock().unwrap();
-        if let Some(ref ram_cache) = inner.ram_cache {
-            ram_cache.contains(&range_cache_key)
-        } else {
-            false
-        }
-    }
-
     /// Load range data from RAM cache, returning the decompressed data if found.
     /// Records hit/miss statistics. Returns None on miss or if RAM cache is disabled.
     pub fn get_range_from_ram_cache(
@@ -8535,144 +7307,6 @@ impl CacheManager {
             inner.ram_cache_manager.last_eviction = ram_stats.last_eviction;
         }
     }
-
-    /// Check if cache needs maintenance based on utilization thresholds
-    pub fn needs_maintenance(&self) -> bool {
-        // Check RAM cache utilization
-        if self.ram_cache_enabled {
-            let ram_utilization = self.get_ram_cache_utilization();
-            if ram_utilization > 90.0 {
-                return true;
-            }
-        }
-
-        // Check write cache utilization
-        let write_cache_percent = {
-            let inner = self.inner.lock().unwrap();
-            inner.statistics.write_cache_percent
-        };
-        if write_cache_percent > 90.0 {
-            return true;
-        }
-
-        false
-    }
-
-    /// Get cache maintenance recommendations
-    pub async fn get_maintenance_recommendations(&self) -> Vec<String> {
-        let mut recommendations = Vec::new();
-
-        // Check RAM cache
-        if self.ram_cache_enabled {
-            let ram_utilization = self.get_ram_cache_utilization();
-            if ram_utilization > 95.0 {
-                recommendations.push(format!(
-                    "RAM cache critically full (>95%), immediate {:?} eviction recommended",
-                    self.eviction_algorithm
-                ));
-            } else if ram_utilization > 85.0 {
-                recommendations.push(format!(
-                    "RAM cache highly utilized (>85%), consider {:?} eviction",
-                    self.eviction_algorithm
-                ));
-            }
-        }
-
-        // Check write cache
-        let write_cache_percent = {
-            let inner = self.inner.lock().unwrap();
-            inner.statistics.write_cache_percent
-        };
-        if write_cache_percent > 95.0 {
-            recommendations.push(
-                "Write cache critically full (>95%), immediate cleanup recommended".to_string(),
-            );
-        } else if write_cache_percent > 85.0 {
-            recommendations
-                .push("Write cache highly utilized (>85%), consider cleanup".to_string());
-        }
-
-        // Check disk cache size - use consolidator (single source of truth)
-        let disk_size = if let Some(consolidator) = self.journal_consolidator.read().await.as_ref()
-        {
-            consolidator.get_current_size().await
-        } else {
-            // Fallback - but this shouldn't happen in normal operation
-            self.calculate_disk_cache_size().await.unwrap_or(0)
-        };
-
-        let max_size = {
-            let inner = self.inner.lock().unwrap();
-            inner.statistics.max_cache_size_limit
-        };
-
-        if max_size > 0 {
-            let disk_utilization = (disk_size as f32 / max_size as f32) * 100.0;
-            if disk_utilization > 95.0 {
-                recommendations.push(format!(
-                    "Disk cache critically full (>95%), immediate {:?} eviction recommended",
-                    self.eviction_algorithm
-                ));
-            } else if disk_utilization > 85.0 {
-                recommendations.push(format!(
-                    "Disk cache highly utilized (>85%), consider {:?} eviction",
-                    self.eviction_algorithm
-                ));
-            }
-        }
-
-        recommendations
-    }
-
-    /// Get the current eviction algorithm used by both RAM and disk caches
-    pub fn get_eviction_algorithm(&self) -> CacheEvictionAlgorithm {
-        self.eviction_algorithm.clone()
-    }
-
-    /// Set the eviction algorithm for both RAM and disk caches
-    /// Note: This will recreate the RAM cache with the new algorithm
-    pub fn set_eviction_algorithm(&mut self, algorithm: CacheEvictionAlgorithm) -> Result<()> {
-        debug!(
-            "Changing eviction algorithm from {:?} to {:?}",
-            self.eviction_algorithm, algorithm
-        );
-
-        self.eviction_algorithm = algorithm.clone();
-
-        // Update RAM cache manager
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.ram_cache_manager.eviction_algorithm = algorithm.clone();
-
-            // Recreate RAM cache with new algorithm if enabled
-            if self.ram_cache_enabled && self.max_ram_cache_size > 0 {
-                // Save current entries if any
-                let current_entries: Vec<_> = if let Some(ram_cache) = &inner.ram_cache {
-                    ram_cache.entries.values().cloned().collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Create new RAM cache with new algorithm
-                let mut new_ram_cache = RamCache::new(self.max_ram_cache_size, algorithm.clone());
-
-                // Restore entries to new cache (they will be re-organized according to new algorithm)
-                for entry in current_entries {
-                    let _ = new_ram_cache.put(entry, &mut inner.compression_handler);
-                }
-
-                inner.ram_cache = Some(new_ram_cache);
-                info!(
-                    "Recreated RAM cache with {:?} eviction algorithm",
-                    algorithm
-                );
-            }
-        }
-
-        info!("Successfully changed eviction algorithm to {:?}", algorithm);
-        Ok(())
-    }
-
     /// Store PUT request in write-through cache with compression - Requirement 10.1
     pub async fn store_write_cache_entry(
         &self,
@@ -9737,56 +8371,6 @@ impl CacheManager {
         debug!("Write cache miss for key: {}", cache_key);
         Ok(None)
     }
-
-    /// Transition write cache entry to GET cache - Requirement 10.4
-    /// When a PUT-cached object is accessed via GET, transition it to use GET_TTL
-    pub async fn transition_write_cache_to_get_cache(&self, cache_key: &str) -> Result<()> {
-        debug!(
-            "Transitioning write cache entry to GET cache for key: {}",
-            cache_key
-        );
-
-        // Get the write cache entry
-        if let Some(write_entry) = self.get_write_cache_entry(cache_key).await? {
-            // Store using new range format with GET_TTL
-            let content_length = write_entry.body.len() as u64;
-            let object_metadata = crate::cache_types::ObjectMetadata {
-                etag: write_entry.metadata.etag.clone(),
-                last_modified: write_entry.metadata.last_modified.clone(),
-                content_length,
-                content_type: write_entry.headers.get("content-type").cloned(),
-                response_headers: write_entry.headers.clone(),
-                upload_state: crate::cache_types::UploadState::Complete,
-                cumulative_size: content_length,
-                parts: Vec::new(),
-                compression_algorithm: CompressionAlgorithm::Lz4,
-                compressed_size: 0,
-                parts_count: None,
-                part_ranges: HashMap::new(),
-                upload_id: None,
-                is_write_cached: false, // No longer write-cached after transition
-                write_cache_expires_at: None,
-                write_cache_created_at: None,
-                write_cache_last_accessed: None,
-            };
-
-            self.store_full_object_as_range_new(cache_key, &write_entry.body, object_metadata)
-                .await?;
-
-            // Remove from write cache
-            self.invalidate_write_cache_entry(cache_key).await?;
-
-            info!(
-                "Successfully transitioned write cache entry to GET cache for key: {}",
-                cache_key
-            );
-        } else {
-            debug!("No write cache entry found for transition: {}", cache_key);
-        }
-
-        Ok(())
-    }
-
     /// Transition from PUT_TTL to GET_TTL (metadata-only update)
     /// Requirements: 2.5, 3.1, 3.2, 3.3, 3.4, 3.5
     ///
@@ -9946,30 +8530,6 @@ impl CacheManager {
         // Parse URL parameters
         let url_params = crate::s3_client::S3UrlParams::parse_from_query(query_params);
 
-        // Check URL parameters for multipart indicators
-        if url_params.is_multipart_upload() {
-            debug!("Detected multipart upload operation via URL parameters: uploadId={:?}, partNumber={:?}, uploads={}",
-                   url_params.upload_id, url_params.part_number, url_params.uploads);
-            return true;
-        }
-
-        // Check Content-Type for multipart
-        if let Some(content_type) = headers.get("content-type") {
-            if content_type.starts_with("multipart/") {
-                debug!("Detected multipart upload via Content-Type header");
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Check if request is a multipart upload using URL params - Requirement 10.4
-    pub fn is_multipart_upload_from_params(
-        &self,
-        headers: &HashMap<String, String>,
-        url_params: &crate::s3_client::S3UrlParams,
-    ) -> bool {
         // Check URL parameters for multipart indicators
         if url_params.is_multipart_upload() {
             debug!("Detected multipart upload operation via URL parameters: uploadId={:?}, partNumber={:?}, uploads={}",
@@ -10391,36 +8951,6 @@ impl CacheManager {
         info!("Cleaned up failed PUT for cache key: {}", cache_key);
         Ok(())
     }
-
-    /// Get write cache statistics for monitoring
-    pub fn get_write_cache_statistics(&self) -> (u64, u64, f32, u64) {
-        let inner = self.inner.lock().unwrap();
-        (
-            inner.write_cache_tracker.current_size,
-            inner.write_cache_tracker.max_size,
-            inner.write_cache_tracker.max_percent,
-            inner.write_cache_tracker.entries_count,
-        )
-    }
-
-    /// Update write cache configuration
-    pub fn update_write_cache_config(&self, max_percent: f32, max_object_size: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.write_cache_tracker.max_percent = max_percent;
-        inner.write_cache_tracker.max_object_size = max_object_size;
-
-        // Recalculate max size based on configured cache size limit
-        if inner.statistics.max_cache_size_limit > 0 {
-            inner.write_cache_tracker.max_size =
-                (inner.statistics.max_cache_size_limit as f32 * max_percent / 100.0) as u64;
-        }
-
-        info!(
-            "Updated write cache config: max_percent={:.1}%, max_object_size={} bytes",
-            max_percent, max_object_size
-        );
-    }
-
     /// Perform comprehensive write cache maintenance
     pub async fn maintain_write_cache(&self) -> Result<(u64, u64)> {
         debug!("Starting comprehensive write cache maintenance");
@@ -10445,48 +8975,6 @@ impl CacheManager {
             Ok(true) // Entry doesn't exist, consider it expired
         }
     }
-
-    /// Update write cache entry access time (for LRU tracking)
-    pub async fn update_write_cache_access_time(&self, cache_key: &str) -> Result<()> {
-        // Access time is tracked in the unified storage metadata
-        // The get_write_cache_entry method already updates last_accessed when reading
-        // This method is kept for API compatibility but is now a no-op
-        // since access tracking is handled by the unified storage format
-        debug!(
-            "Access time update requested for write cache entry: {} (handled by unified storage)",
-            cache_key
-        );
-        Ok(())
-    }
-
-    /// Start background write cache maintenance task
-    pub fn start_write_cache_maintenance_task(
-        cache_manager: Arc<CacheManager>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
-
-            loop {
-                interval.tick().await;
-
-                debug!("Running scheduled write cache maintenance");
-                match cache_manager.maintain_write_cache().await {
-                    Ok((expired, evicted)) => {
-                        if expired > 0 || evicted > 0 {
-                            info!(
-                                "Write cache maintenance: {} expired, {} evicted",
-                                expired, evicted
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Write cache maintenance failed: {}", e);
-                    }
-                }
-            }
-        })
-    }
-
     /// Get cached entry from disk cache (second tier)
     async fn get_from_disk_cache(&self, cache_key: &str) -> Result<Option<CacheEntry>> {
         // Try new architecture first (metadata/ directory with NewCacheMetadata)
@@ -10690,64 +9178,6 @@ impl CacheManager {
 
         Ok(evicted_count)
     }
-
-    /// Get cache hierarchy statistics
-    pub fn get_cache_hierarchy_stats(&self) -> CacheHierarchyStats {
-        let disk_stats = self.get_statistics();
-        let ram_stats = self.get_ram_cache_stats();
-
-        let total_cache_size =
-            disk_stats.total_cache_size + ram_stats.as_ref().map(|s| s.current_size).unwrap_or(0);
-
-        CacheHierarchyStats {
-            ram_cache_enabled: self.ram_cache_enabled,
-            ram_stats,
-            disk_stats,
-            total_cache_size,
-        }
-    }
-
-    /// Perform cache hierarchy maintenance (eviction, cleanup, etc.)
-    pub async fn maintain_cache_hierarchy(&self) -> Result<CacheMaintenanceResult> {
-        debug!("Performing cache hierarchy maintenance");
-
-        let mut result = CacheMaintenanceResult {
-            ram_evicted: 0,
-            disk_cleaned: 0,
-            errors: Vec::new(),
-        };
-
-        // Handle RAM cache eviction if needed
-        if self.ram_cache_enabled {
-            match self.handle_ram_cache_eviction().await {
-                Ok(evicted) => result.ram_evicted = evicted,
-                Err(e) => result
-                    .errors
-                    .push(format!("RAM cache eviction failed: {}", e)),
-            }
-        }
-
-        // Handle disk cache cleanup
-        match self.coordinate_cleanup().await {
-            Ok(cleaned) => result.disk_cleaned = cleaned,
-            Err(e) => result
-                .errors
-                .push(format!("Disk cache cleanup failed: {}", e)),
-        }
-
-        // Update statistics
-        self.update_ram_cache_statistics();
-
-        info!(
-            "Cache hierarchy maintenance completed: RAM evicted: {}, Disk cleaned: {}, Errors: {}",
-            result.ram_evicted,
-            result.disk_cleaned,
-            result.errors.len()
-        );
-
-        Ok(result)
-    }
-
     /// Store range data in cache with compression - Requirements 3.1, 3.2, 3.3, 3.4, 12.7
     ///
     /// This method stores range data using the new range storage architecture.
@@ -10892,51 +9322,6 @@ impl CacheManager {
             (None, None) => Self::generate_cache_key(path, host),
         }
     }
-
-    /// Store response with version-specific cache isolation - Requirements 6.1, 6.2, 6.3
-    pub async fn store_versioned_response(
-        &self,
-        path: &str,
-        url_params: &crate::s3_client::S3UrlParams,
-        response: &[u8],
-        headers: HashMap<String, String>,
-        mut metadata: CacheMetadata,
-    ) -> Result<()> {
-        // Set part number if present in URL params
-        if let Some(part_number) = url_params.part_number {
-            metadata.part_number = Some(part_number);
-        }
-
-        // Generate appropriate cache key
-        let cache_key = Self::generate_cache_key_from_params(path, url_params, None, None);
-
-        debug!(
-            "Storing versioned response for key: {} (part: {:?})",
-            cache_key, url_params.part_number
-        );
-
-        // Store in cache hierarchy
-        self.store_response_in_hierarchy(&cache_key, response, headers, metadata)
-            .await
-    }
-
-    /// Get cached response with version-specific isolation - Requirements 6.1, 6.2, 6.3
-    pub async fn get_versioned_cached_response(
-        &self,
-        path: &str,
-        url_params: &crate::s3_client::S3UrlParams,
-    ) -> Result<Option<CacheEntry>> {
-        // Generate appropriate cache key
-        let cache_key = Self::generate_cache_key_from_params(path, url_params, None, None);
-
-        debug!(
-            "Retrieving versioned cache entry for key: {} (part: {:?})",
-            cache_key, url_params.part_number
-        );
-
-        self.get_cached_response(&cache_key).await
-    }
-
     /// Invalidate cache for object - Requirement 6.4
     pub async fn invalidate_current_version_cache(&self, path: &str) -> Result<()> {
         debug!("Invalidating cache for object: {}", path);
@@ -10952,235 +9337,6 @@ impl CacheManager {
         info!("Invalidated cache for object: {}", path);
         Ok(())
     }
-
-    /// Store range data with version-specific isolation - Requirements 3.1, 6.1, 6.2, 6.3
-    pub async fn store_versioned_range_in_cache(
-        &self,
-        path: &str,
-        url_params: &crate::s3_client::S3UrlParams,
-        range_start: u64,
-        range_end: u64,
-        range_data: &[u8],
-        mut metadata: CacheMetadata,
-    ) -> Result<()> {
-        // Set part number if present in URL params
-        if let Some(part_number) = url_params.part_number {
-            metadata.part_number = Some(part_number);
-        }
-
-        // Generate base cache key (without range)
-        let base_cache_key = Self::generate_cache_key_from_params(path, url_params, None, None);
-
-        debug!(
-            "Storing versioned range {}-{} for key: {} (part: {:?})",
-            range_start, range_end, base_cache_key, url_params.part_number
-        );
-
-        // Store range in cache
-        self.store_range_in_cache(
-            &base_cache_key,
-            range_start,
-            range_end,
-            range_data,
-            metadata,
-        )
-        .await
-    }
-
-    /// Get range data with version-specific isolation - Requirements 3.1, 6.1, 6.2, 6.3
-    pub async fn get_versioned_range_from_cache(
-        &self,
-        path: &str,
-        url_params: &crate::s3_client::S3UrlParams,
-        range_start: u64,
-        range_end: u64,
-    ) -> Result<Option<Range>> {
-        // Generate base cache key (without range)
-        let base_cache_key = Self::generate_cache_key_from_params(path, url_params, None, None);
-
-        debug!(
-            "Retrieving versioned range {}-{} for key: {} (part: {:?})",
-            range_start, range_end, base_cache_key, url_params.part_number
-        );
-
-        self.get_range_from_cache(&base_cache_key, range_start, range_end)
-            .await
-    }
-
-    /// Handle PUT request cache invalidation - Requirement 6.4
-    pub async fn handle_put_request_cache_invalidation(
-        &self,
-        path: &str,
-        _url_params: &crate::s3_client::S3UrlParams,
-    ) -> Result<()> {
-        debug!(
-            "Handling PUT request cache invalidation for object: {}",
-            path
-        );
-
-        // For PUT requests, invalidate the current version cache
-        self.invalidate_current_version_cache(path).await?;
-        debug!("Invalidated current version cache");
-
-        // Also invalidate any write cache entries for this object
-        let write_cache_key = Self::generate_cache_key(path, None);
-        let _ = self.invalidate_write_cache_entry(&write_cache_key).await;
-
-        info!(
-            "Completed PUT request cache invalidation for object: {}",
-            path
-        );
-        Ok(())
-    }
-
-    /// Validate HEAD/GET metadata consistency - Requirement 6.5
-    pub async fn validate_head_get_metadata_consistency(
-        &self,
-        path: &str,
-        url_params: &crate::s3_client::S3UrlParams,
-        head_metadata: &CacheMetadata,
-        get_metadata: &CacheMetadata,
-    ) -> Result<bool> {
-        debug!(
-            "Validating HEAD/GET metadata consistency for object: {}",
-            path
-        );
-
-        // Check if ETags match
-        let etag_match = head_metadata.etag.is_empty()
-            || get_metadata.etag.is_empty()
-            || head_metadata.etag == get_metadata.etag;
-
-        // Check if Last-Modified timestamps match
-        let last_modified_match = head_metadata.last_modified.is_empty()
-            || get_metadata.last_modified.is_empty()
-            || head_metadata.last_modified == get_metadata.last_modified;
-
-        // Check if content lengths match
-        let content_length_match = head_metadata.content_length == 0
-            || get_metadata.content_length == 0
-            || head_metadata.content_length == get_metadata.content_length;
-
-        let is_consistent = etag_match && last_modified_match && content_length_match;
-
-        if !is_consistent {
-            warn!("HEAD/GET metadata inconsistency detected for {} - ETag match: {}, Last-Modified match: {}, Content-Length match: {}",
-                  path, etag_match, last_modified_match, content_length_match);
-
-            // Invalidate GET cache due to inconsistency
-            let cache_key = Self::generate_cache_key_from_params(path, url_params, None, None);
-            self.invalidate_cache_hierarchy(&cache_key).await?;
-
-            info!("Invalidated GET cache due to HEAD/GET metadata inconsistency");
-        } else {
-            debug!("HEAD/GET metadata is consistent for object: {}", path);
-        }
-
-        Ok(is_consistent)
-    }
-
-    /// Enhanced invalidate current version cache with range and part cleanup - Requirement 6.4
-    pub async fn invalidate_current_version_cache_enhanced(&self, path: &str) -> Result<()> {
-        debug!("Enhanced invalidation of cache for object: {}", path);
-
-        // Generate cache key (no version ID)
-        let cache_key = Self::generate_cache_key(path, None);
-
-        // Invalidate main cache
-        self.invalidate_cache_hierarchy(&cache_key).await?;
-
-        // Invalidate related entries (ranges, parts)
-        // This is a simplified approach - in a full implementation we would scan cache directories
-        // for all entries matching the pattern and invalidate them
-
-        // For now, we'll invalidate some common patterns
-        let cache_types = ["objects", "ranges", "parts"];
-        for cache_type in &cache_types {
-            let cache_type_dir = self.cache_dir.join(cache_type);
-            if cache_type_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&cache_type_dir) {
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            let file_name = entry.file_name();
-                            let file_name_str = file_name.to_string_lossy();
-
-                            // Check if this file belongs to the object
-                            let expected_prefix = format!("{}_", self.sanitize_cache_key(path));
-
-                            if file_name_str.starts_with(&expected_prefix) {
-                                // This is a cache file for this object, remove it
-                                let file_path = entry.path();
-                                if let Err(e) = std::fs::remove_file(&file_path) {
-                                    warn!("Failed to remove cache file {:?}: {}", file_path, e);
-                                } else {
-                                    debug!("Removed cache file: {:?}", file_path);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        info!("Enhanced invalidation completed for cache: {}", path);
-        Ok(())
-    }
-
-    /// Check if cached entry represents current version (no version ID) - Requirement 6.4
-    pub fn is_current_version_cache_entry(&self, cache_key: &str) -> bool {
-        // Current version cache keys don't contain ":version:" pattern
-        !cache_key.contains(":version:")
-    }
-
-    /// Check if cached entry represents versioned entry - Requirement 6.1, 6.2, 6.3
-    pub fn is_versioned_cache_entry(&self, cache_key: &str) -> bool {
-        // Versioned cache keys contain ":version:" pattern
-        cache_key.contains(":version:")
-    }
-
-    /// List all cache entries for an object (current and versioned) - for debugging/monitoring
-    pub async fn list_object_cache_entries(&self, path: &str) -> Result<Vec<String>> {
-        let mut cache_entries = Vec::new();
-
-        // Check different cache types
-        let cache_types = ["objects", "ranges", "parts", "write_cache"];
-
-        for cache_type in &cache_types {
-            let cache_type_dir = self.cache_dir.join(cache_type);
-            if cache_type_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&cache_type_dir) {
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            let file_name = entry.file_name();
-                            let file_name_str = file_name.to_string_lossy();
-
-                            // Check if this file belongs to the object
-                            let expected_prefix = format!("{}_", self.sanitize_cache_key(path));
-
-                            if file_name_str.starts_with(&expected_prefix)
-                                && file_name_str.ends_with(".meta")
-                            {
-                                // Extract cache key from filename
-                                if let Some(cache_key) =
-                                    self.extract_cache_key_from_filename(&file_name_str)
-                                {
-                                    cache_entries.push(cache_key);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        debug!(
-            "Found {} cache entries for object {}",
-            cache_entries.len(),
-            path
-        );
-        Ok(cache_entries)
-    }
-
     /// Extract cache key from sanitized filename
     fn extract_cache_key_from_filename(&self, filename: &str) -> Option<String> {
         use percent_encoding::percent_decode_str;

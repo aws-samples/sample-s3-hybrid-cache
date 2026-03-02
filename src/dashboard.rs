@@ -80,6 +80,11 @@ impl DashboardServer {
         self.api_handler.set_metrics_manager(metrics_manager).await;
     }
 
+    /// Set active connections counter for dashboard display
+    pub async fn set_active_connections(&self, active_connections: Arc<std::sync::atomic::AtomicUsize>, max_concurrent_requests: usize) {
+        self.api_handler.set_active_connections(active_connections, max_concurrent_requests).await;
+    }
+
     /// Set logger manager reference
     pub fn set_logger_manager(&mut self, logger_manager: Arc<Mutex<LoggerManager>>) {
         self.logger_manager = Some(logger_manager);
@@ -353,7 +358,8 @@ impl StaticFileHandler {
         <div id="system-info">
             <span id="hostname">Loading...</span> | 
             <span id="version">Loading...</span> | 
-            <span id="uptime">Loading...</span>
+            <span id="uptime">Loading...</span> |
+            <span id="active-requests">Loading...</span>
         </div>
     </header>
     
@@ -930,6 +936,11 @@ async function loadSystemInfo() {
             document.getElementById('uptime').textContent = 'Uptime: ' + uptime;
         }
 
+        // Update active requests display
+        if (data.max_concurrent_requests > 0) {
+            document.getElementById('active-requests').textContent = 'Requests: ' + data.active_requests + ' / ' + data.max_concurrent_requests;
+        }
+
         // Apply server-configured refresh intervals (only on first load)
         if (data.cache_stats_refresh_ms && data.cache_stats_refresh_ms > 0) {
             cacheStatsRefreshMs = data.cache_stats_refresh_ms;
@@ -1417,6 +1428,10 @@ pub struct ApiHandler {
     stats_cache_duration: std::time::Duration,
     /// Dashboard config for refresh intervals
     config: Arc<DashboardConfig>,
+    /// Active HTTP connections counter (shared with HttpProxy)
+    active_connections: Arc<RwLock<Option<Arc<std::sync::atomic::AtomicUsize>>>>,
+    /// Maximum concurrent requests from config
+    max_concurrent_requests: Arc<RwLock<usize>>,
 }
 
 impl ApiHandler {
@@ -1428,6 +1443,8 @@ impl ApiHandler {
             cached_stats: Arc::new(RwLock::new(None)),
             stats_cache_duration: std::time::Duration::from_secs(2), // Cache stats for 2 seconds
             config,
+            active_connections: Arc::new(RwLock::new(None)),
+            max_concurrent_requests: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -1439,6 +1456,11 @@ impl ApiHandler {
     pub async fn set_metrics_manager(&self, metrics_manager: Arc<RwLock<MetricsManager>>) {
         let mut mm = self.metrics_manager.write().await;
         *mm = Some(metrics_manager);
+    }
+
+    pub async fn set_active_connections(&self, active_connections: Arc<std::sync::atomic::AtomicUsize>, max_concurrent_requests: usize) {
+        *self.active_connections.write().await = Some(active_connections);
+        *self.max_concurrent_requests.write().await = max_concurrent_requests;
     }
 
     pub async fn get_cache_stats(&self) -> Result<Response<String>> {
@@ -1728,6 +1750,13 @@ impl ApiHandler {
                     .as_secs()
             };
 
+        // Get active/max concurrent requests directly from atomic counter (real-time)
+        let active_requests_val = self.active_connections.read().await
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64)
+            .unwrap_or(0);
+        let max_concurrent_val = *self.max_concurrent_requests.read().await as u64;
+
         let system_info = SystemInfoResponse {
             timestamp: SystemTime::now(),
             hostname: gethostname::gethostname().to_string_lossy().to_string(),
@@ -1736,6 +1765,8 @@ impl ApiHandler {
             status: "running".to_string(),
             cache_stats_refresh_ms: self.config.cache_stats_refresh_interval.as_millis() as u64,
             logs_refresh_ms: self.config.logs_refresh_interval.as_millis() as u64,
+            active_requests: active_requests_val,
+            max_concurrent_requests: max_concurrent_val,
         };
 
         let body = serde_json::to_string(&system_info).map_err(|e| {
@@ -2296,6 +2327,10 @@ pub struct SystemInfoResponse {
     pub cache_stats_refresh_ms: u64,
     /// Logs refresh interval in milliseconds (from config)
     pub logs_refresh_ms: u64,
+    /// Current active HTTP requests
+    pub active_requests: u64,
+    /// Maximum concurrent requests allowed
+    pub max_concurrent_requests: u64,
 }
 
 /// Log entry structure

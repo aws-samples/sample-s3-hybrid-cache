@@ -28,11 +28,11 @@ sudo cargo run --release -- -c config/config.example.yaml
 ```
 
 The proxy starts on:
-- **HTTP**: `localhost:80` (caching enabled)
-- **HTTPS**: `localhost:443` (passthrough)
-- **Health**: `localhost:8080/health`
-- **Dashboard**: `localhost:8081` (real-time statistics)
-- **Metrics**: `localhost:9090/metrics`
+- **HTTP**: `<proxy-ip>:80` (caching enabled)
+- **HTTPS**: `<proxy-ip>:443` (passthrough)
+- **Health**: `<proxy-ip>:8080/health`
+- **Dashboard**: `<proxy-ip>:8081` (real-time statistics)
+- **Metrics**: `<proxy-ip>:9090/metrics`
 
 **Security Note**: All communication between the proxy and Amazon S3 uses HTTPS encryption, regardless of whether clients connect via HTTP or HTTPS. Secure client-to-proxy HTTP traffic using network controls (VPC, security groups, firewall rules).
 
@@ -443,13 +443,13 @@ export S3_ENDPOINT_URL=http://s3.us-east-1.amazonaws.com
 
 ```bash
 # View real-time dashboard (open in browser)
-open http://localhost:8081
+open http://<proxy-ip>:8081
 
 # View cache metrics (Prometheus format)
-curl http://localhost:9090/metrics | grep cache_hit_rate
+curl http://<proxy-ip>:9090/metrics | grep cache_hit_rate
 
 # Check proxy health
-curl http://localhost:8080/health
+curl http://<proxy-ip>:8080/health
 ```
 
 ## Port Configuration Options
@@ -491,7 +491,7 @@ Possible but not recommended. HTTP clients can use `--endpoint-url`, but HTTPS c
 
 ```bash
 # Test proxy is running
-curl -I http://localhost:8080/health
+curl -I http://<proxy-ip>:8080/health
 
 # Test S3 access through proxy
 aws s3 ls s3://your-bucket \
@@ -501,11 +501,11 @@ aws s3 ls s3://your-bucket \
 ### Monitor Logs
 
 ```bash
-# Watch application logs
-tail -f ./tmp/logs/app/$(hostname)/*.log
+# Watch application logs (replace <app-log-dir> with your configured app_log_dir)
+tail -f <app-log-dir>/$(hostname)/s3-proxy.log*
 
-# Watch access logs
-tail -f ./tmp/logs/access/*.log
+# Watch access logs (replace <access-log-dir> with your configured access_log_dir)
+tail -f <access-log-dir>/$(date +%Y/%m/%d)/*
 ```
 
 ## Troubleshooting
@@ -527,14 +527,14 @@ tail -f ./tmp/logs/access/*.log
    ```
 
 3. **Connection refused**:
-   - Check proxy is running: `curl http://localhost:8080/health`
+   - Check proxy is running: `curl http://<proxy-ip>:8080/health`
    - Verify hosts file configuration
    - Check firewall settings
 
 4. **Cache not working**:
    - Ensure using HTTP endpoint (not HTTPS)
-   - Check cache directory permissions: `ls -la ./tmp/cache/`
-   - Monitor cache metrics: `curl http://localhost:9090/metrics`
+   - Check cache directory permissions: `ls -la <cache-dir>/`
+   - Monitor cache metrics: `curl http://<proxy-ip>:9090/metrics`
 
 ### Debug Mode
 

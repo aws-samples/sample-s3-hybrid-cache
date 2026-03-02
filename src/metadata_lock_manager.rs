@@ -359,24 +359,6 @@ impl MetadataLockManager {
             max_backoff: Duration::from_secs(5),
         }
     }
-
-    /// Create a new metadata lock manager with custom backoff settings
-    pub fn new_with_backoff(
-        cache_dir: PathBuf,
-        lock_timeout: Duration,
-        max_retries: u32,
-        base_backoff: Duration,
-        max_backoff: Duration,
-    ) -> Self {
-        Self {
-            cache_dir,
-            lock_timeout,
-            max_retries,
-            base_backoff,
-            max_backoff,
-        }
-    }
-
     /// Acquire an exclusive metadata lock with stale lock detection and exponential backoff
     pub async fn acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
         let lock_file_path = self.get_lock_file_path(cache_key);
@@ -702,28 +684,6 @@ impl MetadataLockManager {
             }
         }
     }
-
-    /// Validate that a lock holder process exists
-    pub async fn validate_lock_holder(&self, lock_file_path: &Path) -> Result<bool> {
-        let content = std::fs::read_to_string(lock_file_path).map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to read lock file: path={:?}, error={}",
-                lock_file_path, e
-            ))
-        })?;
-
-        let lock_content = LockFileContent::from_json(&content)?;
-
-        let process_exists = is_process_alive(lock_content.process_id);
-
-        debug!(
-            "Lock holder validation: path={:?}, process_id={}, exists={}",
-            lock_file_path, lock_content.process_id, process_exists
-        );
-
-        Ok(process_exists)
-    }
-
     /// Get lock file path for a cache key
     fn get_lock_file_path(&self, cache_key: &str) -> PathBuf {
         // Use the same path structure as metadata files

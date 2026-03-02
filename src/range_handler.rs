@@ -428,32 +428,14 @@ impl RangeHandler {
 
         Ok(())
     }
-
-    /// Check if range request is satisfiable
-    pub fn is_range_satisfiable(&self, range: &RangeSpec, content_length: u64) -> bool {
-        range.start < content_length && range.end < content_length && range.start <= range.end
-    }
-
     /// Convert range specification to HTTP Content-Range header value
     pub fn build_content_range_header(&self, range: &RangeSpec, content_length: u64) -> String {
         format!("bytes {}-{}/{}", range.start, range.end, content_length)
     }
-
-    /// Calculate range size in bytes
-    pub fn calculate_range_size(&self, range: &RangeSpec) -> u64 {
-        range.end - range.start + 1
-    }
-
     /// Check if two ranges overlap
     pub fn ranges_overlap(&self, range1: &RangeSpec, range2: &RangeSpec) -> bool {
         !(range1.end < range2.start || range2.end < range1.start)
     }
-
-    /// Check if one range contains another
-    pub fn range_contains(&self, container: &RangeSpec, contained: &RangeSpec) -> bool {
-        container.start <= contained.start && container.end >= contained.end
-    }
-
     /// Merge overlapping or adjacent ranges
     pub fn merge_ranges(&self, ranges: &[RangeSpec]) -> Vec<RangeSpec> {
         if ranges.is_empty() {
@@ -1005,28 +987,6 @@ impl RangeHandler {
 
         missing
     }
-
-    /// Extract range data from full object body
-    pub fn extract_range_from_body(&self, body: &[u8], range: &RangeSpec) -> Result<Vec<u8>> {
-        let body_len = body.len() as u64;
-
-        if range.start >= body_len {
-            return Err(ProxyError::InvalidRange(
-                "Range start exceeds body length".to_string(),
-            ));
-        }
-
-        let end = std::cmp::min(range.end, body_len - 1);
-        let start = range.start as usize;
-        let end = end as usize;
-
-        if start > end {
-            return Err(ProxyError::InvalidRange("Invalid range bounds".to_string()));
-        }
-
-        Ok(body[start..=end].to_vec())
-    }
-
     /// Load range data from new storage architecture
     ///
     /// This method loads the actual range data from the separate binary files
@@ -1174,47 +1134,6 @@ impl RangeHandler {
         );
         Ok(())
     }
-
-    /// Store full object using new storage architecture
-    ///
-    /// This method stores a full object as a range (0 to content_length-1)
-    /// using the new storage architecture.
-    ///
-    /// # Arguments
-    /// * `cache_key` - The cache key for the object
-    /// * `data` - The full object data
-    /// * `object_metadata` - Metadata about the S3 object
-    pub async fn store_full_object_new_storage(
-        &self,
-        cache_key: &str,
-        data: &[u8],
-        object_metadata: ObjectMetadata,
-        ttl: std::time::Duration,
-    ) -> Result<()> {
-        debug!(
-            "Storing full object using new storage: key={}, size={}",
-            cache_key,
-            data.len()
-        );
-
-        // Check capacity and evict if needed before caching new data (Requirement 1.6)
-        let required_space = data.len() as u64;
-        if let Err(e) = self.cache_manager.evict_if_needed(required_space).await {
-            warn!("Eviction failed before caching full object: {}", e);
-            // Continue anyway - store_full_object_as_range will handle capacity issues
-        }
-
-        let mut disk_cache = self.disk_cache_manager.write().await;
-        // Resolve per-bucket compression settings (Requirements 5.1, 5.2, 5.3)
-        let resolved = self.cache_manager.resolve_settings(cache_key).await;
-        disk_cache
-            .store_full_object_as_range(cache_key, data, object_metadata, ttl, resolved.compression_enabled)
-            .await?;
-
-        info!("Successfully stored full object: {}", cache_key);
-        Ok(())
-    }
-
     /// Build conditional headers for uncached range portions - Requirements 3.6, 3.8
     pub fn build_conditional_headers_for_range(
         &self,
@@ -1271,46 +1190,6 @@ impl RangeHandler {
         );
         conditional_headers
     }
-
-    /// Check if range request needs cache validation
-    pub fn needs_cache_validation(
-        &self,
-        cached_ranges: &[Range],
-        missing_ranges: &[RangeSpec],
-    ) -> bool {
-        // If we have cached ranges and missing ranges, we need validation
-        // to ensure cached data is still valid when fetching missing portions
-        !cached_ranges.is_empty() && !missing_ranges.is_empty()
-    }
-
-    /// Build partial range request for missing portions
-    pub fn build_partial_range_request(
-        &self,
-        missing_ranges: &[RangeSpec],
-        conditional_headers: &HashMap<String, String>,
-    ) -> (String, HashMap<String, String>) {
-        // Build Range header for missing portions
-        let range_specs: Vec<String> = missing_ranges
-            .iter()
-            .map(|r| format!("{}-{}", r.start, r.end))
-            .collect();
-        let range_header = format!("bytes={}", range_specs.join(","));
-
-        // Combine with conditional headers
-        let mut request_headers = conditional_headers.clone();
-        // Remove any existing Range header (case-insensitive) to avoid duplicates
-        request_headers.retain(|k, _| k.to_lowercase() != "range");
-        // Insert new Range header with proper capitalization
-        request_headers.insert("Range".to_string(), range_header.clone());
-
-        debug!(
-            "Built partial range request: Range: {}, Conditionals: {:?}",
-            range_header, conditional_headers
-        );
-
-        (range_header, request_headers)
-    }
-
     // ============================================================================
     // Range Merging Helper Functions
     // ============================================================================
@@ -1448,74 +1327,6 @@ impl RangeHandler {
         let overlap_end = std::cmp::min(range1_end, range2_end);
 
         Some((overlap_start, overlap_end))
-    }
-
-    /// Check if a set of ranges fully covers a requested range
-    /// Returns true if every byte in the requested range is covered by at least one range
-    pub fn ranges_fully_cover(
-        ranges: &[(u64, u64)],
-        requested_start: u64,
-        requested_end: u64,
-    ) -> bool {
-        if ranges.is_empty() {
-            return false;
-        }
-
-        // Sort ranges by start position
-        let mut sorted_ranges = ranges.to_vec();
-        sorted_ranges.sort_by_key(|r| r.0);
-
-        // Check if first range covers the start
-        if sorted_ranges[0].0 > requested_start {
-            return false;
-        }
-
-        // Track the furthest point we've covered
-        let mut covered_to = sorted_ranges[0].1;
-
-        // Check each subsequent range
-        for range in sorted_ranges.iter().skip(1) {
-            // If there's a gap, we don't have full coverage
-            if range.0 > covered_to + 1 {
-                return false;
-            }
-            // Extend coverage
-            covered_to = std::cmp::max(covered_to, range.1);
-        }
-
-        // Check if we covered all the way to the end
-        covered_to >= requested_end
-    }
-
-    /// Merge adjacent or overlapping ranges into minimal set
-    /// Returns a sorted, non-overlapping list of ranges
-    pub fn merge_adjacent_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
-        if ranges.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort ranges by start position
-        let mut sorted_ranges = ranges.to_vec();
-        sorted_ranges.sort_by_key(|r| r.0);
-
-        let mut merged = Vec::new();
-        let mut current = sorted_ranges[0];
-
-        for range in sorted_ranges.iter().skip(1) {
-            // If ranges overlap or are adjacent, merge them
-            if range.0 <= current.1 + 1 {
-                current.1 = std::cmp::max(current.1, range.1);
-            } else {
-                // No overlap, save current and start new range
-                merged.push(current);
-                current = *range;
-            }
-        }
-
-        // Don't forget the last range
-        merged.push(current);
-
-        merged
     }
     /// Check if range merge is actually needed
     ///

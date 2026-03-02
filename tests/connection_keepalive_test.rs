@@ -20,6 +20,8 @@ fn create_keepalive_config() -> ConnectionPoolConfig {
         pool_check_interval: Duration::from_secs(10),
         dns_servers: Vec::new(),
         endpoint_overrides: std::collections::HashMap::new(),
+        ip_distribution_enabled: false,
+        max_idle_per_ip: 10,
     }
 }
 
@@ -36,6 +38,8 @@ fn create_no_keepalive_config() -> ConnectionPoolConfig {
         pool_check_interval: Duration::from_secs(10),
         dns_servers: Vec::new(),
         endpoint_overrides: std::collections::HashMap::new(),
+        ip_distribution_enabled: false,
+        max_idle_per_ip: 10,
     }
 }
 
@@ -83,6 +87,8 @@ async fn test_connection_pool_config_validation() {
         pool_check_interval: Duration::from_secs(5),
         dns_servers: Vec::new(),
         endpoint_overrides: std::collections::HashMap::new(),
+        ip_distribution_enabled: false,
+        max_idle_per_ip: 10,
     };
 
     // Verify values are within reasonable ranges
@@ -90,7 +96,7 @@ async fn test_connection_pool_config_validation() {
     assert!(config.dns_refresh_interval >= Duration::from_secs(10));
     assert!(config.connection_timeout >= Duration::from_secs(1));
     assert!(config.idle_timeout >= Duration::from_secs(10));
-    assert!(config.max_idle_per_host <= 50);
+    assert!(config.max_idle_per_host <= 500);
     assert!(config.max_lifetime >= Duration::from_secs(60));
     assert!(config.pool_check_interval >= Duration::from_secs(1));
 }

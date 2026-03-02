@@ -38,6 +38,9 @@ pub struct SystemHealth {
     pub timestamp: SystemTime,
     pub components: Vec<ComponentHealth>,
     pub uptime_seconds: u64,
+    /// Per-IP connection distribution stats (present when IP distribution is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_distribution: Option<crate::connection_pool::IpDistributionStats>,
 }
 
 /// Health check manager
@@ -99,6 +102,19 @@ impl HealthManager {
             components.push(self.check_connection_pool_health(connection_pool).await);
         }
 
+        // Collect IP distribution stats if any distributors are active
+        let ip_distribution = if let Some(connection_pool) = &self.connection_pool {
+            let pool = connection_pool.lock().await;
+            let stats = pool.get_ip_distribution_stats();
+            if stats.endpoints.is_empty() {
+                None
+            } else {
+                Some(stats)
+            }
+        } else {
+            None
+        };
+
         // Check compression handler health
         if let Some(compression_handler) = &self.compression_handler {
             components.push(self.check_compression_health(compression_handler).await);
@@ -118,6 +134,7 @@ impl HealthManager {
             timestamp: start_time,
             components,
             uptime_seconds: uptime,
+            ip_distribution,
         };
 
         // Cache the result
@@ -289,10 +306,5 @@ impl HealthManager {
             .header("Content-Type", "application/json")
             .body(body)
             .map_err(|e| ProxyError::HttpError(format!("Failed to build health response: {}", e)))
-    }
-
-    /// Get cached health status (non-blocking)
-    pub async fn get_cached_health(&self) -> Option<SystemHealth> {
-        self.last_health_check.read().await.clone()
     }
 }

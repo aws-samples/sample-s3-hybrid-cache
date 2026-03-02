@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum concurrent cache keys processed in a single consolidation cycle
 const KEY_CONCURRENCY_LIMIT: usize = 8;
@@ -189,28 +189,6 @@ impl ConsolidationResult {
             write_cache_delta: 0,
         }
     }
-
-    pub fn success_with_entries(
-        cache_key: String,
-        entries_processed: usize,
-        entries_consolidated: usize,
-        consolidated_entries: Vec<JournalEntry>,
-    ) -> Self {
-        Self {
-            cache_key,
-            entries_processed,
-            entries_consolidated,
-            entries_removed: 0,
-            conflicts_resolved: 0,
-            invalid_entries_removed: 0,
-            success: true,
-            error: None,
-            consolidated_entries,
-            size_delta: 0,
-            write_cache_delta: 0,
-        }
-    }
-
     pub fn failure(cache_key: String, error: String) -> Self {
         Self {
             cache_key,
@@ -337,6 +315,12 @@ impl SizeAccumulator {
     pub fn subtract_write_cache(&self, compressed_size: u64) {
         self.write_cache_delta
             .fetch_sub(compressed_size as i64, Ordering::Relaxed);
+    }
+
+    /// Check if there are any pending deltas to flush.
+    pub fn has_pending_delta(&self) -> bool {
+        self.delta.load(Ordering::Relaxed) != 0
+            || self.write_cache_delta.load(Ordering::Relaxed) != 0
     }
 
     /// Atomically swap both accumulators to zero and write to delta file.
@@ -519,6 +503,22 @@ impl JournalConsolidator {
     /// Get reference to the size accumulator (for store_range and eviction to call)
     pub fn size_accumulator(&self) -> &Arc<SizeAccumulator> {
         &self.size_accumulator
+    }
+
+    /// Quick check for pending journal files without reading their contents.
+    /// Used by idle detection to skip consolidation cycles when no work is pending.
+    /// Only does a directory listing — no lock acquisition, no file reads.
+    fn has_pending_journal_files(&self) -> bool {
+        let journals_dir = self.cache_dir.join("metadata").join("_journals");
+        match std::fs::read_dir(&journals_dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    e.path().extension().map_or(false, |ext| ext == "journal")
+                        && e.metadata().map_or(false, |m| m.len() > 0)
+                }),
+            Err(_) => false,
+        }
     }
 
     /// Read all delta files, sum deltas, reset files to zero.
@@ -1423,86 +1423,6 @@ impl JournalConsolidator {
 
         Ok(state.total_size)
     }
-
-    /// Atomically subtract bytes from size state with retry and exponential backoff
-    ///
-    /// This method wraps `atomic_subtract_size()` with retry logic to handle transient
-    /// failures such as lock timeouts or I/O errors. This prevents size tracking drift
-    /// when eviction encounters temporary issues.
-    ///
-    /// **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
-    ///
-    /// # Retry Configuration
-    /// - Max attempts: 3
-    /// - Base delays: 100ms, 200ms, 400ms (exponential backoff)
-    /// - Jitter: ±20% to prevent thundering herd
-    ///
-    /// # Arguments
-    /// * `bytes_freed` - Number of bytes freed by eviction
-    ///
-    /// # Returns
-    /// * `Ok(new_size)` - The new total size after subtraction
-    /// * `Err` - If all retry attempts fail
-    pub async fn atomic_subtract_size_with_retry(&self, bytes_freed: u64) -> Result<u64> {
-        const MAX_ATTEMPTS: u32 = 3;
-        const BASE_DELAY_MS: u64 = 100;
-        const JITTER_PERCENT: f64 = 0.2; // ±20%
-
-        let mut last_error = None;
-
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self.atomic_subtract_size(bytes_freed).await {
-                Ok(new_size) => {
-                    if attempt > 1 {
-                        info!(
-                            "atomic_subtract_size succeeded on attempt {}: bytes_freed={}, new_size={}",
-                            attempt, bytes_freed, new_size
-                        );
-                    }
-                    return Ok(new_size);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-
-                    if attempt < MAX_ATTEMPTS {
-                        // Calculate delay with exponential backoff: 100ms, 200ms, 400ms
-                        let base_delay_ms = BASE_DELAY_MS * (1 << (attempt - 1));
-                        
-                        // Add jitter (±20%)
-                        let jitter_range = (base_delay_ms as f64 * JITTER_PERCENT) as u64;
-                        let jitter = if jitter_range > 0 {
-                            use rand::Rng;
-                            let mut rng = rand::thread_rng();
-                            rng.gen_range(0..=jitter_range * 2) as i64 - jitter_range as i64
-                        } else {
-                            0
-                        };
-                        let delay_ms = (base_delay_ms as i64 + jitter).max(1) as u64;
-
-                        warn!(
-                            "atomic_subtract_size failed (attempt {}/{}), retrying in {}ms: bytes_freed={}, error={}",
-                            attempt, MAX_ATTEMPTS, delay_ms, bytes_freed, last_error.as_ref().unwrap()
-                        );
-
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    }
-                }
-            }
-        }
-
-        // All retries failed
-        let error = last_error.unwrap_or_else(|| {
-            ProxyError::CacheError("atomic_subtract_size failed with no error".to_string())
-        });
-
-        error!(
-            "atomic_subtract_size failed after {} attempts: bytes_freed={}, error={}",
-            MAX_ATTEMPTS, bytes_freed, error
-        );
-
-        Err(error)
-    }
-
     /// Atomically add bytes to the size state when caching new data
     ///
     /// Uses file locking to ensure atomic read-modify-write across multiple instances.
@@ -1607,135 +1527,8 @@ impl JournalConsolidator {
 
         Ok(state.total_size)
     }
-
-    /// Atomically add bytes to size state with retry and exponential backoff
-    ///
-    /// This method wraps `atomic_add_size()` with retry logic to handle transient
-    /// failures such as lock timeouts or I/O errors.
-    ///
-    /// # Retry Configuration
-    /// - Max attempts: 3
-    /// - Base delays: 100ms, 200ms, 400ms (exponential backoff)
-    /// - Jitter: ±20% to prevent thundering herd
-    ///
-    /// # Arguments
-    /// * `bytes_added` - Number of bytes added to cache
-    ///
-    /// # Returns
-    /// * `Ok(new_size)` - The new total size after addition
-    /// * `Err` - If lock is busy or persistence fails
-    pub async fn atomic_add_size_with_retry(&self, bytes_added: u64) -> Result<u64> {
-        // Use non-blocking try-lock to avoid performance degradation from lock contention.
-        // If lock is busy, return error immediately - consolidation will handle size tracking
-        // via the size_tracked=false flag in the journal entry.
-        //
-        // This replaces the previous retry logic (3 attempts with exponential backoff)
-        // which caused 30-90 second consolidation cycles due to lock waiting.
-        self.atomic_add_size_nonblocking(bytes_added).await
-    }
-
     /// Atomically add bytes to size state with non-blocking try-lock
     ///
-    /// If the lock is busy (held by another instance), returns error immediately
-    /// rather than waiting. The caller should set size_tracked=false in the journal
-    /// entry so consolidation can handle size tracking.
-    ///
-    /// # Arguments
-    /// * `bytes_added` - Number of bytes added to cache
-    ///
-    /// # Returns
-    /// * `Ok(new_size)` - The new total size after addition
-    /// * `Err` - If lock is busy or persistence fails
-    async fn atomic_add_size_nonblocking(&self, bytes_added: u64) -> Result<u64> {
-        #[allow(unused_imports)]
-        use fs2::FileExt;
-        
-        if bytes_added == 0 {
-            return Ok(self.get_current_size().await);
-        }
-
-        // Use a dedicated lock file for size state updates
-        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
-        
-        // Ensure directory exists
-        if let Some(parent) = lock_file_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create size_tracking directory: {}", e))
-            })?;
-        }
-
-        // Try to acquire exclusive lock (non-blocking)
-        let lock_file = match tokio::task::spawn_blocking({
-            let lock_path = lock_file_path.clone();
-            move || {
-                use fs2::FileExt;
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(&lock_path)?;
-                // Non-blocking try_lock - returns immediately if lock is held
-                file.try_lock_exclusive()?;
-                Ok::<_, std::io::Error>(file)
-            }
-        })
-        .await
-        {
-            Ok(Ok(file)) => file,
-            Ok(Err(e)) => {
-                // Lock is busy or I/O error - let consolidation handle it
-                debug!(
-                    "Size state lock busy for add (non-blocking), consolidation will handle: bytes={}, error={}",
-                    bytes_added, e
-                );
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock busy: {}",
-                    e
-                )));
-            }
-            Err(e) => {
-                warn!("Size state lock task failed for add: {}", e);
-                return Err(ProxyError::CacheError(format!(
-                    "Size state lock task failed: {}",
-                    e
-                )));
-            }
-        };
-
-        // Read current state while holding lock
-        let mut state = match self.load_size_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = lock_file.unlock();
-                warn!("Failed to load size state for atomic add: {}", e);
-                return Err(e);
-            }
-        };
-
-        // Add bytes
-        let old_size = state.total_size;
-        state.total_size = state.total_size.saturating_add(bytes_added);
-        state.last_updated_by = get_instance_id();
-
-        // Persist while still holding lock
-        if let Err(e) = self.persist_size_state_internal(&state).await {
-            let _ = lock_file.unlock();
-            warn!("Failed to persist size state after atomic add: {}", e);
-            return Err(e);
-        }
-
-        // Release lock
-        if let Err(e) = lock_file.unlock() {
-            warn!("Failed to release size state lock after add: {}", e);
-        }
-
-        debug!(
-            "Atomic size add (non-blocking): old_size={}, bytes_added={}, new_size={}",
-            old_size, bytes_added, state.total_size
-        );
-
-        Ok(state.total_size)
-    }
-
     /// Initialize the consolidator by loading size state from disk
     ///
     /// This should be called during startup to recover size state from the previous run.
@@ -1883,6 +1676,22 @@ impl JournalConsolidator {
     /// 10. Return ConsolidationCycleResult
     pub async fn run_consolidation_cycle(&self) -> Result<ConsolidationCycleResult> {
         let cycle_start = std::time::Instant::now();
+
+        // Idle detection: skip the entire cycle if there's no pending work.
+        // This avoids acquiring the global consolidation lock, scanning the journal
+        // directory, and reading delta files when the proxy is idle — reducing EFS
+        // metadata IOPS from ~90 to near-zero during idle periods.
+        if !self.size_accumulator.has_pending_delta() && !self.has_pending_journal_files() {
+            return Ok(ConsolidationCycleResult {
+                keys_processed: 0,
+                entries_consolidated: 0,
+                size_delta: 0,
+                cycle_duration: cycle_start.elapsed(),
+                eviction_triggered: false,
+                bytes_evicted: 0,
+                current_size: 0, // Skip size read when idle
+            });
+        }
 
         // Flush own accumulator to delta file (no lock needed)
         // This ensures our pending deltas are written before we try to collect all deltas
@@ -2379,23 +2188,6 @@ impl JournalConsolidator {
         );
         Ok(cache_keys.into_iter().collect())
     }
-
-    /// Discover cache keys with pending journal entries for a specific bucket
-    ///
-    /// Reads from per-instance journals and filters by bucket
-    pub async fn discover_pending_for_bucket(&self, bucket: &str) -> Result<Vec<String>> {
-        let all_cache_keys = self.discover_pending_cache_keys().await?;
-
-        // Filter to only cache keys in the specified bucket
-        let bucket_prefix = format!("{}/", bucket);
-        let bucket_cache_keys: Vec<String> = all_cache_keys
-            .into_iter()
-            .filter(|key| key.starts_with(&bucket_prefix))
-            .collect();
-
-        Ok(bucket_cache_keys)
-    }
-
     /// Get all journal entries for a cache key from all instance journal files
     pub async fn get_all_entries_for_cache_key(
         &self,
@@ -3354,31 +3146,6 @@ impl JournalConsolidator {
             }
         }
     }
-
-    /// Check if immediate consolidation should be triggered for a cache key
-    pub async fn should_trigger_immediate_consolidation(&self, cache_key: &str) -> Result<bool> {
-        let entries = self
-            .journal_manager
-            .get_all_entries_for_cache_key(cache_key)
-            .await?;
-
-        if entries.len() >= self.config.entry_count_threshold {
-            return Ok(true);
-        }
-
-        // Estimate total size of journal entries
-        let estimated_size: u64 = entries
-            .iter()
-            .map(|entry| {
-                serde_json::to_string(entry)
-                    .map(|s| s.len() as u64)
-                    .unwrap_or(1024) // Default estimate
-            })
-            .sum();
-
-        Ok(estimated_size >= self.config.size_threshold)
-    }
-
     /// Graceful shutdown of the journal consolidator
     ///
     /// This method should be called during proxy shutdown to ensure:

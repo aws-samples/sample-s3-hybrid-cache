@@ -46,6 +46,16 @@ pub struct AccessLogEntry {
     pub source_region: Option<String>,
 }
 
+/// Tracks the current log file being appended to within a rotation window
+struct CurrentLogFile {
+    /// Path to the current log file
+    path: PathBuf,
+    /// Date partition key ("YYYY/MM/DD") this file belongs to
+    date_key: String,
+    /// When this file was first created
+    created_at: Instant,
+}
+
 /// Buffered access log writer that batches log entries in RAM before flushing to disk.
 ///
 /// This reduces disk I/O on shared filesystems (NFS/EFS) by buffering entries and
@@ -65,6 +75,10 @@ pub struct AccessLogBuffer {
     last_flush: Arc<RwLock<Instant>>,
     /// Flag to prevent concurrent flushes
     flush_in_progress: AtomicBool,
+    /// Current log file being appended to (per rotation window)
+    current_file: Arc<RwLock<Option<CurrentLogFile>>>,
+    /// Rotation interval for access log files
+    file_rotation_interval: Duration,
 }
 
 /// Result of flushing the access log buffer to disk
@@ -88,6 +102,17 @@ impl Default for AccessLogFlushResult {
     }
 }
 
+/// Result of a log cleanup cycle
+#[derive(Debug, Clone, Default)]
+pub struct LogCleanupResult {
+    /// Number of access log files deleted
+    pub access_files_deleted: u32,
+    /// Number of application log files deleted
+    pub app_files_deleted: u32,
+    /// Number of errors encountered during cleanup
+    pub errors: u32,
+}
+
 /// Default flush interval for access log buffer (5 seconds)
 fn default_access_log_flush_interval() -> Duration {
     Duration::from_secs(5)
@@ -96,6 +121,11 @@ fn default_access_log_flush_interval() -> Duration {
 /// Default maximum buffer size for access log buffer (1000 entries)
 fn default_access_log_buffer_size() -> usize {
     1000
+}
+
+/// Default file rotation interval for access log files (5 minutes)
+fn default_access_log_file_rotation_interval() -> Duration {
+    Duration::from_secs(5 * 60)
 }
 
 /// RAII guard to ensure flush_in_progress is cleared
@@ -117,11 +147,13 @@ impl AccessLogBuffer {
     /// * `hostname` - Hostname for log file naming
     /// * `flush_interval` - Interval between automatic flushes (default: 5s)
     /// * `max_buffer_size` - Maximum entries before forced flush (default: 1000)
+    /// * `file_rotation_interval` - Time window for appending to same file (default: 5m)
     pub fn new(
         log_dir: PathBuf,
         hostname: String,
         flush_interval: Option<Duration>,
         max_buffer_size: Option<usize>,
+        file_rotation_interval: Option<Duration>,
     ) -> Self {
         Self {
             buffer: Arc::new(Mutex::new(Vec::new())),
@@ -131,6 +163,9 @@ impl AccessLogBuffer {
             max_buffer_size: max_buffer_size.unwrap_or_else(default_access_log_buffer_size),
             last_flush: Arc::new(RwLock::new(Instant::now())),
             flush_in_progress: AtomicBool::new(false),
+            current_file: Arc::new(RwLock::new(None)),
+            file_rotation_interval: file_rotation_interval
+                .unwrap_or_else(default_access_log_file_rotation_interval),
         }
     }
 
@@ -264,7 +299,7 @@ impl AccessLogBuffer {
         })
     }
 
-    /// Write entries to a date-partitioned file
+    /// Write entries to a date-partitioned file, reusing the current file within the rotation window
     async fn write_entries_to_file(
         &self,
         date_path: &str,
@@ -280,15 +315,6 @@ impl AccessLogBuffer {
             ProxyError::IoError(format!("Failed to create access log directory: {}", e))
         })?;
 
-        // Create filename with timestamp and hostname
-        let timestamp = entries[0].time;
-        let filename = format!(
-            "{}-{}",
-            timestamp.format("%Y-%m-%d-%H-%M-%S"),
-            self.hostname
-        );
-        let log_file_path = log_dir.join(&filename);
-
         // Format all entries
         let mut content = String::new();
         for entry in entries {
@@ -296,12 +322,26 @@ impl AccessLogBuffer {
             content.push('\n');
         }
 
-        // Write using atomic temp+rename for durability
-        let temp_path = log_file_path.with_extension("tmp");
+        // Determine whether to append to current file or create a new one
+        let now = Instant::now();
+        let should_append = {
+            let current = self.current_file.read().await;
+            if let Some(ref cf) = *current {
+                cf.date_key == date_path
+                    && cf.created_at + self.file_rotation_interval > now
+                    && cf.path.exists()
+            } else {
+                false
+            }
+        };
 
-        // If the target file exists, append to it instead of replacing
-        if log_file_path.exists() {
-            // Append to existing file
+        if should_append {
+            // Append to existing file within the rotation window
+            let log_file_path = {
+                let current = self.current_file.read().await;
+                current.as_ref().unwrap().path.clone()
+            };
+
             use tokio::io::AsyncWriteExt;
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
@@ -319,8 +359,21 @@ impl AccessLogBuffer {
             file.flush()
                 .await
                 .map_err(|e| ProxyError::IoError(format!("Failed to flush access log: {}", e)))?;
+
+            debug!("Appended {} entries to {:?}", entries.len(), log_file_path);
         } else {
-            // Write to temp file and rename for atomicity
+            // Create a new file named {first_entry_timestamp}-{hostname}
+            let timestamp = entries[0].time;
+            let filename = format!(
+                "{}-{}",
+                timestamp.format("%Y-%m-%d-%H-%M-%S"),
+                self.hostname
+            );
+            let log_file_path = log_dir.join(&filename);
+
+            // Write using atomic temp+rename for durability
+            let temp_path = log_file_path.with_extension("tmp");
+
             tokio::fs::write(&temp_path, content.as_bytes())
                 .await
                 .map_err(|e| {
@@ -330,9 +383,18 @@ impl AccessLogBuffer {
             tokio::fs::rename(&temp_path, &log_file_path)
                 .await
                 .map_err(|e| ProxyError::IoError(format!("Failed to rename access log: {}", e)))?;
+
+            // Update current_file tracking
+            let mut current = self.current_file.write().await;
+            *current = Some(CurrentLogFile {
+                path: log_file_path.clone(),
+                date_key: date_path.to_string(),
+                created_at: now,
+            });
+
+            debug!("Created new log file {:?} with {} entries", log_file_path, entries.len());
         }
 
-        debug!("Wrote {} entries to {:?}", entries.len(), log_file_path);
         Ok(())
     }
 
@@ -434,6 +496,14 @@ pub struct LoggingConfig {
     pub access_log_flush_interval: Duration,
     /// Maximum entries in access log buffer before forced flush (default: 1000)
     pub access_log_buffer_size: usize,
+    /// Days to retain access log files (default: 30, range: 1-365)
+    pub access_log_retention_days: u32,
+    /// Days to retain application log files (default: 30, range: 1-365)
+    pub app_log_retention_days: u32,
+    /// Interval between log cleanup cycles (default: 24h, range: 1h-7d)
+    pub log_cleanup_interval: Duration,
+    /// Time window for appending to same access log file (default: 5m, range: 1m-60m)
+    pub access_log_file_rotation_interval: Duration,
 }
 
 /// Access logging mode
@@ -473,6 +543,10 @@ impl LoggerManager {
             log_level: config.log_level,
             access_log_flush_interval: config.access_log_flush_interval,
             access_log_buffer_size: config.access_log_buffer_size,
+            access_log_retention_days: config.access_log_retention_days,
+            app_log_retention_days: config.app_log_retention_days,
+            log_cleanup_interval: config.log_cleanup_interval,
+            access_log_file_rotation_interval: config.access_log_file_rotation_interval,
         };
 
         Self::new(logging_config)
@@ -491,6 +565,7 @@ impl LoggerManager {
                 self.config.hostname.clone(),
                 Some(self.config.access_log_flush_interval),
                 Some(self.config.access_log_buffer_size),
+                Some(self.config.access_log_file_rotation_interval),
             ));
         }
 
@@ -560,25 +635,34 @@ impl LoggerManager {
     }
 
     /// Perform log rotation and cleanup
-    pub fn rotate_logs(&self) -> Result<()> {
+    pub fn rotate_logs(&self, access_log_retention_days: u32, app_log_retention_days: u32) -> Result<LogCleanupResult> {
+        let mut result = LogCleanupResult::default();
         let host_log_dir = self.config.app_log_dir.join(&self.config.hostname);
 
-        // Clean up old log files (keep last 30 days)
-        self.cleanup_old_logs(&host_log_dir, 30)?;
+        // Clean up old application log files
+        let (deleted, errors) = self.cleanup_old_logs(&host_log_dir, app_log_retention_days)?;
+        result.app_files_deleted = deleted;
+        result.errors += errors;
 
         // Clean up old access logs if access logging is enabled
         if self.config.access_log_enabled {
-            self.cleanup_old_access_logs(30)?;
+            let (deleted, errors) = self.cleanup_old_access_logs(access_log_retention_days)?;
+            result.access_files_deleted = deleted;
+            result.errors += errors;
         }
 
         info!("Log rotation and cleanup completed");
-        Ok(())
+        Ok(result)
     }
 
     /// Clean up old application log files
-    fn cleanup_old_logs(&self, log_dir: &PathBuf, keep_days: u32) -> Result<()> {
+    /// Returns (files_deleted, errors)
+    fn cleanup_old_logs(&self, log_dir: &PathBuf, keep_days: u32) -> Result<(u32, u32)> {
         let cutoff_time = std::time::SystemTime::now()
             - std::time::Duration::from_secs(keep_days as u64 * 24 * 3600);
+
+        let mut deleted = 0u32;
+        let mut errors = 0u32;
 
         if let Ok(entries) = std::fs::read_dir(log_dir) {
             for entry in entries.flatten() {
@@ -587,8 +671,10 @@ impl LoggerManager {
                         if modified < cutoff_time {
                             if let Err(e) = std::fs::remove_file(entry.path()) {
                                 warn!("Failed to remove old log file {:?}: {}", entry.path(), e);
+                                errors += 1;
                             } else {
                                 debug!("Removed old log file: {:?}", entry.path());
+                                deleted += 1;
                             }
                         }
                     }
@@ -596,18 +682,22 @@ impl LoggerManager {
             }
         }
 
-        Ok(())
+        Ok((deleted, errors))
     }
 
     /// Clean up old access log files
-    fn cleanup_old_access_logs(&self, keep_days: u32) -> Result<()> {
+    /// Returns (files_deleted, errors)
+    fn cleanup_old_access_logs(&self, keep_days: u32) -> Result<(u32, u32)> {
         let cutoff_time = std::time::SystemTime::now()
             - std::time::Duration::from_secs(keep_days as u64 * 24 * 3600);
 
-        // Walk through the date-partitioned directory structure
-        self.cleanup_directory_recursive(&self.config.access_log_dir, cutoff_time)?;
+        let mut deleted = 0u32;
+        let mut errors = 0u32;
 
-        Ok(())
+        // Walk through the date-partitioned directory structure
+        self.cleanup_directory_recursive(&self.config.access_log_dir, cutoff_time, &mut deleted, &mut errors)?;
+
+        Ok((deleted, errors))
     }
 
     /// Recursively clean up directories and files older than cutoff time
@@ -615,6 +705,8 @@ impl LoggerManager {
         &self,
         dir: &PathBuf,
         cutoff_time: std::time::SystemTime,
+        deleted: &mut u32,
+        errors: &mut u32,
     ) -> Result<()> {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -622,7 +714,7 @@ impl LoggerManager {
 
                 if path.is_dir() {
                     // Recursively clean subdirectories
-                    self.cleanup_directory_recursive(&path, cutoff_time)?;
+                    self.cleanup_directory_recursive(&path, cutoff_time, deleted, errors)?;
 
                     // Remove empty directories
                     if let Ok(mut dir_entries) = std::fs::read_dir(&path) {
@@ -639,8 +731,10 @@ impl LoggerManager {
                         if modified < cutoff_time {
                             if let Err(e) = std::fs::remove_file(&path) {
                                 warn!("Failed to remove old access log file {:?}: {}", path, e);
+                                *errors += 1;
                             } else {
                                 debug!("Removed old access log file: {:?}", path);
+                                *deleted += 1;
                             }
                         }
                     }
@@ -826,6 +920,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(3600)), // 1 hour - won't trigger time-based flush
             Some(1000),                      // Large buffer size
+            None,                            // Default file rotation interval
         );
 
         // Initially buffer should be empty
@@ -858,6 +953,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(3600)),
             Some(1000),
+            None,
         );
 
         // Add an entry with known values
@@ -952,6 +1048,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(3600)), // Long interval - won't trigger time-based flush
             Some(3),                         // Small buffer size - will trigger size-based flush
+            None,                            // Default file rotation interval
         );
 
         // Add entries up to the limit
@@ -998,6 +1095,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_millis(100)), // Short interval for testing
             Some(1000),                       // Large buffer size
+            None,                             // Default file rotation interval
         );
 
         // Add an entry
@@ -1038,6 +1136,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(5)),
             Some(1000),
+            None,
         );
 
         // Flush empty buffer
@@ -1057,6 +1156,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(3600)), // Long interval
             Some(1000),                      // Large buffer
+            None,                            // Default file rotation interval
         );
 
         // Add entries
@@ -1089,6 +1189,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(3600)),
             Some(1000),
+            None,
         );
 
         // Add entry
@@ -1123,6 +1224,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(3600)),
             Some(1000),
+            None,
         );
 
         // First batch
@@ -1173,6 +1275,7 @@ mod tests {
             "test-host".to_string(),
             Some(Duration::from_secs(3600)),
             Some(1000),
+            None,
         ));
 
         // Add entries
@@ -1201,4 +1304,854 @@ mod tests {
             "Either all entries should be flushed or one flush should be blocked"
         );
     }
+
+    // =========================================================================
+    // Unit tests for CurrentLogFile state transitions
+    // Requirements: 9.5, 9.6, 9.7, 9.8
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_no_current_file_creates_new_file() {
+        // When no current file exists, the first flush should create a new file
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_secs(300)),
+        );
+
+        // Verify current_file starts as None
+        assert!(buffer.current_file.read().await.is_none());
+
+        // Log an entry and flush
+        let entry = create_test_entry("test-bucket", "test-key");
+        buffer.log(entry).await.unwrap();
+        let result = buffer.force_flush().await.unwrap();
+        assert_eq!(result.entries_flushed, 1);
+
+        // current_file should now be set
+        let current = buffer.current_file.read().await;
+        assert!(current.is_some(), "current_file should be set after first flush");
+        let cf = current.as_ref().unwrap();
+        assert!(cf.path.exists(), "created file should exist on disk");
+        assert_eq!(cf.date_key, Utc::now().format("%Y/%m/%d").to_string());
+
+        // Exactly one file in the date directory
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let files: Vec<_> = std::fs::read_dir(log_dir.join(&date_path))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert_eq!(files.len(), 1, "First flush should create exactly one file");
+    }
+
+    #[tokio::test]
+    async fn test_within_rotation_window_appends_to_same_file() {
+        // When flushing within the rotation window, entries append to the same file
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_secs(300)), // 5 minute rotation window
+        );
+
+        // First flush — creates a new file
+        let entry1 = create_test_entry("test-bucket", "key-1");
+        buffer.log(entry1).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let first_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+
+        // Second flush — should append to the same file (within rotation window)
+        let entry2 = create_test_entry("test-bucket", "key-2");
+        buffer.log(entry2).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let second_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+        assert_eq!(first_path, second_path, "Should reuse the same file within rotation window");
+
+        // Only one file should exist
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let files: Vec<_> = std::fs::read_dir(log_dir.join(&date_path))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert_eq!(files.len(), 1, "Should have exactly 1 file (appended, not rotated)");
+
+        // File should contain both entries (2 lines)
+        let content = std::fs::read_to_string(&first_path).unwrap();
+        assert_eq!(content.lines().count(), 2, "File should contain 2 entries");
+    }
+
+    #[tokio::test]
+    async fn test_expired_rotation_window_creates_new_file() {
+        // When the rotation window has expired, the next flush creates a new file
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        // Use a very short rotation interval (100ms) so we can test expiry quickly
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_millis(100)),
+        );
+
+        // First flush — creates file
+        let entry1 = create_test_entry("test-bucket", "key-1");
+        buffer.log(entry1).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let first_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+
+        // Sleep past the rotation interval AND past the 1-second timestamp boundary
+        // so the new file gets a distinct name (filenames use second-level precision)
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Second flush — rotation window expired, should create a new file
+        let entry2 = create_test_entry("test-bucket", "key-2");
+        buffer.log(entry2).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let second_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+        assert_ne!(first_path, second_path, "Should create a new file after rotation window expires");
+
+        // Two files should exist
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let files: Vec<_> = std::fs::read_dir(log_dir.join(&date_path))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert_eq!(files.len(), 2, "Should have 2 files after rotation");
+
+        // Each file should have exactly 1 entry
+        for file in &files {
+            let content = std::fs::read_to_string(file.path()).unwrap();
+            assert_eq!(content.lines().count(), 1, "Each rotated file should have 1 entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_date_partition_change_creates_new_file() {
+        // When the date_key changes, a new file is created even within the rotation window.
+        // Since entries use Utc::now(), we test this indirectly by verifying the date_key
+        // check in write_entries_to_file: manually set current_file to a different date_key
+        // and confirm the next flush creates a new file (not an append).
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_secs(300)), // 5 minute rotation window
+        );
+
+        // First flush — creates a file for today's date
+        let entry1 = create_test_entry("test-bucket", "key-1");
+        buffer.log(entry1).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let first_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+
+        // Verify the file has 1 entry
+        let content_before = std::fs::read_to_string(&first_path).unwrap();
+        assert_eq!(content_before.lines().count(), 1, "First file should have 1 entry");
+
+        // Manually override current_file's date_key to simulate a date partition mismatch.
+        // This mimics what happens at midnight when the date rolls over: the current_file
+        // was created for yesterday but new entries belong to today.
+        {
+            let mut current = buffer.current_file.write().await;
+            if let Some(ref mut cf) = *current {
+                cf.date_key = "1999/12/31".to_string();
+            }
+        }
+
+        // Next flush — date_key won't match today's entries, so a new file is created
+        // (not appended to the old one)
+        let entry2 = create_test_entry("test-bucket", "key-2");
+        buffer.log(entry2).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let second_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+
+        // current_file should now point to today's date
+        let current = buffer.current_file.read().await;
+        let cf = current.as_ref().unwrap();
+        assert_eq!(
+            cf.date_key,
+            Utc::now().format("%Y/%m/%d").to_string(),
+            "current_file date_key should match today after date partition change"
+        );
+
+        // The key assertion: the date_key mismatch caused a NEW file to be created
+        // (via atomic write), not an append to the old file. The old file should still
+        // have exactly 1 entry (it was not appended to).
+        let content_after = std::fs::read_to_string(&first_path).unwrap();
+        assert_eq!(
+            content_after.lines().count(), 1,
+            "Original file should still have 1 entry (not appended to after date change)"
+        );
+
+        // The new file should have exactly 1 entry
+        let new_content = std::fs::read_to_string(&second_path).unwrap();
+        assert_eq!(
+            new_content.lines().count(), 1,
+            "New file created after date partition change should have 1 entry"
+        );
+    }
+
+    // =========================================================================
+    // Property-based tests for log lifecycle
+    // =========================================================================
+
+    // Feature: log-lifecycle, Property 7: File rotation window consolidation
+    // **Validates: Requirements 9.5, 9.6, 9.7**
+    //
+    // For any sequence of access log flushes with known timestamps and a given
+    // file_rotation_interval, the number of distinct files created should equal
+    // the number of rotation windows spanned. All entries flushed within the same
+    // rotation window should be written to the same file. A flush after the rotation
+    // interval has elapsed since the current file's creation should create a new file.
+    #[tokio::test]
+    async fn prop_file_rotation_window_consolidation() {
+        use quickcheck::{Gen, Arbitrary};
+
+        // Run multiple random iterations to get property-based coverage.
+        // Each iteration sleeps ~1.2s between batches, so we limit iterations
+        // and batch count to keep total runtime reasonable (~30s).
+        let mut gen = Gen::new(100);
+        for _ in 0..20 {
+            // Generate random batch count [1, 3] and flushes per batch [1, 4]
+            let batch_count = (u8::arbitrary(&mut gen) % 3) as usize + 1;
+            let mut flushes_per_batch: Vec<usize> = Vec::new();
+            let mut entries_per_flush: Vec<Vec<usize>> = Vec::new();
+
+            for _ in 0..batch_count {
+                let num_flushes = (u8::arbitrary(&mut gen) % 4) as usize + 1;
+                let mut flush_entries = Vec::new();
+                for _ in 0..num_flushes {
+                    let num_entries = (u8::arbitrary(&mut gen) % 3) as usize + 1; // 1-3 entries per flush
+                    flush_entries.push(num_entries);
+                }
+                flushes_per_batch.push(num_flushes);
+                entries_per_flush.push(flush_entries);
+            }
+
+            let temp_dir = TempDir::new().unwrap();
+            let log_dir = temp_dir.path().to_path_buf();
+
+            // Use a rotation interval of 500ms. This is short enough for fast tests
+            // but we sleep >1s between batches to ensure both the rotation window
+            // expires AND the entry timestamp (second-level precision) changes,
+            // producing distinct filenames.
+            let rotation_interval = Duration::from_millis(500);
+
+            let buffer = AccessLogBuffer::new(
+                log_dir.clone(),
+                "test-host".to_string(),
+                Some(Duration::from_secs(3600)), // Long flush interval — we flush manually
+                Some(10000),                     // Large buffer size
+                Some(rotation_interval),
+            );
+
+            let mut total_entries = 0usize;
+
+            for (batch_idx, flush_entries) in entries_per_flush.iter().enumerate() {
+                // If not the first batch, sleep past both the rotation interval AND
+                // the 1-second timestamp boundary so the new file gets a distinct name.
+                if batch_idx > 0 {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                }
+
+                // Perform all flushes in this batch quickly (within the rotation window)
+                for &num_entries in flush_entries {
+                    for _ in 0..num_entries {
+                        let entry = create_test_entry("test-bucket", "test-key");
+                        buffer.log(entry).await.unwrap();
+                        total_entries += 1;
+                    }
+                    let result = buffer.force_flush().await.unwrap();
+                    assert!(!result.skipped, "Flush should not be skipped when entries exist");
+                }
+            }
+
+            // Count files in the date-partitioned directory
+            let date_path = chrono::Utc::now().format("%Y/%m/%d").to_string();
+            let log_subdir = log_dir.join(&date_path);
+
+            let files: Vec<_> = std::fs::read_dir(&log_subdir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .collect();
+
+            // File count should equal batch count: flushes within the same rotation
+            // window append to the same file, and sleeping past the interval creates a new one
+            assert_eq!(
+                files.len(),
+                batch_count,
+                "Expected {} files (one per rotation window batch), got {}. \
+                 Batches: {:?}, entries_per_flush: {:?}",
+                batch_count,
+                files.len(),
+                flushes_per_batch,
+                entries_per_flush,
+            );
+
+            // Total lines across all files should equal total entries
+            let mut total_lines = 0usize;
+            for file in &files {
+                let content = std::fs::read_to_string(file.path()).unwrap();
+                total_lines += content.lines().count();
+            }
+            assert_eq!(
+                total_lines, total_entries,
+                "Expected {} total log lines, got {}",
+                total_entries, total_lines,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_lifecycle_property_tests {
+    use super::*;
+    use filetime::{set_file_mtime, FileTime};
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+    use tempfile::TempDir;
+
+    // Feature: log-lifecycle, Property 4: Cleanup deletes exactly the expired files
+    // **Validates: Requirements 4.4, 4.5, 5.1, 5.2, 8.1, 8.2**
+    //
+    // For any set of files with random modification times and any retention period in [1, 365] days,
+    // after running cleanup:
+    //   (a) no file older than the retention period should remain
+    //   (b) all files newer than the retention period should be preserved
+    //   (c) application log cleanup only touches files within the current hostname's directory
+    //   (d) access log cleanup traverses the entire date-partitioned tree
+    #[quickcheck]
+    fn prop_cleanup_deletes_exactly_expired_files(
+        file_ages_days: Vec<u16>,
+        retention_raw: u16,
+        other_host_ages: Vec<u16>,
+    ) -> TestResult {
+        // Need at least one file to test
+        if file_ages_days.is_empty() {
+            return TestResult::discard();
+        }
+        // Cap file count to keep tests fast
+        if file_ages_days.len() > 20 || other_host_ages.len() > 10 {
+            return TestResult::discard();
+        }
+
+        // Map retention to valid range [1, 365]
+        let retention_days = (retention_raw % 365) as u32 + 1;
+
+        let temp_dir = TempDir::new().unwrap();
+        let access_log_dir = temp_dir.path().join("access_logs");
+        let app_log_dir = temp_dir.path().join("app_logs");
+        let hostname = "test-host-prop4";
+
+        // Create directory structure
+        let host_app_dir = app_log_dir.join(hostname);
+        std::fs::create_dir_all(&host_app_dir).unwrap();
+        let other_host_dir = app_log_dir.join("other-host");
+        std::fs::create_dir_all(&other_host_dir).unwrap();
+
+        // Create access log date-partitioned dir
+        let access_date_dir = access_log_dir.join("2024/01/15");
+        std::fs::create_dir_all(&access_date_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+
+        // --- Create app log files for our hostname ---
+        let mut expected_app_surviving = 0u32;
+        let mut expected_app_deleted = 0u32;
+        for (i, &age_raw) in file_ages_days.iter().enumerate() {
+            let age_days = age_raw % 730; // up to ~2 years
+            let path = host_app_dir.join(format!("s3-proxy.log.{}", i));
+            std::fs::write(&path, format!("app log content {}", i)).unwrap();
+
+            let mtime_secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - (age_days as i64 * 86400);
+            set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+
+            if age_days < retention_days as u16 {
+                expected_app_surviving += 1;
+            } else {
+                expected_app_deleted += 1;
+            }
+        }
+
+        // --- Create app log files for OTHER hostname (should NOT be touched) ---
+        let other_host_file_count = other_host_ages.len();
+        for (i, &age_raw) in other_host_ages.iter().enumerate() {
+            let age_days = age_raw % 730;
+            let path = other_host_dir.join(format!("s3-proxy.log.{}", i));
+            std::fs::write(&path, format!("other host log {}", i)).unwrap();
+
+            let mtime_secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - (age_days as i64 * 86400);
+            set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+        }
+
+        // --- Create access log files in date-partitioned tree ---
+        let mut expected_access_surviving = 0u32;
+        let mut expected_access_deleted = 0u32;
+        for (i, &age_raw) in file_ages_days.iter().enumerate() {
+            let age_days = age_raw % 730;
+            let path = access_date_dir.join(format!("2024-01-15-00-00-00-access-{}", i));
+            std::fs::write(&path, format!("access log content {}", i)).unwrap();
+
+            let mtime_secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - (age_days as i64 * 86400);
+            set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+
+            if age_days < retention_days as u16 {
+                expected_access_surviving += 1;
+            } else {
+                expected_access_deleted += 1;
+            }
+        }
+
+        // Create LoggerManager with access logging enabled
+        let config = LoggingConfig {
+            access_log_dir: access_log_dir.clone(),
+            app_log_dir: app_log_dir.clone(),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        };
+        let manager = LoggerManager::new(config);
+
+        // Run cleanup
+        let result = manager.rotate_logs(retention_days, retention_days).unwrap();
+
+        // (a) & (b): Check app log files — only non-expired files for our hostname remain
+        let remaining_app_files: Vec<_> = std::fs::read_dir(&host_app_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+
+        if remaining_app_files.len() as u32 != expected_app_surviving {
+            return TestResult::error(format!(
+                "App log: expected {} surviving files, got {}",
+                expected_app_surviving,
+                remaining_app_files.len()
+            ));
+        }
+
+        if result.app_files_deleted != expected_app_deleted {
+            return TestResult::error(format!(
+                "App log: expected {} deleted, result reports {}",
+                expected_app_deleted, result.app_files_deleted
+            ));
+        }
+
+        // (c): Other hostname's files must ALL still exist (hostname-scoped cleanup)
+        let remaining_other_files: Vec<_> = std::fs::read_dir(&other_host_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+
+        if remaining_other_files.len() != other_host_file_count {
+            return TestResult::error(format!(
+                "Other host: expected {} files untouched, got {}",
+                other_host_file_count,
+                remaining_other_files.len()
+            ));
+        }
+
+        // (d): Check access log files — traverses entire tree
+        // Count remaining files recursively in access_log_dir
+        fn count_files_recursive(dir: &std::path::Path) -> u32 {
+            let mut count = 0;
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        count += count_files_recursive(&path);
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+
+        let remaining_access_files = count_files_recursive(&access_log_dir);
+        if remaining_access_files != expected_access_surviving {
+            return TestResult::error(format!(
+                "Access log: expected {} surviving files, got {}",
+                expected_access_surviving, remaining_access_files
+            ));
+        }
+
+        if result.access_files_deleted != expected_access_deleted {
+            return TestResult::error(format!(
+                "Access log: expected {} deleted, result reports {}",
+                expected_access_deleted, result.access_files_deleted
+            ));
+        }
+
+        TestResult::passed()
+    }
+
+    // Feature: log-lifecycle, Property 5: Empty directories are removed after cleanup
+    // **Validates: Requirements 4.6**
+    //
+    // For any date-partitioned directory tree where all files in a day/month/year directory
+    // have been deleted by cleanup, the empty day, month, and year directories should be removed.
+    // Directories that still contain files or non-empty subdirectories should be preserved.
+    #[quickcheck]
+    fn prop_empty_directories_removed_after_cleanup(
+        // Each element is (month 1-12, day 1-28, file_count 1-3, all_expired: bool)
+        partitions_raw: Vec<(u8, u8, u8, bool)>,
+        retention_raw: u16,
+    ) -> TestResult {
+        // Need at least one partition
+        if partitions_raw.is_empty() {
+            return TestResult::discard();
+        }
+        // Cap partition count to keep tests fast
+        if partitions_raw.len() > 12 {
+            return TestResult::discard();
+        }
+
+        // Map retention to valid range [1, 365]
+        let retention_days = (retention_raw % 365) as u32 + 1;
+
+        let temp_dir = TempDir::new().unwrap();
+        let access_log_dir = temp_dir.path().join("access_logs");
+        let app_log_dir = temp_dir.path().join("app_logs");
+        let hostname = "test-host-prop5";
+
+        // Create app log dir (needed by LoggerManager)
+        let host_app_dir = app_log_dir.join(hostname);
+        std::fs::create_dir_all(&host_app_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let now_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Track which (year, month, day) partitions should survive
+        // A partition survives if it has at least one non-expired file
+        let mut surviving_day_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Deduplicate partitions by (month, day) to avoid conflicts
+        let mut seen_partitions: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+
+        let year = "2024";
+        for &(month_raw, day_raw, file_count_raw, all_expired) in &partitions_raw {
+            let month = (month_raw % 12) + 1; // 1-12
+            let day = (day_raw % 28) + 1; // 1-28
+
+            // Skip duplicate partitions
+            if !seen_partitions.insert((month, day)) {
+                continue;
+            }
+
+            let file_count = ((file_count_raw % 3) + 1) as usize; // 1-3 files
+
+            let date_dir = access_log_dir.join(format!("{}/{:02}/{:02}", year, month, day));
+            std::fs::create_dir_all(&date_dir).unwrap();
+
+            for i in 0..file_count {
+                let path = date_dir.join(format!("2024-{:02}-{:02}-00-00-00-file-{}", month, day, i));
+                std::fs::write(&path, format!("access log content {}", i)).unwrap();
+
+                let mtime_secs = if all_expired {
+                    // Set mtime well beyond retention period
+                    now_secs - ((retention_days as i64 + 30) * 86400)
+                } else {
+                    // Set mtime to recent (within retention)
+                    now_secs - 3600 // 1 hour ago
+                };
+                set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+            }
+
+            if !all_expired {
+                surviving_day_dirs.insert(format!("{}/{:02}/{:02}", year, month, day));
+            }
+        }
+
+        // Create LoggerManager
+        let config = LoggingConfig {
+            access_log_dir: access_log_dir.clone(),
+            app_log_dir: app_log_dir.clone(),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        };
+        let manager = LoggerManager::new(config);
+
+        // Run cleanup
+        manager.rotate_logs(retention_days, retention_days).unwrap();
+
+        // Verify: surviving day directories still exist
+        for day_path in &surviving_day_dirs {
+            let full_path = access_log_dir.join(day_path);
+            if !full_path.exists() {
+                return TestResult::error(format!(
+                    "Non-empty day dir should be preserved but was removed: {}",
+                    day_path
+                ));
+            }
+        }
+
+        // Verify: no empty directories remain anywhere in the access log tree
+        fn find_empty_dirs(dir: &std::path::Path, results: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+                if entries.is_empty() {
+                    results.push(dir.to_path_buf());
+                    return;
+                }
+                for entry in &entries {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        find_empty_dirs(&path, results);
+                    }
+                }
+            }
+        }
+
+        let mut empty_dirs = Vec::new();
+        if access_log_dir.exists() {
+            find_empty_dirs(&access_log_dir, &mut empty_dirs);
+        }
+
+        // The access_log_dir root itself may be empty if all partitions were expired — that's fine,
+        // cleanup_directory_recursive doesn't remove the root dir. But any subdirectory that is
+        // empty should have been removed.
+        let empty_subdirs: Vec<_> = empty_dirs
+            .iter()
+            .filter(|d| *d != &access_log_dir)
+            .collect();
+
+        if !empty_subdirs.is_empty() {
+            return TestResult::error(format!(
+                "Empty subdirectories should have been removed: {:?}",
+                empty_subdirs
+            ));
+        }
+
+        // Verify: parent directories of surviving partitions exist (month and year)
+        for day_path in &surviving_day_dirs {
+            let parts: Vec<&str> = day_path.split('/').collect();
+            // Check year dir
+            let year_dir = access_log_dir.join(parts[0]);
+            if !year_dir.exists() {
+                return TestResult::error(format!(
+                    "Year dir should be preserved for surviving partition: {}",
+                    parts[0]
+                ));
+            }
+            // Check month dir
+            let month_dir = access_log_dir.join(format!("{}/{}", parts[0], parts[1]));
+            if !month_dir.exists() {
+                return TestResult::error(format!(
+                    "Month dir should be preserved for surviving partition: {}/{}",
+                    parts[0], parts[1]
+                ));
+            }
+        }
+
+        TestResult::passed()
+    }
+
+    // Feature: log-lifecycle, Property 6: Cleanup continues after I/O errors
+    // **Validates: Requirements 6.3**
+    //
+    // For any set of files where some files are inaccessible (permission denied, etc.),
+    // cleanup should still delete all accessible expired files and report the error count.
+    // The number of successfully deleted files plus the error count should equal the total
+    // number of expired files.
+    #[quickcheck]
+    fn prop_cleanup_continues_after_io_errors(
+        deletable_count_raw: u8,
+        undeletable_count_raw: u8,
+    ) -> TestResult {
+        // Map to reasonable counts: at least 1 deletable and 1 undeletable
+        let deletable_count = (deletable_count_raw % 10) as usize + 1;
+        let undeletable_count = (undeletable_count_raw % 10) as usize + 1;
+
+        let temp_dir = TempDir::new().unwrap();
+        let access_log_dir = temp_dir.path().join("access_logs");
+        let app_log_dir = temp_dir.path().join("app_logs");
+        let hostname = "test-host-prop6";
+
+        // Create app log dir (needed by LoggerManager)
+        let host_app_dir = app_log_dir.join(hostname);
+        std::fs::create_dir_all(&host_app_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let now_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // All files are expired (well beyond any retention period)
+        let expired_mtime_secs = now_secs - (400 * 86400); // 400 days ago
+        let retention_days = 1u32;
+
+        // --- Create deletable expired files in a normal (writable) subdirectory ---
+        let writable_dir = access_log_dir.join("2023/01/01");
+        std::fs::create_dir_all(&writable_dir).unwrap();
+
+        for i in 0..deletable_count {
+            let path = writable_dir.join(format!("2023-01-01-00-00-00-deletable-{}", i));
+            std::fs::write(&path, format!("deletable content {}", i)).unwrap();
+            set_file_mtime(&path, FileTime::from_unix_time(expired_mtime_secs, 0)).unwrap();
+        }
+
+        // --- Create undeletable expired files in a read-only subdirectory ---
+        // Making the parent directory read-only prevents file deletion on Unix
+        let readonly_dir = access_log_dir.join("2023/02/01");
+        std::fs::create_dir_all(&readonly_dir).unwrap();
+
+        for i in 0..undeletable_count {
+            let path = readonly_dir.join(format!("2023-02-01-00-00-00-undeletable-{}", i));
+            std::fs::write(&path, format!("undeletable content {}", i)).unwrap();
+            set_file_mtime(&path, FileTime::from_unix_time(expired_mtime_secs, 0)).unwrap();
+        }
+
+        // Make the subdirectory read-only (removes write permission)
+        // This prevents deletion of files inside it on Unix
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(true);
+        }
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+
+        // Create LoggerManager
+        let config = LoggingConfig {
+            access_log_dir: access_log_dir.clone(),
+            app_log_dir: app_log_dir.clone(),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        };
+        let manager = LoggerManager::new(config);
+
+        // Run cleanup — this should NOT panic or abort
+        let result = manager.rotate_logs(retention_days, retention_days).unwrap();
+
+        // Restore permissions so tempfile can clean up the directory
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(false);
+        }
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+
+        // Assert: all deletable expired files were removed
+        let remaining_writable: Vec<_> = std::fs::read_dir(&writable_dir)
+            .ok()
+            .map(|entries| entries.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).collect())
+            .unwrap_or_default();
+
+        if !remaining_writable.is_empty() {
+            return TestResult::error(format!(
+                "Expected all {} deletable files removed, but {} remain",
+                deletable_count,
+                remaining_writable.len()
+            ));
+        }
+
+        // Assert: undeletable files still exist
+        let remaining_readonly: Vec<_> = std::fs::read_dir(&readonly_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+
+        if remaining_readonly.len() != undeletable_count {
+            return TestResult::error(format!(
+                "Expected {} undeletable files to remain, but {} remain",
+                undeletable_count,
+                remaining_readonly.len()
+            ));
+        }
+
+        // Assert: deleted count matches deletable files
+        if result.access_files_deleted != deletable_count as u32 {
+            return TestResult::error(format!(
+                "Expected {} access files deleted, got {}",
+                deletable_count, result.access_files_deleted
+            ));
+        }
+
+        // Assert: error count matches undeletable files
+        if result.errors != undeletable_count as u32 {
+            return TestResult::error(format!(
+                "Expected {} errors, got {}",
+                undeletable_count, result.errors
+            ));
+        }
+
+        // Assert: deleted + errors = total expired files
+        let total_expired = (deletable_count + undeletable_count) as u32;
+        if result.access_files_deleted + result.errors != total_expired {
+            return TestResult::error(format!(
+                "deleted ({}) + errors ({}) != total expired ({})",
+                result.access_files_deleted, result.errors, total_expired
+            ));
+        }
+
+        TestResult::passed()
+    }
+
+
 }

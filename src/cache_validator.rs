@@ -220,13 +220,6 @@ impl MetadataIntegrityResult {
             warnings: Vec::new(),
         }
     }
-
-    /// Add a warning to the result
-    pub fn with_warning(mut self, warning: MetadataIntegrityWarning) -> Self {
-        self.warnings.push(warning);
-        self
-    }
-
     /// Get summary string
     pub fn summary(&self) -> String {
         if self.is_valid {

@@ -39,6 +39,8 @@ fn create_test_config() -> ConnectionPoolConfig {
         pool_check_interval: Duration::from_secs(10),
         dns_servers: Vec::new(),
         endpoint_overrides: std::collections::HashMap::new(),
+        ip_distribution_enabled: false,
+        max_idle_per_ip: 10,
     }
 }
 

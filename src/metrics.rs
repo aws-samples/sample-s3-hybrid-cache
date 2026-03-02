@@ -232,6 +232,8 @@ pub struct RequestMetrics {
     pub failed_requests: u64,
     pub average_response_time_ms: u64,
     pub requests_per_second: f32,
+    pub active_requests: u64,
+    pub max_concurrent_requests: u64,
 }
 
 /// Internal atomic metadata writes statistics tracking
@@ -301,6 +303,10 @@ pub struct MetricsManager {
     bucket_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
     last_metrics: Arc<RwLock<Option<SystemMetrics>>>,
     otlp_exporter: Option<Arc<RwLock<OtlpExporter>>>,
+    /// Active HTTP connections counter (shared with HttpProxy)
+    active_connections: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Maximum concurrent requests from config
+    max_concurrent_requests: usize,
 }
 
 /// Internal request statistics tracking
@@ -469,6 +475,8 @@ impl MetricsManager {
             bucket_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             last_metrics: Arc::new(RwLock::new(None)),
             otlp_exporter: None,
+            active_connections: None,
+            max_concurrent_requests: 200,
         }
     }
 
@@ -504,6 +512,12 @@ impl MetricsManager {
     /// Set cache size tracker reference
     pub fn set_cache_size_tracker(&mut self, cache_size_tracker: Arc<CacheSizeTracker>) {
         self.cache_size_tracker = Some(cache_size_tracker);
+    }
+
+    /// Set active connections counter and max concurrent requests for metrics reporting
+    pub fn set_active_connections(&mut self, active_connections: Arc<std::sync::atomic::AtomicUsize>, max_concurrent_requests: usize) {
+        self.active_connections = Some(active_connections);
+        self.max_concurrent_requests = max_concurrent_requests;
     }
 
     /// Record a request completion
@@ -855,6 +869,10 @@ impl MetricsManager {
             failed_requests: stats.failed_requests,
             average_response_time_ms,
             requests_per_second,
+            active_requests: self.active_connections.as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64)
+                .unwrap_or(0),
+            max_concurrent_requests: self.max_concurrent_requests as u64,
         }
     }
 
@@ -930,16 +948,6 @@ impl MetricsManager {
     pub async fn get_cached_metrics(&self) -> Option<SystemMetrics> {
         self.last_metrics.read().await.clone()
     }
-
-    /// Reset request statistics
-    pub async fn reset_request_stats(&self) {
-        let mut stats = self.request_stats.write().await;
-        *stats = RequestStats {
-            last_reset: SystemTime::now(),
-            ..Default::default()
-        };
-    }
-
     /// Record a proxy request for OTLP export (similar to Mountpoint S3)
     pub async fn record_proxy_request(
         &self,
@@ -977,15 +985,6 @@ impl MetricsManager {
             );
         }
     }
-
-    /// Shutdown OTLP exporter
-    pub async fn shutdown_otlp(&mut self) -> Result<()> {
-        if let Some(otlp_exporter) = &mut self.otlp_exporter {
-            otlp_exporter.write().await.shutdown().await?;
-        }
-        Ok(())
-    }
-
     /// Record corrupted metadata file event
     /// Requirement 8.1: Track metadata corruption events
     ///
@@ -1155,12 +1154,6 @@ impl MetricsManager {
 
         debug!("Recorded range load duration: {:.2}ms", duration_ms);
     }
-
-    /// Get range storage statistics
-    pub async fn get_range_storage_stats(&self) -> RangeStorageStats {
-        self.range_storage_stats.read().await.clone()
-    }
-
     /// Record old cache key format encounter
     /// Requirement 7.4: Track encounters with old cache key format (host:path) for migration monitoring
     ///
@@ -1369,12 +1362,6 @@ impl MetricsManager {
             stats.cache_failures_total
         );
     }
-
-    /// Get signed PUT statistics
-    pub async fn get_signed_put_stats(&self) -> SignedPutStats {
-        self.signed_put_stats.read().await.clone()
-    }
-
     /// Record cache bypass with reason
     /// Requirements: 5.5, 13.4
     ///
@@ -1591,50 +1578,11 @@ impl MetricsManager {
             "Cache cleanup operation failed"
         );
     }
-
-    /// Backward compatibility method for simple ETag validation recording
-    pub async fn record_etag_validation_simple(&self) {
-        self.record_etag_validation("unknown", "unknown", "unknown", true)
-            .await;
-    }
-
-    /// Backward compatibility method for simple ETag mismatch recording
-    pub async fn record_etag_mismatch_simple(&self) {
-        self.record_etag_mismatch("unknown", "unknown", "unknown")
-            .await;
-    }
-
-    /// Backward compatibility method for simple range invalidation recording
-    pub async fn record_range_invalidation_simple(&self) {
-        self.record_range_invalidation("unknown", &[], "unknown")
-            .await;
-    }
-
-    /// Backward compatibility method for simple orphaned ranges cleanup recording
-    pub async fn record_orphaned_ranges_cleaned_simple(&self, count: u64) {
-        let ranges: Vec<String> = (0..count).map(|i| format!("range_{}", i)).collect();
-        self.record_orphaned_ranges_cleaned("unknown", &ranges)
-            .await;
-    }
-
     /// Backward compatibility method for simple corrupted metadata recording
     pub async fn record_corrupted_metadata_simple(&self) {
         self.record_corrupted_metadata("unknown", "unknown", "unknown")
             .await;
     }
-
-    /// Backward compatibility method for simple cache operation duration recording
-    pub async fn record_cache_operation_duration_simple(&self, duration_ms: f64) {
-        self.record_cache_operation_duration("unknown", "unknown", duration_ms)
-            .await;
-    }
-
-    /// Backward compatibility method for simple cache cleanup failure recording
-    pub async fn record_cache_cleanup_failure_simple(&self) {
-        self.record_cache_cleanup_failure("unknown", "unknown", "unknown")
-            .await;
-    }
-
     /// Record part cache hit event
     /// Requirement 8.1: Track part cache hits for monitoring
     ///
@@ -1819,18 +1767,6 @@ impl MetricsManager {
             stats.timeouts_total
         );
     }
-
-    /// Record an S3 fetch saved by coalescing
-    /// Requirement 19.4: Track S3 fetches avoided
-    pub async fn record_coalesce_s3_fetch_saved(&self) {
-        let mut stats = self.coalescing_stats.write().await;
-        stats.s3_fetches_saved_total += 1;
-        debug!(
-            "Recorded S3 fetch saved (total: {})",
-            stats.s3_fetches_saved_total
-        );
-    }
-
     /// Record wait duration for coalescing
     /// Requirement 19.5: Track wait duration histogram
     pub async fn record_coalesce_wait_duration(&self, duration: std::time::Duration) {
@@ -1860,14 +1796,6 @@ impl MetricsManager {
         let mut stats = self.coalescing_stats.write().await;
         stats.fetcher_completions_error += 1;
     }
-
-    /// Get coalescing statistics
-    /// Returns the current coalescing metrics for monitoring
-    pub async fn get_coalescing_stats(&self) -> CoalescingStats {
-        let stats = self.coalescing_stats.read().await;
-        stats.clone()
-    }
-
     /// Record a per-bucket cache hit.
     /// Only call this for buckets that have a `_settings.json` file.
     /// Requirements: 11.1, 11.2
@@ -2447,11 +2375,6 @@ impl MetricsManager {
             total_fallbacks = stats.write_mode_fallbacks,
             "Atomic metadata write mode fallback occurred"
         );
-    }
-
-    /// Get atomic metadata statistics
-    pub async fn get_atomic_metadata_stats(&self) -> AtomicMetadataStats {
-        self.atomic_metadata_stats.read().await.clone()
     }
 }
 #[cfg(test)]

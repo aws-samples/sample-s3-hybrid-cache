@@ -45,9 +45,9 @@ connection_pool:
 - Default: 30 seconds
 
 #### 3. Max Lifetime
-- Background task checks for connections exceeding `max_lifetime`
-- Ensures connections are rotated periodically
-- Handles DNS changes and connection staleness
+- Connections are not actively closed when exceeding `max_lifetime`
+- Hyper's built-in idle timeout handles connection rotation
+- The `max_lifetime` config field is accepted but not currently enforced
 - Default: 300 seconds (5 minutes)
 
 #### 4. Per-IP Pool Isolation

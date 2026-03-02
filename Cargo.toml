@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "1.6.8"
+version = "1.8.2"
 edition = "2021"
 
 [dependencies]
@@ -66,6 +66,7 @@ scopeguard = "1.2"
 uuid = { version = "1.0", features = ["v4"] }
 bytes = "1.0"
 futures = "0.3"
+tokio-stream = "0.1"
 pin-project = "1.0"
 gethostname = "0.4"
 hostname = "0.3"

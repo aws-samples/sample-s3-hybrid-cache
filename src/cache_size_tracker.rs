@@ -310,12 +310,6 @@ impl CacheSizeTracker {
     pub async fn get_size(&self) -> u64 {
         self.consolidator.get_current_size().await
     }
-
-    /// Get validation path for testing
-    pub fn get_validation_path(&self) -> &std::path::Path {
-        &self.validation_path
-    }
-
     /// Set cache manager reference for GET cache expiration
     pub fn set_cache_manager(&self, cache_manager: Weak<crate::cache::CacheManager>) {
         *self.cache_manager.lock().unwrap() = Some(cache_manager);

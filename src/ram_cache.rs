@@ -14,20 +14,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
-
-/// Result of verifying RAM cache entry against disk cache
-#[derive(Debug, Clone, PartialEq)]
-pub enum VerificationResult {
-    /// RAM cache data matches disk cache data
-    Valid,
-    /// RAM cache data does not match disk cache data
-    Invalid,
-    /// Disk cache entry does not exist
-    DiskMissing,
-    /// Verification failed due to I/O error
-    Error(String),
-}
-
 /// RAM cache manager with configurable eviction algorithms
 pub struct RamCache {
     /// Maximum size in bytes
@@ -412,16 +398,6 @@ impl RamCache {
             None
         }
     }
-
-    /// Extract the base key from a cache key (without range suffix)
-    pub fn extract_base_key(cache_key: &str) -> String {
-        if let Some((base_key, _, _)) = Self::parse_range_cache_key(cache_key) {
-            base_key
-        } else {
-            cache_key.to_string()
-        }
-    }
-
     /// Record a RAM cache access for disk metadata update
     ///
     /// Note: This is now a no-op. Access tracking is handled by the journal system
@@ -431,19 +407,6 @@ impl RamCache {
         // No-op: Access tracking is now handled by the journal system
         // at the DiskCacheManager level via CacheHitUpdateBuffer
     }
-
-    /// Check if verification is needed for a cache key
-    /// Note: Always returns false as verification is no longer needed with journal system
-    pub fn should_verify(&self, _cache_key: &str) -> bool {
-        false
-    }
-
-    /// Record that verification was performed for a cache key
-    /// Note: This is now a no-op as verification is no longer needed with journal system
-    pub fn record_verification(&mut self, _cache_key: &str) {
-        // No-op
-    }
-
     /// Get the number of pending disk updates
     /// Note: Always returns 0 as access tracking is now handled by journal system
     pub fn pending_disk_updates(&self) -> usize {
@@ -481,20 +444,6 @@ impl RamCache {
 
         Ok(evicted_count)
     }
-
-    /// Unified eviction with TTL-aware priority (expired entries first, then LRU/TinyLFU)
-    pub fn evict_entry_with_ttl_priority(&mut self) -> Result<()> {
-        // First, try to evict any expired entries
-        if let Ok(evicted_count) = self.evict_expired_entries() {
-            if evicted_count > 0 {
-                return Ok(());
-            }
-        }
-
-        // If no expired entries, use normal eviction algorithm
-        self.evict_entry()
-    }
-
     /// Invalidate an entry from the cache
     pub fn invalidate_entry(&mut self, cache_key: &str) -> Result<()> {
         if let Some(entry) = self.entries.remove(cache_key) {

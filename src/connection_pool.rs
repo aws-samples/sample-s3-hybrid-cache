@@ -7,6 +7,7 @@ use crate::{ProxyError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 use trust_dns_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
@@ -134,6 +135,83 @@ impl Default for HealthMetrics {
     }
 }
 
+/// Distributes requests across S3 IP addresses using round-robin selection.
+///
+/// Maintains a set of IP addresses and an atomic counter for lock-free
+/// round-robin distribution. Used by `ConnectionPoolManager` to select
+/// target IPs for per-IP connection pool separation.
+#[derive(Debug)]
+pub struct IpDistributor {
+    ips: Vec<IpAddr>,
+    counter: AtomicUsize,
+}
+
+impl IpDistributor {
+    /// Create a new IpDistributor with the given set of IP addresses.
+    pub fn new(ips: Vec<IpAddr>) -> Self {
+        Self {
+            ips,
+            counter: AtomicUsize::new(0),
+        }
+    }
+
+    /// Select the next IP address using round-robin distribution.
+    ///
+    /// Returns `None` if the IP set is empty. Uses `fetch_add` with
+    /// `Relaxed` ordering for lock-free atomic increment.
+    pub fn select_ip(&self) -> Option<IpAddr> {
+        if self.ips.is_empty() {
+            return None;
+        }
+        let index = self.counter.fetch_add(1, Ordering::Relaxed) % self.ips.len();
+        Some(self.ips[index])
+    }
+
+    /// Replace the IP set with new IPs from a DNS refresh.
+    ///
+    /// Logs additions and removals at info level. Resets the round-robin
+    /// counter to avoid modulo bias when the set size changes.
+    pub fn update_ips(&mut self, new_ips: Vec<IpAddr>, reason: &str) {
+        let added: Vec<&IpAddr> = new_ips.iter().filter(|ip| !self.ips.contains(ip)).collect();
+        let removed: Vec<&IpAddr> = self.ips.iter().filter(|ip| !new_ips.contains(ip)).collect();
+
+        for ip in &added {
+            info!(ip = %ip, reason = %reason, "IP added to distributor");
+        }
+        for ip in &removed {
+            info!(ip = %ip, reason = %reason, "IP removed from distributor");
+        }
+
+        self.ips = new_ips;
+        self.counter.store(0, Ordering::Relaxed);
+    }
+
+    /// Remove a specific IP address from the selection set.
+    ///
+    /// This only removes the IP from the distributor's selection Vec so new
+    /// requests are no longer routed to it. Existing connections to the removed
+    /// IP remain in hyper's internal pool and in-flight requests on those
+    /// connections complete naturally — hyper manages connection lifecycle
+    /// independently of the distributor. No explicit abort logic is needed.
+    pub fn remove_ip(&mut self, ip: IpAddr, reason: &str) {
+        if let Some(pos) = self.ips.iter().position(|&x| x == ip) {
+            self.ips.remove(pos);
+            info!(ip = %ip, reason = %reason, "IP removed from distributor");
+            self.counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Return the number of IPs currently in the selection set.
+    pub fn ip_count(&self) -> usize {
+        self.ips.len()
+    }
+
+    /// Return a snapshot of the current IP set for health check reporting.
+    pub fn get_ips(&self) -> Vec<IpAddr> {
+        self.ips.clone()
+    }
+}
+
 /// Connection pool manager
 pub struct ConnectionPoolManager {
     pools: HashMap<String, ConnectionPool>,
@@ -144,50 +222,11 @@ pub struct ConnectionPoolManager {
     dns_refresh_count: u64,
     /// Static hostname-to-IP mappings that bypass DNS resolution (for PrivateLink etc.)
     endpoint_overrides: HashMap<String, Vec<IpAddr>>,
+    /// Per-endpoint IP distributors for round-robin request distribution
+    ip_distributors: HashMap<String, IpDistributor>,
 }
 
 impl ConnectionPool {
-    /// Get the best performing IP addresses for connection selection
-    pub fn get_best_performing_ips(&self, limit: usize) -> Vec<IpAddr> {
-        let mut ip_scores: Vec<(IpAddr, f64)> = self
-            .health_metrics
-            .iter()
-            .filter(|(_, metrics)| !metrics.is_excluded)
-            .map(|(&ip, metrics)| {
-                let score = metrics.success_rate as f64
-                    - (metrics.average_latency.as_millis() as f64 / 1000.0) * 0.1
-                    - (metrics.consecutive_failures as f64 * 0.2);
-                (ip, score)
-            })
-            .collect();
-
-        ip_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ip_scores
-            .into_iter()
-            .take(limit)
-            .map(|(ip, _)| ip)
-            .collect()
-    }
-
-    /// Check if DNS refresh is needed
-    pub fn needs_dns_refresh(&self) -> bool {
-        SystemTime::now()
-            .duration_since(self.last_dns_refresh)
-            .unwrap_or(Duration::ZERO)
-            >= self.dns_refresh_interval
-    }
-
-    /// Get connection count for a specific IP
-    pub fn get_connection_count(&self, ip: IpAddr) -> usize {
-        self.connections.get(&ip).map_or(0, |conns| conns.len())
-    }
-
-    /// Get active connection count for a specific IP
-    pub fn get_active_connection_count(&self, ip: IpAddr) -> usize {
-        self.connections
-            .get(&ip)
-            .map_or(0, |conns| conns.iter().filter(|c| c.is_active).count())
-    }
 }
 
 impl ConnectionPoolManager {
@@ -225,6 +264,7 @@ impl ConnectionPoolManager {
             default_load_balancing_strategy: LoadBalancingStrategy::PerformanceBased,
             dns_refresh_count: 0,
             endpoint_overrides: HashMap::new(),
+            ip_distributors: HashMap::new(),
         })
     }
 
@@ -302,6 +342,7 @@ impl ConnectionPoolManager {
             default_load_balancing_strategy: LoadBalancingStrategy::PerformanceBased,
             dns_refresh_count: 0,
             endpoint_overrides,
+            ip_distributors: HashMap::new(),
         })
     }
 
@@ -683,12 +724,50 @@ impl ConnectionPoolManager {
             }
         }
 
+        // Update the IP distributor with the current set of healthy IPs (Requirements 3.1, 3.2)
+        // Filter out excluded IPs so the distributor only selects healthy ones
+        let healthy_ips: Vec<IpAddr> = if let Some(pool) = self.pools.get(endpoint) {
+            new_ip_addresses
+                .iter()
+                .filter(|ip| {
+                    pool.health_metrics
+                        .get(ip)
+                        .map(|m| !m.is_excluded)
+                        .unwrap_or(true)
+                })
+                .copied()
+                .collect()
+        } else {
+            new_ip_addresses.clone()
+        };
+
+        if let Some(distributor) = self.ip_distributors.get_mut(endpoint) {
+            info!(
+                endpoint = %endpoint,
+                ip_count = healthy_ips.len(),
+                "Updating IP distributor on DNS refresh"
+            );
+            distributor.update_ips(healthy_ips, "DNS refresh");
+        } else {
+            info!(
+                endpoint = %endpoint,
+                ip_count = healthy_ips.len(),
+                "Creating IP distributor on DNS refresh"
+            );
+            self.ip_distributors
+                .insert(endpoint.to_string(), IpDistributor::new(healthy_ips));
+        }
+
         Ok(())
     }
 
     /// Monitor connection health for all pools (Requirement 16.3)
     pub async fn monitor_connection_health(&mut self) -> Result<()> {
         let now = SystemTime::now();
+
+        // Collect IP exclusion/re-enable events to update distributors after the loop
+        let mut excluded_ips: Vec<(String, IpAddr)> = Vec::new();
+        let mut reenabled_ips: Vec<(String, IpAddr)> = Vec::new();
 
         for (endpoint, pool) in self.pools.iter_mut() {
             for (ip, metrics) in pool.health_metrics.iter_mut() {
@@ -699,9 +778,30 @@ impl ConnectionPoolManager {
                             metrics.is_excluded = false;
                             metrics.exclusion_expires_at = None;
                             metrics.consecutive_failures = 0;
-                            info!("Re-enabled IP address {} for endpoint {}", ip, endpoint);
+                            info!(
+                                ip = %ip,
+                                endpoint = %endpoint,
+                                reason = "exclusion expiry",
+                                "Re-enabled IP address for endpoint"
+                            );
+                            reenabled_ips.push((endpoint.clone(), *ip));
                         }
                     }
+                }
+
+                // Mark IP as excluded if consecutive failures exceed threshold (Requirement 3.4)
+                if !metrics.is_excluded && metrics.consecutive_failures >= 3 {
+                    metrics.is_excluded = true;
+                    metrics.exclusion_expires_at =
+                        Some(now + Duration::from_secs(30));
+                    info!(
+                        ip = %ip,
+                        endpoint = %endpoint,
+                        reason = "health exclusion",
+                        consecutive_failures = metrics.consecutive_failures,
+                        "Excluded IP address from distributor"
+                    );
+                    excluded_ips.push((endpoint.clone(), *ip));
                 }
 
                 // Update active connection count
@@ -725,62 +825,27 @@ impl ConnectionPoolManager {
             }
         }
 
-        Ok(())
-    }
-
-    /// Record request metrics for performance tracking
-    pub fn record_request_metrics(
-        &mut self,
-        endpoint: &str,
-        ip: IpAddr,
-        latency: Duration,
-        throughput: Option<f64>,
-        success: bool,
-    ) -> Result<()> {
-        if let Some(pool) = self.pools.get_mut(endpoint) {
-            if let Some(metrics) = pool.health_metrics.get_mut(&ip) {
-                metrics.total_requests += 1;
-
-                if success {
-                    metrics.consecutive_failures = 0;
-                } else {
-                    metrics.failed_requests += 1;
-                    metrics.consecutive_failures += 1;
-                    metrics.last_failure = Some(SystemTime::now());
-
-                    // Exclude IP if too many consecutive failures (Requirement 16.7)
-                    if metrics.consecutive_failures >= 3 {
-                        metrics.is_excluded = true;
-                        metrics.exclusion_expires_at =
-                            Some(SystemTime::now() + Duration::from_secs(30)); // 30 seconds
-                        warn!(
-                            "Excluded IP address {} for 30 seconds due to {} consecutive failures",
-                            ip, metrics.consecutive_failures
-                        );
-                    }
-                }
-
-                // Update performance metrics
-                metrics.performance_metrics.latency_samples.push(latency);
-                if let Some(tp) = throughput {
-                    metrics.performance_metrics.throughput_samples.push(tp);
-                }
-                metrics.performance_metrics.sample_count += 1;
-                metrics.performance_metrics.last_updated = SystemTime::now();
-
-                // Keep only recent samples (last 100)
-                if metrics.performance_metrics.latency_samples.len() > 100 {
-                    metrics.performance_metrics.latency_samples.remove(0);
-                }
-                if metrics.performance_metrics.throughput_samples.len() > 100 {
-                    metrics.performance_metrics.throughput_samples.remove(0);
-                }
+        // Update IP distributors for excluded IPs (Requirement 3.4)
+        for (endpoint, ip) in excluded_ips {
+            if let Some(distributor) = self.ip_distributors.get_mut(&endpoint) {
+                distributor.remove_ip(ip, "health exclusion");
             }
+        }
+
+        // Note: Re-enabled IPs will be re-added on the next DNS refresh via update_ips.
+        // We don't add them back here because the distributor's update_ips in
+        // refresh_endpoint_dns already filters out excluded IPs.
+        // Log re-enabled IPs for observability (Requirement 6.3)
+        for (endpoint, ip) in reenabled_ips {
+            debug!(
+                ip = %ip,
+                endpoint = %endpoint,
+                "Re-enabled IP will be added back to distributor on next DNS refresh"
+            );
         }
 
         Ok(())
     }
-
     /// Release a connection back to the pool
     pub fn release_connection(&mut self, endpoint: &str, connection_id: &str) -> Result<()> {
         if let Some(pool) = self.pools.get_mut(endpoint) {
@@ -867,150 +932,6 @@ impl ConnectionPoolManager {
         let connection = self.get_connection(endpoint, request_size).await?;
         Ok(vec![connection])
     }
-
-    /// Track IP address performance for intelligent selection (Requirement 16.4)
-    pub fn track_ip_performance(
-        &mut self,
-        endpoint: &str,
-        ip: IpAddr,
-        performance_score: f64,
-    ) -> Result<()> {
-        if let Some(pool) = self.pools.get_mut(endpoint) {
-            if let Some(metrics) = pool.health_metrics.get_mut(&ip) {
-                // Update performance tracking
-                let current_time = SystemTime::now();
-                metrics.performance_metrics.last_updated = current_time;
-
-                // De-prioritize consistently poor performing IPs (Requirement 16.4)
-                if performance_score < 0.3 {
-                    metrics.consecutive_failures += 1;
-                    if metrics.consecutive_failures >= 5 {
-                        metrics.is_excluded = true;
-                        metrics.exclusion_expires_at =
-                            Some(current_time + Duration::from_secs(600)); // 10 minutes
-                        warn!("De-prioritized IP address {} due to poor performance", ip);
-                    }
-                } else {
-                    metrics.consecutive_failures = 0;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Balance load across connections based on current utilization
-    pub fn balance_load(&mut self, endpoint: &str) -> Result<()> {
-        if let Some(pool) = self.pools.get_mut(endpoint) {
-            // Calculate load distribution across IPs
-            let mut ip_loads: Vec<(IpAddr, f64)> = Vec::new();
-
-            for (&ip, connections) in &pool.connections {
-                let active_count = connections.iter().filter(|c| c.is_active).count();
-                let load = active_count as f64 / pool.max_connections_per_ip as f64;
-                ip_loads.push((ip, load));
-            }
-
-            // Sort by load (ascending)
-            ip_loads.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Log load distribution for monitoring
-            for (ip, load) in &ip_loads {
-                debug!("IP {} load: {:.2}%", ip, load * 100.0);
-            }
-
-            // Update preferred status based on load
-            for (ip, load) in ip_loads {
-                if let Some(dns_cache) = &mut pool.dns_cache {
-                    if let Some(ip_info) = dns_cache
-                        .ip_addresses
-                        .iter_mut()
-                        .find(|info| info.ip_address == ip)
-                    {
-                        ip_info.is_preferred = load < 0.8; // Mark as preferred if under 80% load
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Handle connection failures and implement exclusion logic (Requirement 16.7)
-    pub fn handle_connection_failure(
-        &mut self,
-        endpoint: &str,
-        ip: IpAddr,
-        error_type: &str,
-    ) -> Result<()> {
-        if let Some(pool) = self.pools.get_mut(endpoint) {
-            if let Some(metrics) = pool.health_metrics.get_mut(&ip) {
-                metrics.failed_requests += 1;
-                metrics.consecutive_failures += 1;
-                metrics.last_failure = Some(SystemTime::now());
-
-                // Implement progressive exclusion based on failure type and count
-                let exclusion_duration = match error_type {
-                    "timeout" => Duration::from_secs(60 * metrics.consecutive_failures as u64), // Progressive timeout
-                    "connection_refused" => Duration::from_secs(60), // 1 minute for connection refused
-                    "dns_failure" => Duration::from_secs(60),        // 1 minute for DNS issues
-                    _ => Duration::from_secs(30),                    // 30 seconds for other errors
-                };
-
-                // Exclude IP if failures exceed threshold
-                if metrics.consecutive_failures >= 3 {
-                    metrics.is_excluded = true;
-                    metrics.exclusion_expires_at = Some(SystemTime::now() + exclusion_duration);
-
-                    // Close all connections to the failed IP
-                    if let Some(connections) = pool.connections.get_mut(&ip) {
-                        connections.clear();
-                    }
-
-                    warn!(
-                        "Excluded IP address {} for {} seconds due to {} consecutive {} failures",
-                        ip,
-                        exclusion_duration.as_secs(),
-                        metrics.consecutive_failures,
-                        error_type
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Periodically retry excluded IP addresses (Requirement 16.7)
-    pub async fn retry_excluded_ips(&mut self) -> Result<()> {
-        let now = SystemTime::now();
-
-        for (endpoint, pool) in self.pools.iter_mut() {
-            let excluded_ips: Vec<IpAddr> = pool
-                .health_metrics
-                .iter()
-                .filter(|(_, metrics)| {
-                    metrics.is_excluded
-                        && metrics
-                            .exclusion_expires_at
-                            .map_or(true, |expires| now > expires)
-                })
-                .map(|(&ip, _)| ip)
-                .collect();
-
-            for ip in excluded_ips {
-                if let Some(metrics) = pool.health_metrics.get_mut(&ip) {
-                    metrics.is_excluded = false;
-                    metrics.exclusion_expires_at = None;
-                    metrics.consecutive_failures = 0;
-                    info!(
-                        "Retrying previously excluded IP address {} for endpoint {}",
-                        ip, endpoint
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Get health metrics for all connections
     pub async fn get_health_metrics(&self) -> Result<Vec<HealthMetrics>> {
         let mut all_metrics = Vec::new();
@@ -1057,17 +978,99 @@ impl ConnectionPoolManager {
         })
     }
 
-    /// Get connection statistics for all endpoints
-    pub fn get_all_connection_statistics(&self) -> Vec<ConnectionStatistics> {
-        self.pools
-            .keys()
-            .filter_map(|endpoint| self.get_connection_statistics(endpoint))
-            .collect()
+    /// Get per-IP connection distribution statistics for all endpoints with active distributors.
+    ///
+    /// Returns per-IP active/idle connection counts for each endpoint that has an
+    /// IpDistributor, enabling operators to verify load distribution (Requirement 6.1).
+    pub fn get_ip_distribution_stats(&self) -> IpDistributionStats {
+        let mut endpoints = Vec::new();
+
+        for (endpoint, distributor) in &self.ip_distributors {
+            let distributor_ips = distributor.get_ips();
+            let mut ip_stats = Vec::new();
+
+            for ip in &distributor_ips {
+                let (active, idle) = self
+                    .pools
+                    .get(endpoint)
+                    .and_then(|pool| pool.connections.get(ip))
+                    .map(|connections| {
+                        let active = connections.iter().filter(|c| c.is_active).count();
+                        let idle = connections.len() - active;
+                        (active, idle)
+                    })
+                    .unwrap_or((0, 0));
+
+                ip_stats.push(IpConnectionStats {
+                    ip: ip.to_string(),
+                    active_connections: active,
+                    idle_connections: idle,
+                });
+            }
+
+            endpoints.push(EndpointIpDistributionStats {
+                endpoint: endpoint.clone(),
+                total_distributor_ips: distributor_ips.len(),
+                ips: ip_stats,
+            });
+        }
+
+        IpDistributionStats { endpoints }
     }
 
     /// Get DNS refresh count
     pub fn get_dns_refresh_count(&self) -> u64 {
         self.dns_refresh_count
+    }
+
+    /// Get a distributed IP address for the given endpoint using round-robin selection.
+    ///
+    /// For endpoints with `endpoint_overrides`, lazily initializes an `IpDistributor`
+    /// from the static IPs on first call (Requirement 4.1).
+    /// For DNS-resolved endpoints, the distributor is populated by `refresh_endpoint_dns`
+    /// (Requirement 4.2).
+    /// Returns `None` if no distributor exists or the IP set is empty, triggering
+    /// fallback to hostname-based resolution (Requirement 7.1).
+    pub fn get_distributed_ip(&mut self, endpoint: &str) -> Option<IpAddr> {
+        // Lazily initialize distributor from endpoint_overrides if not yet created (Req 4.1)
+        if !self.ip_distributors.contains_key(endpoint) {
+            if let Some(override_ips) = self.endpoint_overrides.get(endpoint) {
+                if !override_ips.is_empty() {
+                    info!(
+                        endpoint = %endpoint,
+                        ip_count = override_ips.len(),
+                        "Initializing IP distributor from endpoint overrides"
+                    );
+                    self.ip_distributors
+                        .insert(endpoint.to_string(), IpDistributor::new(override_ips.clone()));
+                }
+            }
+        }
+
+        // Delegate to the distributor's round-robin selection (Req 1.1, 4.2, 4.3)
+        self.ip_distributors
+            .get(endpoint)
+            .and_then(|d| d.select_ip())
+    }
+
+    /// Look up the endpoint hostname that owns a given IP address.
+    ///
+    /// Searches all IP distributors to find which endpoint the IP belongs to.
+    /// Used by `CustomHttpsConnector` to determine the original hostname for TLS SNI
+    /// when the URI authority has been rewritten to an IP address (Requirement 2.1).
+    pub fn get_hostname_for_ip(&self, ip: &IpAddr) -> Option<String> {
+        for (endpoint, distributor) in &self.ip_distributors {
+            if distributor.get_ips().contains(ip) {
+                return Some(endpoint.clone());
+            }
+        }
+        // Also check endpoint_overrides for IPs not yet in a distributor
+        for (endpoint, ips) in &self.endpoint_overrides {
+            if ips.contains(ip) {
+                return Some(endpoint.clone());
+            }
+        }
+        None
     }
 
     /// Cleanup idle connections to free resources
@@ -1152,6 +1155,28 @@ impl ConnectionPoolManager {
     }
 }
 
+/// Per-IP connection count statistics for observability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpConnectionStats {
+    pub ip: String,
+    pub active_connections: usize,
+    pub idle_connections: usize,
+}
+
+/// IP distribution statistics for a single endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointIpDistributionStats {
+    pub endpoint: String,
+    pub total_distributor_ips: usize,
+    pub ips: Vec<IpConnectionStats>,
+}
+
+/// Aggregated IP distribution statistics across all endpoints
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpDistributionStats {
+    pub endpoints: Vec<EndpointIpDistributionStats>,
+}
+
 /// Connection statistics for monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionStatistics {
@@ -1163,4 +1188,493 @@ pub struct ConnectionStatistics {
     pub idle_connections: usize,
     pub last_dns_refresh: SystemTime,
     pub next_dns_refresh: SystemTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_ips(count: u8) -> Vec<IpAddr> {
+        (1..=count)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))
+            .collect()
+    }
+
+    #[test]
+    fn test_select_ip_returns_none_when_empty() {
+        let distributor = IpDistributor::new(vec![]);
+        assert!(distributor.select_ip().is_none());
+    }
+
+    #[test]
+    fn test_round_robin_cycles_through_all_ips_in_order() {
+        let ips = test_ips(3);
+        let distributor = IpDistributor::new(ips.clone());
+
+        // First cycle
+        assert_eq!(distributor.select_ip(), Some(ips[0]));
+        assert_eq!(distributor.select_ip(), Some(ips[1]));
+        assert_eq!(distributor.select_ip(), Some(ips[2]));
+
+        // Second cycle wraps around
+        assert_eq!(distributor.select_ip(), Some(ips[0]));
+        assert_eq!(distributor.select_ip(), Some(ips[1]));
+        assert_eq!(distributor.select_ip(), Some(ips[2]));
+    }
+
+    #[test]
+    fn test_update_ips_replaces_set_and_resets_counter() {
+        let mut distributor = IpDistributor::new(test_ips(3));
+
+        // Advance counter past first IP
+        distributor.select_ip();
+        distributor.select_ip();
+
+        // Replace with new IPs
+        let new_ips = vec![
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
+        ];
+        distributor.update_ips(new_ips.clone(), "DNS refresh");
+
+        // Counter reset: first selection returns the first new IP
+        assert_eq!(distributor.select_ip(), Some(new_ips[0]));
+        assert_eq!(distributor.select_ip(), Some(new_ips[1]));
+        assert_eq!(distributor.ip_count(), 2);
+        assert_eq!(distributor.get_ips(), new_ips);
+    }
+
+    #[test]
+    fn test_remove_ip_excludes_from_selection() {
+        let ips = test_ips(3);
+        let mut distributor = IpDistributor::new(ips.clone());
+
+        distributor.remove_ip(ips[1], "health exclusion"); // remove 10.0.0.2
+
+        assert_eq!(distributor.ip_count(), 2);
+
+        // Only 10.0.0.1 and 10.0.0.3 remain
+        let selected: Vec<IpAddr> = (0..4).filter_map(|_| distributor.select_ip()).collect();
+        assert_eq!(selected, vec![ips[0], ips[2], ips[0], ips[2]]);
+    }
+
+    #[test]
+    fn test_remove_ip_nonexistent_is_noop() {
+        let ips = test_ips(2);
+        let mut distributor = IpDistributor::new(ips.clone());
+
+        let nonexistent = IpAddr::V4(Ipv4Addr::new(99, 99, 99, 99));
+        distributor.remove_ip(nonexistent, "health exclusion");
+
+        assert_eq!(distributor.ip_count(), 2);
+        assert_eq!(distributor.get_ips(), ips);
+    }
+
+    #[test]
+    fn test_remove_all_ips_then_select_returns_none() {
+        let ips = test_ips(2);
+        let mut distributor = IpDistributor::new(ips.clone());
+
+        distributor.remove_ip(ips[0], "health exclusion");
+        distributor.remove_ip(ips[1], "health exclusion");
+
+        assert_eq!(distributor.ip_count(), 0);
+        assert!(distributor.select_ip().is_none());
+    }
+
+    #[test]
+    fn test_single_ip_always_selected() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let distributor = IpDistributor::new(vec![ip]);
+
+        for _ in 0..5 {
+            assert_eq!(distributor.select_ip(), Some(ip));
+        }
+    }
+
+    // --- DNS lifecycle integration tests (Task 4.3) ---
+
+    #[test]
+    fn test_update_ips_after_dns_refresh_selects_new_ips() {
+        // Simulate DNS refresh: start with old IPs, update to new ones,
+        // verify new IPs are selected and old ones are not.
+        let old_ips = test_ips(2); // 10.0.0.1, 10.0.0.2
+        let mut distributor = IpDistributor::new(old_ips.clone());
+
+        // Verify old IPs work
+        assert_eq!(distributor.select_ip(), Some(old_ips[0]));
+
+        // DNS refresh returns new IPs
+        let new_ips = vec![
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 1)),
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 2)),
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 3)),
+        ];
+        distributor.update_ips(new_ips.clone(), "DNS refresh");
+
+        // All selections should come from new IPs only
+        let selected: Vec<IpAddr> = (0..6).filter_map(|_| distributor.select_ip()).collect();
+        assert_eq!(selected, vec![
+            new_ips[0], new_ips[1], new_ips[2],
+            new_ips[0], new_ips[1], new_ips[2],
+        ]);
+
+        // Old IPs must not appear
+        for ip in &old_ips {
+            assert!(!selected.contains(ip));
+        }
+    }
+
+    #[test]
+    fn test_removed_ip_no_longer_selected() {
+        // Simulate health exclusion: remove an IP, verify it never appears in selection.
+        let ips = test_ips(4); // 10.0.0.1 .. 10.0.0.4
+        let mut distributor = IpDistributor::new(ips.clone());
+
+        // Remove 10.0.0.2 and 10.0.0.4
+        distributor.remove_ip(ips[1], "health exclusion");
+        distributor.remove_ip(ips[3], "health exclusion");
+
+        // Select many times, verify removed IPs never appear
+        let selected: Vec<IpAddr> = (0..20).filter_map(|_| distributor.select_ip()).collect();
+        assert!(!selected.contains(&ips[1]));
+        assert!(!selected.contains(&ips[3]));
+        // Only 10.0.0.1 and 10.0.0.3 should be selected
+        for ip in &selected {
+            assert!(ip == &ips[0] || ip == &ips[2]);
+        }
+    }
+
+    #[test]
+    fn test_endpoint_overrides_used_for_distribution() {
+        // When endpoint_overrides are configured, get_distributed_ip should
+        // lazily initialize a distributor from those static IPs.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.1.100".to_string(), "10.0.2.100".to_string()],
+        );
+
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        let expected_ips = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, 100)),
+        ];
+
+        // First call lazily initializes the distributor from overrides
+        let ip1 = manager.get_distributed_ip("s3.us-west-2.amazonaws.com");
+        let ip2 = manager.get_distributed_ip("s3.us-west-2.amazonaws.com");
+        let ip3 = manager.get_distributed_ip("s3.us-west-2.amazonaws.com");
+
+        assert_eq!(ip1, Some(expected_ips[0]));
+        assert_eq!(ip2, Some(expected_ips[1]));
+        // Round-robin wraps
+        assert_eq!(ip3, Some(expected_ips[0]));
+    }
+
+    #[test]
+    fn test_get_distributed_ip_returns_none_no_distributor() {
+        // When no distributor exists and no overrides exist, get_distributed_ip returns None.
+        // This covers the startup scenario before DNS resolution completes (Requirement 7.1, 7.3).
+        let config = crate::config::ConnectionPoolConfig::default();
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        assert_eq!(manager.get_distributed_ip("s3.eu-west-1.amazonaws.com"), None);
+    }
+
+    #[test]
+    fn test_startup_before_dns_resolution_falls_back_to_hostname() {
+        // Validates: Requirements 7.1, 7.3
+        // At startup, no DNS refresh has occurred, so ip_distributors is empty.
+        // get_distributed_ip must return None for any endpoint, which triggers
+        // the fallback path in try_forward_request to use the original hostname URI.
+        let config = crate::config::ConnectionPoolConfig {
+            ip_distribution_enabled: true,
+            ..crate::config::ConnectionPoolConfig::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        // ip_distributors is empty at startup — no DNS refresh has happened
+        assert!(manager.ip_distributors.is_empty());
+
+        // Multiple different S3 endpoints all return None before DNS resolves
+        assert_eq!(manager.get_distributed_ip("s3.eu-west-1.amazonaws.com"), None);
+        assert_eq!(manager.get_distributed_ip("s3.us-east-1.amazonaws.com"), None);
+        assert_eq!(manager.get_distributed_ip("s3.ap-southeast-1.amazonaws.com"), None);
+
+        // Distributors remain empty (no lazy initialization without endpoint_overrides)
+        assert!(manager.ip_distributors.is_empty());
+    }
+
+    // --- TLS SNI preservation tests (Task 8.2, Requirement 2.1) ---
+
+    #[test]
+    fn test_get_hostname_for_ip_returns_endpoint_from_distributor() {
+        // When an IP is present in an IpDistributor, get_hostname_for_ip should
+        // return the endpoint hostname associated with that distributor.
+        let config = crate::config::ConnectionPoolConfig::default();
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 224)),
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 225)),
+        ];
+        let endpoint = "s3.eu-west-1.amazonaws.com";
+        manager
+            .ip_distributors
+            .insert(endpoint.to_string(), IpDistributor::new(ips.clone()));
+
+        assert_eq!(
+            manager.get_hostname_for_ip(&ips[0]),
+            Some(endpoint.to_string())
+        );
+        assert_eq!(
+            manager.get_hostname_for_ip(&ips[1]),
+            Some(endpoint.to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_hostname_for_ip_returns_endpoint_from_overrides() {
+        // When an IP is in endpoint_overrides but not yet in a distributor,
+        // get_hostname_for_ip should still find it via the overrides fallback.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "s3.us-east-1.amazonaws.com".to_string(),
+            vec!["10.0.1.50".to_string(), "10.0.1.51".to_string()],
+        );
+
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+
+        let manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 50));
+        assert_eq!(
+            manager.get_hostname_for_ip(&ip),
+            Some("s3.us-east-1.amazonaws.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_hostname_for_ip_returns_none_when_not_found() {
+        // When an IP is not in any distributor or endpoint_overrides,
+        // get_hostname_for_ip should return None.
+        let config = crate::config::ConnectionPoolConfig::default();
+        let manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        let unknown_ip = IpAddr::V4(Ipv4Addr::new(99, 99, 99, 99));
+        assert_eq!(manager.get_hostname_for_ip(&unknown_ip), None);
+    }
+
+    #[test]
+    fn test_ip_address_detection_for_tls_sni() {
+        // The CustomHttpsConnector uses IpAddr::from_str to detect whether a URI
+        // host is an IP address (from IpDistributor rewriting) or a hostname.
+        // This test verifies that detection works correctly.
+        use std::net::IpAddr;
+
+        // IP addresses parse successfully — triggers the IP-based TLS SNI path
+        assert!("52.92.17.224".parse::<IpAddr>().is_ok());
+        assert!("10.0.1.100".parse::<IpAddr>().is_ok());
+        assert!("2600:1fa0:4a42::".parse::<IpAddr>().is_ok()); // IPv6
+
+        // Hostnames fail to parse — uses hostname directly for TLS SNI
+        assert!("s3.amazonaws.com".parse::<IpAddr>().is_err());
+        assert!("s3.eu-west-1.amazonaws.com".parse::<IpAddr>().is_err());
+        assert!("my-bucket.s3.amazonaws.com".parse::<IpAddr>().is_err());
+    }
+
+    // --- Observability tests (Task 10.3, Requirements 6.1, 6.2, 6.3) ---
+
+    #[test]
+    fn test_get_ip_distribution_stats_returns_correct_per_ip_counts() {
+        // Create a ConnectionPoolManager with endpoint_overrides so we can
+        // lazily initialize a distributor via get_distributed_ip.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "s3.eu-west-1.amazonaws.com".to_string(),
+            vec!["10.0.0.1".to_string(), "10.0.0.2".to_string(), "10.0.0.3".to_string()],
+        );
+
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        // Trigger lazy initialization of the distributor
+        let _ = manager.get_distributed_ip("s3.eu-west-1.amazonaws.com");
+
+        let stats = manager.get_ip_distribution_stats();
+
+        // Should have one endpoint entry
+        assert_eq!(stats.endpoints.len(), 1);
+        let ep = &stats.endpoints[0];
+        assert_eq!(ep.endpoint, "s3.eu-west-1.amazonaws.com");
+        assert_eq!(ep.total_distributor_ips, 3);
+        assert_eq!(ep.ips.len(), 3);
+
+        // Verify all three IPs are present with zero connections (no pool created)
+        let ip_strings: Vec<&str> = ep.ips.iter().map(|s| s.ip.as_str()).collect();
+        assert!(ip_strings.contains(&"10.0.0.1"));
+        assert!(ip_strings.contains(&"10.0.0.2"));
+        assert!(ip_strings.contains(&"10.0.0.3"));
+
+        for ip_stat in &ep.ips {
+            assert_eq!(ip_stat.active_connections, 0);
+            assert_eq!(ip_stat.idle_connections, 0);
+        }
+    }
+
+    #[test]
+    fn test_get_ip_distribution_stats_empty_when_no_distributors() {
+        // A default ConnectionPoolManager has no distributors, so stats should be empty.
+        let config = crate::config::ConnectionPoolConfig::default();
+        let manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        let stats = manager.get_ip_distribution_stats();
+        assert!(stats.endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_update_ips_and_remove_ip_with_reason_parameter() {
+        // Verify that update_ips and remove_ip accept the reason parameter
+        // and the distributor state is correct after the operations.
+        let initial_ips = test_ips(3); // 10.0.0.1, 10.0.0.2, 10.0.0.3
+        let mut distributor = IpDistributor::new(initial_ips.clone());
+        assert_eq!(distributor.ip_count(), 3);
+
+        // update_ips with a "DNS refresh" reason — replaces the set
+        let new_ips = vec![
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 1)),
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 2)),
+        ];
+        distributor.update_ips(new_ips.clone(), "DNS refresh");
+        assert_eq!(distributor.ip_count(), 2);
+        assert_eq!(distributor.get_ips(), new_ips);
+
+        // remove_ip with a "health exclusion" reason
+        distributor.remove_ip(new_ips[0], "health exclusion");
+        assert_eq!(distributor.ip_count(), 1);
+        assert_eq!(distributor.get_ips(), vec![new_ips[1]]);
+
+        // After removal, only the remaining IP is selected
+        assert_eq!(distributor.select_ip(), Some(new_ips[1]));
+
+        // update_ips with "exclusion expiry" reason — can restore IPs
+        let restored_ips = vec![
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 1)),
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 2)),
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 3)),
+        ];
+        distributor.update_ips(restored_ips.clone(), "exclusion expiry");
+        assert_eq!(distributor.ip_count(), 3);
+        assert_eq!(distributor.get_ips(), restored_ips);
+    }
+
+    // --- In-flight request handling during IP removal (Task 11.2, Requirement 3.3) ---
+
+    #[test]
+    fn test_remove_ip_is_non_destructive_to_existing_state() {
+        // Verifies that remove_ip only affects the distributor's selection set.
+        // The IpDistributor has no reference to hyper's connection pool, so
+        // removing an IP cannot abort in-flight requests. Hyper manages
+        // connection lifecycle independently: existing connections to a removed
+        // IP remain in hyper's pool and in-flight requests complete naturally.
+        //
+        // This test confirms the architectural guarantee by verifying:
+        // 1. remove_ip only modifies the Vec<IpAddr> selection set
+        // 2. Remaining IPs continue to be selected normally
+        // 3. The removed IP is simply absent from future selections
+        // 4. No panic, no side effects beyond the selection set change
+        let ips = test_ips(4); // 10.0.0.1 .. 10.0.0.4
+
+        let mut distributor = IpDistributor::new(ips.clone());
+
+        // Select a few IPs before removal to advance the counter
+        let pre_removal_ip = distributor.select_ip();
+        assert!(pre_removal_ip.is_some());
+
+        // Remove an IP — this only removes from the Vec, nothing else
+        let removed_ip = ips[2]; // 10.0.0.3
+        distributor.remove_ip(removed_ip, "DNS refresh");
+
+        // The distributor still functions for remaining IPs
+        assert_eq!(distributor.ip_count(), 3);
+        let remaining = distributor.get_ips();
+        assert!(!remaining.contains(&removed_ip));
+        assert!(remaining.contains(&ips[0]));
+        assert!(remaining.contains(&ips[1]));
+        assert!(remaining.contains(&ips[3]));
+
+        // Subsequent selections only return remaining IPs
+        let selected: Vec<IpAddr> = (0..12).filter_map(|_| distributor.select_ip()).collect();
+        assert!(!selected.contains(&removed_ip));
+        for ip in &selected {
+            assert!(remaining.contains(ip));
+        }
+
+        // Distribution across remaining IPs is still even (round-robin)
+        let count_per_ip: std::collections::HashMap<IpAddr, usize> =
+            selected.iter().fold(std::collections::HashMap::new(), |mut acc, &ip| {
+                *acc.entry(ip).or_insert(0) += 1;
+                acc
+            });
+        // 12 selections across 3 IPs = 4 each
+        for &ip in &remaining {
+            assert_eq!(count_per_ip.get(&ip).copied().unwrap_or(0), 4);
+        }
+    }
+
+    // --- Graceful degradation tests (Task 11.3, Requirements 7.1, 7.2, 7.3) ---
+
+    #[test]
+    fn test_get_distributed_ip_returns_none_when_distributor_has_zero_ips() {
+        // Validates: Requirement 7.1
+        // Edge case: a distributor was created (e.g., after DNS refresh) but all IPs
+        // were subsequently removed (e.g., all marked unhealthy). The distributor
+        // exists in the map but has an empty IP set, so get_distributed_ip must
+        // return None to trigger the hostname fallback path.
+        let config = crate::config::ConnectionPoolConfig {
+            ip_distribution_enabled: true,
+            ..crate::config::ConnectionPoolConfig::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        // Manually insert a distributor with IPs, then remove them all
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 1)),
+            IpAddr::V4(Ipv4Addr::new(52, 92, 17, 2)),
+        ];
+        let endpoint = "s3.eu-west-1.amazonaws.com";
+        manager
+            .ip_distributors
+            .insert(endpoint.to_string(), IpDistributor::new(ips.clone()));
+
+        // Verify distributor works before removal
+        assert!(manager.get_distributed_ip(endpoint).is_some());
+
+        // Remove all IPs (simulating all IPs marked unhealthy)
+        let distributor = manager.ip_distributors.get_mut(endpoint).unwrap();
+        distributor.remove_ip(ips[0], "health exclusion");
+        distributor.remove_ip(ips[1], "health exclusion");
+        assert_eq!(distributor.ip_count(), 0);
+
+        // get_distributed_ip must return None, triggering hostname fallback
+        assert_eq!(manager.get_distributed_ip(endpoint), None);
+    }
+
+
+
 }

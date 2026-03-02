@@ -21,6 +21,10 @@ async fn test_access_log_creation() {
         log_level: "info".to_string(),
         access_log_flush_interval: std::time::Duration::from_secs(5),
         access_log_buffer_size: 1000,
+        access_log_retention_days: 30,
+        app_log_retention_days: 30,
+        log_cleanup_interval: std::time::Duration::from_secs(86400),
+        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
     };
 
     let mut logger = LoggerManager::new(config);
@@ -89,6 +93,10 @@ fn test_access_log_entry_creation() {
         log_level: "info".to_string(),
         access_log_flush_interval: std::time::Duration::from_secs(5),
         access_log_buffer_size: 1000,
+        access_log_retention_days: 30,
+        app_log_retention_days: 30,
+        log_cleanup_interval: std::time::Duration::from_secs(86400),
+        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
     };
 
     let logger = LoggerManager::new(config);
@@ -131,6 +139,10 @@ fn test_cached_only_logging_mode() {
         log_level: "info".to_string(),
         access_log_flush_interval: std::time::Duration::from_secs(5),
         access_log_buffer_size: 1000,
+        access_log_retention_days: 30,
+        app_log_retention_days: 30,
+        log_cleanup_interval: std::time::Duration::from_secs(86400),
+        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
     };
 
     let logger = LoggerManager::new(config);
@@ -154,6 +166,10 @@ fn test_s3_uri_parsing() {
         log_level: "info".to_string(),
         access_log_flush_interval: std::time::Duration::from_secs(5),
         access_log_buffer_size: 1000,
+        access_log_retention_days: 30,
+        app_log_retention_days: 30,
+        log_cleanup_interval: std::time::Duration::from_secs(86400),
+        access_log_file_rotation_interval: std::time::Duration::from_secs(300),
     };
 
     let logger = LoggerManager::new(config);
@@ -186,7 +202,7 @@ async fn test_log_filename_format_compliance() {
     let log_dir = temp_dir.path().to_path_buf();
     let hostname = "test-host".to_string();
 
-    let buffer = AccessLogBuffer::new(log_dir.clone(), hostname.clone(), None, None);
+    let buffer = AccessLogBuffer::new(log_dir.clone(), hostname.clone(), None, None, None);
 
     // Create a test entry with a specific timestamp: 2024-01-15 14:30:25 UTC
     let test_time = Utc.with_ymd_and_hms(2024, 1, 15, 14, 30, 25).unwrap();

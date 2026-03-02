@@ -14,24 +14,32 @@
     - [Access Point and MRAP Cache Key Prefixing](#access-point-and-mrap-cache-key-prefixing)
 - [Time-To-Live (TTL) Configuration](#time-to-live-ttl-configuration)
   - [GET TTL](#get-ttl-get_ttl)
-  - [PUT TTL](#put-ttl-put_ttl)
   - [HEAD TTL](#head-ttl-head_ttl)
+  - [PUT TTL](#put-ttl-put_ttl)
   - [Cache Expiration Modes](#cache-expiration-modes-actively_remove_cached_data)
 - [Cache Validation Flow](#cache-validation-flow)
-- [Write Cache Configuration](#write-cache-configuration)
+- [S3 Response Header Handling](#s3-response-header-handling)
+- [Conditional Headers Handling](#conditional-headers-handling)
+- [Cache Types](#cache-types)
 - [Bucket-Level Cache Settings](#bucket-level-cache-settings)
-- [RAM-Disk Cache Coherency](#ram-disk-cache-coherency-1)
-- [Range Request Optimization](#range-request-optimization)
-- [Part Caching](#part-caching)
-- [Download Coordination](#download-coordination)
-- [Eviction Configuration](#eviction-configuration)
-- [Multi-Instance Coordination](#multi-instance-coordination)
-- [Journal-Based Metadata Updates (Shared Storage)](#journal-based-metadata-updates-shared-storage)
-- [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction)
+- [Cache Bypass for Non-Cacheable Operations](#cache-bypass-for-non-cacheable-operations)
+- [Cache Bypass Headers](#cache-bypass-headers)
+- [Versioned Request Handling](#versioned-request-handling)
+- [Configuration Examples](#configuration-examples)
+- [Cache Invalidation](#cache-invalidation)
+- [Compression](#compression)
+- [Multi-Instance Caching](#multi-instance-caching)
 - [Cache Access Tracking](#cache-access-tracking)
 - [Distributed Eviction Coordination](#distributed-eviction-coordination)
-- [Cache Bypass for Non-Cacheable Operations](#cache-bypass-for-non-cacheable-operations)
-- [Versioned Request Handling](#versioned-request-handling)
+- [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction)
+- [Monitoring](#monitoring)
+- [Cache Coherency](#cache-coherency)
+- [Signed Range Request Handling](#signed-range-request-handling)
+- [Limitations](#limitations)
+- [Cache Size Tracking](#cache-size-tracking)
+- [Part Caching](#part-caching)
+- [Download Coordination](#download-coordination)
+- [Cache Eviction](#cache-eviction)
 
 ---
 
@@ -924,7 +932,7 @@ cache:
 - Useful when storage capacity can be dynamically adjusted
 
 **Use cases**:
-- Elastic shared filesystems (e.g., AWS EFS)
+- Elastic shared filesystems (NFS)
 - Multi-instance deployments with shared cache volumes
 - Cloud deployments where storage costs scale with usage
 - Environments where disk space is constrained or expensive
@@ -2947,7 +2955,7 @@ Consolidated access data is written to range metadata:
 The eviction system uses per-range access tracking data to make decisions:
 
 - **LRU (Least Recently Used)**: Sorts ranges by `last_accessed` (oldest first)
-- **TinyLFU**: Combines frequency (`access_count`) and recency (`last_accessed`) for optimal eviction
+- **TinyLFU** (TinyLFU-like): Combines frequency (`access_count`) and recency (`last_accessed`) using a simplified windowed frequency approach
 
 Each range is evaluated independently, allowing hot ranges to be retained even if other ranges of the same object are cold. See [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction) for details.
 
@@ -3524,14 +3532,14 @@ The disk cache uses **range-level eviction** where each cached range is an indep
 
 ### Eviction Algorithms
 
-**LRU (Least Recently Used)**:
+**LRU (Least Recently Used, default)**:
 - Evicts ranges based on last access time
 - Oldest accessed ranges are evicted first
 - Simple and predictable behavior
 
-**TinyLFU (default)**:
-- Combines access frequency and recency for optimal cache hit rates
-- Uses probabilistic frequency sketches for memory efficiency
+**TinyLFU**:
+- Simplified frequency-recency hybrid inspired by TinyLFU
+- Uses windowed frequency counting with decay
 - Better performance than LRU for most workloads
 
 ### Range-Level Granularity
@@ -3683,7 +3691,7 @@ cache:
 
 **Eviction Algorithms**:
 - **LRU (Least Recently Used)**: Evicts ranges with oldest `last_accessed` timestamp first
-- **TinyLFU**: Combines frequency (`access_count`) and recency (`last_accessed`) for optimal eviction decisions
+- **TinyLFU** (TinyLFU-like): Combines frequency (`access_count`) and recency (`last_accessed`) using a simplified windowed frequency approach
 
 ## Monitoring
 
@@ -4729,11 +4737,10 @@ When eviction triggers, it continues until cache usage drops to 80% or below, fr
 
 ### Eviction Algorithm
 
-The proxy supports three eviction algorithms configured via `cache.eviction_algorithm`:
+The proxy supports two eviction algorithms configured via `cache.eviction_algorithm`:
 
-- **LRU** (Least Recently Used): Evicts ranges with oldest access time
-- **LFU** (Least Frequently Used): Evicts ranges with lowest access count
-- **TinyLFU** (default): Combines recency and frequency for optimal hit rate
+- **LRU** (Least Recently Used, default): Evicts ranges with oldest access time
+- **TinyLFU**: Combines recency and frequency using a simplified windowed frequency approach (TinyLFU-like)
 
 ### Range-Based Eviction
 
@@ -4758,7 +4765,7 @@ In shared storage deployments (`shared_storage.enabled: true`), eviction uses di
 ```yaml
 cache:
   max_cache_size: 10737418240        # 10GB - eviction trigger based on this
-  eviction_algorithm: "TinyLFU"      # LRU, LFU, or TinyLFU
+  eviction_algorithm: "tinylfu"      # "lru" (default) or "tinylfu"
 ```
 
 ### Logging

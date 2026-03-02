@@ -5,7 +5,7 @@
 //! This prevents signature validation failures that occur when headers are modified.
 
 use crate::cache_types::ObjectMetadata;
-use crate::compression::CompressionAlgorithm;
+
 use crate::{ProxyError, Result};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -170,87 +170,6 @@ pub fn extract_metadata(
     // Create ObjectMetadata with extracted values (Requirement 3.4, 3.5)
     ObjectMetadata::new(etag, last_modified, content_length, content_type)
 }
-
-/// Extract metadata from S3 response with compression information
-///
-/// This function extracts metadata from S3 response headers and includes
-/// compression information from the cache writer.
-///
-/// # Arguments
-///
-/// * `response_headers` - HTTP response headers from S3
-/// * `request_headers` - HTTP request headers from client
-/// * `content_length` - Uncompressed content length
-/// * `compression_algorithm` - Compression algorithm used
-/// * `compressed_size` - Size of compressed data
-///
-/// # Returns
-///
-/// Returns ObjectMetadata with compression information
-///
-/// # Requirements
-///
-/// - Requirement 3.1: Extract ETag from response headers
-/// - Requirement 3.2: Extract Last-Modified from response headers
-/// - Requirement 3.3: Extract Content-Type from request headers
-/// - Requirement 7.2: Store compression metadata
-pub fn extract_metadata_with_compression(
-    response_headers: &HashMap<String, String>,
-    request_headers: &HashMap<String, String>,
-    content_length: u64,
-    compression_algorithm: CompressionAlgorithm,
-    compressed_size: u64,
-) -> ObjectMetadata {
-    use crate::cache_types::ObjectMetadata;
-
-    // Extract ETag from response headers (Requirement 3.1)
-    let etag = response_headers
-        .get("etag")
-        .or_else(|| response_headers.get("ETag"))
-        .cloned()
-        .unwrap_or_else(|| {
-            debug!("ETag not found in response headers, using empty string");
-            String::new()
-        });
-
-    // Extract Last-Modified from response headers (Requirement 3.2)
-    let last_modified = response_headers
-        .get("last-modified")
-        .or_else(|| response_headers.get("Last-Modified"))
-        .cloned()
-        .unwrap_or_else(|| {
-            debug!("Last-Modified not found in response headers, using empty string");
-            String::new()
-        });
-
-    // Extract Content-Type from request headers (Requirement 3.3)
-    let content_type = request_headers
-        .get("content-type")
-        .or_else(|| request_headers.get("Content-Type"))
-        .cloned();
-
-    if content_type.is_none() {
-        debug!("Content-Type not found in request headers");
-    }
-
-    // Log extracted metadata with compression info
-    info!(
-        "Extracted metadata with compression: etag={}, last_modified={}, content_type={:?}, content_length={}, compressed_size={}, compression={:?}",
-        etag, last_modified, content_type, content_length, compressed_size, compression_algorithm
-    );
-
-    // Create ObjectMetadata with compression information and complete headers (Requirement 7.2)
-    ObjectMetadata::new_with_compression_and_headers(
-        etag,
-        last_modified,
-        content_length,
-        content_type,
-        response_headers.clone(),
-        compression_algorithm,
-        compressed_size,
-    )
-}
-
 /// Forward a signed request by preserving the original HTTP request exactly
 ///
 /// This function:
