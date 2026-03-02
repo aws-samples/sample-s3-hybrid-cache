@@ -28,88 +28,22 @@ The S3 proxy includes intelligent compression with per-entry algorithm metadata 
 
 ## RAM Cache Compression Optimization
 
-The proxy implements an advanced optimization that eliminates unnecessary decompress/recompress cycles when promoting data from disk cache to RAM cache.
+When promoting data from disk cache to RAM cache, the proxy passes compressed data directly without decompressing and recompressing. Size checks use the compressed size, so large compressible files are accepted into RAM cache based on their compressed footprint rather than their uncompressed size.
 
-### The Problem (Before Optimization)
+**Algorithm handling**:
 
-Traditional multi-tier caching systems suffer from compression inefficiency:
+| Disk Cache | RAM Cache | Behavior | CPU Cost |
+|------------|-----------|----------|----------|
+| LZ4 | LZ4 | Pass compressed data directly | None |
+| Different algorithm | LZ4 | Decompress then recompress | 1× decompress + 1× compress |
 
-```
-Disk Cache: File (LZ4 compressed, 1MB)
-     ↓ Load for RAM promotion
-RAM Cache: File (decompressed to 500MB for size check)
-     ↓ Size check: 500MB > 256MB limit → REJECTED
-Result: Large compressible files cannot be cached in RAM
-```
+**Example**: A 500MB text file compressed to 1MB on disk is stored in RAM cache as 1MB. The size check compares 1MB against the RAM cache limit, not 500MB.
 
-Or if the file did fit:
+No configuration is required. The behavior is automatic based on compression metadata stored with each cache entry.
 
-```
-Disk Cache: File (LZ4 compressed, 1MB) 
-     ↓ Decompress for RAM cache
-RAM Cache: File (uncompressed, 500MB)
-     ↓ Recompress with LZ4
-RAM Cache: File (LZ4 compressed, 1MB)
-Result: Wasted CPU cycles (decompress + recompress same algorithm)
-```
-
-### The Solution (After Optimization)
-
-The proxy now preserves compression state during cache tier promotion:
-
-```
-Disk Cache: File (LZ4 compressed, 1MB)
-     ↓ Pass compressed data directly
-RAM Cache: File (LZ4 compressed, 1MB) → Size check: 1MB < 256MB → ACCEPTED
-Result: Large compressible files cached efficiently in RAM
-```
-
-### Algorithm Compatibility Matrix
-
-| Disk Cache | RAM Cache Config | Behavior | CPU Cost |
-|------------|------------------|----------|----------|
-| LZ4 | LZ4 | Pass compressed data directly | **0** (optimized) |
-| Zstd | LZ4 | Decompress Zstd, recompress LZ4 | 1x decompress + 1x compress |
-
-### Performance Benefits
-
-**CPU Efficiency**:
-- **Before**: 2x compression work (decompress + recompress)
-- **After**: 0x compression work (direct pass-through)
-- **Savings**: 100% CPU reduction for same-algorithm promotion
-
-**Memory Efficiency**:
-- **Before**: Temporary 500MB buffer during decompression
-- **After**: No temporary buffers (1MB stays compressed)
-- **Savings**: 99.8% memory reduction during promotion
-
-**Cache Capacity**:
-- **Before**: Size check on 500MB uncompressed data → rejected
-- **After**: Size check on 1MB compressed data → accepted
-- **Result**: 500x improvement in effective cache capacity for compressible data
-
-### Real-World Example
-
-**Scenario**: Application logs (highly compressible JSON)
-- **File size**: 500MB uncompressed
-- **LZ4 compression**: 500MB → 1MB (99.8% ratio)
-- **RAM cache limit**: 256MB
-
-**Before Optimization**:
-```
-2025-12-12T17:56:31.099287+00:00 WARN Entry /bucket/app.log too large for RAM cache 
-(524288000 bytes > 268435456 bytes max)
-```
-
-**After Optimization**:
-```
-2025-12-12T17:56:31.099287+00:00 DEBUG Using pre-compressed data for RAM cache entry: 
-/bucket/app.log (algorithm: Lz4)
-2025-12-12T17:56:31.099287+00:00 DEBUG Stored entry in RAM cache: /bucket/app.log 
-(1048576 bytes, compressed: true, algorithm: Lz4)
-```
-
-**Result**: 500MB log file successfully cached in RAM using only 1MB of space.
+**Debug log indicators**:
+- `"Using pre-compressed data for RAM cache entry"` — direct pass-through path
+- `"Compressed data for RAM cache entry"` — first-time compression path
 
 ## Multipart Upload Compression
 

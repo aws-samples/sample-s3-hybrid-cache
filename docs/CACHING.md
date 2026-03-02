@@ -494,17 +494,16 @@ Range Request → Check RAM cache (key: {cache_key}:range:{start}:{end})
 
 The streaming and caching path includes several optimizations for maximum throughput:
 
-**Zero-Copy Cache Writes (v0.7.4+):**
+**Zero-Copy Cache Writes:**
 - When compression is disabled, cache writes use the original data slice directly
-- No `data.to_vec()` copy operation - writes directly from the incoming buffer
+- No `data.to_vec()` copy operation — writes directly from the incoming buffer
 - Reduces memory allocations and CPU usage during cache-miss streaming
 - Particularly beneficial for large file transfers (8MB+ ranges)
 
-**JournalOnly Metadata Mode (v0.7.3+):**
+**Journal-Only Metadata Mode:**
 - Cache-miss range metadata writes use journal-only mode on shared storage
 - Eliminates lock contention when multiple instances cache the same object
 - Journal consolidator merges entries asynchronously without blocking streaming
-- Prevents the 4x performance degradation seen with lock contention on NFS
 
 **Bytes Reference Counting:**
 - TeeStream uses `Bytes::clone()` which is reference-counted (not a deep copy)
@@ -2711,104 +2710,7 @@ compression:
 
 ### RAM Cache Compression Optimization
 
-The proxy implements an intelligent compression optimization that eliminates unnecessary decompress/recompress cycles when promoting data from disk cache to RAM cache.
-
-#### How It Works
-
-**Before Optimization (Inefficient)**:
-```
-Disk Cache: Data (LZ4 compressed) 
-    ↓ decompress LZ4
-RAM Cache: Data (uncompressed) → size check (FAILS for large files)
-    ↓ recompress LZ4  
-RAM Cache: Data (LZ4 compressed)
-```
-
-**After Optimization (Efficient)**:
-```
-Disk Cache: Data (LZ4 compressed)
-    ↓ pass compressed data directly
-RAM Cache: Data (LZ4 compressed) → size check (PASSES on compressed size)
-```
-
-#### Key Benefits
-
-1. **Fixes Large File Caching**: Large compressible files (e.g., 500MB of text) can now be stored in RAM cache
-   - Size check happens **after** compression, not before
-   - Files that compress well (high compression ratio) fit within RAM cache limits
-   - Eliminates "too large for RAM cache" warnings for compressible data
-
-2. **Eliminates CPU Waste**: No more decompress → recompress cycles
-   - When disk and RAM use the same compression algorithm (LZ4), data passes through unchanged
-   - Saves CPU cycles and reduces memory pressure during cache promotion
-   - Faster disk-to-RAM promotion (no compression work needed)
-
-3. **Algorithm Compatibility**: Handles mixed compression scenarios correctly
-   - **LZ4 → LZ4**: Pass compressed data directly (optimized path)
-   - **None → LZ4**: Compress for first time (normal path)  
-   - **LZ4 → None**: Decompress and store uncompressed (normal path)
-   - **Mixed algorithms**: Handled correctly with fallback to decompress/recompress
-
-#### Performance Impact
-
-**Disk-to-RAM Promotion**:
-- **Before**: Decompress (CPU) + Recompress (CPU) + Size check on uncompressed data
-- **After**: Size check on compressed data (no CPU work)
-- **Result**: 2-5x faster promotion for large compressible files
-
-**Memory Usage**:
-- **Before**: Temporary uncompressed buffer during promotion (high memory pressure)
-- **After**: No temporary buffers (compressed data passed directly)
-- **Result**: Lower memory usage during cache operations
-
-**Cache Capacity**:
-- **Before**: Large compressible files rejected based on uncompressed size
-- **After**: Large compressible files accepted based on compressed size
-- **Result**: Better cache utilization for compressible workloads
-
-#### Example Scenario
-
-```
-File: 500MB of highly compressible text data (logs, JSON, etc.)
-LZ4 Compression: 500MB → 1MB (99.8% compression ratio)
-RAM Cache Limit: 256MB
-
-Before Optimization:
-- Size check: 500MB > 256MB → REJECTED
-- Warning: "Entry too large for RAM cache (524288000 bytes > 268435456 bytes max)"
-- File never cached in RAM
-
-After Optimization:
-- Disk cache stores: 1MB compressed data
-- RAM cache receives: 1MB compressed data (no decompression)
-- Size check: 1MB < 256MB → ACCEPTED
-- Result: File successfully cached in RAM for fast access
-```
-
-#### Configuration
-
-No configuration changes are required. The optimization is automatic and maintains backward compatibility:
-
-- **Same algorithm**: Compressed data passed directly (optimized)
-- **Different algorithms**: Falls back to decompress/recompress (compatible)
-- **Algorithm detection**: Based on compression metadata from disk cache
-
-#### Monitoring
-
-The optimization can be observed in debug logs:
-
-```
-DEBUG Using pre-compressed data for RAM cache entry: /bucket/large-file.txt 
-      (algorithm: Lz4)
-
-DEBUG Stored entry in RAM cache: /bucket/large-file.txt 
-      (1048576 bytes, compressed: true, algorithm: Lz4)
-```
-
-**Log Indicators**:
-- **"Using pre-compressed data"**: Optimization applied (no decompress/recompress)
-- **"Compressed data for RAM cache entry"**: Normal compression path (first-time compression)
-- **Size in logs**: Shows final compressed size used for RAM cache storage
+When promoting data from disk cache to RAM cache, compressed data is passed directly without decompressing and recompressing. Size checks use the compressed size. See [COMPRESSION.md - RAM Cache Compression Optimization](COMPRESSION.md#ram-cache-compression-optimization) for details.
 
 ## Multi-Instance Caching
 

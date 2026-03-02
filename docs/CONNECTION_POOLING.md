@@ -3,7 +3,7 @@
 ## Connection Keepalive Implementation
 
 ### Overview
-The S3 proxy now implements true HTTP connection keepalive (persistent connections) using Hyper 1.0's built-in connection pooling. This eliminates the TCP and TLS handshake overhead for subsequent requests to the same S3 endpoint.
+The proxy uses Hyper 1.0's built-in connection pooling to reuse TCP/TLS connections to S3, eliminating handshake overhead for subsequent requests to the same endpoint.
 
 ### Architecture
 - **Hyper Client**: Manages connection pooling automatically
