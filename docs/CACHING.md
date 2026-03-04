@@ -1065,19 +1065,37 @@ All bytes cached in non-contiguous ranges (typical after multipart upload). Serv
 
 #### Scenario 3c: TTL-Expired Cache Entry (Revalidation)
 
-When a cached entry's TTL expires, the proxy uses `If-Modified-Since` to revalidate without re-downloading unchanged data:
+When a cached entry's TTL expires, the proxy revalidates using conditional headers to avoid re-downloading unchanged data:
 
 ```
 Client GET → Proxy checks cache → GET_TTL expired
-          → Proxy adds If-Modified-Since header with cached Last-Modified timestamp
+          → Proxy adds conditional headers from cached metadata:
+             - If-Modified-Since: cached Last-Modified timestamp (1-second granularity)
+             - If-None-Match: cached ETag (content hash, when available)
           → Forward request to S3
-          → S3 validates If-Modified-Since:
+          → S3 validates conditions:
              - 304 Not Modified: Object unchanged, refresh TTL, serve from cache
              - 200 OK: Object changed, invalidate old cache, cache new data, serve fresh
           → Return response
 ```
 
-This minimizes bandwidth usage while ensuring cache freshness.
+`If-None-Match` (ETag) is the primary revalidation signal. `Last-Modified` has one-second granularity — two writes to the same key within one second produce identical timestamps, which can cause false 304 responses. ETag is a content hash that changes on every write regardless of timing.
+
+Both headers are sent when available. If only one is present (e.g., ETag absent for objects PUT through the proxy before v1.8.3), the proxy sends whichever is available. If neither is present (metadata unreadable), the proxy falls back to an unconditional GET.
+
+#### Scenario 3d: HEAD Detects Object Change (Range Invalidation)
+
+When a HEAD response returns a different ETag or content-length than what is cached, the proxy invalidates all cached ranges for that key:
+
+```
+Client HEAD → Proxy forwards to S3 → S3 returns new ETag or content-length
+           → Proxy compares against cached metadata
+           → Mismatch detected: clear all cached ranges, expire object immediately
+           → Update metadata with new values from HEAD
+           → Next GET fetches fresh data from S3
+```
+
+This prevents serving stale range data when the object has been overwritten between GET accesses.
 
 ### HEAD Request Scenarios
 

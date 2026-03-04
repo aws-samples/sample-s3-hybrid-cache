@@ -5635,14 +5635,14 @@ impl DiskCacheManager {
                     "Metadata file not found during expiration check: cache_key={}, path={:?}",
                     cache_key, metadata_path
                 );
-                return Ok(ObjectExpirationResult::Expired { last_modified: None });
+                return Ok(ObjectExpirationResult::Expired { last_modified: None, etag: None });
             }
             Err(e) => {
                 warn!(
                     "Failed to read metadata during expiration check: cache_key={}, error={}",
                     cache_key, e
                 );
-                return Ok(ObjectExpirationResult::Expired { last_modified: None });
+                return Ok(ObjectExpirationResult::Expired { last_modified: None, etag: None });
             }
         };
 
@@ -5653,7 +5653,7 @@ impl DiskCacheManager {
                     "Failed to parse metadata during expiration check: cache_key={}, error={}",
                     cache_key, e
                 );
-                return Ok(ObjectExpirationResult::Expired { last_modified: None });
+                return Ok(ObjectExpirationResult::Expired { last_modified: None, etag: None });
             }
         };
 
@@ -5664,6 +5664,7 @@ impl DiskCacheManager {
             );
             Ok(ObjectExpirationResult::Expired {
                 last_modified: Some(metadata.object_metadata.last_modified.clone()),
+                etag: Some(metadata.object_metadata.etag.clone()).filter(|e| !e.is_empty()),
             })
         } else {
             Ok(ObjectExpirationResult::Fresh)
@@ -8577,7 +8578,7 @@ mod tests {
         let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None },
+            ObjectExpirationResult::Expired { last_modified: None, etag: None },
             "Corrupted metadata should be treated as expired with no last_modified"
         );
     }
@@ -8601,7 +8602,7 @@ mod tests {
         let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None },
+            ObjectExpirationResult::Expired { last_modified: None, etag: None },
             "Invalid JSON schema should be treated as expired with no last_modified"
         );
     }
@@ -8620,7 +8621,7 @@ mod tests {
         let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None },
+            ObjectExpirationResult::Expired { last_modified: None, etag: None },
             "Missing metadata should be treated as expired with no last_modified"
         );
     }
@@ -8644,7 +8645,7 @@ mod tests {
         let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None },
+            ObjectExpirationResult::Expired { last_modified: None, etag: None },
             "Empty metadata file should be treated as expired with no last_modified"
         );
     }

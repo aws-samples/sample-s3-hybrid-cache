@@ -6628,6 +6628,29 @@ impl CacheManager {
 
         // S3 responses are always authoritative - update object metadata from HEAD response
         // This ensures cached metadata stays in sync with S3's current state
+
+        // Detect object change from HEAD response before overwriting fields
+        let etag_changed = !legacy_metadata.etag.is_empty()
+            && !metadata.object_metadata.etag.is_empty()
+            && metadata.object_metadata.etag != legacy_metadata.etag;
+
+        let size_changed = legacy_metadata.content_length > 0
+            && metadata.object_metadata.content_length > 0
+            && metadata.object_metadata.content_length != legacy_metadata.content_length;
+
+        if etag_changed || size_changed {
+            info!(
+                "HEAD response indicates object changed: cache_key={}, etag_changed={} (cached={}, head={}), size_changed={} (cached={}, head={})",
+                cache_key,
+                etag_changed, metadata.object_metadata.etag, legacy_metadata.etag,
+                size_changed, metadata.object_metadata.content_length, legacy_metadata.content_length
+            );
+            // Clear cached ranges — they belong to the old object version
+            metadata.ranges.clear();
+            // Expire immediately so the next GET fetches fresh data
+            metadata.expires_at = std::time::SystemTime::now();
+        }
+
         if !legacy_metadata.last_modified.is_empty() {
             if metadata.object_metadata.last_modified != legacy_metadata.last_modified {
                 debug!(
@@ -7314,6 +7337,7 @@ impl CacheManager {
         response_body: &[u8],
         headers: HashMap<String, String>,
         metadata: CacheMetadata,
+        response_headers: HashMap<String, String>,
     ) -> Result<()> {
         debug!(
             "Storing write cache entry for key: {} using new range storage format",
@@ -7391,6 +7415,7 @@ impl CacheManager {
             upload_state: crate::cache_types::UploadState::Complete, // Mark as Complete for PUT
             cumulative_size: content_length,
             parts: Vec::new(),
+            response_headers,
             ..Default::default()
         };
 
@@ -7399,9 +7424,10 @@ impl CacheManager {
         self.store_full_object_as_range_new(cache_key, response_body, object_metadata)
             .await?;
 
-        // Set expiration to PUT_TTL
+        // Set expiration to PUT_TTL (resolve per-bucket override)
         let now = SystemTime::now();
-        let expires_at = now + self.put_ttl;
+        let resolved = self.resolve_settings(cache_key).await;
+        let expires_at = now + resolved.put_ttl;
         self.update_metadata_expiration_new(cache_key, expires_at)
             .await?;
 

@@ -5,13 +5,30 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.5] - 2026-03-04
+
+### Fixed
+- **Non-streaming PUT missing S3 response headers in cache**: The non-streaming PUT cache path stored an empty `response_headers` map in metadata. S3 response headers (`x-amz-server-side-encryption`, `x-amz-version-id`, checksums, etc.) are now captured and stored, matching the signed PUT handler behavior. Checksum headers from the request are merged as fallback.
+
+## [1.8.4] - 2026-03-04
+
+### Fixed
+- **PUT write-cache ignores bucket-level `put_ttl` override**: The non-streaming PUT cache path (`store_write_cache_entry`) used the global `put_ttl` instead of resolving per-bucket settings. Bucket-level `put_ttl` overrides in `_settings.json` now apply correctly.
+
+## [1.8.3] - 2026-03-04
+
+### Fixed
+- **ETag-based cache revalidation**: TTL-expired objects now send `If-None-Match` (ETag) alongside `If-Modified-Since` during revalidation. Closes stale-data window when two writes to the same key occur within one second (identical `Last-Modified` timestamps).
+- **HEAD-triggered range invalidation**: When a HEAD response returns a different ETag or content-length than cached, all cached ranges for that key are cleared immediately. Prevents serving stale range data after object overwrites.
+- **PUT response ETag capture**: The non-streaming PUT handler now captures ETag from S3 response headers instead of request headers, ensuring correct ETag is stored in cache metadata.
+
 ## [1.8.2] - 2026-03-02
 
 ### Fixed
 - **PERF logging actually moved to DEBUG**: Fixed v1.7.9 sed command that failed to match multiline `info!(\n    "PERF` pattern. All 9 PERF log lines now correctly use `debug!` macro.
 
 ### Changed
-- **Idle consolidation detection**: Consolidation cycle skips entirely when no pending work (zero accumulator deltas and no journal files). Reduces EFS metadata IOPS from ~90 to near-zero during idle periods across 3 instances.
+- **Idle consolidation detection**: Consolidation cycle skips entirely when no pending work (zero accumulator deltas and no journal files). Reduces metadata IOPS to near-zero during idle periods.
 
 ## [1.8.1] - 2026-03-01
 

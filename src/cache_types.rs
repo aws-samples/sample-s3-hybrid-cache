@@ -18,6 +18,8 @@ pub enum ObjectExpirationResult {
     Expired {
         /// last_modified for If-Modified-Since header, None if metadata was unreadable
         last_modified: Option<String>,
+        /// etag for If-None-Match header, None if not available
+        etag: Option<String>,
     },
 }
 

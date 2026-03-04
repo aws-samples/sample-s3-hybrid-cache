@@ -1664,7 +1664,7 @@ impl HttpProxy {
                                     .check_object_expiration(&cache_key)
                                     .await
                                 {
-                                    Ok(ObjectExpirationResult::Expired { last_modified }) => {
+                                    Ok(ObjectExpirationResult::Expired { last_modified, etag }) => {
                                     debug!(
                                         "Full object expired, performing conditional validation: cache_key={}",
                                         cache_key
@@ -1678,6 +1678,10 @@ impl HttpProxy {
                                     if let Some(ref lm) = last_modified {
                                         validation_headers
                                             .insert("if-modified-since".to_string(), lm.clone());
+                                    }
+                                    if let Some(ref et) = etag {
+                                        validation_headers
+                                            .insert("if-none-match".to_string(), et.clone());
                                     }
 
                                     // Build S3 request context for conditional validation
@@ -2264,10 +2268,34 @@ impl HttpProxy {
 
                 if status.is_success() {
                     // Cache the PUT request body - Requirement 10.1
-                    let metadata = Self::extract_metadata_from_headers(&headers, body_size);
+                    let mut metadata = Self::extract_metadata_from_headers(&headers, body_size);
+
+                    // Build response headers map from S3 response
+                    let mut response_headers: HashMap<String, String> = response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect();
+
+                    // Capture ETag from S3 response headers (not request headers)
+                    if let Some(etag) = response_headers.get("etag").cloned() {
+                        metadata.etag = etag;
+                    }
+
+                    // Merge checksum headers from request if not present in response
+                    for (key, value) in &headers {
+                        let key_lower = key.to_lowercase();
+                        if (key_lower.starts_with("x-amz-checksum-")
+                            || key_lower.starts_with("x-amz-content-sha256")
+                            || key_lower == "content-md5")
+                            && !response_headers.contains_key(key)
+                        {
+                            response_headers.insert(key.clone(), value.clone());
+                        }
+                    }
 
                     if let Err(e) = cache_manager
-                        .store_write_cache_entry(&cache_key, &body_bytes, headers, metadata)
+                        .store_write_cache_entry(&cache_key, &body_bytes, headers, metadata, response_headers)
                         .await
                     {
                         warn!("Failed to store PUT request in write cache: {}", e);
@@ -3017,7 +3045,7 @@ impl HttpProxy {
                                 .check_object_expiration(&cache_key)
                                 .await
                             {
-                                Ok(ObjectExpirationResult::Expired { last_modified }) => {
+                                Ok(ObjectExpirationResult::Expired { last_modified, etag }) => {
                                 debug!(
                                     "Range expired, performing conditional validation: cache_key={}",
                                     cache_key
@@ -3031,6 +3059,10 @@ impl HttpProxy {
                                 if let Some(ref lm) = last_modified {
                                     validation_headers
                                         .insert("if-modified-since".to_string(), lm.clone());
+                                }
+                                if let Some(ref et) = etag {
+                                    validation_headers
+                                        .insert("if-none-match".to_string(), et.clone());
                                 }
                                 validation_headers.insert(
                                     "range".to_string(),
