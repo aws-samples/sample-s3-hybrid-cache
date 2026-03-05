@@ -162,7 +162,33 @@ See [Security Considerations](docs/ARCHITECTURE.md#security-considerations) for 
 
 ## Performance
 
-Tested with 100 concurrent clients (c7gn.large) downloading 100 files (0.1–100 MB each, ~1.4 GB total per client) through 3 proxy instances (m6in.2xlarge) with shared NFS cache.
+### Single-Client Throughput Testing
+
+Single client downloading large files (up to 5 GiB) using AWS CLI with [CRT](https://aws.amazon.com/blogs/storage/improving-amazon-s3-throughput-for-the-aws-cli-and-boto3-with-the-aws-common-runtime/), 8 proxies (m6in.2xlarge), with FSx for OpenZFS (10 GiB/s) as shared cache.
+
+**m6in.4xlarge client (up to 50 Gbps)**
+
+| Scenario | Throughput |
+|----------|------------|
+| Direct S3 (no proxy) | ~2.9 GiB/s |
+| Cache miss (proxy → S3) | ~1.7 GiB/s |
+| Cache hit (proxy → FSx) | ~3.4 GiB/s |
+
+**m6in.16xlarge client (100 Gbps)**
+
+| Scenario | Throughput |
+|----------|------------|
+| Direct S3 (no proxy) | ~5.0 GiB/s |
+| Cache miss (proxy → S3) | ~2.0 GiB/s |
+| Cache hit (proxy → FSx) | ~5.5 GiB/s |
+
+Cache hit throughput exceeded direct S3 throughput. Cache miss throughput is proxy-limited (S3 fetch + TLS + LZ4 compression + cache write). Compared to a 3-proxy configuration (which achieved ~1.1 GiB/s cache miss and ~2.4 GiB/s cache hit), scaling to 8 proxies approximately doubled  throughput. 
+
+See [this article](https://repost.aws/articles/ARRnpZ4QYrS9CtnYyTleS5bg/storage-benchmarking-downloading-deepseek-v3-0324-from-amazon-s3-to-local-storage-at-8-1-gib-s) for guidance on configuring the AWS CLI CRT transfer client for high throughput.
+
+### Multi-Client Request Time And Efficiency Testing
+
+100 clients (c7gn.large) each seqentially downloading the same 100 (0.1–100 MB) files, i.e. 'thundering herd'. 3 proxies (m6in.2xlarge) with shared NFS cache:
 
 | Scenario | p50 | p95 | p99 | Throughput |
 |----------|-----|-----|-----|------------|
@@ -170,28 +196,7 @@ Tested with 100 concurrent clients (c7gn.large) downloading 100 files (0.1–100
 | Proxy, cold cache | 627 ms | 4,469 ms | 6,409 ms | 1.1 GiB/s |
 | Proxy, warm cache | 578 ms | 839 ms | 1,247 ms | 1.9 GiB/s |
 
-Warm cache delivers 22% higher throughput and 2.4× lower p95 latency than direct S3 access. Download coordination coalesced 94% of concurrent cache-miss requests during the cold-cache run (4,323 of ~4,600 requests served from cache after waiting, only 272 actual S3 fetches). CloudWatch confirmed 95% S3 data transfer savings: 6.3 GB pulled from S3 to serve 137 GB to 100 clients (22× amplification). Zero errors across 30,000+ requests.
-
-### Single-Client Throughput Test
-
-Single m6in.2xlarge test client downloading multiple large files cross-region (eu-west-1 → us-west-2) using S3 CLI with CRT. 3× m6in.2xlarge proxies, FSx for OpenZFS (10GB/s Single-AZ 2, 64GB, 64,000 IOPS) as shared cache. 
-
-| Scenario | Throughput |
-|----------|------------|
-| Cache miss (proxy → S3) | ~1.0 GiB/s |
-| Cache hit (proxy → FSx) | ~2.4 GiB/s |
-| Direct S3 | ~1.3 GiB/s |
-
-Cache hits were 2.5× faster than misses and 1.8× faster than direct S3. Cache miss throughput with a single proxy was ~0.5 GiB/s, even scaled to m6in.8xlarge.
-
-## Status
-
-**Beta Status**: This is sample code demonstrating S3 caching concepts. Not recommended for production use without thorough testing and validation for your specific use case.
-
-**Key Limitations**:
-- Requires hosts file or DNS modification for transparent operation
-- HTTPS mode provides passthrough only (no caching)
-- Cannot initiate requests to S3 (no AWS credentials, transparent forwarder only)
+Warm cache delivered 22% higher throughput and 2.4× lower p95 latency than direct S3 access. Download coordination coalesced 94% of concurrent cache-miss requests during the cold-cache run (4,323 of ~4,600 requests served from cache after waiting, only 272 actual S3 fetches). 6.3 GB downloaded from S3 to serve 137 GB (22× data transfer reduction). 
 
 ## FAQ
 
@@ -210,6 +215,10 @@ A: As the cache is transparent and has no credentials of its own, it cannot requ
 **Q: Will this work with S3-compatible storage?**
 
 A: Nothing about this solution is specific to Amazon S3. Any origin compatible with the S3 API should work.
+
+## Status
+
+**Beta Status**: This is sample code demonstrating S3 caching concepts. Not recommended for production use without thorough testing and validation for your specific use case.
 
 ## Author
 

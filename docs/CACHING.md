@@ -790,9 +790,10 @@ cache:
 
 **Cache Revalidation:**
 When an expired entry is accessed in lazy mode, the proxy uses HTTP conditional requests to validate freshness:
-1. Sends `If-Modified-Since` header with cached object's `Last-Modified` timestamp
+1. Sends `If-None-Match` with the cached ETag and `If-Modified-Since` with the cached `Last-Modified` timestamp
 2. If S3 returns `304 Not Modified`: Object unchanged, TTL refreshed, cached data served (no data transfer)
 3. If S3 returns `200 OK`: Object changed, old cached data actively removed, fresh data fetched and cached
+4. If S3 returns `403 Forbidden` or `401 Unauthorized`: Error returned to client, cached data preserved (a credentials failure is not a data change — cached data remains valid for other authorized callers)
 
 This approach minimizes bandwidth usage while ensuring cache freshness and consistency.
 

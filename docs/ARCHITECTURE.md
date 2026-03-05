@@ -446,6 +446,8 @@ cache:
   actively_remove_cached_data: false  # Required - must use lazy expiration
 ```
 
+**Behavior with TTL>0 (expired)**: When a cached object's TTL has elapsed, the next request triggers the same conditional revalidation flow described below. See [Cache Revalidation](CACHING.md#get-ttl-get_ttl) in the Caching documentation for full details including 304, 200, and 403 outcomes.
+
 **Behavior with TTL=0**:
 - Cache still stores data (useful for range merging, bandwidth savings)
 - Every request triggers S3 revalidation via conditional requests (`If-Modified-Since`)
