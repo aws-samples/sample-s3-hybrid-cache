@@ -234,11 +234,11 @@ cache:
     # Valid range: 1-300 seconds
     refresh_interval: "5s"
     
-    # Maximum number of entries in the cache (default: 10000)
-    # Each entry is ~1-2KB, so 10000 entries uses ~15-25MB of RAM.
+    # Maximum number of entries in the cache (default: 100000)
+    # Each entry is ~1-2KB, so 100000 entries uses ~150-250MB of RAM.
     # Increase for workloads with many unique objects.
     # Valid range: 100-1000000
-    max_entries: 10000
+    max_entries: 100000
     
     # Maximum retries for stale file handle errors (default: 3)
     # On shared storage (NFS), stale file handles can occur when files
