@@ -5,6 +5,25 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.7] - 2026-03-20
+
+### Changed
+- **Dashboard: flow-chart layout for cache statistics**: Replaced the flat 4-card grid with a two-column flow-chart showing HEAD and GET request paths separately. Each column shows RAM → Disk → S3 Fetch with hit/miss counts, hit rates, and flow arrows. Per-column totals and overall hit rate at the bottom. Overall Statistics section shows total requests, cached objects, Total Cache Size, Write Cache, S3 savings, and uptime.
+- **Dashboard: metadata cache disk hits counter**: New `disk_hits` metric tracks metadata lookups that missed RAM but were served from unexpired `.meta` files on disk. Previously these were invisible — counted as a RAM miss with no corresponding hit anywhere.
+- **Dashboard: per-bucket table HEAD TTL column**: Added HEAD TTL column to the Per-Bucket Cache Settings table. Previously only GET TTL was shown despite HEAD TTL being available in the API response and detail view.
+- **Dashboard: click-to-expand help text**: Replaced hover-over `title` tooltips with ⓘ icons that toggle inline help text on click. Works on mobile and is more discoverable than hover tooltips.
+- **Dashboard: stale refreshes help text**: Updated to clarify that stale refreshes count as RAM misses but may still be disk hits, rather than the previous incorrect "does not affect hit rate" wording.
+- **Dashboard: bucket overrides section redesign**: Renamed "Per-Bucket Cache Settings" to "Bucket and Prefix Overrides". Flattened bucket-level and prefix-level overrides into one table showing Bucket, Prefix, HEAD hit rate ("x% of y"), GET hit rate ("x% of y"), with a "Settings" button that expands to show TTLs and cache flags inline. Removed redundant "Cache Statistics" and "Application Logs" h2 headings.
+- **Per-bucket cache hit/miss recording for HEAD requests**: HEAD cache hits and misses now call `record_bucket_cache_access` and `update_statistics`, fixing the per-bucket counters that were always zero for HEAD-heavy workloads.
+
+## [1.9.6] - 2026-03-18
+
+### Changed
+- **Rate-limited S3 forwarding error logs**: All "Failed to forward request to S3" error paths now route through a single rate-limited helper that emits at most one log line per 60 seconds with an occurrence count and the most recent request's URI, method, and error. Previously, 10+ call sites used direct `error!()` calls that spammed logs during S3 connectivity issues. The helper uses `try_lock` on a `Mutex` to store the latest example without blocking the hot path.
+
+### Fixed
+- **Cached objects counter not reconciled when size drift is zero**: The daily validation scan only called `update_size_from_validation` (which corrects `cached_objects`) when the scanned size differed from the tracked size. With accumulator-based size tracking producing zero drift, the object count was never corrected — it accumulated double-counts from multi-instance consolidation and OOM restarts (1,076k tracked vs 691k actual). Now always reconciles `cached_objects` from the validation scan's `.meta` file count regardless of size drift.
+
 ## [1.9.5] - 2026-03-17
 
 ### Changed

@@ -4392,7 +4392,7 @@ grep "Consolidation cycle" /logs/app/*/app.log | grep "duration="
 
 **Validation Scan**:
 - Frequency: Once per day (configurable time)
-- Duration: ~26 minutes for 100M objects (parallel scanning)
+- Duration: ~10 minutes for 691k objects on EFS (parallel scanning)
 - CPU usage: Limited to 50% (parallel processing across cores)
 - Does not impact cache operation latency
 
