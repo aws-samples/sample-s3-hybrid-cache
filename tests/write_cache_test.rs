@@ -66,7 +66,7 @@ async fn test_write_cache_basic_operations() -> Result<()> {
 
     // Store write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone())
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
         .await?;
 
     // Retrieve and verify
@@ -141,7 +141,7 @@ async fn test_write_cache_ttl_expiration() -> Result<()> {
     let metadata = create_test_metadata("expired-etag", test_data.len() as u64);
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata)
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
         .await?;
 
     // Should exist and not be expired yet
@@ -169,7 +169,7 @@ async fn test_write_cache_cleanup() -> Result<()> {
     let metadata = create_test_metadata("cleanup-etag", test_data.len() as u64);
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata)
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
         .await?;
 
     // Cleanup should remove the entry
@@ -199,7 +199,7 @@ async fn test_write_cache_statistics() -> Result<()> {
     assert!(cache_manager.get_write_cache_entry(cache_key).await?.is_none());
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata)
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
         .await?;
 
     // Verify the entry was stored (write cache size tracking is async via JournalConsolidator,

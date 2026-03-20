@@ -62,7 +62,7 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone())
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
         .await
         .unwrap();
 
@@ -150,7 +150,7 @@ async fn test_upload_state_is_complete() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata)
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
         .await
         .unwrap();
 
@@ -220,7 +220,7 @@ async fn test_put_ttl_is_used_for_expiration() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata)
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
         .await
         .unwrap();
 
@@ -315,7 +315,7 @@ async fn test_put_cached_objects_not_in_ram_cache() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata)
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
         .await
         .unwrap();
 
@@ -391,7 +391,7 @@ async fn test_put_storage_with_headers() {
 
     // Store with headers
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, headers.clone(), metadata.clone())
+        .store_write_cache_entry(cache_key, test_data, headers.clone(), metadata.clone(), HashMap::new())
         .await
         .unwrap();
 
@@ -456,7 +456,7 @@ async fn test_multiple_put_operations_same_key() {
     };
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data_1, HashMap::new(), metadata_1)
+        .store_write_cache_entry(cache_key, test_data_1, HashMap::new(), metadata_1, HashMap::new())
         .await
         .unwrap();
 
@@ -481,7 +481,7 @@ async fn test_multiple_put_operations_same_key() {
     };
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data_2, HashMap::new(), metadata_2)
+        .store_write_cache_entry(cache_key, test_data_2, HashMap::new(), metadata_2, HashMap::new())
         .await
         .unwrap();
 

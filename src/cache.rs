@@ -793,12 +793,12 @@ impl CacheManager {
             interval: shared_storage_config.consolidation_interval,
             size_threshold: shared_storage_config.consolidation_size_threshold,
             entry_count_threshold: 100,
-            max_keys_per_run: 50,
             max_cache_size,
             eviction_trigger_percent: self.eviction_trigger_percent,
             eviction_target_percent: self.eviction_target_percent,
             stale_entry_timeout_secs: 300, // 5 minutes
             consolidation_cycle_timeout: shared_storage_config.consolidation_cycle_timeout,
+            max_keys_per_cycle: 5000,
         };
         let journal_consolidator = Arc::new(crate::journal_consolidator::JournalConsolidator::new(
             self.cache_dir.clone(),
@@ -2697,7 +2697,7 @@ impl CacheManager {
     /// Record per-bucket cache hit or miss for buckets with `_settings.json`.
     /// Extracts the bucket from the cache key, checks if it has custom settings,
     /// and records the metric if so. Requirements: 11.1, 11.2
-    pub async fn record_bucket_cache_access(&self, cache_key: &str, hit: bool) {
+    pub async fn record_bucket_cache_access(&self, cache_key: &str, hit: bool, is_head: bool) {
         let bucket = match crate::bucket_settings::BucketSettingsManager::extract_bucket(cache_key) {
             Some(b) => b.to_string(),
             None => return,
@@ -2710,9 +2710,9 @@ impl CacheManager {
         if let Some(mm_guard) = self.metrics_manager.read().await.as_ref() {
             let mm = mm_guard.read().await;
             if hit {
-                mm.record_bucket_cache_hit(&bucket).await;
+                mm.record_bucket_cache_hit(&bucket, is_head).await;
             } else {
-                mm.record_bucket_cache_miss(&bucket).await;
+                mm.record_bucket_cache_miss(&bucket, is_head).await;
             }
         }
     }
@@ -3732,6 +3732,13 @@ impl CacheManager {
                     .record_eviction_coordinated()
                     .await;
             }
+
+            // Decrement cached_objects count for each object whose metadata was fully deleted
+            if total_keys_evicted > 0 {
+                if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
+                    consolidator.decrement_cached_objects(total_keys_evicted).await;
+                }
+            }
         }
 
         // Return total_bytes_freed (not total_ranges_evicted) for accurate size tracking
@@ -4693,11 +4700,16 @@ impl CacheManager {
 
         match self.read_new_cache_metadata_from_disk(&metadata_path).await {
             Ok(metadata) => {
-                // Store in MetadataCache for future requests
-                self.metadata_cache.put(cache_key, metadata.clone()).await;
+                // Only cache in RAM if metadata has ranges — HEAD-only entries (ranges=0)
+                // would cause range lookups to miss even when consolidation has added
+                // ranges to the disk .meta. The HEAD cache handles HEAD responses separately.
+                if !metadata.ranges.is_empty() {
+                    self.metadata_cache.put(cache_key, metadata.clone()).await;
+                }
+                self.metadata_cache.record_disk_hit();
                 debug!(
-                    "Metadata loaded from disk and cached for key: {}",
-                    cache_key
+                    "Metadata loaded from disk for key: {} (ranges={}, cached_in_ram={})",
+                    cache_key, metadata.ranges.len(), !metadata.ranges.is_empty()
                 );
                 Ok(Some(metadata))
             }
@@ -6485,6 +6497,7 @@ impl CacheManager {
                     // Check if HEAD is still valid
                     if !metadata.is_head_expired() {
                         debug!("HEAD cache hit (disk .meta) for key: {}", cache_key);
+                        self.metadata_cache.record_disk_hit();
                         // Note: HEAD access tracking is handled by MetadataCache internally
                         // No need for journal-based tracking since HEAD doesn't have ranges
                         return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
@@ -6557,48 +6570,60 @@ impl CacheManager {
         }
 
         // Store in the unified NewCacheMetadata format
+        // Try to read existing metadata from disk instead of using exists() check.
+        // On NFS, exists() can return false due to attribute caching even when the file
+        // was recently written by consolidation on another instance. A direct read
+        // bypasses the attribute cache and avoids overwriting consolidated .meta files
+        // (which contain ranges) with HEAD-only versions (empty ranges).
         let metadata_path = self.get_new_metadata_file_path(cache_key);
-        if metadata_path.exists() {
-            // Update existing metadata with HEAD fields
-            match self
-                .update_metadata_head_fields(cache_key, &headers, &metadata)
-                .await
-            {
-                Ok(new_metadata) => {
-                    // Store in MetadataCache
-                    self.metadata_cache.put(cache_key, new_metadata).await;
-                    debug!(
-                        "Updated HEAD fields in NewCacheMetadata for key: {}",
-                        cache_key
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to update HEAD fields in NewCacheMetadata for {}: {}",
-                        cache_key, e
-                    );
-                    return Err(e);
+        match self.read_new_cache_metadata_from_disk(&metadata_path).await {
+            Ok(existing_metadata) => {
+                // Existing metadata found — update HEAD fields, preserving ranges
+                match self
+                    .update_metadata_head_fields(cache_key, &headers, &metadata)
+                    .await
+                {
+                    Ok(new_metadata) => {
+                        // Only cache in RAM if metadata has ranges — prevents HEAD-only
+                        // entries from blocking range lookups that need to read from disk
+                        if !new_metadata.ranges.is_empty() {
+                            self.metadata_cache.put(cache_key, new_metadata).await;
+                        }
+                        debug!(
+                            "Updated HEAD fields in NewCacheMetadata for key: {} (preserved {} ranges)",
+                            cache_key, existing_metadata.ranges.len()
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to update HEAD fields in NewCacheMetadata for {}: {}",
+                            cache_key, e
+                        );
+                        return Err(e);
+                    }
                 }
             }
-        } else {
-            // Create new metadata file with HEAD fields only
-            match self
-                .create_head_only_metadata(cache_key, &headers, &metadata)
-                .await
-            {
-                Ok(new_metadata) => {
-                    // Store in MetadataCache
-                    self.metadata_cache.put(cache_key, new_metadata).await;
-                    debug!("Created HEAD-only NewCacheMetadata for key: {}", cache_key);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to create HEAD-only NewCacheMetadata for {}: {}",
-                        cache_key, e
-                    );
-                    return Err(e);
+            Err(_) => {
+                // No existing metadata on disk — create HEAD-only
+                match self
+                    .create_head_only_metadata(cache_key, &headers, &metadata)
+                    .await
+                {
+                    Ok(_new_metadata) => {
+                        // HEAD-only metadata has no ranges — don't cache in RAM.
+                        // This prevents range lookups from getting stale empty-ranges
+                        // entries when consolidation has already added ranges to disk.
+                        debug!("Created HEAD-only NewCacheMetadata for key: {} (not cached in RAM)", cache_key);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create HEAD-only NewCacheMetadata for {}: {}",
+                            cache_key, e
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }

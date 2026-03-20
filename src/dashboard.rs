@@ -370,10 +370,9 @@ impl StaticFileHandler {
     
     <main>
         <div id="cache-stats" class="tab-content active">
-            <h2>Cache Statistics</h2>
             <div id="cache-stats-content">Loading...</div>
             <div id="bucket-stats-section" style="display:none;">
-                <h2>Per-Bucket Cache Settings</h2>
+                <h2>Bucket and Prefix Overrides</h2>
                 <div class="bucket-stats-controls">
                     <input type="text" id="bucket-filter" placeholder="Filter by bucket name..." />
                     <span id="bucket-stats-toggle"></span>
@@ -382,14 +381,11 @@ impl StaticFileHandler {
                     <table id="bucket-stats-table">
                         <thead>
                             <tr>
-                                <th class="sortable" data-sort="bucket">Bucket <span class="sort-arrow"></span></th>
-                                <th class="sortable" data-sort="hits">Hits <span class="sort-arrow"></span></th>
-                                <th class="sortable" data-sort="misses">Misses <span class="sort-arrow"></span></th>
-                                <th class="sortable" data-sort="hitRate">Hit Rate <span class="sort-arrow"></span></th>
-                                <th class="sortable" data-sort="getTtl">GET TTL <span class="sort-arrow"></span></th>
-                                <th class="sortable" data-sort="readCache">Read Cache <span class="sort-arrow"></span></th>
-                                <th class="sortable" data-sort="writeCache">Write Cache <span class="sort-arrow"></span></th>
-                                <th class="sortable" data-sort="ramCache">RAM Cache <span class="sort-arrow"></span></th>
+                                <th>Bucket</th>
+                                <th>Prefix</th>
+                                <th>HEAD</th>
+                                <th>GET</th>
+                                <th></th>
                             </tr>
                         </thead>
                         <tbody id="bucket-stats-body"></tbody>
@@ -399,7 +395,6 @@ impl StaticFileHandler {
         </div>
         
         <div id="logs" class="tab-content">
-            <h2>Application Logs</h2>
             <div class="logs-controls">
                 <label for="log-level-filter">Level:</label>
                 <select id="log-level-filter">
@@ -537,11 +532,38 @@ main {
     display: flex;
     justify-content: space-between;
     margin-bottom: 0.5rem;
+    flex-wrap: wrap;
 }
 
-.stat-item span[title] {
-    cursor: help;
-    border-bottom: 1px dotted #95a5a6;
+.stat-item .stat-label {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.stat-item .help-icon {
+    cursor: pointer;
+    color: #95a5a6;
+    font-size: 0.75rem;
+    user-select: none;
+    line-height: 1;
+}
+
+.stat-item .help-icon:hover {
+    color: #3498db;
+}
+
+.stat-item .help-text {
+    display: none;
+    width: 100%;
+    font-size: 0.78rem;
+    color: #6c757d;
+    padding: 0.2rem 0 0.1rem 1.2rem;
+    line-height: 1.3;
+}
+
+.stat-item .help-text.visible {
+    display: block;
 }
 
 .stat-item.warning {
@@ -675,6 +697,66 @@ main {
     margin-top: 2rem;
 }
 
+/* Flow chart layout for HEAD/GET request paths */
+.flow-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.flow-column {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.flow-header {
+    text-align: center;
+    color: #2c3e50;
+    margin: 0 0 0.75rem 0;
+    font-size: 1.1rem;
+}
+
+.flow-card {
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+}
+
+.flow-card h4 {
+    margin: 0 0 0.5rem 0;
+    color: #495057;
+    font-size: 0.9rem;
+    border-bottom: 1px solid #dee2e6;
+    padding-bottom: 0.4rem;
+}
+
+.flow-card-s3 {
+    background: #fff3cd;
+    border-color: #ffc107;
+}
+
+.flow-arrow {
+    text-align: center;
+    color: #6c757d;
+    font-size: 0.8rem;
+    padding: 0.25rem 0;
+}
+
+.flow-summary {
+    margin-top: 0.5rem;
+    padding: 0.5rem 1rem;
+    background: #e8f4f8;
+    border-radius: 6px;
+    border: 1px solid #bee5eb;
+}
+
+.overall-card {
+    max-width: 100%;
+}
+
 #bucket-stats-section h2 {
     margin-bottom: 1rem;
     color: #2c3e50;
@@ -736,38 +818,65 @@ main {
     user-select: none;
 }
 
-.bucket-stats-table th.sortable {
-    cursor: pointer;
-}
-
-.bucket-stats-table th.sortable:hover {
-    background: #3d566e;
-}
-
-.bucket-stats-table th .sort-arrow {
-    font-size: 0.7rem;
-    margin-left: 0.25rem;
-}
-
 .bucket-stats-table td {
     padding: 0.6rem 1rem;
     border-bottom: 1px solid #eee;
 }
 
 .bucket-stats-table tr.bucket-row {
-    cursor: pointer;
+    font-weight: 500;
 }
 
-.bucket-stats-table tr.bucket-row:hover {
+.bucket-stats-table tr.bucket-row:hover,
+.bucket-stats-table tr.prefix-row:hover {
     background-color: #f0f7ff;
 }
 
-.bucket-stats-table tr.detail-row {
+.bucket-stats-table tr.prefix-row td:first-child {
+    color: #95a5a6;
+}
+
+.bucket-stats-table tr.stats-detail-row {
     background-color: #f8f9fa;
 }
 
-.bucket-stats-table tr.detail-row td {
-    padding: 1rem;
+.bucket-stats-table tr.stats-detail-row td {
+    padding: 0.5rem 1rem;
+}
+
+.stats-detail {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.85rem;
+    color: #495057;
+}
+
+.stats-btn {
+    background: #e8f4f8;
+    border: 1px solid #bee5eb;
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    color: #495057;
+}
+
+.stats-btn:hover {
+    background: #d1ecf1;
+}
+
+.detail-sep {
+    color: #dee2e6;
+    margin: 0 0.25rem;
+}
+
+.badge-on {
+    color: #27ae60;
+    font-weight: 500;
+}
+
+.badge-off {
+    color: #95a5a6;
 }
 
 .detail-content {
@@ -978,6 +1087,7 @@ async function loadCacheStats() {
         }
         
         const data = await response.json();
+        helpCounter = 0; // Reset so IDs are stable across refreshes
         content.innerHTML = renderCacheStats(data);
     } catch (error) {
         content.innerHTML = `<div class="error">Failed to load cache statistics: ${error.message}</div>`;
@@ -1024,138 +1134,110 @@ function renderCacheStats(data) {
         return '<div class="loading">No cache statistics available</div>';
     }
     
-    // Build stale handle errors display (only show if > 0)
-    const staleHandleDisplay = (data.metadata_cache?.stale_handle_errors || 0) > 0 
-        ? `<div class="stat-item warning">
-               <span title="File handle errors when reading metadata from shared storage (NFS/EFS). Indicates stale NFS file handles that required retry.">Stale Handle Errors:</span>
-               <span class="stat-value warning-value">${formatNumber(data.metadata_cache?.stale_handle_errors || 0)}</span>
-           </div>`
-        : '';
-    
-    // Build disk revalidated display (only show if > 0)
+    // Conditional displays
     const staleRefreshes = data.metadata_cache?.stale_refreshes || 0;
-    const totalMetadataLookups = (data.metadata_cache?.hits || 0) + (data.metadata_cache?.misses || 0) + staleRefreshes;
-    const diskRevalidatedPct = totalMetadataLookups > 0 ? (staleRefreshes / totalMetadataLookups * 100).toFixed(1) : '0.0';
     const staleRefreshesDisplay = staleRefreshes > 0 
-        ? `<div class="stat-item">
-               <span title="Percentage of metadata lookups where the cached entry exceeded the refresh interval and was re-read from disk.">Disk Revalidated:</span>
-               <span class="stat-value">${diskRevalidatedPct}%</span>
-           </div>`
+        ? stat('Stale Refreshes', formatNumber(staleRefreshes),
+            'RAM entries that expired and required a disk re-read. These count as RAM misses but may still be disk hits.')
         : '';
-    
-    // Build last consolidation display (only show if available)
+    const staleHandleDisplay = (data.metadata_cache?.stale_handle_errors || 0) > 0 
+        ? statWarn('Stale Handle Errors', formatNumber(data.metadata_cache?.stale_handle_errors || 0),
+            'File handle errors when reading metadata from shared storage (NFS/EFS). Indicates stale NFS file handles that required retry.')
+        : '';
     const lastConsolidationDisplay = data.last_consolidation 
-        ? `<div class="stat-item">
-               <span title="When the journal consolidator last processed pending journal entries and updated cache size tracking.">Last Consolidation:</span>
-               <span class="stat-value">${formatTimestamp(data.last_consolidation)}</span>
-           </div>`
+        ? stat('Last Consolidation', formatTimestamp(data.last_consolidation),
+            'When the journal consolidator last processed pending journal entries and updated cache size tracking.')
         : '';
-    
+
+    // HEAD flow metrics
+    const headRamHits = data.metadata_cache?.hits || 0;
+    const headDiskHits = data.metadata_cache?.disk_hits || 0;
+    const headMisses = data.metadata_cache?.misses || 0;
+    const headTotal = headRamHits + headDiskHits + headMisses;
+    const headOverallHitRate = headTotal > 0 ? ((headRamHits + headDiskHits) / headTotal * 100).toFixed(1) : '0.0';
+    const headRamHitRate = (headRamHits + headMisses + headDiskHits) > 0 ? (headRamHits / (headRamHits + headMisses + headDiskHits) * 100).toFixed(1) : '0.0';
+    const headDiskTotal = headDiskHits + headMisses;
+    const headDiskHitRate = headDiskTotal > 0 ? (headDiskHits / headDiskTotal * 100).toFixed(1) : '0.0';
+
+    // GET flow metrics
+    const getRamHits = data.ram_cache?.hits || 0;
+    const getRamMisses = data.ram_cache?.misses || 0;
+    const getDiskHits = data.disk_cache?.hits || 0;
+    const getDiskMisses = data.disk_cache?.misses || 0;
+    const getTotal = data.overall?.get_total || (getRamHits + getDiskHits + getDiskMisses);
+    const getOverallHitRate = getTotal > 0 ? ((getRamHits + getDiskHits) / getTotal * 100).toFixed(1) : '0.0';
+    const getRamHitRate = (data.ram_cache?.hit_rate || 0).toFixed(1);
+    const getDiskTotal = getDiskHits + getDiskMisses;
+    const getDiskHitRate = getDiskTotal > 0 ? (getDiskHits / getDiskTotal * 100).toFixed(1) : '0.0';
+
     return `
+        <div class="flow-layout">
+            <div class="flow-column">
+                <h3 class="flow-header">HEAD Requests</h3>
+                <div class="flow-summary">
+                    ${stat('Total', formatNumber(headTotal), 'Total HEAD requests processed.')}
+                    ${stat('Overall Hit Rate', headOverallHitRate + '%', 'Percentage of HEAD requests served from any cache tier without S3 fetch.')}
+                </div>
+                <div class="flow-card">
+                    <h4>RAM Metadata</h4>
+                    ${stat('Hit Rate', headRamHitRate + '%', 'Percentage of HEAD metadata lookups served from RAM without disk I/O.')}
+                    ${stat('Hits', formatNumber(headRamHits), 'HEAD metadata lookups served from RAM.')}
+                    ${stat('Misses', formatNumber(headDiskHits + headMisses), 'HEAD metadata lookups not found in RAM (falls through to disk).')}
+                    ${stat('Entries', formatNumber(data.metadata_cache?.entries || 0) + ' / ' + formatNumber(data.metadata_cache?.max_entries || 0), 'Metadata entries currently held in RAM vs configured maximum.')}
+                    ${stat('Evictions', formatNumber(data.metadata_cache?.evictions || 0), 'Metadata entries evicted from RAM when at capacity (LRU).')}
+                    ${staleRefreshesDisplay}
+                    ${staleHandleDisplay}
+                </div>
+                <div class="flow-arrow">▼ miss</div>
+                <div class="flow-card">
+                    <h4>Disk Metadata</h4>
+                    ${stat('Hit Rate', headDiskHitRate + '%', 'Percentage of disk metadata lookups that found unexpired .meta files.')}
+                    ${stat('Hits', formatNumber(headDiskHits), 'HEAD lookups served from unexpired .meta files on disk.')}
+                </div>
+                <div class="flow-arrow">▼ miss</div>
+                <div class="flow-card flow-card-s3">
+                    ${stat('S3 Fetch', formatNumber(headMisses), 'HEAD requests forwarded to S3 because no cached metadata was found on RAM or disk.')}
+                </div>
+            </div>
+            
+            <div class="flow-column">
+                <h3 class="flow-header">GET Requests</h3>
+                <div class="flow-summary">
+                    ${stat('Total', formatNumber(getTotal), 'Total GET requests processed.')}
+                    ${stat('Overall Hit Rate', getOverallHitRate + '%', 'Percentage of GET requests served from any cache tier without S3 fetch.')}
+                </div>
+                <div class="flow-card">
+                    <h4>RAM Range Cache</h4>
+                    ${stat('Hit Rate', getRamHitRate + '%', 'Percentage of GET range lookups served from RAM without disk I/O.')}
+                    ${stat('Hits', formatNumber(getRamHits), 'GET requests served from RAM range cache.')}
+                    ${stat('Misses', formatNumber(getRamMisses), 'GET requests not found in RAM (falls through to disk).')}
+                    ${stat('Size', (data.ram_cache?.size_human || '0 B') + (data.ram_cache?.max_size_human ? ' / ' + data.ram_cache.max_size_human : ''), 'Current RAM range cache usage vs configured maximum.')}
+                    ${stat('Evictions', formatNumber(data.ram_cache?.evictions || 0), 'Range entries evicted from RAM to make room for new data.')}
+                </div>
+                <div class="flow-arrow">▼ miss</div>
+                <div class="flow-card">
+                    <h4>Disk Range Cache</h4>
+                    ${stat('Hit Rate', getDiskHitRate + '%', 'Percentage of disk range lookups that found cached data.')}
+                    ${stat('Hits', formatNumber(getDiskHits), 'GET requests served from cached range data on disk.')}
+                    ${stat('Evictions', formatNumber(data.disk_cache?.evictions || 0), 'Cached ranges removed during eviction to free disk space.')}
+                </div>
+                <div class="flow-arrow">▼ miss</div>
+                <div class="flow-card flow-card-s3">
+                    ${stat('S3 Fetch', formatNumber(getDiskMisses), 'GET requests forwarded to S3 because no cached range data was found on RAM or disk.')}
+                </div>
+            </div>
+        </div>
+        
         <div class="stats-grid">
-            <div class="stat-card">
-                <h3>RAM Cache: Object Ranges</h3>
-                <p class="stat-subtitle">Object range data (GET responses)</p>
-                <div class="stat-item">
-                    <span title="Percentage of RAM cache lookups that found data. Higher is better.">Hit Rate:</span>
-                    <span class="stat-value">${(data.ram_cache?.hit_rate || 0).toFixed(1)}%</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of GET requests served from RAM cache without disk I/O.">Hits:</span>
-                    <span class="stat-value">${formatNumber(data.ram_cache?.hits || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of GET requests not found in RAM cache, falling through to disk.">Misses:</span>
-                    <span class="stat-value">${formatNumber(data.ram_cache?.misses || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Current RAM cache usage vs configured maximum size.">Size:</span>
-                    <span class="stat-value">${data.ram_cache?.size_human || '0 B'}${data.ram_cache?.max_size_human ? ' / ' + data.ram_cache.max_size_human : ''}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of entries removed from RAM cache to make room for new data.">Evictions:</span>
-                    <span class="stat-value">${formatNumber(data.ram_cache?.evictions || 0)}</span>
-                </div>
-            </div>
-            
-            <div class="stat-card">
-                <h3>RAM Metadata Cache</h3>
-                <p class="stat-subtitle">In-memory cache for .meta objects (HEAD + GET)</p>
-                <div class="stat-item">
-                    <span title="Percentage of metadata lookups served from the in-memory metadata cache.">Hit Rate:</span>
-                    <span class="stat-value">${(data.metadata_cache?.hit_rate || 0).toFixed(1)}%</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of metadata lookups served from the in-memory cache.">Hits:</span>
-                    <span class="stat-value">${formatNumber(data.metadata_cache?.hits || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of metadata lookups that required reading from disk.">Misses:</span>
-                    <span class="stat-value">${formatNumber(data.metadata_cache?.misses || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of metadata entries currently held in RAM vs configured maximum.">Cached Entries:</span>
-                    <span class="stat-value">${formatNumber(data.metadata_cache?.entries || 0)} / ${formatNumber(data.metadata_cache?.max_entries || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of metadata entries evicted from RAM cache when at capacity (LRU).">Evictions:</span>
-                    <span class="stat-value">${formatNumber(data.metadata_cache?.evictions || 0)}</span>
-                </div>
-                ${staleRefreshesDisplay}
-                ${staleHandleDisplay}
-            </div>
-            
-            <div class="stat-card">
-                <h3>Disk Cache: Object Ranges</h3>
-                <p class="stat-subtitle">GET and PUT data on disk</p>
-                <div class="stat-item">
-                    <span title="Percentage of GET requests served from disk cache.">Hit Rate:</span>
-                    <span class="stat-value">${(data.disk_cache?.hit_rate || 0).toFixed(1)}%</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of GET requests served from cached range data on disk.">Hits:</span>
-                    <span class="stat-value">${formatNumber(data.disk_cache?.hits || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of GET requests forwarded to S3 (not found in cache).">Misses:</span>
-                    <span class="stat-value">${formatNumber(data.disk_cache?.misses || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Total disk cache usage (read + write cache) vs configured maximum.">Total Disk Size:</span>
-                    <span class="stat-value">${data.disk_cache?.size_human || '0 B'}${data.disk_cache?.max_size_human ? ' / ' + data.disk_cache.max_size_human : ''}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Disk space used by MPUs in progress and PUT objects not yet read via GET. Subset of total disk size, capped at write_cache_percent of total.">Write Cache Size:</span>
-                    <span class="stat-value">${data.write_cache?.size_human || '0 B'} / ${data.write_cache?.max_size_human || '0 B'}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of cached ranges removed during eviction to free disk space.">Evictions:</span>
-                    <span class="stat-value">${formatNumber(data.disk_cache?.evictions || 0)}</span>
-                </div>
-            </div>
-            
-            <div class="stat-card">
+            <div class="stat-card overall-card">
                 <h3>Overall Statistics</h3>
-                <div class="stat-item">
-                    <span title="Number of distinct objects (unique S3 keys) currently stored on disk.">Total Cached Objects:</span>
-                    <span class="stat-value">${data.disk_cache?.cached_objects != null ? formatNumber(data.disk_cache.cached_objects) : 'N/A'}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Total GET and HEAD cache lookups (read cache requests + metadata cache requests).">Cache Requests (GET + HEAD):</span>
-                    <span class="stat-value">${formatNumber((data.overall?.total_requests || 0) + (data.metadata_cache?.hits || 0) + (data.metadata_cache?.misses || 0))}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Total bytes served from cache instead of fetching from S3.">S3 Transfer Saved:</span>
-                    <span class="stat-value">${data.overall?.s3_transfer_saved_human || '0 B'}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Number of S3 requests avoided by serving from cache (GET + HEAD cache hits).">S3 Requests Saved:</span>
-                    <span class="stat-value">${formatNumber(data.overall?.s3_requests_saved || 0)}</span>
-                </div>
-                <div class="stat-item">
-                    <span title="Time since the proxy process started.">Uptime:</span>
-                    <span class="stat-value">${formatUptime(data.overall?.uptime_seconds || 0)}</span>
-                </div>
+                ${stat('Total Requests', formatNumber(data.overall?.total_requests || 0), 'Total HTTP requests processed (HEAD + GET).')}
+                ${stat('Cached Objects', data.disk_cache?.cached_objects != null ? formatNumber(data.disk_cache.cached_objects) : 'N/A', 'Number of distinct S3 objects currently stored on disk.')}
+                ${stat('Total Cache Size', (data.disk_cache?.size_human || '0 B') + (data.disk_cache?.max_size_human ? ' / ' + data.disk_cache.max_size_human : ''), 'Total disk cache usage (read + write cache) vs configured maximum.')}
+                ${stat('Write Cache', (data.write_cache?.size_human || '0 B') + ' / ' + (data.write_cache?.max_size_human || '0 B'), 'Disk space used by MPUs in progress and PUT objects not yet read via GET.')}
+                ${stat('S3 Requests Saved', formatNumber(data.overall?.s3_requests_saved || 0), 'Number of S3 requests avoided by serving from cache (GET + HEAD cache hits).')}
+                ${stat('S3 Transfer Saved', data.overall?.s3_transfer_saved_human || '0 B', 'Total bytes served from cache instead of fetching from S3.')}
+                ${stat('Uptime', formatUptime(data.overall?.uptime_seconds || 0), 'Time since the proxy process started.')}
                 ${lastConsolidationDisplay}
             </div>
         </div>
@@ -1240,6 +1322,40 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+let expandedHelp = new Set();
+let helpCounter = 0;
+
+function stat(label, value, help) {
+    const id = 'help-' + (helpCounter++);
+    const vis = expandedHelp.has(label) ? ' visible' : '';
+    return `<div class="stat-item">
+        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${label}','${id}')">ⓘ</span></span>
+        <span class="stat-value">${value}</span>
+        <span class="help-text${vis}" id="${id}">${help}</span>
+    </div>`;
+}
+
+function statWarn(label, value, help) {
+    const id = 'help-' + (helpCounter++);
+    const vis = expandedHelp.has(label) ? ' visible' : '';
+    return `<div class="stat-item warning">
+        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${label}','${id}')">ⓘ</span></span>
+        <span class="stat-value warning-value">${value}</span>
+        <span class="help-text${vis}" id="${id}">${help}</span>
+    </div>`;
+}
+
+function toggleHelp(label, id) {
+    const el = document.getElementById(id);
+    if (el.classList.contains('visible')) {
+        el.classList.remove('visible');
+        expandedHelp.delete(label);
+    } else {
+        el.classList.add('visible');
+        expandedHelp.add(label);
+    }
+}
+
 // Event listeners for log controls
 document.getElementById('log-level-filter').addEventListener('change', loadLogs);
 document.getElementById('log-limit').addEventListener('change', loadLogs);
@@ -1251,11 +1367,10 @@ document.getElementById('log-text-filter').addEventListener('input', function() 
     textFilterTimeout = setTimeout(loadLogs, 300);
 });
 
-// === Bucket Stats Table ===
+// === Bucket and Prefix Overrides Table ===
 let bucketStatsData = [];
-let bucketSortCol = 'hits';
-let bucketSortAsc = false;
 let bucketShowAll = false;
+let expandedSettings = new Set(); // Track which rows have settings expanded
 const BUCKET_PAGE_SIZE = 20;
 
 async function loadBucketStats() {
@@ -1276,146 +1391,111 @@ async function loadBucketStats() {
     }
 }
 
+function hitSummary(hits, total) {
+    if (total === 0) return '-';
+    const pct = (hits / total * 100).toFixed(1);
+    return pct + '% of ' + formatNumber(total);
+}
+
 function renderBucketStats() {
     const filter = (document.getElementById('bucket-filter').value || '').toLowerCase();
-    let rows = bucketStatsData;
-    if (filter) {
-        rows = rows.filter(b => b.bucket.toLowerCase().includes(filter));
-    }
-    // Sort
-    rows = rows.slice().sort((a, b) => {
-        let va, vb;
-        switch (bucketSortCol) {
-            case 'bucket': va = a.bucket.toLowerCase(); vb = b.bucket.toLowerCase(); break;
-            case 'hits': va = a.hit_count; vb = b.hit_count; break;
-            case 'misses': va = a.miss_count; vb = b.miss_count; break;
-            case 'hitRate': va = a.hit_rate; vb = b.hit_rate; break;
-            case 'getTtl': va = a.settings.get_ttl; vb = b.settings.get_ttl; break;
-            case 'readCache': va = a.settings.read_cache_enabled ? 1 : 0; vb = b.settings.read_cache_enabled ? 1 : 0; break;
-            case 'writeCache': va = a.settings.write_cache_enabled ? 1 : 0; vb = b.settings.write_cache_enabled ? 1 : 0; break;
-            case 'ramCache': va = a.settings.ram_cache_eligible ? 1 : 0; vb = b.settings.ram_cache_eligible ? 1 : 0; break;
-            default: va = a.hit_count; vb = b.hit_count;
+    let rows = [];
+    bucketStatsData.forEach(b => {
+        if (filter && !b.bucket.toLowerCase().includes(filter)) return;
+        const s = b.settings;
+        const hasBucketLevelOverrides = s.get_ttl || s.head_ttl || s.put_ttl ||
+            s.read_cache_enabled != null || s.write_cache_enabled != null ||
+            s.compression_enabled != null || s.ram_cache_eligible != null;
+        // Bucket-level defaults row
+        if (hasBucketLevelOverrides || !s.prefix_overrides || s.prefix_overrides.length === 0) {
+            rows.push({
+                rowKey: b.bucket + '::default',
+                bucket: b.bucket,
+                prefix: s.prefix_overrides && s.prefix_overrides.length > 0 ? '(bucket default)' : '(all)',
+                headHits: b.head_hit_count || 0, headTotal: (b.head_hit_count || 0) + (b.head_miss_count || 0),
+                getHits: b.get_hit_count || 0, getTotal: (b.get_hit_count || 0) + (b.get_miss_count || 0),
+                settings: s
+            });
         }
-        if (va < vb) return bucketSortAsc ? -1 : 1;
-        if (va > vb) return bucketSortAsc ? 1 : -1;
-        return 0;
+        if (s.prefix_overrides) {
+            s.prefix_overrides.forEach(po => {
+                rows.push({
+                    rowKey: b.bucket + '::' + po.prefix,
+                    bucket: s.prefix_overrides.length > 0 && !hasBucketLevelOverrides ? b.bucket : '',
+                    prefix: po.prefix,
+                    headHits: b.head_hit_count || 0, headTotal: (b.head_hit_count || 0) + (b.head_miss_count || 0),
+                    getHits: b.get_hit_count || 0, getTotal: (b.get_hit_count || 0) + (b.get_miss_count || 0),
+                    settings: po
+                });
+            });
+        }
     });
 
     const total = rows.length;
     const display = bucketShowAll ? rows : rows.slice(0, BUCKET_PAGE_SIZE);
-
-    // Update toggle
     const toggle = document.getElementById('bucket-stats-toggle');
     if (total > BUCKET_PAGE_SIZE) {
-        if (bucketShowAll) {
-            toggle.innerHTML = '<a onclick="bucketShowAll=false;renderBucketStats();">Show top ' + BUCKET_PAGE_SIZE + '</a>';
-        } else {
-            toggle.innerHTML = '<a onclick="bucketShowAll=true;renderBucketStats();">Show all ' + total + ' buckets</a>';
-        }
+        toggle.innerHTML = bucketShowAll
+            ? '<a onclick="bucketShowAll=false;renderBucketStats();">Show top ' + BUCKET_PAGE_SIZE + '</a>'
+            : '<a onclick="bucketShowAll=true;renderBucketStats();">Show all ' + total + ' rows</a>';
     } else {
         toggle.innerHTML = '';
     }
 
-    // Update sort arrows
-    document.querySelectorAll('#bucket-stats-table th.sortable').forEach(th => {
-        const arrow = th.querySelector('.sort-arrow');
-        if (th.dataset.sort === bucketSortCol) {
-            arrow.textContent = bucketSortAsc ? '\u25B2' : '\u25BC';
-        } else {
-            arrow.textContent = '';
-        }
-    });
-
-    // Render rows
     const tbody = document.getElementById('bucket-stats-body');
     tbody.innerHTML = '';
-    display.forEach((b, idx) => {
+    display.forEach(r => {
         const tr = document.createElement('tr');
-        tr.className = 'bucket-row';
+        tr.className = r.bucket ? 'bucket-row' : 'prefix-row';
+        const settingsBtn = '<button class="stats-btn" onclick="event.stopPropagation();toggleSettings(this,\'' + r.rowKey.replace(/'/g, "\\'") + '\')">Settings</button>';
         tr.innerHTML =
-            '<td>' + escapeHtml(b.bucket) + '</td>' +
-            '<td>' + formatNumber(b.hit_count) + '</td>' +
-            '<td>' + formatNumber(b.miss_count) + '</td>' +
-            '<td>' + (b.hit_rate * 100).toFixed(1) + '%</td>' +
-            '<td>' + escapeHtml(b.settings.get_ttl) + '</td>' +
-            '<td class="' + (b.settings.read_cache_enabled ? 'badge-on' : 'badge-off') + '">' + (b.settings.read_cache_enabled ? 'On' : 'Off') + '</td>' +
-            '<td class="' + (b.settings.write_cache_enabled ? 'badge-on' : 'badge-off') + '">' + (b.settings.write_cache_enabled ? 'On' : 'Off') + '</td>' +
-            '<td class="' + (b.settings.ram_cache_eligible ? 'badge-on' : 'badge-off') + '">' + (b.settings.ram_cache_eligible ? 'On' : 'Off') + '</td>';
-        tr.addEventListener('click', function() { toggleBucketDetail(this, b); });
+            '<td>' + escapeHtml(r.bucket) + '</td>' +
+            '<td>' + escapeHtml(r.prefix) + '</td>' +
+            '<td>' + hitSummary(r.headHits, r.headTotal) + '</td>' +
+            '<td>' + hitSummary(r.getHits, r.getTotal) + '</td>' +
+            '<td>' + settingsBtn + '</td>';
+        tr.dataset.settings = JSON.stringify(r.settings);
         tbody.appendChild(tr);
+
+        // Restore expanded settings if previously open
+        if (expandedSettings.has(r.rowKey)) {
+            appendSettingsRow(tr, r.settings, r.rowKey);
+        }
     });
 }
 
-function toggleBucketDetail(row, b) {
-    const next = row.nextElementSibling;
-    if (next && next.classList.contains('detail-row')) {
-        next.remove();
-        return;
-    }
-    // Remove any other open detail rows
-    document.querySelectorAll('#bucket-stats-body tr.detail-row').forEach(r => r.remove());
-
+function appendSettingsRow(row, settings, rowKey) {
+    const s = typeof settings === 'string' ? JSON.parse(settings) : settings;
     const detail = document.createElement('tr');
-    detail.className = 'detail-row';
+    detail.className = 'stats-detail-row';
+    detail.dataset.rowKey = rowKey;
     const td = document.createElement('td');
-    td.colSpan = 8;
-
-    const s = b.settings;
-    let html = '<div class="detail-content">';
-    html += '<h4>Resolved Settings</h4>';
-    html += '<div class="detail-grid">';
-    html += detailItem('GET TTL', s.get_ttl);
-    html += detailItem('HEAD TTL', s.head_ttl);
-    html += detailItem('PUT TTL', s.put_ttl);
-    html += detailItem('Read Cache', s.read_cache_enabled ? 'On' : 'Off');
-    html += detailItem('Write Cache', s.write_cache_enabled ? 'On' : 'Off');
-    html += detailItem('Compression', s.compression_enabled ? 'On' : 'Off');
-    html += detailItem('RAM Cache', s.ram_cache_eligible ? 'On' : 'Off');
-    html += detailItem('Prefix Overrides', String(s.prefix_override_count));
-    html += '</div>';
-
-    if (s.prefix_overrides && s.prefix_overrides.length > 0) {
-        html += '<h4>Prefix Overrides</h4>';
-        html += '<table class="prefix-table"><thead><tr>';
-        html += '<th>Prefix</th><th>GET TTL</th><th>HEAD TTL</th><th>PUT TTL</th><th>Read</th><th>Write</th><th>Compression</th><th>RAM</th>';
-        html += '</tr></thead><tbody>';
-        s.prefix_overrides.forEach(po => {
-            html += '<tr>';
-            html += '<td>' + escapeHtml(po.prefix) + '</td>';
-            html += '<td>' + (po.get_ttl != null ? escapeHtml(po.get_ttl) : '-') + '</td>';
-            html += '<td>' + (po.head_ttl != null ? escapeHtml(po.head_ttl) : '-') + '</td>';
-            html += '<td>' + (po.put_ttl != null ? escapeHtml(po.put_ttl) : '-') + '</td>';
-            html += '<td>' + (po.read_cache_enabled != null ? (po.read_cache_enabled ? 'On' : 'Off') : '-') + '</td>';
-            html += '<td>' + (po.write_cache_enabled != null ? (po.write_cache_enabled ? 'On' : 'Off') : '-') + '</td>';
-            html += '<td>' + (po.compression_enabled != null ? (po.compression_enabled ? 'On' : 'Off') : '-') + '</td>';
-            html += '<td>' + (po.ram_cache_eligible != null ? (po.ram_cache_eligible ? 'On' : 'Off') : '-') + '</td>';
-            html += '</tr>';
-        });
-        html += '</tbody></table>';
-    }
-    html += '</div>';
-    td.innerHTML = html;
+    td.colSpan = 5;
+    const items = [];
+    if (s.get_ttl) items.push('GET TTL: ' + escapeHtml(s.get_ttl));
+    if (s.head_ttl) items.push('HEAD TTL: ' + escapeHtml(s.head_ttl));
+    if (s.put_ttl) items.push('PUT TTL: ' + escapeHtml(s.put_ttl));
+    if (s.read_cache_enabled != null) items.push('Read: ' + (s.read_cache_enabled ? 'On' : 'Off'));
+    if (s.write_cache_enabled != null) items.push('Write: ' + (s.write_cache_enabled ? 'On' : 'Off'));
+    if (s.compression_enabled != null) items.push('Compression: ' + (s.compression_enabled ? 'On' : 'Off'));
+    if (s.ram_cache_eligible != null) items.push('RAM: ' + (s.ram_cache_eligible ? 'On' : 'Off'));
+    td.innerHTML = '<div class="stats-detail">' + items.join('<span class="detail-sep">·</span>') + '</div>';
     detail.appendChild(td);
     row.after(detail);
 }
 
-function detailItem(label, value) {
-    return '<div class="detail-item"><span class="detail-label">' + label + '</span><span class="detail-value">' + escapeHtml(value) + '</span></div>';
+function toggleSettings(btn, rowKey) {
+    const row = btn.closest('tr');
+    const next = row.nextElementSibling;
+    if (next && next.classList.contains('stats-detail-row')) {
+        next.remove();
+        expandedSettings.delete(rowKey);
+        return;
+    }
+    const s = JSON.parse(row.dataset.settings);
+    expandedSettings.add(rowKey);
+    appendSettingsRow(row, s, rowKey);
 }
-
-// Sort handler
-document.querySelectorAll('#bucket-stats-table th.sortable').forEach(th => {
-    th.addEventListener('click', function() {
-        const col = this.dataset.sort;
-        if (bucketSortCol === col) {
-            bucketSortAsc = !bucketSortAsc;
-        } else {
-            bucketSortCol = col;
-            bucketSortAsc = col === 'bucket';
-        }
-        renderBucketStats();
-    });
-});
 
 // Bucket filter with debounce
 let bucketFilterTimeout;
@@ -1647,6 +1727,7 @@ impl ApiHandler {
                     },
                     hits: metadata_stats.hits,
                     misses: metadata_stats.misses,
+                    disk_hits: metadata_stats.disk_hits,
                     entries: metadata_entries as u64,
                     max_entries: metadata_max_entries as u64,
                     evictions: metadata_stats.evictions,
@@ -1689,6 +1770,12 @@ impl ApiHandler {
                 },
                 overall: OverallStats {
                     total_requests,
+                    head_total: cache_stats.head_hits.saturating_add(cache_stats.head_misses),
+                    get_total: cache_stats.get_hits.saturating_add(cache_stats.get_misses),
+                    head_hits: cache_stats.head_hits,
+                    head_misses: cache_stats.head_misses,
+                    get_hits: cache_stats.get_hits,
+                    get_misses: cache_stats.get_misses,
                     uptime_seconds,
                     s3_transfer_saved_bytes: cache_stats.bytes_served_from_cache,
                     s3_transfer_saved_human: format_bytes(cache_stats.bytes_served_from_cache),
@@ -1909,6 +1996,10 @@ impl ApiHandler {
             let stats = bucket_cache_stats.get(bucket.as_str());
             let hit_count = stats.map_or(0, |s| s.hit_count);
             let miss_count = stats.map_or(0, |s| s.miss_count);
+            let head_hit_count = stats.map_or(0, |s| s.head_hit_count);
+            let head_miss_count = stats.map_or(0, |s| s.head_miss_count);
+            let get_hit_count = stats.map_or(0, |s| s.get_hit_count);
+            let get_miss_count = stats.map_or(0, |s| s.get_miss_count);
             let total = hit_count + miss_count;
             let hit_rate = if total > 0 {
                 hit_count as f64 / total as f64
@@ -1921,6 +2012,10 @@ impl ApiHandler {
                 hit_count,
                 miss_count,
                 hit_rate,
+                head_hit_count,
+                head_miss_count,
+                get_hit_count,
+                get_miss_count,
                 settings: ResolvedSettingsSummary {
                     get_ttl: crate::bucket_settings::format_duration(resolved.get_ttl),
                     head_ttl: crate::bucket_settings::format_duration(resolved.head_ttl),
@@ -2295,6 +2390,7 @@ pub struct MetadataCacheStats {
     pub hit_rate: f32,
     pub hits: u64,
     pub misses: u64,
+    pub disk_hits: u64,
     pub entries: u64,
     pub max_entries: u64,
     pub evictions: u64,
@@ -2323,6 +2419,12 @@ pub struct CacheStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverallStats {
     pub total_requests: u64,
+    pub head_total: u64,
+    pub get_total: u64,
+    pub head_hits: u64,
+    pub head_misses: u64,
+    pub get_hits: u64,
+    pub get_misses: u64,
     pub uptime_seconds: u64,
     pub s3_transfer_saved_bytes: u64,
     pub s3_transfer_saved_human: String,
@@ -2387,6 +2489,10 @@ pub struct BucketStatsEntry {
     pub hit_count: u64,
     pub miss_count: u64,
     pub hit_rate: f64,
+    pub head_hit_count: u64,
+    pub head_miss_count: u64,
+    pub get_hit_count: u64,
+    pub get_miss_count: u64,
     pub settings: ResolvedSettingsSummary,
 }
 

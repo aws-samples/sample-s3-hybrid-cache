@@ -80,7 +80,7 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata)
+        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
         .await?;
 
     // Step 2: Create range handler
@@ -185,7 +185,7 @@ async fn test_invalidate_stale_ranges() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata)
+        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
         .await?;
 
     // Step 2: Verify data is stored
@@ -274,7 +274,7 @@ async fn test_invalidate_stale_ranges_no_mismatch() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata)
+        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
         .await?;
 
     // Step 2: Try to invalidate with same ETag (should not invalidate)

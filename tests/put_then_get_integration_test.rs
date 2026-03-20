@@ -65,6 +65,7 @@ async fn store_write_cache_entry_unified(
             data,
             std::collections::HashMap::new(),
             metadata.clone(),
+            std::collections::HashMap::new(),
         )
         .await
 }

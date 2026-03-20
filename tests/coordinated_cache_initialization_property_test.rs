@@ -348,7 +348,7 @@ fn prop_cross_validation_threshold_behavior(manager_size: u32, tracker_size: u32
         // Set the write cache size via consolidator's size state
         if tracker_size > 0 {
             consolidator
-                .update_size_from_validation(0, Some(tracker_size))
+                .update_size_from_validation(0, Some(tracker_size), None)
                 .await;
         }
 

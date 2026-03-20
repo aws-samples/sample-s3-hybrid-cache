@@ -957,7 +957,17 @@ impl DiskCacheManager {
         }
 
         let uncompressed_size = data.len() as u64;
-        if uncompressed_size != (end - start + 1) {
+        // When the client requests a range larger than the object (e.g., Range: bytes=0-52428799
+        // for a 10-byte object), S3 returns only the available bytes with Content-Range: bytes 0-9/10.
+        // Clamp the range end to match the actual data received from S3.
+        let end = if uncompressed_size < (end - start + 1) && uncompressed_size > 0 {
+            let clamped_end = start + uncompressed_size - 1;
+            info!(
+                "Range clamped to actual data size: key={}, requested_end={}, clamped_end={}, data_size={}",
+                cache_key, end, clamped_end, uncompressed_size
+            );
+            clamped_end
+        } else if uncompressed_size != (end - start + 1) {
             error!(
                 "Range validation failed: data size mismatch for key={}, expected={}, actual={}",
                 cache_key,
@@ -969,7 +979,9 @@ impl DiskCacheManager {
                 uncompressed_size,
                 end - start + 1
             )));
-        }
+        } else {
+            end
+        };
 
         debug!(
             "Range validation passed: key={}, range={}-{}, size={} bytes",

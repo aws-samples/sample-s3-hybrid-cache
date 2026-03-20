@@ -90,7 +90,7 @@ async fn test_put_then_full_get_uses_cache() {
 
     println!("[TEST] Step 1: Storing PUT data in write cache");
     cache_manager
-        .store_write_cache_entry(&cache_key, test_data, headers.clone(), metadata.clone())
+        .store_write_cache_entry(&cache_key, test_data, headers.clone(), metadata.clone(), HashMap::new())
         .await
         .unwrap();
 
@@ -286,7 +286,7 @@ async fn test_put_then_full_get_large_object() {
 
     println!("[TEST] Storing 1MB PUT data in write cache");
     cache_manager
-        .store_write_cache_entry(&cache_key, &test_data, headers, metadata)
+        .store_write_cache_entry(&cache_key, &test_data, headers, metadata, HashMap::new())
         .await
         .unwrap();
 
@@ -385,7 +385,7 @@ async fn test_has_cached_ranges_optimization() {
 
     println!("[TEST] Step 1: Storing PUT data");
     cache_manager
-        .store_write_cache_entry(&cache_key, test_data, headers, metadata)
+        .store_write_cache_entry(&cache_key, test_data, headers, metadata, HashMap::new())
         .await
         .unwrap();
 

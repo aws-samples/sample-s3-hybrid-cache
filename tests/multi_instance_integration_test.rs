@@ -114,8 +114,9 @@ impl TestProxyInstance {
         let headers = HashMap::new();
 
         // Store using the public cache manager API
+        let response_headers = HashMap::new();
         self.cache_manager
-            .store_write_cache_entry(cache_key, data, headers, metadata)
+            .store_write_cache_entry(cache_key, data, headers, metadata, response_headers)
             .await?;
 
         Ok(())

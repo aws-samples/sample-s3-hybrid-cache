@@ -341,7 +341,7 @@ async fn main() -> Result<()> {
                             Ok(result) => {
                                 if result.entries_consolidated > 0 || result.eviction_triggered {
                                     info!(
-                                        "Consolidation cycle: entries={}, size_delta={:+}, evicted={}, current_size={}",
+                                        "Consolidation cycle: entries={}, size_delta={:+}, evicted={}, total_cache_size={}",
                                         result.entries_consolidated,
                                         result.size_delta,
                                         result.bytes_evicted,

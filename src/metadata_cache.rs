@@ -32,7 +32,7 @@ impl Default for MetadataCacheConfig {
         Self {
             enabled: true,
             refresh_interval: Duration::from_secs(5),
-            max_entries: 10000,
+            max_entries: 100000,
             stale_handle_max_retries: 3,
         }
     }
@@ -77,9 +77,9 @@ impl MetadataCacheEntry {
 /// Metrics for the metadata cache
 #[derive(Debug, Default)]
 pub struct MetadataCacheMetrics {
-    /// Number of cache hits
+    /// Number of cache hits (found in RAM, not stale)
     pub hits: AtomicU64,
-    /// Number of cache misses
+    /// Number of cache misses (key not in RAM)
     pub misses: AtomicU64,
     /// Number of stale refreshes (re-reads from disk due to staleness)
     pub stale_refreshes: AtomicU64,
@@ -87,6 +87,8 @@ pub struct MetadataCacheMetrics {
     pub evictions: AtomicU64,
     /// Number of stale file handle errors encountered
     pub stale_handle_errors: AtomicU64,
+    /// Number of disk hits (RAM miss but found on disk)
+    pub disk_hits: AtomicU64,
 }
 
 impl MetadataCacheMetrics {
@@ -98,6 +100,7 @@ impl MetadataCacheMetrics {
             stale_refreshes: self.stale_refreshes.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             stale_handle_errors: self.stale_handle_errors.load(Ordering::Relaxed),
+            disk_hits: self.disk_hits.load(Ordering::Relaxed),
         }
     }
 }
@@ -110,6 +113,7 @@ pub struct MetadataCacheMetricsSnapshot {
     pub stale_refreshes: u64,
     pub evictions: u64,
     pub stale_handle_errors: u64,
+    pub disk_hits: u64,
 }
 
 impl MetadataCacheMetricsSnapshot {
@@ -162,6 +166,11 @@ impl MetadataCache {
     /// Check if the cache is enabled
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Record a disk hit (RAM miss but found on disk)
+    pub fn record_disk_hit(&self) {
+        self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the configuration

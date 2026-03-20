@@ -79,7 +79,7 @@ async fn test_range_request_from_write_cache() {
     // Store as write cache entry (simulating PUT request)
     println!("Storing PUT-cached object...");
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone())
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
         .await
         .unwrap();
 
@@ -304,7 +304,7 @@ async fn test_full_object_range_from_write_cache() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone())
+        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
         .await
         .unwrap();
 

@@ -282,6 +282,10 @@ pub struct AtomicMetadataStats {
 pub struct BucketCacheStats {
     pub hit_count: u64,
     pub miss_count: u64,
+    pub head_hit_count: u64,
+    pub head_miss_count: u64,
+    pub get_hit_count: u64,
+    pub get_miss_count: u64,
 }
 
 /// Metrics collector and manager
@@ -1760,20 +1764,20 @@ impl MetricsManager {
     }
     /// Record a per-bucket cache hit.
     /// Only call this for buckets that have a `_settings.json` file.
-    /// Requirements: 11.1, 11.2
-    pub async fn record_bucket_cache_hit(&self, bucket: &str) {
+    pub async fn record_bucket_cache_hit(&self, bucket: &str, is_head: bool) {
         let mut stats = self.bucket_cache_stats.write().await;
         let entry = stats.entry(bucket.to_string()).or_default();
         entry.hit_count += 1;
+        if is_head { entry.head_hit_count += 1; } else { entry.get_hit_count += 1; }
     }
 
     /// Record a per-bucket cache miss.
     /// Only call this for buckets that have a `_settings.json` file.
-    /// Requirements: 11.1, 11.2
-    pub async fn record_bucket_cache_miss(&self, bucket: &str) {
+    pub async fn record_bucket_cache_miss(&self, bucket: &str, is_head: bool) {
         let mut stats = self.bucket_cache_stats.write().await;
         let entry = stats.entry(bucket.to_string()).or_default();
         entry.miss_count += 1;
+        if is_head { entry.head_miss_count += 1; } else { entry.get_miss_count += 1; }
     }
 
     /// Get per-bucket cache stats for all tracked buckets.

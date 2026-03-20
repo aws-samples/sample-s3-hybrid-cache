@@ -44,12 +44,12 @@ async fn create_test_consolidator(
         interval: Duration::from_secs(5),
         size_threshold: 1024 * 1024,
         entry_count_threshold: 100,
-        max_keys_per_run: 50,
         max_cache_size,
         eviction_trigger_percent: 95,
         eviction_target_percent: 80,
         stale_entry_timeout_secs: 300,
         consolidation_cycle_timeout: Duration::from_secs(30),
+        max_keys_per_cycle: 5000,
     };
     let consolidator = Arc::new(JournalConsolidator::new(
         cache_dir,
@@ -92,6 +92,7 @@ fn prop_multi_instance_shared_state_persistence(
         let original_state = SizeState {
             total_size: total_size as u64,
             write_cache_size: write_cache_size as u64,
+            cached_objects: 0,
             last_consolidation: SystemTime::now(),
             consolidation_count: consolidation_count as u64,
             last_updated_by: "instance-1:12345".to_string(),
@@ -170,6 +171,7 @@ fn prop_crash_recovery_size_state(
         let previous_state = SizeState {
             total_size: total_size as u64,
             write_cache_size: write_cache_size as u64,
+            cached_objects: 0,
             last_consolidation: SystemTime::now() - Duration::from_secs(60),
             consolidation_count: consolidation_count as u64,
             last_updated_by: "previous-instance:12345".to_string(),
@@ -289,7 +291,7 @@ fn prop_crash_recovery_validation_correction(
 
         // Update size from validation (simulating what CacheSizeTracker does after a scan)
         consolidator
-            .update_size_from_validation(correct_size, Some(write_cache_size))
+            .update_size_from_validation(correct_size, Some(write_cache_size), None)
             .await;
 
         // Property: size should be corrected by validation

@@ -759,7 +759,7 @@ fn default_metadata_cache_refresh_interval() -> Duration {
 }
 
 fn default_metadata_cache_max_entries() -> usize {
-    10000
+    100000
 }
 
 fn default_metadata_cache_stale_handle_max_retries() -> u32 {

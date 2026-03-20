@@ -609,7 +609,7 @@ impl LoggerManager {
         // Try to set global subscriber, but don't fail if already set (for tests)
         // Use config log_level, but allow RUST_LOG env var to override
         let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&self.config.log_level));
+            .unwrap_or_else(|_| EnvFilter::new(&format!("{},trust_dns_proto=error", self.config.log_level)));
 
         let result = tracing_subscriber::registry()
             .with(env_filter)

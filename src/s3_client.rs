@@ -19,7 +19,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// S3 client with Hyper connection pooling support
 pub struct S3Client {
@@ -288,7 +288,7 @@ impl S3Client {
                             // Connection errors don't count against retry limit (Requirement 5.5)
                             debug!("Retrying after connection error (not counted against retry limit) in {:?}", delay);
                         } else {
-                            warn!(
+                            info!(
                                 "Request attempt {} failed, retrying in {:?}: {}",
                                 attempt + 1,
                                 delay,

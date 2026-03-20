@@ -785,6 +785,60 @@ impl JournalManager {
     ///
     /// Reads from per-instance journals: `metadata/_journals/{instance_id}.journal`
     /// Both HybridMetadataWriter and CacheHitUpdateBuffer now use this format.
+    /// Like `get_all_entries_for_cache_key` but reads only the provided files instead of
+    /// scanning the entire journal directory. Use this when the caller already has a
+    /// pre-built index (e.g. from `discover_pending_cache_keys_indexed`) to avoid
+    /// redundant full-directory scans on every key during a consolidation cycle.
+    pub async fn get_entries_from_files(
+        &self,
+        cache_key: &str,
+        journal_files: &[std::path::PathBuf],
+    ) -> Result<Vec<JournalEntry>> {
+        let mut all_entries = Vec::new();
+
+        for journal_file in journal_files {
+            match tokio::fs::read_to_string(journal_file).await {
+                Ok(content) => {
+                    for line in content.lines() {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<JournalEntry>(line) {
+                            Ok(entry) => {
+                                if entry.cache_key == cache_key {
+                                    all_entries.push(entry);
+                                }
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Failed to parse journal entry: file={:?}, error={}",
+                                    journal_file, e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to read journal file: file={:?}, error={}",
+                        journal_file, e
+                    );
+                }
+            }
+        }
+
+        all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        debug!(
+            "Retrieved {} journal entries for cache_key={} from {} journal files (indexed)",
+            all_entries.len(),
+            cache_key,
+            journal_files.len()
+        );
+
+        Ok(all_entries)
+    }
+
     pub async fn get_all_entries_for_cache_key(
         &self,
         cache_key: &str,

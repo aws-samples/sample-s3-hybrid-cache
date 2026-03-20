@@ -326,12 +326,12 @@ async fn create_test_consolidator(
         interval: Duration::from_secs(5),
         size_threshold: 1024 * 1024,
         entry_count_threshold: 100,
-        max_keys_per_run: 50,
         max_cache_size,
         eviction_trigger_percent: 95,
         eviction_target_percent: 80,
         stale_entry_timeout_secs: 300,
         consolidation_cycle_timeout: Duration::from_secs(30),
+        max_keys_per_cycle: 5000,
     };
     let consolidator = Arc::new(JournalConsolidator::new(
         cache_dir,
@@ -670,6 +670,7 @@ async fn test_crash_recovery_with_existing_size_state() {
     let previous_state = SizeState {
         total_size: 5000,
         write_cache_size: 500,
+        cached_objects: 0,
         last_consolidation: SystemTime::now() - Duration::from_secs(60),
         consolidation_count: 10,
         last_updated_by: "previous-instance:12345".to_string(),
@@ -766,7 +767,7 @@ async fn test_validation_scan_corrects_drift() {
 
     // Update size from validation (simulating what CacheSizeTracker does after a scan)
     consolidator
-        .update_size_from_validation(correct_size, Some(500))
+        .update_size_from_validation(correct_size, Some(500), None)
         .await;
 
     // Verify size was corrected

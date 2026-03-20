@@ -64,12 +64,12 @@ impl TestProxyInstance {
                 interval: Duration::from_secs(1),
                 size_threshold: 512,
                 entry_count_threshold: 3,
-                max_keys_per_run: 10,
                 max_cache_size: 0, // No eviction in tests
                 eviction_trigger_percent: 95,
                 eviction_target_percent: 80,
                 stale_entry_timeout_secs: 300,
                 consolidation_cycle_timeout: Duration::from_secs(30),
+                max_keys_per_cycle: 5000,
             },
         );
 
@@ -567,12 +567,12 @@ async fn test_startup_validation_coordination_with_multiple_instances() {
         interval: Duration::from_secs(5),
         size_threshold: 1024 * 1024,
         entry_count_threshold: 100,
-        max_keys_per_run: 50,
         max_cache_size: 0,
         eviction_trigger_percent: 95,
         eviction_target_percent: 80,
         stale_entry_timeout_secs: 300,
         consolidation_cycle_timeout: Duration::from_secs(30),
+        max_keys_per_cycle: 5000,
     };
     let consolidator = Arc::new(JournalConsolidator::new(
         cache_dir.clone(),

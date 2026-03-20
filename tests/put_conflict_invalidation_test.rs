@@ -51,6 +51,7 @@ async fn test_put_invalidates_existing_complete_cache() -> Result<()> {
             initial_data,
             initial_headers.clone(),
             initial_metadata,
+            HashMap::new(),
         )
         .await?;
 
@@ -88,7 +89,7 @@ async fn test_put_invalidates_existing_complete_cache() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, new_data, new_headers, new_metadata)
+        .store_write_cache_entry(&cache_key, new_data, new_headers, new_metadata, HashMap::new())
         .await?;
 
     // Verify metadata file still exists but with new content
@@ -170,7 +171,7 @@ async fn test_put_invalidates_in_progress_multipart() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, put_data, put_headers, put_metadata)
+        .store_write_cache_entry(&cache_key, put_data, put_headers, put_metadata, HashMap::new())
         .await?;
 
     // Verify metadata file now contains the PUT data, not the multipart
@@ -230,6 +231,7 @@ async fn test_put_deletes_range_files_on_conflict() -> Result<()> {
             initial_data,
             initial_headers.clone(),
             initial_metadata,
+            HashMap::new(),
         )
         .await?;
 
@@ -266,7 +268,7 @@ async fn test_put_deletes_range_files_on_conflict() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, new_data, new_headers, new_metadata)
+        .store_write_cache_entry(&cache_key, new_data, new_headers, new_metadata, HashMap::new())
         .await?;
 
     // Verify old range files were deleted and new ones created
@@ -327,7 +329,7 @@ async fn test_multipart_initiation_invalidates_put_cache() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, put_data, put_headers, put_metadata)
+        .store_write_cache_entry(&cache_key, put_data, put_headers, put_metadata, HashMap::new())
         .await?;
 
     // Verify PUT data is cached

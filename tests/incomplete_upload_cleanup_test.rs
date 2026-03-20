@@ -256,7 +256,7 @@ async fn test_cleanup_incomplete_uploads_preserves_completed() -> Result<()> {
     };
 
     cache_manager
-        .store_write_cache_entry(path, test_data, headers, metadata)
+        .store_write_cache_entry(path, test_data, headers, metadata, HashMap::new())
         .await?;
 
     let cache_key = CacheManager::generate_cache_key(path, None);

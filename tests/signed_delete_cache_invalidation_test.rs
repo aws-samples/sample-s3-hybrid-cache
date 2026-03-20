@@ -67,7 +67,7 @@ async fn store_test_cache_entry(cache_manager: &CacheManager, cache_key: &str) -
         last_accessed: std::time::SystemTime::now(),
     };
     cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata)
+        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
         .await
 }
 

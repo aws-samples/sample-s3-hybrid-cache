@@ -652,13 +652,29 @@ impl HttpProxy {
         let _permit = match request_semaphore.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
-                // Return 429 Too Many Requests when limit exceeded
-                warn!("Request limit exceeded, returning 429");
+                // Return 503 Service Unavailable (S3-compatible SlowDown) when limit exceeded
+                // AWS SDKs have built-in retry with exponential backoff for 503
+                static LAST_503_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static REJECTED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let _rejected = REJECTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last = LAST_503_LOG.load(std::sync::atomic::Ordering::Relaxed);
+                if now_secs >= last + 60 {
+                    LAST_503_LOG.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                    let total_rejected = REJECTED_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        "Request limit exceeded (max_concurrent_requests={}, rejected={} in last period)",
+                        config.server.max_concurrent_requests, total_rejected
+                    );
+                }
                 let response = Self::build_error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "TooManyRequests",
-                    "Request rate exceeded. Please retry after some time.",
-                    Some("10"), // Retry-After header
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SlowDown",
+                    "Please reduce your request rate.",
+                    Some("5"), // Retry-After header
                 );
                 return Ok(response);
             }
@@ -1560,6 +1576,10 @@ impl HttpProxy {
 
                     info!("HEAD {} HIT for {}", cache_layer, uri);
 
+                    // Record per-bucket cache hit for HEAD
+                    cache_manager.update_statistics(true, 0, true);
+                    cache_manager.record_bucket_cache_access(&cache_key, true, true).await;
+
                     // Build response from HEAD cache
                     let mut response_builder = Response::builder().status(StatusCode::OK);
 
@@ -1580,6 +1600,10 @@ impl HttpProxy {
                 }
                 Ok(None) => {
                     info!("HEAD cache MISS for {}", uri);
+
+                    // Record per-bucket cache miss for HEAD
+                    cache_manager.update_statistics(false, 0, true);
+                    cache_manager.record_bucket_cache_access(&cache_key, false, true).await;
 
                     // Forward request to S3 and cache response
                     Self::forward_get_head_to_s3_and_cache(
@@ -2092,7 +2116,7 @@ impl HttpProxy {
                     {
                         Ok(response) => Ok(response),
                         Err(e) => {
-                            error!("Failed to handle signed PUT with caching: {}", e);
+                            Self::log_s3_forward_error(&uri, &"PUT", &e);
                             Ok(Self::build_error_response(
                                 StatusCode::BAD_GATEWAY,
                                 "BadGateway",
@@ -2103,7 +2127,7 @@ impl HttpProxy {
                     }
                 }
                 None => {
-                    error!("No distributed IP available for signed PUT request to {}", host);
+                    Self::log_s3_forward_error(&uri, &"PUT", &"no distributed IP available");
                     Ok(Self::build_error_response(
                         StatusCode::BAD_GATEWAY,
                         "BadGateway",
@@ -2338,7 +2362,7 @@ impl HttpProxy {
                 Ok(response)
             }
             Err(e) => {
-                error!("Failed to forward PUT request to S3: {:?}", e);
+                Self::log_s3_forward_error(&path, &"PUT", &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
@@ -2493,13 +2517,53 @@ impl HttpProxy {
                 Self::convert_s3_response_to_http(s3_response)
             }
             Err(e) => {
-                error!("Failed to forward request to S3: {}", e);
+                Self::log_s3_forward_error(&uri, &method, &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
                     "Failed to forward request to S3",
                     None,
                 ))
+            }
+        }
+    }
+
+    /// Rate-limited error log for S3 forwarding failures (once per minute with count).
+    /// Stores the most recent request details so the emitted log always shows a fresh example.
+    fn log_s3_forward_error(uri: &impl std::fmt::Display, method: &impl std::fmt::Display, error: &impl std::fmt::Display) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Mutex;
+
+        static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+        static ERR_COUNT: AtomicU64 = AtomicU64::new(0);
+        static LAST_EXAMPLE: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+
+        ERR_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        // Store latest example (try_lock to avoid blocking the hot path)
+        if let Ok(mut guard) = LAST_EXAMPLE.try_lock() {
+            *guard = Some((uri.to_string(), method.to_string(), error.to_string()));
+        }
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_LOG.load(Ordering::Relaxed);
+        if now_secs >= last + 60 {
+            LAST_LOG.store(now_secs, Ordering::Relaxed);
+            let count = ERR_COUNT.swap(0, Ordering::Relaxed);
+            let example = LAST_EXAMPLE.try_lock().ok().and_then(|mut g| g.take());
+            if let Some((ex_uri, ex_method, ex_error)) = example {
+                error!(
+                    "Failed to forward request to S3: occurrences={} in last 60s, latest_example: uri={}, method={}, error={}",
+                    count, ex_uri, ex_method, ex_error
+                );
+            } else {
+                error!(
+                    "Failed to forward request to S3: occurrences={} in last 60s",
+                    count
+                );
             }
         }
     }
@@ -2584,7 +2648,7 @@ impl HttpProxy {
         };
 
         // Build S3 request context
-        let context = build_s3_request_context(method, uri, headers, body_bytes, host);
+        let context = build_s3_request_context(method.clone(), uri.clone(), headers, body_bytes, host);
 
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
@@ -2593,7 +2657,7 @@ impl HttpProxy {
                 Self::convert_s3_response_to_http(s3_response)
             }
             Err(e) => {
-                error!("Failed to forward PUT request to S3: {}", e);
+                Self::log_s3_forward_error(&uri, &method, &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
@@ -2618,7 +2682,7 @@ impl HttpProxy {
         );
 
         // Build URI
-        let uri = match format!("https://{}{}", host, path).parse() {
+        let uri: hyper::Uri = match format!("https://{}{}", host, path).parse() {
             Ok(uri) => uri,
             Err(e) => {
                 error!("Failed to parse URI: {}", e);
@@ -2634,7 +2698,7 @@ impl HttpProxy {
         // Build S3 request context
         let context = build_s3_request_context(
             Method::PUT,
-            uri,
+            uri.clone(),
             headers,
             Some(Bytes::from(body_bytes)),
             host,
@@ -2646,7 +2710,7 @@ impl HttpProxy {
                 Self::convert_s3_response_to_http(s3_response)
             }
             Err(e) => {
-                error!("Failed to forward PUT request with body to S3: {}", e);
+                Self::log_s3_forward_error(&uri, &"PUT", &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
@@ -3334,7 +3398,7 @@ impl HttpProxy {
                             // Record cache miss for disk cache statistics (GET request)
                             // This is a partial or complete miss since we need to fetch from S3
                             cache_manager.update_statistics(false, 0, false);
-                            cache_manager.record_bucket_cache_access(&cache_key, false).await;
+                            cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
 
                             // Check if this is a signed range request (Requirement 1.2, 1.3)
                             // Only check signature when there are cache gaps to avoid overhead
@@ -3749,7 +3813,7 @@ impl HttpProxy {
 
             // Record cache hit statistics
             cache_manager.update_statistics(true, range_size, method == Method::HEAD);
-            cache_manager.record_bucket_cache_access(&cache_key, true).await;
+            cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
 
             return Ok(response);
         }
@@ -4056,7 +4120,7 @@ impl HttpProxy {
 
                     // Record cache hit statistics for streaming path
                     cache_manager.update_statistics(true, range_size, false);
-                    cache_manager.record_bucket_cache_access(&cache_key, true).await;
+                    cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
 
                     return Ok(response);
                 }
@@ -4343,6 +4407,11 @@ impl HttpProxy {
 
         let response = response_builder.body(body).unwrap();
 
+        // Record cache hit statistics (buffered path — RAM and streaming paths record separately)
+        let range_size = range_spec.end - range_spec.start + 1;
+        cache_manager.update_statistics(true, range_size, false);
+        cache_manager.record_bucket_cache_access(cache_key, true, false).await;
+
         // Log cache hit at INFO level for observability
         let cache_tier = if is_ram_hit { "RAM" } else { "Disk" };
         info!(
@@ -4455,7 +4524,7 @@ impl HttpProxy {
                         let s3_response = match s3_client.forward_request(context).await {
                             Ok(resp) => resp,
                             Err(e) => {
-                                error!("Failed to fetch missing range from S3: {}", e);
+                                Self::log_s3_forward_error(&uri, &"GET", &e);
                                 return Err(Self::build_error_response(
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     "InternalError",
@@ -4830,7 +4899,7 @@ impl HttpProxy {
                 }
             }
             Err(e) => {
-                error!("Failed to forward conditional request to S3: {}", e);
+                Self::log_s3_forward_error(&uri, &method, &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
@@ -4892,7 +4961,7 @@ impl HttpProxy {
                 Self::convert_s3_response_to_http(s3_response)
             }
             Err(e) => {
-                error!("Failed to forward request to S3: {}", e);
+                Self::log_s3_forward_error(&uri, &method, &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
@@ -5005,7 +5074,7 @@ impl HttpProxy {
         // Requirement 18.4
         if !coordination_enabled {
             cache_manager.update_statistics(false, 0, false);
-            cache_manager.record_bucket_cache_access(&cache_key, false).await;
+            cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
             return Self::forward_get_head_to_s3_and_cache(
                 method,
                 uri,
@@ -5035,7 +5104,7 @@ impl HttpProxy {
 
                 // Fetcher always goes to S3 — record cache miss
                 cache_manager.update_statistics(false, 0, false);
-                cache_manager.record_bucket_cache_access(&cache_key, false).await;
+                cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
 
                 let response = Self::forward_get_head_to_s3_and_cache(
                     method,
@@ -5327,7 +5396,7 @@ impl HttpProxy {
                                     part_number, cache_key
                                 );
                                 cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
-                                cache_manager.record_bucket_cache_access(&cache_key, true).await;
+                                cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
                                 Self::serve_cached_part_response(cached_part, method, uri.path()).await
                             }
                             _ => {
@@ -5337,7 +5406,7 @@ impl HttpProxy {
                                     part_number, cache_key
                                 );
                                 cache_manager.update_statistics(false, 0, false);
-                                cache_manager.record_bucket_cache_access(&cache_key, false).await;
+                                cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
                                 Self::forward_get_head_to_s3_and_cache(
                                     method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
                                 )
@@ -5651,7 +5720,7 @@ impl HttpProxy {
                             cache_key
                         );
                         cache_manager.update_statistics(true, total_size, false);
-                        cache_manager.record_bucket_cache_access(&cache_key, true).await;
+                        cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
 
                         let header_map: hyper::header::HeaderMap = headers
                             .iter()
@@ -5687,7 +5756,7 @@ impl HttpProxy {
             cache_key
         );
         cache_manager.update_statistics(false, 0, false);
-        cache_manager.record_bucket_cache_access(&cache_key, false).await;
+        cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
         Self::forward_get_head_to_s3_and_cache(
             method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
         )
@@ -6018,7 +6087,7 @@ impl HttpProxy {
                 }
             }
             Err(e) => {
-                error!("Failed to forward request to S3: {}", e);
+                Self::log_s3_forward_error(&uri, &method, &e);
 
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
@@ -6163,7 +6232,7 @@ impl HttpProxy {
                         .await;
                     }
                     Err(e) => {
-                        warn!(
+                        info!(
                             "S3 request failed (will retry): cache_key={}, error={}",
                             cache_key, e
                         );
@@ -6174,10 +6243,7 @@ impl HttpProxy {
         }
 
         // All retries exhausted
-        error!(
-            "Failed to forward signed range request to S3 after {} attempts: cache_key={}, error={:?}",
-            MAX_RETRIES + 1, cache_key, last_error
-        );
+        Self::log_s3_forward_error(&uri, &method, &format_args!("all {} attempts failed, cache_key={}, last_error={:?}", MAX_RETRIES + 1, cache_key, last_error));
         Ok(Self::build_error_response(
             StatusCode::BAD_GATEWAY,
             "BadGateway",
@@ -6720,10 +6786,7 @@ impl HttpProxy {
                 }
             }
             Err(e) => {
-                error!(
-                    "Failed to fetch missing ranges from S3: {}, falling back to complete S3 fetch",
-                    e
-                );
+                Self::log_s3_forward_error(&uri, &method, &e);
                 // Fall back to complete S3 fetch - Requirement 2.5
                 Self::fetch_complete_range_from_s3(
                     method,
@@ -6836,7 +6899,7 @@ impl HttpProxy {
                 }
             }
             Err(e) => {
-                error!("Failed to stream range request from S3: {}", e);
+                Self::log_s3_forward_error(&uri, &method, &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
@@ -6875,7 +6938,7 @@ impl HttpProxy {
             format!("bytes={}-{}", range_spec.start, range_spec.end),
         );
 
-        let context = build_s3_request_context(method.clone(), uri, s3_headers, None, host);
+        let context = build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host);
 
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
@@ -6911,7 +6974,7 @@ impl HttpProxy {
                 }
             }
             Err(e) => {
-                error!("Failed to forward range request to S3: {}", e);
+                Self::log_s3_forward_error(&uri, &method, &e);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
@@ -6942,6 +7005,8 @@ impl HttpProxy {
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Get connection pool to resolve DNS and get target IP
+        let req_uri = req.uri().clone();
+        let req_method = req.method().clone();
         let pool = s3_client.get_connection_pool();
         let pool_manager = pool.read().await;
 
@@ -6996,7 +7061,7 @@ impl HttpProxy {
                         Ok(response)
                     }
                     Err(e) => {
-                        error!("Failed to forward signed request: {}", e);
+                        Self::log_s3_forward_error(&req_uri, &req_method, &e);
                         Ok(Self::build_error_response(
                             StatusCode::BAD_GATEWAY,
                             "BadGateway",
@@ -7007,7 +7072,7 @@ impl HttpProxy {
                 }
             }
             None => {
-                error!("No distributed IP available for signed request to {}", host);
+                Self::log_s3_forward_error(&req_uri, &req_method, &"no distributed IP available");
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",

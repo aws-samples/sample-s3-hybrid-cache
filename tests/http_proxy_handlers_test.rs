@@ -8,6 +8,7 @@
 /// - Conflict invalidation
 use s3_proxy::cache::CacheManager;
 use s3_proxy::config::SharedStorageConfig;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -134,7 +135,7 @@ async fn test_regular_put_with_conflict_invalidation() {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, body_data, headers.clone(), metadata.clone())
+        .store_write_cache_entry(&cache_key, body_data, headers.clone(), metadata.clone(), HashMap::new())
         .await
         .unwrap();
     println!("✓ Initial PUT cached");
@@ -159,7 +160,7 @@ async fn test_regular_put_with_conflict_invalidation() {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, new_body_data, headers, new_metadata)
+        .store_write_cache_entry(&cache_key, new_body_data, headers, new_metadata, HashMap::new())
         .await
         .unwrap();
     println!("✓ New PUT cached");

@@ -300,6 +300,14 @@ impl CacheSizeTracker {
         self.consolidator.get_write_cache_size().await
     }
 
+    /// Forward scan results to the consolidator to reconcile size_state.json.
+    /// Called on cold startup after a real metadata scan completes.
+    pub async fn update_size_from_scan(&self, total_size: u64, write_cache_size: u64, cached_objects: u64) {
+        self.consolidator
+            .update_size_from_validation(total_size, Some(write_cache_size), Some(cached_objects))
+            .await;
+    }
+
     // NOTE: set_write_cache_size() has been removed - consolidator handles all size state.
 
     // NOTE: update_size_sync() method has been removed.
@@ -733,8 +741,8 @@ impl CacheSizeTracker {
             );
         }
 
-        // Scan metadata files using shared validator (returns size, cache_expired, cache_skipped, cache_errors)
-        let (scanned_size, cache_expired, cache_skipped, cache_errors) =
+        // Scan metadata files using shared validator (returns size, cache_expired, cache_skipped, cache_errors, object_count)
+        let (scanned_size, cache_expired, cache_skipped, cache_errors, scanned_objects) =
             self.scan_metadata_with_shared_validator().await?;
         let tracked_size = self.get_size().await; // Delegate to consolidator (Task 12.3)
         let drift = scanned_size as i64 - tracked_size as i64;
@@ -757,14 +765,17 @@ impl CacheSizeTracker {
                 "Reconciling tracked size to scanned size: {} bytes drift",
                 drift
             );
-            // Update the consolidator's size state (Task 12 - consolidator is source of truth)
-            self.consolidator
-                .update_size_from_validation(scanned_size, None)
-                .await;
         }
 
+        // Always update size state from validation — even when size drift is zero,
+        // cached_objects may have drifted due to multi-instance double-counting.
+        // The validation scan's .meta file count is the authoritative object count.
+        self.consolidator
+            .update_size_from_validation(scanned_size, None, Some(scanned_objects))
+            .await;
+
         // Write validation metadata
-        let files_scanned = 0; // Will be updated when we implement scanning
+        let files_scanned = scanned_objects;
         self.write_validation_metadata(
             scanned_size,
             tracked_size,
@@ -814,17 +825,15 @@ impl CacheSizeTracker {
     /// This method now uses the shared CacheValidator to avoid duplicating scanning logic.
     /// The coordinated initialization handles the initial scan, and this method is used
     /// only for periodic validation scans.
-    async fn scan_metadata_with_shared_validator(&self) -> Result<(u64, u64, u64, u64)> {
-        use rayon::iter::ParallelBridge;
+    async fn scan_metadata_with_shared_validator(&self) -> Result<(u64, u64, u64, u64, u64)> {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicU64, Ordering};
-        use walkdir::WalkDir;
 
         let now = std::time::SystemTime::now();
         let metadata_dir = self.cache_dir.join("metadata");
 
         if !metadata_dir.exists() {
-            return Ok((0, 0, 0, 0));
+            return Ok((0, 0, 0, 0, 0));
         }
 
         // Atomic counters for lock-free accumulation from parallel workers
@@ -834,41 +843,75 @@ impl CacheSizeTracker {
         let cache_errors = AtomicU64::new(0);
         let files_processed = AtomicU64::new(0);
 
-        // Stream WalkDir directly into rayon's parallel iterator via par_bridge().
-        // WalkDir yields entries lazily — no Vec<PathBuf> allocation.
-        // par_bridge() feeds entries to rayon's work-stealing thread pool as they're discovered.
-        // Memory: O(rayon_threads) instead of O(total_files).
-        WalkDir::new(&metadata_dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|entry| match entry {
-                Ok(e) if e.path().extension().map_or(false, |ext| ext == "meta") => {
-                    Some(e.into_path())
+        // Collect L1 shard directories for parallel traversal.
+        // Structure: metadata/{bucket}/{L1}/{L2}/*.meta
+        // Instead of a single sequential WalkDir over the entire tree, we enumerate
+        // L1 directories and walk each in parallel via rayon. This overlaps NFS readdir
+        // round-trips across threads, reducing wall-clock time from ~35 min to ~2-5 min.
+        let mut l1_dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(bucket_entries) = std::fs::read_dir(&metadata_dir) {
+            for bucket_entry in bucket_entries.flatten() {
+                let bucket_path = bucket_entry.path();
+                if !bucket_path.is_dir() { continue; }
+                // Skip _journals and other internal directories
+                if bucket_path.file_name().map_or(false, |n| {
+                    n.to_str().map_or(false, |s| s.starts_with('_'))
+                }) {
+                    continue;
                 }
-                Ok(_) => None,
-                Err(e) => {
-                    warn!("Directory walk error during validation: {}", e);
-                    None
+                if let Ok(l1_entries) = std::fs::read_dir(&bucket_path) {
+                    for l1_entry in l1_entries.flatten() {
+                        let l1_path = l1_entry.path();
+                        if l1_path.is_dir() {
+                            l1_dirs.push(l1_path);
+                        }
+                    }
                 }
-            })
-            .par_bridge()
-            .for_each(|path| {
-                let result = self.scan_metadata_file(&path, now);
-                total_size.fetch_add(result.size_bytes, Ordering::Relaxed);
-                if result.cache_expired {
-                    cache_expired.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        info!(
+            "Cache validation: scanning {} L1 shard directories in parallel",
+            l1_dirs.len()
+        );
+
+        // Walk each L1 directory in parallel using rayon's thread pool.
+        // Within each L1, enumerate L2 subdirectories and their .meta files sequentially.
+        l1_dirs.par_iter().for_each(|l1_dir| {
+            let l2_entries = match std::fs::read_dir(l1_dir) {
+                Ok(entries) => entries,
+                Err(_) => return,
+            };
+            for l2_entry in l2_entries.flatten() {
+                let l2_path = l2_entry.path();
+                if !l2_path.is_dir() { continue; }
+                let file_entries = match std::fs::read_dir(&l2_path) {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+                for file_entry in file_entries.flatten() {
+                    let path = file_entry.path();
+                    if !path.extension().map_or(false, |ext| ext == "meta") {
+                        continue;
+                    }
+                    let result = self.scan_metadata_file(&path, now);
+                    total_size.fetch_add(result.size_bytes, Ordering::Relaxed);
+                    if result.cache_expired {
+                        cache_expired.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if result.cache_skipped {
+                        cache_skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if result.cache_error {
+                        cache_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let count = files_processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % 100_000 == 0 {
+                        info!("Cache validation progress: {} files processed", count);
+                    }
                 }
-                if result.cache_skipped {
-                    cache_skipped.fetch_add(1, Ordering::Relaxed);
-                }
-                if result.cache_error {
-                    cache_errors.fetch_add(1, Ordering::Relaxed);
-                }
-                let count = files_processed.fetch_add(1, Ordering::Relaxed) + 1;
-                if count % 100_000 == 0 {
-                    info!("Cache validation progress: {} files processed", count);
-                }
-            });
+            }
+        });
 
         let total = files_processed.load(Ordering::Relaxed);
         info!("Cache validation: processed {} metadata files", total);
@@ -878,6 +921,7 @@ impl CacheSizeTracker {
             cache_expired.load(Ordering::Relaxed),
             cache_skipped.load(Ordering::Relaxed),
             cache_errors.load(Ordering::Relaxed),
+            files_processed.load(Ordering::Relaxed),
         ))
     }
 
