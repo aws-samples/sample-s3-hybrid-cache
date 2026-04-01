@@ -450,7 +450,7 @@ cache:
 
 **Behavior with TTL=0**:
 - Cache still stores data (useful for range merging, bandwidth savings)
-- Every request triggers S3 revalidation via conditional requests (`If-Modified-Since`)
+- Every request triggers S3 revalidation via conditional requests (`If-Modified-Since` + `If-None-Match`)
 - Client's original request headers (including Authorization) are forwarded to S3
 - S3 validates the requesting client's IAM credentials on every request
 - S3 returns 304 Not Modified if unchanged → cached data served, bandwidth saved
