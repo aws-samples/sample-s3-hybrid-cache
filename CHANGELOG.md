@@ -5,10 +5,19 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.1] - 2026-04-15
+
+### Added
+- **Proxy-only mode**: New `server.mode: "proxy_only"` option starts only the HTTP forward proxy listener (default port 3128) without binding to ports 80 or 443. No `sudo`, DNS changes, or `/etc/hosts` modifications needed — clients set `HTTP_PROXY=http://127.0.0.1:3128` to route S3 traffic through the proxy. TLS listener (port 3129) remains available in both modes. Includes config validation for port conflicts, privileged port warnings, and documented shared NFS cache HA pattern as an alternative to DNS multi-value routing.
+
+### Changed
+- **RAM cache hit: eliminated redundant data clone**: `RamCache::get()` previously cloned the full `RamCacheEntry` (including the `Vec<u8>` data buffer) twice per hit — once to extract from the HashMap, and again to reinsert with updated access metadata. Refactored to update `last_accessed` and `access_count` in-place via `get_mut()`, reducing to a single clone for the caller return value.
+- **Replaced `rand` with `fastrand`**: Removed `rand` crate dependency to resolve Dependabot security advisory (unsound aliased mutable reference in ThreadRng reseeding, affecting `rand >= 0.7.0, < 0.9.3`). All usages replaced with the existing `fastrand` dependency which was already used elsewhere in the codebase.
+
 ## [1.10.0] - 2026-04-10
 
 ### Added
-- **TLS proxy listener with HTTP_PROXY support**: New configurable TLS-terminating listener (default port 8443) that accepts encrypted client connections using the proxy's own certificate, then processes decrypted HTTP through the caching pipeline. Clients set `HTTP_PROXY=https://proxy:8443` with `--endpoint-url http://s3.region.amazonaws.com` — the SDK signs against the real S3 hostname at the HTTP level, the proxy decrypts, caches, and forwards to S3 over HTTPS. SigV4 signatures remain valid because they are computed over HTTP-level content, not the transport layer. Configured via `server.tls` in YAML config with `enabled`, `tls_proxy_port`, `cert_path`, and `key_path` fields. Forward proxy URI detection also works on the HTTP listener (port 80) for private networks where TLS between client and proxy is unnecessary.
+- **TLS proxy listener with HTTP_PROXY support**: New configurable TLS-terminating listener (default port 3129) that accepts encrypted client connections using the proxy's own certificate, then processes decrypted HTTP through the caching pipeline. Clients set `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com` — the SDK signs against the real S3 hostname at the HTTP level, the proxy decrypts, caches, and forwards to S3 over HTTPS. SigV4 signatures remain valid because they are computed over HTTP-level content, not the transport layer. Configured via `server.tls` in YAML config with `enabled`, `tls_proxy_port`, `cert_path`, and `key_path` fields. Forward proxy URI detection also works on the HTTP listener (port 80) for private networks where TLS between client and proxy is unnecessary.
 - **CONNECT passthrough on TLS listener**: When `HTTPS_PROXY` is set, SDKs send `CONNECT` requests to establish end-to-end encrypted tunnels. The TLS listener now handles these as TCP passthrough (same as port 443) — the request succeeds but bypasses the cache. This prevents a hard failure when `HTTPS_PROXY` is used instead of `HTTP_PROXY`.
 - **TLS config validation**: Validates cert/key paths are non-empty when TLS is enabled, rejects port 0, and detects port conflicts with HTTP, HTTPS, health, metrics, and dashboard ports.
 - **Property-based tests**: 8 quickcheck property tests covering URI detection, component extraction, cache key equivalence, header preservation, TLS config serialization, config validation, port conflict detection, and certificate loading error messages.

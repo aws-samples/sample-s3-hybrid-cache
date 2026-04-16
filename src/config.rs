@@ -184,13 +184,38 @@ pub struct Config {
     pub dashboard: DashboardConfig,
 }
 
+/// Server operating mode
+///
+/// Controls which listeners are started at startup.
+/// - `Standard`: HTTP (port 80) + HTTPS (port 443) + optional TLS proxy
+/// - `ProxyOnly`: HTTP forward proxy (port 3128) + optional TLS proxy
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ServerMode {
+    #[serde(rename = "standard")]
+    Standard,
+    #[serde(rename = "proxy_only")]
+    ProxyOnly,
+}
+
+impl Default for ServerMode {
+    fn default() -> Self {
+        ServerMode::Standard
+    }
+}
+
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Server operating mode (default: standard)
+    #[serde(default)]
+    pub mode: ServerMode,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
     #[serde(default = "default_https_port")]
     pub https_port: u16,
+    /// HTTP forward proxy port for proxy-only mode (default: 3128)
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
     /// Maximum number of concurrent requests to handle
     /// Default: 200 (suitable for most deployments)
     /// Small deployments: 50-100
@@ -219,6 +244,10 @@ fn default_https_port() -> u16 {
     443
 }
 
+fn default_proxy_port() -> u16 {
+    3128
+}
+
 fn default_max_concurrent_requests() -> usize {
     200
 }
@@ -231,14 +260,16 @@ fn default_add_referer_header() -> bool {
 }
 
 fn default_tls_proxy_port() -> u16 {
-    8443
+    3129
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            mode: ServerMode::Standard,
             http_port: default_http_port(),
             https_port: default_https_port(),
+            proxy_port: default_proxy_port(),
             max_concurrent_requests: default_max_concurrent_requests(),
             request_timeout: default_request_timeout(),
             add_referer_header: default_add_referer_header(),
@@ -257,7 +288,7 @@ pub struct TlsConfig {
     /// Whether the TLS proxy listener is active
     #[serde(default)]
     pub enabled: bool,
-    /// Port for the TLS proxy listener (default: 8443)
+    /// Port for the TLS proxy listener (default: 3129)
     #[serde(default = "default_tls_proxy_port")]
     pub tls_proxy_port: u16,
     /// Path to PEM-encoded certificate chain file
@@ -1596,8 +1627,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig {
+                mode: ServerMode::Standard,
                 http_port: 80,
                 https_port: 443,
+                proxy_port: 3128,
                 max_concurrent_requests: 200,
                 request_timeout: Duration::from_secs(30),
                 add_referer_header: true,
@@ -1763,6 +1796,10 @@ impl Config {
         // Requirements: 6.2, 6.3, 6.5
         config.validate_tls_config()?;
 
+        // Validate proxy-only mode configuration
+        // Requirements: 2.1, 2.2, 2.3, 2.4, 2.5
+        config.validate_proxy_only_mode()?;
+
         // Validate and clamp download coordination configuration
         config.cache.download_coordination.validate_and_clamp();
 
@@ -1849,6 +1886,25 @@ impl Config {
             );
         } else {
             info!("Download coordination disabled");
+        }
+
+        // Log server mode and relevant ports
+        match config.server.mode {
+            ServerMode::Standard => {
+                info!("Server mode: standard");
+                info!(
+                    "HTTP port: {}, HTTPS port: {}",
+                    config.server.http_port, config.server.https_port
+                );
+            }
+            ServerMode::ProxyOnly => {
+                info!("Server mode: proxy_only");
+                info!(
+                    "HTTP forward proxy port: {}",
+                    config.server.proxy_port
+                );
+                info!("HTTP/HTTPS direct listeners will not be started");
+            }
         }
 
         info!("Configuration loaded successfully");
@@ -2440,6 +2496,60 @@ impl Config {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Validate proxy-only mode configuration.
+    /// Returns Ok(()) immediately when mode is Standard.
+    /// In ProxyOnly mode, validates proxy_port is non-zero, does not conflict
+    /// with infrastructure ports, and warns on privileged ports.
+    /// Requirements: 2.1, 2.2, 2.3, 2.4, 2.5
+    fn validate_proxy_only_mode(&self) -> Result<()> {
+        if self.server.mode != ServerMode::ProxyOnly {
+            return Ok(());
+        }
+
+        // Validate proxy_port is not 0
+        if self.server.proxy_port == 0 {
+            return Err(ProxyError::ConfigError(
+                "server.proxy_port must not be 0 in proxy_only mode".into(),
+            ));
+        }
+
+        // Warn if proxy_port < 1024 (defeats purpose of proxy-only mode)
+        if self.server.proxy_port < 1024 {
+            warn!(
+                "server.proxy_port={} requires elevated privileges; \
+                 proxy_only mode is designed for non-privileged ports (>= 1024)",
+                self.server.proxy_port
+            );
+        }
+
+        // Check proxy_port doesn't conflict with health/metrics/dashboard ports
+        let reserved: &[(u16, &str)] = &[
+            (self.health.port, "health"),
+            (self.metrics.port, "metrics"),
+            (self.dashboard.port, "dashboard"),
+        ];
+        for &(port, name) in reserved {
+            if self.server.proxy_port == port {
+                return Err(ProxyError::ConfigError(format!(
+                    "server.proxy_port={} conflicts with {} port",
+                    self.server.proxy_port, name
+                )));
+            }
+        }
+
+        // If TLS enabled, check tls_proxy_port doesn't conflict with proxy_port
+        if let Some(tls) = &self.server.tls {
+            if tls.enabled && tls.tls_proxy_port == self.server.proxy_port {
+                return Err(ProxyError::ConfigError(format!(
+                    "tls.tls_proxy_port={} conflicts with server.proxy_port={}",
+                    tls.tls_proxy_port, self.server.proxy_port
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -4851,6 +4961,202 @@ metrics:
         // Port 0 check still applies
         // But http_port (80) is not 0, so this should pass since enabled=false skips conflict check
         assert!(config.validate_tls_config().is_ok());
+    }
+
+    // ── Proxy-only mode tests (Task 6) ──────────────────────────────────
+
+    /// 6.1 ServerMode deserialization: "standard" → Standard, "proxy_only" → ProxyOnly, invalid → error
+    /// Validates: Requirements 1.1
+    #[test]
+    fn test_server_mode_deserialize_standard() {
+        let mode: ServerMode = serde_yaml::from_str("\"standard\"").unwrap();
+        assert_eq!(mode, ServerMode::Standard);
+    }
+
+    #[test]
+    fn test_server_mode_deserialize_proxy_only() {
+        let mode: ServerMode = serde_yaml::from_str("\"proxy_only\"").unwrap();
+        assert_eq!(mode, ServerMode::ProxyOnly);
+    }
+
+    #[test]
+    fn test_server_mode_deserialize_invalid_value() {
+        let result: std::result::Result<ServerMode, _> = serde_yaml::from_str("\"invalid\"");
+        assert!(result.is_err());
+    }
+
+    /// 6.2 ServerConfig defaults: mode == Standard, proxy_port == 3128
+    /// Validates: Requirements 1.2, 1.3, 6.2
+    #[test]
+    fn test_server_config_defaults() {
+        let server = ServerConfig::default();
+        assert_eq!(server.mode, ServerMode::Standard);
+        assert_eq!(server.proxy_port, 3128);
+    }
+
+    /// 6.3 validate_proxy_only_mode returns Ok for valid proxy-only config
+    /// Validates: Requirements 2.1, 2.2, 2.3, 2.4
+    #[test]
+    fn test_validate_proxy_only_mode_valid_config() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::ProxyOnly;
+        config.server.proxy_port = 3128;
+        assert!(config.validate_proxy_only_mode().is_ok());
+    }
+
+    /// 6.4 validate_proxy_only_mode returns Err when proxy_port == 0
+    /// Validates: Requirements 2.1
+    #[test]
+    fn test_validate_proxy_only_mode_port_zero() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::ProxyOnly;
+        config.server.proxy_port = 0;
+        let result = config.validate_proxy_only_mode();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("proxy_port"));
+    }
+
+    /// 6.5 validate_proxy_only_mode returns Err for port conflicts
+    /// Validates: Requirements 2.2, 2.3
+    #[test]
+    fn test_validate_proxy_only_mode_conflict_health_port() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::ProxyOnly;
+        config.server.proxy_port = config.health.port; // 8080
+        let result = config.validate_proxy_only_mode();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("health"));
+    }
+
+    #[test]
+    fn test_validate_proxy_only_mode_conflict_metrics_port() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::ProxyOnly;
+        // Set metrics to a unique port so it doesn't collide with health
+        config.metrics.port = 9090;
+        config.server.proxy_port = 9090;
+        let result = config.validate_proxy_only_mode();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("metrics"));
+    }
+
+    #[test]
+    fn test_validate_proxy_only_mode_conflict_dashboard_port() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::ProxyOnly;
+        config.server.proxy_port = config.dashboard.port; // 8081
+        let result = config.validate_proxy_only_mode();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("dashboard"));
+    }
+
+    #[test]
+    fn test_validate_proxy_only_mode_conflict_tls_proxy_port() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::ProxyOnly;
+        config.server.proxy_port = 3129;
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port: 3129,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+        let result = config.validate_proxy_only_mode();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("tls_proxy_port"));
+    }
+
+    /// 6.6 validate_proxy_only_mode returns Ok for privileged port (< 1024) — warning only
+    /// Validates: Requirements 2.4
+    #[test]
+    fn test_validate_proxy_only_mode_privileged_port_ok() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::ProxyOnly;
+        config.server.proxy_port = 80;
+        // Should succeed (warning only, not an error)
+        assert!(config.validate_proxy_only_mode().is_ok());
+    }
+
+    /// 6.7 validate_proxy_only_mode returns Ok immediately when mode is Standard
+    /// Validates: Requirements 2.5
+    #[test]
+    fn test_validate_proxy_only_mode_standard_mode_skips() {
+        let mut config = Config::default();
+        config.server.mode = ServerMode::Standard;
+        // Even with an invalid proxy_port, standard mode skips validation
+        config.server.proxy_port = 0;
+        assert!(config.validate_proxy_only_mode().is_ok());
+    }
+
+    /// 6.8 Config parsing with mode: "proxy_only" and custom proxy_port
+    /// Validates: Requirements 1.1, 1.3, 6.1
+    #[test]
+    fn test_config_parse_proxy_only_mode_with_custom_port() {
+        let yaml = r#"
+server:
+  mode: "proxy_only"
+  proxy_port: 4000
+  http_port: 8000
+  https_port: 8443
+  max_concurrent_requests: 200
+  request_timeout: "30s"
+cache:
+  cache_dir: "./cache"
+  max_cache_size: 1073741824
+  ram_cache_enabled: false
+  max_ram_cache_size: 268435456
+  eviction_algorithm: "lru"
+  write_cache_enabled: true
+  write_cache_percent: 10.0
+  write_cache_max_object_size: 268435456
+  put_ttl: "3600s"
+  get_ttl: "315360000s"
+  head_ttl: "3600s"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+  access_log_enabled: true
+  access_log_mode: "all"
+  log_level: "info"
+connection_pool:
+  max_connections_per_ip: 10
+  dns_refresh_interval: "60s"
+  connection_timeout: "10s"
+  idle_timeout: "60s"
+compression:
+  enabled: true
+  threshold: 1024
+  preferred_algorithm: "lz4"
+  content_aware: true
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  check_interval: "30s"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 8080
+  collection_interval: "60s"
+  include_cache_stats: true
+  include_compression_stats: true
+  include_connection_stats: true
+  otlp:
+    enabled: false
+    endpoint: "http://localhost:4318"
+    export_interval: "60s"
+    timeout: "10s"
+    compression: "none"
+    headers: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        assert_eq!(config.server.mode, ServerMode::ProxyOnly);
+        assert_eq!(config.server.proxy_port, 4000);
     }
 }
 

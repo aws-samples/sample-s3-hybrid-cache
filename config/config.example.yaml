@@ -2,6 +2,14 @@
 # This file demonstrates all available configuration options
 
 server:
+  # Server operating mode (default: "standard")
+  # "standard"    — starts HTTP listener on http_port and HTTPS listener on https_port
+  # "proxy_only"  — starts only the HTTP forward proxy on proxy_port; no sudo, DNS
+  #                  changes, or /etc/hosts modifications needed
+  mode: "standard"
+  # Port for the HTTP forward proxy in proxy_only mode (default: 3128)
+  # Ignored in standard mode. Clients set HTTP_PROXY=http://127.0.0.1:<proxy_port>.
+  proxy_port: 3128
   http_port: 80
   https_port: 443
   https_mode: "passthrough"  # Only option: "passthrough" (TCP passthrough)
@@ -24,15 +32,15 @@ server:
 
   # TLS Proxy Listener Configuration
   # Terminates TLS using the proxy's own certificate, then processes decrypted HTTP
-  # through the caching pipeline. Use with HTTP_PROXY=https://proxy-host:8443.
+  # through the caching pipeline. Use with HTTP_PROXY=https://proxy-host:3129.
   # Note: tls_proxy_port is distinct from https_port — https_port is TCP passthrough
   # (no caching), while tls_proxy_port terminates TLS and enables full caching.
   tls:
     # Whether the TLS proxy listener is active (default: false)
     enabled: false
-    # Port for the TLS proxy listener (default: 8443)
+    # Port for the TLS proxy listener (default: 3129)
     # Named tls_proxy_port to distinguish from https_port which is TCP passthrough
-    tls_proxy_port: 8443
+    tls_proxy_port: 3129
     # Path to PEM-encoded certificate chain file
     cert_path: "/etc/proxy/tls/cert.pem"
     # Path to PEM-encoded private key file
@@ -377,3 +385,44 @@ dashboard:
   cache_stats_refresh_interval: "5s"
   logs_refresh_interval: "10s"
   max_log_entries: 100
+
+# ==============================================================================
+# PROXY-ONLY MODE EXAMPLE
+# ==============================================================================
+# Starts only the HTTP forward proxy on port 3128. No sudo, DNS changes, or
+# /etc/hosts modifications needed. Clients set HTTP_PROXY to route S3 traffic.
+#
+# Minimal configuration:
+#
+# server:
+#   mode: "proxy_only"
+#   proxy_port: 3128
+#
+# cache:
+#   cache_dir: "/mnt/cache"
+#   max_cache_size: 524288000  # 500MB
+#
+# Client usage:
+#   export HTTP_PROXY=http://127.0.0.1:3128
+#   export NO_PROXY=169.254.169.254
+#   aws s3 cp s3://bucket/key ./local \
+#     --endpoint-url http://s3.us-east-1.amazonaws.com
+#
+# With TLS (encrypted client-to-proxy):
+#
+# server:
+#   mode: "proxy_only"
+#   proxy_port: 3128
+#   tls:
+#     enabled: true
+#     tls_proxy_port: 3129
+#     cert_path: "/etc/proxy/tls/cert.pem"
+#     key_path: "/etc/proxy/tls/key.pem"
+#
+# Client usage (TLS):
+#   export HTTP_PROXY=https://127.0.0.1:3129
+#   export NO_PROXY=169.254.169.254
+#   export AWS_CA_BUNDLE=/path/to/proxy-cert.pem
+#   aws s3 cp s3://bucket/key ./local \
+#     --endpoint-url http://s3.us-east-1.amazonaws.com
+# ==============================================================================

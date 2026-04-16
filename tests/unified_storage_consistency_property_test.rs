@@ -125,12 +125,8 @@ async fn test_property_unified_storage_consistency() {
 /// Additional test: Verify that multiple PUT operations all use unified storage
 #[tokio::test]
 async fn test_property_multiple_puts_use_unified_storage() {
-    use rand::Rng;
-
-    let mut rng = rand::thread_rng();
-
     for iteration in 0..20 {
-        let actual_count: usize = rng.gen_range(1..=10);
+        let actual_count: usize = fastrand::usize(1..=10);
 
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_manager = create_test_cache_manager(&temp_dir);
@@ -196,13 +192,9 @@ async fn test_property_multiple_puts_use_unified_storage() {
 /// **Feature: legacy-write-cache-removal, Property 3: Invalidation completeness**
 #[tokio::test]
 async fn test_property_invalidation_completeness() {
-    use rand::Rng;
-
-    let mut rng = rand::thread_rng();
-
     for iteration in 0..20 {
-        let data_size: u16 = rng.gen_range(1..4096);
-        let key_suffix: u8 = rng.gen();
+        let data_size: u16 = fastrand::u16(1..4096);
+        let key_suffix: u8 = fastrand::u8(..);
 
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_manager = create_test_cache_manager(&temp_dir);
@@ -296,12 +288,8 @@ async fn test_property_invalidation_completeness() {
 /// Additional test: Verify invalidation of multiple entries uses only unified storage
 #[tokio::test]
 async fn test_property_multiple_invalidations_use_unified_storage() {
-    use rand::Rng;
-
-    let mut rng = rand::thread_rng();
-
     for iteration in 0..20 {
-        let entry_count: usize = rng.gen_range(1..=5);
+        let entry_count: usize = fastrand::usize(1..=5);
 
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_manager = create_test_cache_manager(&temp_dir);

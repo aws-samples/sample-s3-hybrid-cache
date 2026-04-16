@@ -3,7 +3,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use s3_proxy::{
     background_recovery::{BackgroundRecoveryConfig, BackgroundRecoverySystem},
-    config::Config,
+    config::{Config, ServerMode},
     dashboard::DashboardServer,
     health::HealthManager,
     http_proxy::HttpProxy,
@@ -158,7 +158,18 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         env!("BUILD_TIMESTAMP")
     );
-    info!("HTTP port: {}", config.server.http_port);
+    // Log mode-specific port information
+    match config.server.mode {
+        ServerMode::Standard => {
+            info!("Server mode: standard");
+            info!("HTTP port: {}", config.server.http_port);
+            info!("HTTPS port: {}", config.server.https_port);
+        }
+        ServerMode::ProxyOnly => {
+            info!("Server mode: proxy_only");
+            info!("HTTP forward proxy port: {}", config.server.proxy_port);
+        }
+    }
 
     // Log cache configuration
     info!(
@@ -197,10 +208,30 @@ async fn main() -> Result<()> {
     // Initialize shutdown coordinator
     let mut shutdown_coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
 
-    // Create HTTP proxy (always enabled on port 80)
-    // Bind to [::] for IPv6 dual-stack (accepts both IPv4 and IPv6)
-    let http_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.http_port));
-    let mut http_proxy = HttpProxy::new(http_addr, std::sync::Arc::new(config.clone()))?;
+    // Create HTTP proxy and optionally HTTPS proxy based on server mode
+    let config_arc = std::sync::Arc::new(config.clone());
+    let (mut http_proxy, https_proxy) = match config.server.mode {
+        ServerMode::Standard => {
+            // Standard mode: HTTP on http_port, HTTPS on https_port
+            let http_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.http_port));
+            let http_proxy = HttpProxy::new(http_addr, config_arc.clone())?;
+
+            let https_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.https_port));
+            let https_proxy = HttpsProxy::new(https_addr, config_arc.clone());
+
+            (http_proxy, Some(https_proxy))
+        }
+        ServerMode::ProxyOnly => {
+            // Proxy-only mode: HTTP forward proxy on proxy_port, no HTTPS passthrough
+            let proxy_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.proxy_port));
+            let http_proxy = HttpProxy::new(proxy_addr, config_arc.clone())?;
+
+            info!("Proxy-only mode: HTTP direct listener (port {}) not started", config.server.http_port);
+            info!("Proxy-only mode: HTTPS passthrough listener (port {}) not started", config.server.https_port);
+
+            (http_proxy, None)
+        }
+    };
 
     // Set logger manager on HTTP proxy for access logging
     let logger_manager = Arc::new(tokio::sync::Mutex::new(logger));
@@ -208,11 +239,6 @@ async fn main() -> Result<()> {
 
     // Task 5.1: Set logger manager on shutdown coordinator for flushing access log buffer
     shutdown_coordinator.set_logger_manager(logger_manager.clone());
-
-    // Create HTTPS proxy based on mode
-    // Bind to [::] for IPv6 dual-stack (accepts both IPv4 and IPv6)
-    let https_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.https_port));
-    let https_proxy = HttpsProxy::new(https_addr, std::sync::Arc::new(config.clone()));
 
     // Get references to shared components from HTTP proxy for health/metrics monitoring
     // Note: We use the HTTP proxy's components since both proxies create their own instances
@@ -528,9 +554,13 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Subscribe shutdown signals for HTTP and HTTPS proxies before coordinator is moved
+    // Subscribe shutdown signals for HTTP proxy (and HTTPS if in standard mode)
     let http_shutdown_rx = shutdown_coordinator.subscribe();
-    let https_shutdown_rx = shutdown_coordinator.subscribe();
+    let https_shutdown_rx = if https_proxy.is_some() {
+        Some(shutdown_coordinator.subscribe())
+    } else {
+        None
+    };
 
     // Start TLS proxy listener if enabled
     let _tls_task = if let Some(tls_config) = &config.server.tls {
@@ -616,7 +646,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start both HTTP and HTTPS proxies with shutdown signals
+    // Start HTTP proxy with shutdown signal
     let http_shutdown = ShutdownSignal::new(http_shutdown_rx);
     let _http_task = tokio::spawn(async move {
         if let Err(e) = http_proxy.start(http_shutdown).await {
@@ -624,12 +654,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    let https_shutdown = ShutdownSignal::new(https_shutdown_rx);
-    let _https_task = tokio::spawn(async move {
-        if let Err(e) = https_proxy.start(https_shutdown).await {
-            error!("HTTPS proxy failed: {}", e);
-        }
-    });
+    // Start HTTPS proxy only in standard mode
+    let _https_task = if let Some(https_proxy) = https_proxy {
+        let https_shutdown = ShutdownSignal::new(https_shutdown_rx.expect("HTTPS shutdown receiver must exist in standard mode"));
+        Some(tokio::spawn(async move {
+            if let Err(e) = https_proxy.start(https_shutdown).await {
+                error!("HTTPS proxy failed: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
 
     // Wait for shutdown to complete — all components receive the broadcast signal
     // and stop their accept loops. The shutdown_task runs the coordinator's teardown

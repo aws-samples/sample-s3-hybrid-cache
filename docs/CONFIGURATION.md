@@ -151,13 +151,13 @@ WHERE referer IS NULL OR referer NOT LIKE 's3-hybrid-cache/%';
 
 ### TLS Proxy Configuration
 
-The TLS proxy listener terminates TLS on a configurable port and processes decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:8443` with `--endpoint-url http://s3.region.amazonaws.com`.
+The TLS proxy listener terminates TLS on a configurable port and processes decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com`.
 
 ```yaml
 server:
   tls:
     enabled: true                    # Enable TLS proxy listener (default: false)
-    tls_proxy_port: 8443             # TLS proxy port (default: 8443)
+    tls_proxy_port: 3129             # TLS proxy port (default: 3129)
     cert_path: "/mnt/nfs/config/tls/cert.pem"   # Path to PEM certificate
     key_path: "/mnt/nfs/config/tls/key.pem"     # Path to PEM private key
 ```
@@ -167,7 +167,7 @@ server:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable the TLS proxy listener |
-| `tls_proxy_port` | `8443` | Port for TLS-terminated caching connections |
+| `tls_proxy_port` | `3129` | Port for TLS-terminated caching connections |
 | `cert_path` | (empty) | Path to PEM certificate file (required when enabled) |
 | `key_path` | (empty) | Path to PEM private key file (required when enabled) |
 
@@ -177,7 +177,7 @@ server:
 - `tls_proxy_port` must not be 0
 - If TLS listener fails to start (cert error, bind error), HTTP and HTTPS listeners continue normally
 
-**TLS proxy port vs HTTPS port**: The HTTPS port (443) does TCP passthrough without caching. The TLS proxy port (8443) terminates TLS using the proxy's own certificate and processes decrypted HTTP through the caching pipeline with full range merging, compression, and write-through support.
+**TLS proxy port vs HTTPS port**: The HTTPS port (443) does TCP passthrough without caching. The TLS proxy port (3129) terminates TLS using the proxy's own certificate and processes decrypted HTTP through the caching pipeline with full range merging, compression, and write-through support.
 
 **Certificate storage**: For multi-instance deployments with shared storage, store the certificate and key on the shared volume alongside the configuration so all instances use the same certificate. See [Architecture - Network Security](ARCHITECTURE.md#network-security-requirements) for details.
 
@@ -1314,7 +1314,7 @@ health:
 - Health check: `http://localhost:8080/health`
 - Metrics: `http://localhost:9090/metrics`
 - Dashboard: `http://localhost:8081`
-- TLS proxy: `https://localhost:8443` (when enabled)
+- TLS proxy: `https://localhost:3129` (when enabled)
 
 ## HTTPS Passthrough
 
@@ -1326,7 +1326,7 @@ HTTPS requests on port 443 are handled via TCP passthrough — the proxy tunnels
 - No certificate management needed for this port
 - Transparent to clients
 
-**Note**: For encrypted client-to-proxy connections with caching, use the [TLS Proxy](#tls-proxy-configuration) on port 8443 instead.
+**Note**: For encrypted client-to-proxy connections with caching, use the [TLS Proxy](#tls-proxy-configuration) on port 3129 instead.
 
 **Configuration**: HTTPS passthrough is automatically enabled when `https_port` is configured:
 
@@ -1335,8 +1335,8 @@ server:
   https_port: 443  # Enable HTTPS passthrough on port 443
 ```
 
-**Note**: Only HTTP (port 80) and TLS proxy (port 8443) requests are cached. HTTPS passthrough (port 443) bypasses the cache entirely. To ensure caching benefits:
-- Set `HTTP_PROXY=https://proxy:8443` for encrypted caching via the TLS proxy listener (recommended)
+**Note**: Only HTTP (port 80) and TLS proxy (port 3129) requests are cached. HTTPS passthrough (port 443) bypasses the cache entirely. To ensure caching benefits:
+- Set `HTTP_PROXY=https://proxy:3129` for encrypted caching via the TLS proxy listener (recommended)
 - Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` for AWS CLI with DNS routing (works for buckets in that region)
 - Set `S3_ENDPOINT_URL=http://s3.<region>.amazonaws.com` for s5cmd
 - For cross-region requests, use `--endpoint-url` with the bucket's region
@@ -1390,7 +1390,7 @@ All configuration options can be overridden via environment variables:
 | Variable | Configuration Path | Example |
 |----------|-------------------|---------|
 | `HTTP_PORT` | `server.http_port` | `HTTP_PORT=8081` |
-| `HTTPS_PORT` | `server.https_port` | `HTTPS_PORT=8443` |
+| `HTTPS_PORT` | `server.https_port` | `HTTPS_PORT=3129` |
 | `CACHE_DIR` | `cache.cache_dir` | `CACHE_DIR=/var/cache/s3-proxy` |
 | `MAX_CACHE_SIZE` | `cache.max_cache_size` | `MAX_CACHE_SIZE=10737418240` |
 | `RAM_CACHE_ENABLED` | `cache.ram_cache_enabled` | `RAM_CACHE_ENABLED=true` |
@@ -1416,7 +1416,7 @@ All configuration options can be overridden via environment variables:
 ```yaml
 server:
   http_port: 8081
-  https_port: 8443
+  https_port: 3129
 
 cache:
   cache_dir: "./tmp/cache"
@@ -1444,7 +1444,7 @@ server:
   max_concurrent_requests: 500
   tls:
     enabled: true
-    tls_proxy_port: 8443
+    tls_proxy_port: 3129
     cert_path: "/mnt/nfs/config/tls/cert.pem"
     key_path: "/mnt/nfs/config/tls/key.pem"
 

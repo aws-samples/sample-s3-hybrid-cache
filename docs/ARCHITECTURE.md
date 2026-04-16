@@ -50,7 +50,7 @@ Technical architecture overview and design principles for S3 Proxy.
 │                          S3 Proxy (1..N)                                   │
 │                                                                            │
 │  ┌────────────────────┐ ┌─────────────────────┐ ┌───────────────────────┐  │
-│  │ HTTP (Port 80)     │ │ TLS Proxy (Port 8443)│ │ HTTPS (Port 443)     │  │
+│  │ HTTP (Port 80)     │ │ TLS Proxy (Port 3129)│ │ HTTPS (Port 443)     │  │
 │  │ - Caching          │ │ - TLS Termination    │ │ - TCP Passthrough    │  │
 │  │ - Range Merging    │ │ - Caching            │ │ - No Caching         │  │
 │  │ - Streaming        │ │ - Range Merging      │ │ - Direct to S3       │  │
@@ -423,7 +423,7 @@ Each instance operates independently - the shared storage is the only integratio
 - **Trusted Network Required**: Deploy only in secured network environments (VPCs, internal networks, isolated subnets)
 - **Data in Transit**: S3 data flows unencrypted between client and proxy on port 80 (proxy-to-S3 communication always uses HTTPS)
 - **Network Controls**: Use security groups, firewalls, or network segmentation to restrict proxy access to authorized clients only
-- **Encrypted Alternative**: The TLS proxy listener (port 8443) terminates TLS using the proxy's own certificate, providing encrypted client-to-proxy traffic with full caching. Clients use `HTTP_PROXY=https://proxy:8443` with `--endpoint-url http://s3.region.amazonaws.com`. See [Getting Started](GETTING_STARTED.md) for configuration details.
+- **Encrypted Alternative**: The TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, providing encrypted client-to-proxy traffic with full caching. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com`. See [Getting Started](GETTING_STARTED.md) for configuration details.
 
 **TLS Certificate Management**: When TLS is enabled, the proxy loads a certificate and private key from paths specified in the config. For multi-instance deployments with shared storage, store the certificate and key on the shared volume alongside the configuration (e.g., `/mnt/nfs/config/tls/cert.pem` and `/mnt/nfs/config/tls/key.pem`) so all instances use the same certificate. Restrict file permissions on the private key (`chmod 600`). The certificate's Subject Alternative Names (SANs) must match how clients connect — use `IP:` SANs for direct IP connections, or `DNS:` SANs when clients connect through a load balancer or DNS name.
 

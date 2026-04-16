@@ -2,6 +2,45 @@
 
 Quick start guide for installing, configuring, and running S3 Proxy.
 
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+  - [1. Clone and Build](#1-clone-and-build)
+  - [2. Start the Proxy](#2-start-the-proxy)
+  - [3. Configure Client Routing](#3-configure-client-routing)
+    - [Option A: HTTP_PROXY (Single-Instance / No DNS Changes)](#option-a-http_proxy-single-instance--no-dns-changes)
+    - [Option B: DNS Zone (Production Deployments)](#option-b-dns-zone-production-deployments)
+    - [Option C: Hosts File (Testing/Development)](#option-c-hosts-file-testingdevelopment)
+    - [S3 PrivateLink (Interface VPC Endpoints)](#s3-privatelink-interface-vpc-endpoints)
+    - [Access Point and MRAP Endpoint Requirements](#access-point-and-mrap-endpoint-requirements)
+    - [Access Point Alias Usage](#access-point-alias-usage)
+    - [MRAP Alias Usage](#mrap-alias-usage)
+    - [Access Point Endpoint Summary](#access-point-endpoint-summary)
+- [Basic Usage](#basic-usage)
+  - [Upload and Download Files](#upload-and-download-files)
+- [Simplifying Client Configuration](#simplifying-client-configuration)
+  - [AWS CLI Environment Variable](#aws-cli-environment-variable)
+  - [s5cmd Configuration](#s5cmd-configuration)
+  - [Mountpoint for Amazon S3](#mountpoint-for-amazon-s3)
+  - [Shell Profile Configuration](#shell-profile-configuration)
+  - [Check Cache Performance](#check-cache-performance)
+- [Port Configuration Options](#port-configuration-options)
+- [Proxy-Only Mode](#proxy-only-mode)
+  - [Configuration](#configuration)
+  - [Client Configuration](#client-configuration)
+  - [High Availability: Shared NFS Cache Pattern](#high-availability-shared-nfs-cache-pattern)
+- [Configuration Files](#configuration-files)
+- [Verification](#verification)
+  - [Test Basic Functionality](#test-basic-functionality)
+  - [Monitor Logs](#monitor-logs)
+- [Troubleshooting](#troubleshooting)
+  - [Common Issues](#common-issues)
+  - [Debug Mode](#debug-mode)
+- [Next Steps](#next-steps)
+- [Performance Tips](#performance-tips)
+- [System Requirements and Sizing](#system-requirements-and-sizing)
+
 ## Prerequisites
 
 - **Rust 1.70+** toolchain
@@ -30,7 +69,7 @@ sudo cargo run --release -- -c config/config.example.yaml
 The proxy starts on:
 - **HTTP**: `<proxy-ip>:80` (caching enabled)
 - **HTTPS**: `<proxy-ip>:443` (passthrough)
-- **TLS Proxy**: `<proxy-ip>:8443` (TLS-terminated caching, when enabled)
+- **TLS Proxy**: `<proxy-ip>:3129` (TLS-terminated caching, when enabled)
 - **Health**: `<proxy-ip>:8080/health`
 - **Dashboard**: `<proxy-ip>:8081` (real-time statistics)
 - **Metrics**: `<proxy-ip>:9090/metrics`
@@ -41,43 +80,117 @@ The proxy starts on:
 
 The proxy intercepts S3 traffic by routing client requests to the proxy's IP address. Choose the appropriate method for your environment:
 
-- **Option A (Hosts File)** — edit `/etc/hosts` for local testing
+- **Option A (HTTP_PROXY)** — set an environment variable for single-instance setups with no DNS changes
 - **Option B (DNS Zone)** — configure DNS for production multi-instance deployments
-- **Option C (HTTP_PROXY)** — set an environment variable for single-instance setups with no DNS changes
+- **Option C (Hosts File)** — edit `/etc/hosts` for local testing
 
-#### Option A: Hosts File (Testing/Development)
+#### Option A: HTTP_PROXY (Single-Instance / No DNS Changes)
 
-For local testing or single-machine setups, edit `/etc/hosts`:
+Instead of modifying DNS or hosts files, you can route S3 traffic through the proxy using the `HTTP_PROXY` environment variable. The client sends requests with absolute URIs (`GET http://s3.amazonaws.com/bucket/key`), and the proxy extracts the target host from the URI and processes the request through the caching pipeline.
+
+**When to use HTTP_PROXY vs DNS routing:**
+
+| Approach | Best for | Trade-offs |
+|----------|----------|------------|
+| `HTTP_PROXY` | Single-instance, dev/test, quick setup | No HA — if the proxy is down, clients fail. No multi-instance load balancing. |
+| DNS routing (Option B/C) | Production, multi-instance, HA | Requires DNS infrastructure. Supports multi-value A records for load balancing and failover. |
+
+**Unencrypted (private networks):**
 
 ```bash
-sudo nano /etc/hosts
-
-# Add entries for your region's S3 endpoints
-127.0.0.1 s3.amazonaws.com
-127.0.0.1 s3.us-east-1.amazonaws.com
-127.0.0.1 s3.eu-west-1.amazonaws.com
-# Add other regions as needed
-
-# For bucket-style URLs, add each bucket explicitly
-127.0.0.1 your-bucket.s3.us-east-1.amazonaws.com
-127.0.0.1 another-bucket.s3.us-east-1.amazonaws.com
-
-# For S3 Access Points, add each access point explicitly
-# Regional access points: {name}-{account_id}.s3-accesspoint.{region}.amazonaws.com
-127.0.0.1 my-ap-123456789012.s3-accesspoint.us-east-1.amazonaws.com
-127.0.0.1 other-ap-123456789012.s3-accesspoint.eu-west-1.amazonaws.com
-
-# Multi-Region Access Points (MRAPs): {mrap_alias}.accesspoint.s3-global.amazonaws.com
-127.0.0.1 mfzwi23gnjvgw.accesspoint.s3-global.amazonaws.com
+export HTTP_PROXY=http://<proxy-ip>:80
+export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1
 ```
 
-**Important Limitations**: 
-- Hosts files don't support wildcards, so you must add each bucket and access point individually
-- Hosts files don't support multi-value responses, preventing load distribution across multiple proxy instances
-- No high availability - if the single proxy instance fails, all S3 traffic fails
-- For production deployments with multiple proxy instances or high availability requirements, use DNS-based routing instead
+**Encrypted (recommended):**
 
-See [AWS S3 endpoints documentation](https://docs.aws.amazon.com/general/latest/gr/s3.html) for complete list of regional endpoints.
+```bash
+export HTTP_PROXY=https://<proxy-ip>:3129
+export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1
+```
+
+The `--endpoint-url http://s3.region.amazonaws.com` is required so the SDK signs the request against the real S3 hostname (`Host: s3.us-east-1.amazonaws.com`), not the proxy hostname. SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer, so they remain valid regardless of whether the client connects via HTTP or TLS.
+
+`NO_PROXY=169.254.169.254` prevents EC2 instance metadata (IMDS) requests from being sent through the proxy. Without this, credential retrieval from the instance metadata service will fail.
+
+**Why `HTTP_PROXY`, not `HTTPS_PROXY`?** When `HTTPS_PROXY` is set, the SDK sends a `CONNECT` request asking the proxy to establish a TCP tunnel to S3. The traffic inside the tunnel is end-to-end encrypted between the client and S3 — the proxy cannot decrypt, inspect, or cache it. The TLS proxy listener handles `CONNECT` as a passthrough tunnel (same as port 443), so the request succeeds but bypasses the cache entirely. Use `HTTP_PROXY` for caching. Use `HTTP_PROXY` instead. The `HTTP_PROXY` variable controls where the SDK sends HTTP requests, regardless of whether the proxy URL uses `http://` or `https://`. With `HTTP_PROXY=https://proxy:3129`, the client opens a TLS connection to the proxy, then sends plaintext HTTP inside that tunnel. The proxy decrypts the TLS layer and sees the HTTP request for caching.
+
+##### TLS Proxy Listener Configuration
+
+To use `HTTP_PROXY=https://...`, enable the TLS proxy listener in your config:
+
+```yaml
+server:
+  tls:
+    enabled: true
+    tls_proxy_port: 3129
+    cert_path: "/etc/proxy/tls/cert.pem"
+    key_path: "/etc/proxy/tls/key.pem"
+```
+
+The `tls_proxy_port` is distinct from `https_port` — the HTTPS port (443) does TCP passthrough without caching, while the TLS proxy port terminates TLS using the proxy's own certificate and processes decrypted HTTP through the caching pipeline.
+
+##### Generating a Self-Signed Certificate
+
+For development or testing, generate a self-signed certificate with `openssl`:
+
+```bash
+openssl req -x509 -newkey rsa:2048 \
+  -keyout key.pem -out cert.pem \
+  -days 365 -nodes \
+  -subj "/CN=proxy-host" \
+  -addext "subjectAltName=DNS:proxy-host,IP:10.0.1.101"
+```
+
+The `-addext "subjectAltName=..."` entries must match how clients connect to the proxy:
+- `IP:10.0.1.101` — clients connecting by IP address (e.g., `HTTP_PROXY=https://10.0.1.101:3129`). Use this for direct connections to proxy instances.
+- `DNS:proxy-host` — clients connecting by hostname (e.g., `HTTP_PROXY=https://proxy-host:3129`). Use this when clients connect through a DNS name or load balancer.
+
+Add multiple SAN entries to cover all proxy instances or connection methods. For example, a multi-instance deployment where clients connect by IP:
+
+```bash
+openssl req -x509 -newkey rsa:2048 \
+  -keyout key.pem -out cert.pem \
+  -days 365 -nodes \
+  -subj "/CN=s3-proxy" \
+  -addext "subjectAltName=IP:10.0.1.101,IP:10.0.1.102,IP:10.0.1.103"
+```
+
+Or when clients connect through a load balancer or DNS name:
+
+```bash
+openssl req -x509 -newkey rsa:2048 \
+  -keyout key.pem -out cert.pem \
+  -days 365 -nodes \
+  -subj "/CN=s3-proxy.internal" \
+  -addext "subjectAltName=DNS:s3-proxy.internal,DNS:*.s3-proxy.internal"
+```
+
+Without a matching SAN, TLS clients will reject the certificate with a hostname verification error.
+
+##### Configuring Clients to Trust the Certificate
+
+AWS CLI and SDKs need to trust the proxy's certificate. Two options:
+
+```bash
+export AWS_CA_BUNDLE=/path/to/cert.pem  # Tell the SDK to trust this CA
+```
+
+Or for quick testing (disables all TLS verification — not for production):
+
+```bash
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --no-verify-ssl
+```
+
+For production, use a certificate signed by your organization's internal CA, or add the self-signed certificate to the system trust store.
 
 #### Option B: DNS Zone (Production Deployments)
 
@@ -234,119 +347,45 @@ This approach mirrors how [S3 itself uses multi-value answer routing for DNS que
 
 **Multi-Instance Shared Storage**: When running multiple proxy instances with shared NFS storage, the volume MUST be mounted with `lookupcache=pos` for reliable cache coordination. See [Configuration Guide - Multi-Instance Coordination](CONFIGURATION.md#multi-instance-coordination) for details.
 
-#### Option C: HTTP_PROXY (Single-Instance / No DNS Changes)
+#### Option C: Hosts File (Testing/Development)
 
-Instead of modifying DNS or hosts files, you can route S3 traffic through the proxy using the `HTTP_PROXY` environment variable. The client sends requests with absolute URIs (`GET http://s3.amazonaws.com/bucket/key`), and the proxy extracts the target host from the URI and processes the request through the caching pipeline.
-
-**When to use HTTP_PROXY vs DNS routing:**
-
-| Approach | Best for | Trade-offs |
-|----------|----------|------------|
-| `HTTP_PROXY` | Single-instance, dev/test, quick setup | No HA — if the proxy is down, clients fail. No multi-instance load balancing. |
-| DNS routing (Option A/B) | Production, multi-instance, HA | Requires DNS infrastructure. Supports multi-value A records for load balancing and failover. |
-
-**Unencrypted (private networks):**
+For local testing or single-machine setups, edit `/etc/hosts`:
 
 ```bash
-export HTTP_PROXY=http://<proxy-ip>:80
-export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
-aws s3 cp s3://your-bucket/key ./local \
-  --endpoint-url http://s3.us-east-1.amazonaws.com \
-  --region us-east-1
+sudo nano /etc/hosts
+
+# Add entries for your region's S3 endpoints
+127.0.0.1 s3.amazonaws.com
+127.0.0.1 s3.us-east-1.amazonaws.com
+127.0.0.1 s3.eu-west-1.amazonaws.com
+# Add other regions as needed
+
+# For bucket-style URLs, add each bucket explicitly
+127.0.0.1 your-bucket.s3.us-east-1.amazonaws.com
+127.0.0.1 another-bucket.s3.us-east-1.amazonaws.com
+
+# For S3 Access Points, add each access point explicitly
+# Regional access points: {name}-{account_id}.s3-accesspoint.{region}.amazonaws.com
+127.0.0.1 my-ap-123456789012.s3-accesspoint.us-east-1.amazonaws.com
+127.0.0.1 other-ap-123456789012.s3-accesspoint.eu-west-1.amazonaws.com
+
+# Multi-Region Access Points (MRAPs): {mrap_alias}.accesspoint.s3-global.amazonaws.com
+127.0.0.1 mfzwi23gnjvgw.accesspoint.s3-global.amazonaws.com
 ```
 
-**Encrypted (recommended):**
+**Important Limitations**: 
+- Hosts files don't support wildcards, so you must add each bucket and access point individually
+- Hosts files don't support multi-value responses, preventing load distribution across multiple proxy instances
+- No high availability - if the single proxy instance fails, all S3 traffic fails
+- For production deployments with multiple proxy instances or high availability requirements, use DNS-based routing instead
 
-```bash
-export HTTP_PROXY=https://<proxy-ip>:8443
-export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
-aws s3 cp s3://your-bucket/key ./local \
-  --endpoint-url http://s3.us-east-1.amazonaws.com \
-  --region us-east-1
-```
-
-The `--endpoint-url http://s3.region.amazonaws.com` is required so the SDK signs the request against the real S3 hostname (`Host: s3.us-east-1.amazonaws.com`), not the proxy hostname. SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer, so they remain valid regardless of whether the client connects via HTTP or TLS.
-
-`NO_PROXY=169.254.169.254` prevents EC2 instance metadata (IMDS) requests from being sent through the proxy. Without this, credential retrieval from the instance metadata service will fail.
-
-**Why `HTTP_PROXY`, not `HTTPS_PROXY`?** When `HTTPS_PROXY` is set, the SDK sends a `CONNECT` request asking the proxy to establish a TCP tunnel to S3. The traffic inside the tunnel is end-to-end encrypted between the client and S3 — the proxy cannot decrypt, inspect, or cache it. The TLS proxy listener handles `CONNECT` as a passthrough tunnel (same as port 443), so the request succeeds but bypasses the cache entirely. Use `HTTP_PROXY` for caching. Use `HTTP_PROXY` instead. The `HTTP_PROXY` variable controls where the SDK sends HTTP requests, regardless of whether the proxy URL uses `http://` or `https://`. With `HTTP_PROXY=https://proxy:8443`, the client opens a TLS connection to the proxy, then sends plaintext HTTP inside that tunnel. The proxy decrypts the TLS layer and sees the HTTP request for caching.
-
-##### TLS Proxy Listener Configuration
-
-To use `HTTP_PROXY=https://...`, enable the TLS proxy listener in your config:
-
-```yaml
-server:
-  tls:
-    enabled: true
-    tls_proxy_port: 8443
-    cert_path: "/etc/proxy/tls/cert.pem"
-    key_path: "/etc/proxy/tls/key.pem"
-```
-
-The `tls_proxy_port` is distinct from `https_port` — the HTTPS port (443) does TCP passthrough without caching, while the TLS proxy port terminates TLS using the proxy's own certificate and processes decrypted HTTP through the caching pipeline.
-
-##### Generating a Self-Signed Certificate
-
-For development or testing, generate a self-signed certificate with `openssl`:
-
-```bash
-openssl req -x509 -newkey rsa:2048 \
-  -keyout key.pem -out cert.pem \
-  -days 365 -nodes \
-  -subj "/CN=proxy-host" \
-  -addext "subjectAltName=DNS:proxy-host,IP:10.0.1.101"
-```
-
-The `-addext "subjectAltName=..."` entries must match how clients connect to the proxy:
-- `IP:10.0.1.101` — clients connecting by IP address (e.g., `HTTP_PROXY=https://10.0.1.101:8443`). Use this for direct connections to proxy instances.
-- `DNS:proxy-host` — clients connecting by hostname (e.g., `HTTP_PROXY=https://proxy-host:8443`). Use this when clients connect through a DNS name or load balancer.
-
-Add multiple SAN entries to cover all proxy instances or connection methods. For example, a multi-instance deployment where clients connect by IP:
-
-```bash
-openssl req -x509 -newkey rsa:2048 \
-  -keyout key.pem -out cert.pem \
-  -days 365 -nodes \
-  -subj "/CN=s3-proxy" \
-  -addext "subjectAltName=IP:10.0.1.101,IP:10.0.1.102,IP:10.0.1.103"
-```
-
-Or when clients connect through a load balancer or DNS name:
-
-```bash
-openssl req -x509 -newkey rsa:2048 \
-  -keyout key.pem -out cert.pem \
-  -days 365 -nodes \
-  -subj "/CN=s3-proxy.internal" \
-  -addext "subjectAltName=DNS:s3-proxy.internal,DNS:*.s3-proxy.internal"
-```
-
-Without a matching SAN, TLS clients will reject the certificate with a hostname verification error.
-
-##### Configuring Clients to Trust the Certificate
-
-AWS CLI and SDKs need to trust the proxy's certificate. Two options:
-
-```bash
-export AWS_CA_BUNDLE=/path/to/cert.pem  # Tell the SDK to trust this CA
-```
-
-Or for quick testing (disables all TLS verification — not for production):
-
-```bash
-aws s3 cp s3://your-bucket/key ./local \
-  --endpoint-url http://s3.us-east-1.amazonaws.com \
-  --no-verify-ssl
-```
-
-For production, use a certificate signed by your organization's internal CA, or add the self-signed certificate to the system trust store.
+See [AWS S3 endpoints documentation](https://docs.aws.amazon.com/general/latest/gr/s3.html) for complete list of regional endpoints.
 
 #### S3 PrivateLink (Interface VPC Endpoints)
 
 If your environment uses S3 interface VPC endpoints (PrivateLink), the proxy needs additional configuration to route traffic to S3 through the private endpoint rather than over the public internet.
 
-Client-to-proxy DNS routing (Option A or B above) remains unchanged. PrivateLink only affects how the proxy resolves and connects to S3 on the backend.
+Client-to-proxy DNS routing (Option B or C above) remains unchanged. PrivateLink only affects how the proxy resolves and connects to S3 on the backend.
 
 **The problem**: By default, the proxy uses external DNS servers (Google DNS, Cloudflare DNS) to resolve S3 endpoints. These public resolvers return public S3 IPs, bypassing your PrivateLink endpoints entirely. Traffic would leave your private network instead of using the private path.
 
@@ -533,7 +572,7 @@ mount-s3 --endpoint-url http://s3.us-east-1.amazonaws.com \
   your-bucket /mnt/s3
 ```
 
-**Important**: Mountpoint uses HTTPS by default, which bypasses the cache (TCP passthrough on port 443). The `--endpoint-url` flag with HTTP is required for caching when using DNS routing. Alternatively, configure Mountpoint to use `HTTP_PROXY=https://proxy:8443` with the TLS proxy listener for encrypted caching.
+**Important**: Mountpoint uses HTTPS by default, which bypasses the cache (TCP passthrough on port 443). The `--endpoint-url` flag with HTTP is required for caching when using DNS routing. Alternatively, configure Mountpoint to use `HTTP_PROXY=https://proxy:3129` with the TLS proxy listener for encrypted caching.
 
 **DNS routing**: If using Route53 private hosted zones or hosts file DNS routing, the endpoint URL should match your configured DNS zone. The proxy will cache HEAD responses (metadata) and range requests from Mountpoint, significantly improving performance for repeated reads.
 
@@ -584,15 +623,124 @@ server:
 ```yaml
 server:
   http_port: 8081
-  https_port: 8443
+  https_port: 3129
 ```
 
 - **Pros**: No `sudo` required
-- **Cons**: HTTPS clients may fail if they can't configure port 8443
+- **Cons**: HTTPS clients may fail if they can't configure port 3129
 
 ### Custom Ports
 
 Possible but not recommended. HTTP clients can use `--endpoint-url`, but HTTPS clients with non-configurable endpoints will fail.
+
+## Proxy-Only Mode
+
+Proxy-only mode starts only the HTTP forward proxy listener (default port 3128) without binding to ports 80 or 443. No `sudo`, DNS changes, or `/etc/hosts` modifications needed — clients set `HTTP_PROXY` and traffic flows through the proxy.
+
+Use proxy-only mode for:
+- **Localhost deployments** — run the proxy on the same machine as your clients
+- **Development and testing** — quick setup with no system-level changes
+- **Environments where DNS changes are impractical** — no infrastructure dependencies
+
+### Configuration
+
+Set `server.mode` to `"proxy_only"` in your config file:
+
+```yaml
+server:
+  mode: "proxy_only"
+  # proxy_port: 3128  (default)
+
+cache:
+  cache_dir: "./tmp/cache"
+  max_cache_size: 524288000  # 500MB
+```
+
+Start the proxy (no `sudo` required):
+
+```bash
+cargo run --release -- -c config.yaml
+```
+
+The proxy listens on port 3128. Optionally enable the TLS listener on port 3129 for encrypted client-to-proxy traffic:
+
+```yaml
+server:
+  mode: "proxy_only"
+  proxy_port: 3128
+  tls:
+    enabled: true
+    tls_proxy_port: 3129
+    cert_path: "/etc/proxy/tls/cert.pem"
+    key_path: "/etc/proxy/tls/key.pem"
+```
+
+### Client Configuration
+
+Set `HTTP_PROXY` to route S3 traffic through the proxy. Use `--endpoint-url` so the SDK signs requests against the real S3 hostname.
+
+**Unencrypted (private networks or localhost):**
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:3128
+export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
+aws s3 cp s3://bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1
+```
+
+**Encrypted via TLS listener:**
+
+```bash
+export HTTP_PROXY=https://127.0.0.1:3129
+export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
+export AWS_CA_BUNDLE=/path/to/proxy-cert.pem
+aws s3 cp s3://bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1
+```
+
+See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for details on `--endpoint-url`, `NO_PROXY`, `HTTP_PROXY` vs `HTTPS_PROXY`, TLS certificate generation, and client trust configuration.
+
+### High Availability: Shared NFS Cache Pattern
+
+Instead of centralized proxy instances behind DNS multi-value routing, each compute node runs its own localhost proxy with a shared cache volume (NFS/EFS). HA comes from the storage layer, not the proxy layer.
+
+```
+Node A:  proxy (127.0.0.1:3128) ──┐
+Node B:  proxy (127.0.0.1:3128) ──┼──► /mnt/shared-cache (NFS/EFS) ──► S3
+Node C:  proxy (127.0.0.1:3128) ──┘
+```
+
+Each node's config points to the shared mount:
+
+```yaml
+server:
+  mode: "proxy_only"
+
+cache:
+  cache_dir: "/mnt/shared-cache"
+  max_cache_size: 107374182400  # 100GB
+```
+
+How it works:
+- Each client talks to `127.0.0.1` — no load balancer or DNS infrastructure needed
+- Objects cached by any node are available to all nodes via the shared volume
+- If a node's proxy crashes, its process supervisor (systemd, etc.) restarts it — other nodes are unaffected
+- NFS mount requirement: `lookupcache=pos` for reliable cache coordination
+
+**Comparison with DNS multi-value routing:**
+
+| | DNS Multi-Value Routing | Shared NFS Cache |
+|---|---|---|
+| **Architecture** | Centralized proxies behind Route 53 | Per-node localhost proxies with shared storage |
+| **HA mechanism** | DNS failover across proxy IPs | Process supervisor restarts local proxy |
+| **Load balancing** | DNS distributes clients across proxies | Each client uses its own local proxy |
+| **Infrastructure** | Route 53 private hosted zones, multi-value A records | NFS/EFS mount, process supervisor |
+| **Network hops** | Client → network → proxy → S3 | Client → localhost → S3 |
+| **Best for** | Shared proxy fleet serving many clients | Compute clusters where each node runs its own workload |
+
+DNS multi-value routing (see [Option B: DNS Zone](#option-b-dns-zone-production-deployments)) is better when a small number of proxy instances serve many clients. The shared NFS cache pattern is better when each compute node generates its own S3 traffic and you want to avoid DNS infrastructure entirely.
 
 ## Configuration Files
 

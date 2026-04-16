@@ -163,7 +163,7 @@ The Rust test suite provides standard cargo test output with pass/fail status fo
    - Verify bucket exists and is accessible
 
 4. **Connection refused**:
-   - Check proxy is running on expected ports (HTTP: 80, HTTPS: 443, TLS proxy: 8443 if enabled)
+   - Check proxy is running on expected ports (HTTP: 80, HTTPS: 443, TLS proxy: 3129 if enabled)
    - Verify firewall settings
    - Try different endpoint URL
 

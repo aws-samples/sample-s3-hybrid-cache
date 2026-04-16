@@ -1551,7 +1551,7 @@ impl DiskCacheManager {
         }
 
         // Unique .tmp filename with random suffix for concurrent write safety
-        let random_suffix: u32 = rand::random();
+        let random_suffix: u32 = fastrand::u32(..);
         let stem = range_file_path
             .file_stem()
             .unwrap_or_default()

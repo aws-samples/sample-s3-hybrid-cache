@@ -75,27 +75,24 @@ impl RamCache {
 
     /// Get an entry from the RAM cache
     pub fn get(&mut self, cache_key: &str) -> Option<RamCacheEntry> {
-        if let Some(entry) = self.entries.get(cache_key).cloned() {
-            // Update access tracking based on eviction algorithm
-            self.update_access_tracking(cache_key);
-
-            // Update the entry with new access info
-            let mut updated_entry = entry;
-            updated_entry.last_accessed = SystemTime::now();
-            updated_entry.access_count += 1;
-
-            // Update the entry in storage
-            self.entries
-                .insert(cache_key.to_string(), updated_entry.clone());
-
-            self.hit_count += 1;
-            debug!("RAM cache hit for key: {}", cache_key);
-            Some(updated_entry)
-        } else {
+        if !self.entries.contains_key(cache_key) {
             self.miss_count += 1;
             debug!("RAM cache miss for key: {}", cache_key);
-            None
+            return None;
         }
+
+        // Update eviction tracking (LRU order / TinyLFU frequencies)
+        self.update_access_tracking(cache_key);
+
+        // Now update access metadata in-place and clone once for the caller
+        let entry = self.entries.get_mut(cache_key).unwrap();
+        entry.last_accessed = SystemTime::now();
+        entry.access_count += 1;
+        let result = entry.clone();
+
+        self.hit_count += 1;
+        debug!("RAM cache hit for key: {}", cache_key);
+        Some(result)
     }
 
     /// Check if a key exists in the RAM cache without updating access tracking

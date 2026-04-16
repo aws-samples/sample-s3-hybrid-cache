@@ -725,7 +725,7 @@ async fn test_high_concurrent_write_load_performance() {
 
             let task = async move {
                 // Simulate some processing time
-                sleep(Duration::from_millis(rand::random::<u64>() % 50)).await;
+                sleep(Duration::from_millis(fastrand::u64(0..50))).await;
 
                 // Create instance within the task to avoid borrowing issues
                 let mut instance = TestProxyInstance::new(

@@ -540,7 +540,6 @@ impl CacheSizeTracker {
     /// Calculate next validation time based on configured time of day with fixed 1-hour jitter
     pub async fn calculate_next_validation_time(&self) -> SystemTime {
         use chrono::{Duration as ChronoDuration, Local, Timelike};
-        use rand::Rng;
 
         // Check if validation metadata exists - if not, run immediately
         if self.read_validation_metadata().await.is_err() {
@@ -591,10 +590,7 @@ impl CacheSizeTracker {
         }
 
         // Add fixed 1-hour jitter to prevent thundering herd
-        let jitter = {
-            let mut rng = rand::thread_rng();
-            Duration::from_secs(rng.gen_range(0..=3600))
-        };
+        let jitter = Duration::from_secs(fastrand::u64(0..=3600));
 
         // Convert to SystemTime and add jitter
         let next_system_time: SystemTime = next_time.into();

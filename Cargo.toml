@@ -81,7 +81,6 @@ regex = "1.0"
 fastrand = "2.0"
 
 # Cache size tracking
-rand = "0.8"
 rayon = "1.8"
 walkdir = "2.4"
 
