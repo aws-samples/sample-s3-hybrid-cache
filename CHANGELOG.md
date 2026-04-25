@@ -5,6 +5,17 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.2] - 2026-04-25
+
+### Added
+- **Suffix (wildcard) patterns in `endpoint_overrides`**: Config keys starting with `*.` are now treated as suffix patterns that match any hostname ending with that suffix. For example, `"*.s3.us-west-2.amazonaws.com": ["10.0.1.100"]` routes all virtual-hosted bucket hostnames in us-west-2 through the specified PrivateLink ENI without requiring per-bucket entries. Exact matches take precedence over suffix matches; among suffix matches the longest (most specific) suffix wins. Extracted a shared `EndpointOverrides` struct used by both the HTTP caching path (`connection_pool.rs`) and the HTTPS TCP passthrough path (`tcp_proxy.rs`), eliminating duplicated parsing logic in `https_proxy.rs`. Added unit tests for exact match, suffix match, exact-wins-over-suffix, and longest-suffix-wins semantics.
+
+## [1.11.1] - 2026-04-24
+
+### Fixed
+- **SigV4A (AWS4-ECDSA-P256-SHA256) requests treated as unsigned**: The SigV4 detection helpers in `signed_request_proxy::is_aws_sigv4_signed` and `is_range_signed`, the referer-injection guards in `http_proxy` and `signed_put_handler`, and the streaming payload check in `aws_chunked_decoder::is_aws_chunked` all hard-coded the classic `AWS4-HMAC-SHA256` algorithm label. MRAP requests (the AWS CLI picks SigV4A automatically for any MRAP ARN) therefore bypassed every signed-request code path: range signatures weren't recognized so the proxy could modify the `Range` header and break the signature, proxy-identification `Referer` headers could be injected even when `referer` was in `SignedHeaders`, and `aws-chunked` streaming PUT bodies tagged with `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` weren't decoded for caching. Introduced a shared `is_sigv4_algorithm` helper that matches both `AWS4-HMAC-SHA256` and `AWS4-ECDSA-P256-SHA256`; the `SignedHeaders=` parse logic is identical for both so no other changes were required. Added unit tests covering SigV4A detection, SigV4A range-signing (present and absent), and the SigV4A streaming-payload sentinel. Host-based MRAP cache-key routing (`{alias}.mrap/`) was already supported and is unchanged.
+- **TLS handshake failure against VPC interface endpoints (PrivateLink)**: When `endpoint_overrides` pointed the proxy at a VPC interface endpoint ENI, the outbound TLS connector offered TLS 1.3 in its ClientHello. VPC interface endpoints only support TLS 1.2 and drop the connection on a TLS 1.3-only handshake, producing `tls handshake eof`. When `endpoint_overrides` is non-empty the proxy now locks all outbound TLS to 1.2 via `rustls::ClientConfig::builder_with_protocol_versions(&[&TLS12])`. Regular S3 endpoints support TLS 1.2 so there is no functional regression. Enabled the `tls12` feature on `rustls` and `tokio-rustls` crates (previously only TLS 1.3 was compiled in).
+
 ## [1.11.0] - 2026-04-24
 
 ### Fixed

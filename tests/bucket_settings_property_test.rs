@@ -152,25 +152,10 @@ fn test_property_bucket_settings_round_trip_serialization() {
 // **Validates: Requirements 10.1, 10.2, 10.4**
 // ============================================================================
 
-/// Generate an invalid prefix string: either empty or not starting with "/".
-fn arbitrary_invalid_prefix(g: &mut Gen) -> String {
-    if bool::arbitrary(g) {
-        // Empty prefix
-        String::new()
-    } else {
-        // Non-empty prefix that does not start with "/"
-        let len = (u8::arbitrary(g) % 8) + 1;
-        let mut prefix = String::new();
-        for _ in 0..len {
-            let c = b'a' + (u8::arbitrary(g) % 26);
-            prefix.push(c as char);
-        }
-        // Ensure it doesn't accidentally start with '/'
-        if prefix.starts_with('/') {
-            prefix.insert(0, 'x');
-        }
-        prefix
-    }
+/// Generate an invalid prefix string: empty (the only invalid case).
+/// Prefixes without a leading "/" are valid — S3 object keys don't have leading slashes.
+fn arbitrary_invalid_prefix(_g: &mut Gen) -> String {
+    String::new()
 }
 
 /// Wrapper for generating a BucketSettings with at least one invalid prefix override.

@@ -31,6 +31,9 @@ pub struct S3Client {
     metrics_manager:
         Arc<tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>>>,
     health_tracker: Arc<IpHealthTracker>,
+    /// True when endpoint_overrides is configured (PrivateLink destinations).
+    /// Used to lock outbound TLS to 1.2 for VPC interface endpoint compatibility.
+    has_endpoint_overrides: bool,
 }
 
 /// S3 request context for forwarding
@@ -149,9 +152,18 @@ impl S3Client {
                 .map_err(|e| ProxyError::TlsError(format!("Failed to add cert: {}", e)))?;
         }
 
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let tls_config = if config.endpoint_overrides.is_empty() {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        } else {
+            info!(
+                "Endpoint overrides configured — locking outbound TLS to 1.2 for PrivateLink compatibility"
+            );
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
 
         let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
@@ -205,6 +217,7 @@ impl S3Client {
             ip_distribution_enabled: config.ip_distribution_enabled,
             metrics_manager: metrics_ref,
             health_tracker,
+            has_endpoint_overrides: !config.endpoint_overrides.is_empty(),
         })
     }
 
@@ -221,6 +234,12 @@ impl S3Client {
         &self,
     ) -> Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>> {
         Arc::clone(&self.pool_manager)
+    }
+
+    /// Whether endpoint_overrides is configured (PrivateLink destinations present).
+    /// When true, outbound TLS should be locked to 1.2 for VPC interface endpoint compatibility.
+    pub fn has_endpoint_overrides(&self) -> bool {
+        self.has_endpoint_overrides
     }
 
     /// Forward request to S3 endpoint with connection pooling and retries

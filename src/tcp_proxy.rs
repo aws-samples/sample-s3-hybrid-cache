@@ -4,6 +4,7 @@
 //! This module handles Layer 3/4 transparent TCP tunneling without TLS termination,
 //! preserving end-to-end TLS encryption and certificate validation.
 
+use crate::connection_pool::EndpointOverrides;
 use crate::{ProxyError, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::collections::HashMap;
@@ -17,13 +18,13 @@ use trust_dns_resolver::TokioAsyncResolver;
 pub struct TcpProxy {
     listen_addr: SocketAddr,
     resolver: TokioAsyncResolver,
-    /// Static hostname-to-IP mappings that bypass DNS resolution (for PrivateLink etc.)
-    endpoint_overrides: HashMap<String, Vec<IpAddr>>,
+    /// Parsed endpoint overrides (exact + suffix) for PrivateLink etc.
+    overrides: EndpointOverrides,
 }
 
 impl TcpProxy {
     /// Create a new TCP proxy instance with external DNS resolver
-    pub fn new(listen_addr: SocketAddr, endpoint_overrides: HashMap<String, Vec<IpAddr>>) -> Self {
+    pub fn new(listen_addr: SocketAddr, overrides: EndpointOverrides) -> Self {
         // Use external DNS servers to bypass /etc/hosts (same as connection pool)
         let mut config = ResolverConfig::new();
         config.add_name_server(NameServerConfigGroup::google().into_inner()[0].clone());
@@ -36,14 +37,15 @@ impl TcpProxy {
 
         let resolver = TokioAsyncResolver::tokio(config, opts);
 
-        if !endpoint_overrides.is_empty() {
-            info!("TCP proxy initialized with {} endpoint override(s)", endpoint_overrides.len());
+        if !overrides.is_empty() {
+            info!("TCP proxy initialized with {} exact + {} suffix endpoint override(s)",
+                overrides.exact_count(), overrides.suffix_count());
         }
 
         Self {
             listen_addr,
             resolver,
-            endpoint_overrides,
+            overrides,
         }
     }
 
@@ -67,10 +69,10 @@ impl TcpProxy {
                             }
 
                             let resolver = self.resolver.clone();
-                            let endpoint_overrides = self.endpoint_overrides.clone();
+                            let overrides = self.overrides.clone();
                             tokio::spawn(async move {
                                 if let Err(e) =
-                                    Self::handle_connection(client_stream, client_addr, resolver, endpoint_overrides).await
+                                    Self::handle_connection(client_stream, client_addr, resolver, overrides).await
                                 {
                                     // Check if this is a client-initiated cancellation or connection error
                                     let err_str = e.to_string();
@@ -106,7 +108,7 @@ impl TcpProxy {
         client_stream: TcpStream,
         client_addr: SocketAddr,
         resolver: TokioAsyncResolver,
-        endpoint_overrides: HashMap<String, Vec<IpAddr>>,
+        overrides: EndpointOverrides,
     ) -> Result<()> {
         // Set up connection cleanup on error
         let cleanup_connection = || {
@@ -168,7 +170,7 @@ impl TcpProxy {
         );
 
         // Establish TCP tunnel to the target S3 endpoint with error handling
-        match Self::establish_tcp_tunnel(client_stream, client_addr, &target_host, resolver, endpoint_overrides).await {
+        match Self::establish_tcp_tunnel(client_stream, client_addr, &target_host, resolver, overrides).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 error!(
@@ -317,15 +319,15 @@ impl TcpProxy {
         client_addr: SocketAddr,
         target_host: &str,
         resolver: TokioAsyncResolver,
-        endpoint_overrides: HashMap<String, Vec<IpAddr>>,
+        overrides: EndpointOverrides,
     ) -> Result<()> {
         debug!(
             "Resolving {} using external DNS (bypassing /etc/hosts)",
             target_host
         );
 
-        // Check endpoint overrides first (for PrivateLink etc.)
-        let ip_addresses: Vec<IpAddr> = if let Some(ips) = endpoint_overrides.get(target_host) {
+        // Check endpoint overrides first (exact then suffix, for PrivateLink etc.)
+        let ip_addresses: Vec<IpAddr> = if let Some(ips) = overrides.resolve(target_host) {
             info!(
                 "Using endpoint override for {}: {:?}",
                 target_host, ips

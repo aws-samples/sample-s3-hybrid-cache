@@ -923,10 +923,24 @@ The proxy cannot use your on-prem DNS server for this — on-prem DNS resolves S
 ```yaml
 connection_pool:
   endpoint_overrides:
+    # Exact match — single hostname
     "s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
+
+    # Suffix (wildcard) match — all virtual-hosted bucket hostnames in a region
+    "*.s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
+
+    # MRAP global endpoint (requires the com.amazonaws.s3-global.accesspoint VPCE)
+    "*.accesspoint.s3-global.amazonaws.com": ["10.0.3.100"]
+
+    # Regional access points
+    "*.s3-accesspoint.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
 ```
 
-The proxy load-balances across the listed IPs. This also works for the HTTPS passthrough handler (port 443), which otherwise uses its own hardcoded DNS.
+Keys starting with `*.` are suffix patterns — they match any hostname ending with that suffix. Exact matches take precedence; among suffix matches the longest (most specific) wins. The proxy load-balances across the listed IPs.
+
+When any `endpoint_overrides` are configured, outbound TLS is locked to version 1.2 for VPC interface endpoint compatibility (interface endpoints do not support TLS 1.3). Regular S3 endpoints support TLS 1.2, so there is no functional regression.
+
+Overrides apply to both the HTTP caching path and the HTTPS passthrough handler (port 443).
 
 See [Getting Started - S3 PrivateLink](GETTING_STARTED.md#s3-privatelink-interface-vpc-endpoints) for setup details and verification steps.
 

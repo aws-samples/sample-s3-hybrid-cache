@@ -69,14 +69,20 @@ impl fmt::Display for AwsChunkedError {
 
 impl std::error::Error for AwsChunkedError {}
 
-/// Streaming SigV4 payload indicator header value
+/// Streaming SigV4 payload indicator header value (classic HMAC SigV4)
 const STREAMING_AWS4_HMAC_SHA256_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/// Streaming SigV4A payload indicator header value (ECDSA SigV4A, used by
+/// clients talking to Multi-Region Access Points). The chunk framing format
+/// is identical to classic SigV4 streaming payloads; only this label differs.
+const STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD: &str = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD";
 
 /// Check if a request uses aws-chunked encoding.
 ///
 /// Returns true if either:
 /// - The `content-encoding` header contains `aws-chunked`
 /// - The `x-amz-content-sha256` header equals `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+///   or `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` (SigV4A equivalent)
 ///
 /// # Arguments
 /// * `headers` - HashMap of request headers (case-insensitive keys recommended)
@@ -92,8 +98,11 @@ pub fn is_aws_chunked(headers: &HashMap<String, String>) -> bool {
     }
 
     // Check x-amz-content-sha256 header for streaming payload indicator
+    // (SigV4 HMAC or SigV4A ECDSA — chunk framing is identical)
     if let Some(sha256) = headers.get("x-amz-content-sha256") {
-        if sha256 == STREAMING_AWS4_HMAC_SHA256_PAYLOAD {
+        if sha256 == STREAMING_AWS4_HMAC_SHA256_PAYLOAD
+            || sha256 == STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD
+        {
             return true;
         }
     }
@@ -278,6 +287,18 @@ mod tests {
         headers.insert(
             "x-amz-content-sha256".to_string(),
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
+        );
+        assert!(is_aws_chunked(&headers));
+    }
+
+    #[test]
+    fn test_is_aws_chunked_with_sigv4a_sha256_header() {
+        // MRAP requests use SigV4A; streaming payloads carry a different
+        // x-amz-content-sha256 sentinel but the same chunk framing.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".to_string(),
         );
         assert!(is_aws_chunked(&headers));
     }

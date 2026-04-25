@@ -199,7 +199,7 @@ pub fn maybe_add_referer(
 
     // Check if referer is in SignedHeaders (must not modify signed headers)
     if let Some(auth) = auth_header {
-        if auth.contains("AWS4-HMAC-SHA256") {
+        if crate::signed_request_proxy::is_sigv4_algorithm(auth) {
             if let Some(pos) = auth.find("SignedHeaders=") {
                 let after_param = &auth[pos + 14..];
                 let end = after_param
@@ -2165,9 +2165,18 @@ impl HttpProxy {
                         }
                     }
 
-                    let tls_config = rustls::ClientConfig::builder()
+                    let tls_config = if config.connection_pool.endpoint_overrides.is_empty() {
+                        rustls::ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth()
+                    } else {
+                        // VPC interface endpoints (PrivateLink) only support TLS 1.2
+                        rustls::ClientConfig::builder_with_protocol_versions(
+                            &[&rustls::version::TLS12],
+                        )
                         .with_root_certificates(root_store)
-                        .with_no_client_auth();
+                        .with_no_client_auth()
+                    };
 
                     let tls_connector =
                         Arc::new(tokio_rustls::TlsConnector::from(Arc::new(tls_config)));
@@ -7130,9 +7139,18 @@ impl HttpProxy {
                     }
                 }
 
-                let tls_config = rustls::ClientConfig::builder()
+                let tls_config = if s3_client.has_endpoint_overrides() {
+                    // VPC interface endpoints (PrivateLink) only support TLS 1.2
+                    rustls::ClientConfig::builder_with_protocol_versions(
+                        &[&rustls::version::TLS12],
+                    )
                     .with_root_certificates(root_store)
-                    .with_no_client_auth();
+                    .with_no_client_auth()
+                } else {
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth()
+                };
 
                 let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
 

@@ -686,7 +686,7 @@ impl SignedPutHandler {
         if let Some(ref referer_value) = self.proxy_referer {
             if !headers.contains_key("referer") {
                 let should_add = if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                    if auth.contains("AWS4-HMAC-SHA256") {
+                    if crate::signed_request_proxy::is_sigv4_algorithm(auth) {
                         if let Some(pos) = auth.find("SignedHeaders=") {
                             let after_param = &auth[pos + 14..];
                             let end = after_param.find(',').or_else(|| after_param.find(' ')).unwrap_or(after_param.len());
@@ -910,7 +910,7 @@ impl SignedPutHandler {
         if let Some(ref referer_value) = self.proxy_referer {
             if !headers.contains_key("referer") {
                 let should_add = if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                    if auth.contains("AWS4-HMAC-SHA256") {
+                    if crate::signed_request_proxy::is_sigv4_algorithm(auth) {
                         if let Some(pos) = auth.find("SignedHeaders=") {
                             let after_param = &auth[pos + 14..];
                             let end = after_param.find(',').or_else(|| after_param.find(' ')).unwrap_or(after_param.len());

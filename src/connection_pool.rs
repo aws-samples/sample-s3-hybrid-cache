@@ -15,6 +15,94 @@ use trust_dns_resolver::config::{NameServerConfigGroup, ResolverConfig, Resolver
 use trust_dns_resolver::TokioAsyncResolver;
 
 // ---------------------------------------------------------------------------
+// EndpointOverrides — shared exact + suffix hostname-to-IP resolution
+// ---------------------------------------------------------------------------
+
+/// Parsed endpoint overrides supporting both exact hostname matches and
+/// suffix (wildcard) patterns.
+///
+/// Config keys starting with `*.` are treated as suffix patterns — the `*`
+/// is stripped and the remaining suffix (including the leading dot) is
+/// matched against the end of the hostname.  All other keys are exact
+/// matches.  At resolve time exact wins first, then the longest matching
+/// suffix.
+#[derive(Debug, Clone)]
+pub struct EndpointOverrides {
+    exact: HashMap<String, Vec<IpAddr>>,
+    /// Sorted longest-suffix-first for most-specific-wins semantics.
+    suffixes: Vec<(String, Vec<IpAddr>)>,
+}
+
+impl EndpointOverrides {
+    /// Parse from the raw config map.
+    pub fn from_config(raw: &HashMap<String, Vec<String>>) -> Self {
+        let mut exact = HashMap::new();
+        let mut suffixes: Vec<(String, Vec<IpAddr>)> = Vec::new();
+
+        for (hostname, ip_strings) in raw {
+            let mut ips = Vec::new();
+            for ip_str in ip_strings {
+                match ip_str.parse::<IpAddr>() {
+                    Ok(ip) => ips.push(ip),
+                    Err(e) => {
+                        warn!(
+                            "Invalid IP address '{}' in endpoint_overrides for '{}': {}",
+                            ip_str, hostname, e
+                        );
+                    }
+                }
+            }
+            if ips.is_empty() {
+                continue;
+            }
+            if let Some(suffix) = hostname.strip_prefix('*') {
+                info!("Endpoint suffix override: *{} -> {:?}", suffix, ips);
+                suffixes.push((suffix.to_string(), ips));
+            } else {
+                info!("Endpoint override: {} -> {:?}", hostname, ips);
+                exact.insert(hostname.clone(), ips);
+            }
+        }
+        suffixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        Self { exact, suffixes }
+    }
+
+    /// Resolve a hostname against overrides.  Returns `None` if no match.
+    pub fn resolve(&self, endpoint: &str) -> Option<&Vec<IpAddr>> {
+        if let Some(ips) = self.exact.get(endpoint) {
+            return Some(ips);
+        }
+        for (suffix, ips) in &self.suffixes {
+            if endpoint.ends_with(suffix.as_str()) {
+                return Some(ips);
+            }
+        }
+        None
+    }
+
+    /// Whether any overrides (exact or suffix) are configured.
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.suffixes.is_empty()
+    }
+
+    /// Number of exact entries (for log messages).
+    pub fn exact_count(&self) -> usize {
+        self.exact.len()
+    }
+
+    /// Number of suffix entries (for log messages).
+    pub fn suffix_count(&self) -> usize {
+        self.suffixes.len()
+    }
+
+    /// Iterate over all exact overrides (for distributor seeding / health reporting).
+    pub fn exact_iter(&self) -> impl Iterator<Item = (&String, &Vec<IpAddr>)> {
+        self.exact.iter()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IpDistributor — lock-free round-robin IP selection
 // ---------------------------------------------------------------------------
 
@@ -150,8 +238,8 @@ pub struct ConnectionPoolManager {
     resolver: TokioAsyncResolver,
     default_dns_refresh_interval: Duration,
     dns_refresh_count: u64,
-    /// Static hostname-to-IP mappings that bypass DNS resolution (for PrivateLink etc.)
-    endpoint_overrides: HashMap<String, Vec<IpAddr>>,
+    /// Parsed endpoint overrides (exact + suffix) for PrivateLink etc.
+    overrides: EndpointOverrides,
     /// Per-endpoint IP distributors for round-robin request distribution
     pub ip_distributors: HashMap<String, IpDistributor>,
     /// Resolved IPs per endpoint (for DNS refresh tracking)
@@ -179,7 +267,7 @@ impl ConnectionPoolManager {
             resolver,
             default_dns_refresh_interval: Duration::from_secs(60),
             dns_refresh_count: 0,
-            endpoint_overrides: HashMap::new(),
+            overrides: EndpointOverrides::from_config(&HashMap::new()),
             ip_distributors: HashMap::new(),
             resolved_ips: HashMap::new(),
             last_dns_refresh: HashMap::new(),
@@ -231,27 +319,12 @@ impl ConnectionPoolManager {
 
         let resolver = TokioAsyncResolver::tokio(resolver_config, opts);
 
-        // Parse endpoint overrides
-        let mut endpoint_overrides = HashMap::new();
-        for (hostname, ip_strings) in &config.endpoint_overrides {
-            let mut ips = Vec::new();
-            for ip_str in ip_strings {
-                match ip_str.parse::<IpAddr>() {
-                    Ok(ip) => ips.push(ip),
-                    Err(e) => {
-                        warn!("Invalid IP address '{}' in endpoint_overrides for '{}': {}", ip_str, hostname, e);
-                    }
-                }
-            }
-            if !ips.is_empty() {
-                info!("Endpoint override: {} -> {:?}", hostname, ips);
-                endpoint_overrides.insert(hostname.clone(), ips);
-            }
-        }
+        // Parse endpoint overrides (exact + suffix patterns)
+        let overrides = EndpointOverrides::from_config(&config.endpoint_overrides);
 
-        // Eagerly initialize distributors for endpoint_overrides (moved from lazy init)
+        // Eagerly initialize distributors for exact endpoint overrides
         let mut ip_distributors = HashMap::new();
-        for (hostname, ips) in &endpoint_overrides {
+        for (hostname, ips) in overrides.exact_iter() {
             info!(
                 endpoint = %hostname,
                 ip_count = ips.len(),
@@ -259,21 +332,35 @@ impl ConnectionPoolManager {
             );
             ip_distributors.insert(hostname.clone(), IpDistributor::new(ips.clone()));
         }
+        // Note: suffix overrides create distributors lazily on first match
+        // because the actual hostname isn't known until request time.
 
         Ok(Self {
             resolver,
             default_dns_refresh_interval: config.dns_refresh_interval,
             dns_refresh_count: 0,
-            endpoint_overrides,
+            overrides,
             ip_distributors,
             resolved_ips: HashMap::new(),
             last_dns_refresh: HashMap::new(),
         })
     }
 
+    /// Look up an endpoint override — exact match first, then longest-suffix match.
+    /// Returns the IPs if found, None otherwise.
+    pub fn resolve_override(&self, endpoint: &str) -> Option<&Vec<IpAddr>> {
+        self.overrides.resolve(endpoint)
+    }
+
+    /// Whether any endpoint overrides (exact or suffix) are configured.
+    pub fn has_overrides(&self) -> bool {
+        !self.overrides.is_empty()
+    }
+
     /// Resolve endpoint to IP addresses
     async fn resolve_endpoint(&self, endpoint: &str) -> Result<Vec<IpAddr>> {
-        if let Some(ips) = self.endpoint_overrides.get(endpoint) {
+        // Check overrides (exact then suffix)
+        if let Some(ips) = self.overrides.resolve(endpoint) {
             info!("Using endpoint override for {}: {:?}", endpoint, ips);
             return Ok(ips.clone());
         }
@@ -308,8 +395,8 @@ impl ConnectionPoolManager {
     /// Subsequent calls to `refresh_dns` will keep the distributor up to date.
     /// No-op if the endpoint is already registered or covered by `endpoint_overrides`.
     pub async fn register_endpoint(&mut self, endpoint: &str) {
-        // Skip if already registered or covered by a static override
-        if self.resolved_ips.contains_key(endpoint) || self.endpoint_overrides.contains_key(endpoint) {
+        // Skip if already registered or covered by a static override (exact or suffix)
+        if self.resolved_ips.contains_key(endpoint) || self.resolve_override(endpoint).is_some() {
             return;
         }
         info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
@@ -405,8 +492,8 @@ impl ConnectionPoolManager {
                 return Some(endpoint.clone());
             }
         }
-        // Also check endpoint_overrides for IPs not yet in a distributor
-        for (endpoint, ips) in &self.endpoint_overrides {
+        // Also check exact endpoint_overrides for IPs not yet in a distributor
+        for (endpoint, ips) in self.overrides.exact_iter() {
             if ips.contains(ip) {
                 return Some(endpoint.clone());
             }
@@ -773,5 +860,86 @@ mod tests {
         distributor.remove_ip(ips[1], "health exclusion");
 
         assert_eq!(manager.get_distributed_ip(endpoint), None);
+    }
+
+    // --- EndpointOverrides tests ---
+
+    #[test]
+    fn test_endpoint_overrides_exact_match() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.1.100".to_string()],
+        );
+        let eo = EndpointOverrides::from_config(&raw);
+        assert!(eo.resolve("s3.us-west-2.amazonaws.com").is_some());
+        assert!(eo.resolve("other.s3.us-west-2.amazonaws.com").is_none());
+    }
+
+    #[test]
+    fn test_endpoint_overrides_suffix_match() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "*.s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.1.100".to_string()],
+        );
+        let eo = EndpointOverrides::from_config(&raw);
+        // Suffix should match any subdomain
+        assert!(eo.resolve("mybucket.s3.us-west-2.amazonaws.com").is_some());
+        assert!(eo.resolve("other.s3.us-west-2.amazonaws.com").is_some());
+        // Bare apex should also match (ends with ".s3.us-west-2.amazonaws.com")
+        // But "s3.us-west-2.amazonaws.com" itself does NOT end with ".s3.us-west-2..."
+        assert!(eo.resolve("s3.us-west-2.amazonaws.com").is_none());
+    }
+
+    #[test]
+    fn test_endpoint_overrides_exact_wins_over_suffix() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "*.s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.1.100".to_string()],
+        );
+        raw.insert(
+            "special.s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.2.200".to_string()],
+        );
+        let eo = EndpointOverrides::from_config(&raw);
+        // Exact match should return the exact IP
+        let exact_ips = eo.resolve("special.s3.us-west-2.amazonaws.com").unwrap();
+        assert_eq!(exact_ips[0], IpAddr::V4(Ipv4Addr::new(10, 0, 2, 200)));
+        // Other subdomains hit the suffix
+        let suffix_ips = eo.resolve("other.s3.us-west-2.amazonaws.com").unwrap();
+        assert_eq!(suffix_ips[0], IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100)));
+    }
+
+    #[test]
+    fn test_endpoint_overrides_longest_suffix_wins() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "*.amazonaws.com".to_string(),
+            vec!["10.0.0.1".to_string()],
+        );
+        raw.insert(
+            "*.accesspoint.s3-global.amazonaws.com".to_string(),
+            vec!["10.0.0.2".to_string()],
+        );
+        let eo = EndpointOverrides::from_config(&raw);
+        // MRAP hostname should match the more specific suffix
+        let ips = eo.resolve("myalias.mrap.accesspoint.s3-global.amazonaws.com").unwrap();
+        assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        // Regular S3 hostname matches the shorter suffix
+        let ips2 = eo.resolve("mybucket.s3.us-west-2.amazonaws.com").unwrap();
+        assert_eq!(ips2[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_endpoint_overrides_is_empty() {
+        let eo = EndpointOverrides::from_config(&HashMap::new());
+        assert!(eo.is_empty());
+
+        let mut raw = HashMap::new();
+        raw.insert("*.s3.us-west-2.amazonaws.com".to_string(), vec!["10.0.0.1".to_string()]);
+        let eo2 = EndpointOverrides::from_config(&raw);
+        assert!(!eo2.is_empty());
     }
 }

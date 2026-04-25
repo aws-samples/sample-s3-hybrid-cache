@@ -403,10 +403,15 @@ The proxy cannot use your on-prem DNS server for this, because on-prem DNS resol
 ```yaml
 connection_pool:
   endpoint_overrides:
-    "s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
+    # Suffix patterns cover all bucket/AP hostnames in a region
+    "*.s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
+    # MRAP global endpoint (separate VPCE: com.amazonaws.s3-global.accesspoint)
+    "*.accesspoint.s3-global.amazonaws.com": ["10.0.3.100"]
 ```
 
-This bypasses DNS entirely for the specified hostnames. The proxy load-balances across the listed IPs. See [Configuration Guide - endpoint_overrides](CONFIGURATION.md#s3-privatelink-interface-vpc-endpoints) for details.
+Keys starting with `*.` are suffix patterns — they match any hostname ending with that suffix. Exact-match keys (without `*.`) are also supported and take precedence. See [Configuration Guide - endpoint_overrides](CONFIGURATION.md#s3-privatelink-interface-vpc-endpoints) for the full syntax and precedence rules.
+
+When any `endpoint_overrides` are configured, outbound TLS is locked to version 1.2 for VPC interface endpoint compatibility.
 
 **Verifying PrivateLink resolution**: From the proxy host, confirm the inbound endpoint returns private IPs for S3 endpoints:
 
@@ -450,6 +455,8 @@ The ARN in the S3 URI provides the SDK with all information needed to build the 
 aws s3 cp s3://arn:aws:s3::123456789012:accesspoint/mfzwi23gnjvgw/bigfiles/5GB ~/tmp/ \
   --endpoint-url http://accesspoint.s3-global.amazonaws.com
 ```
+
+The AWS CLI automatically uses SigV4A (`AWS4-ECDSA-P256-SHA256`) for MRAP requests. The proxy recognizes SigV4A signatures and handles them identically to classic SigV4 — signed headers are preserved, range signatures are detected, and referer injection respects the `SignedHeaders` list.
 
 #### Access Point Alias Usage
 

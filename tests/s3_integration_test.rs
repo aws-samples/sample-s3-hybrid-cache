@@ -50,6 +50,7 @@ fn create_test_config() -> Config {
             request_timeout: Duration::from_secs(30),
             add_referer_header: true,
             tls: None,
+            ..ServerConfig::default()
         },
         cache: CacheConfig {
             cache_dir: PathBuf::from("/tmp/s3_proxy_integration_test"),
@@ -151,7 +152,7 @@ async fn test_tcp_passthrough_mode() {
     let tcp_addr = SocketAddr::from(([127, 0, 0, 1], 8443));
 
     // Create TCP proxy for passthrough mode
-    let tcp_proxy = TcpProxy::new(tcp_addr, std::collections::HashMap::new());
+    let tcp_proxy = TcpProxy::new(tcp_addr, s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()));
 
     // Verify TCP proxy can be created and configured
     // Note: TCP proxy doesn't expose bind_address method, but creation success indicates proper setup
@@ -279,7 +280,7 @@ async fn test_end_to_end_proxy_setup() {
 
     // TCP proxy setup (for HTTPS passthrough)
     let tcp_addr = SocketAddr::from(([127, 0, 0, 1], 8443));
-    let _tcp_proxy = TcpProxy::new(tcp_addr, std::collections::HashMap::new());
+    let _tcp_proxy = TcpProxy::new(tcp_addr, s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()));
 
     // Connection pool manager setup
     let manager =

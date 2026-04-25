@@ -318,13 +318,33 @@ connection_pool:
   max_idle_per_host: 100  # More idle connections = more memory, fewer TLS handshakes during bursts
   max_lifetime: "300s"
   pool_check_interval: "10s"
-  # endpoint_overrides: Static hostname-to-IP mappings that bypass DNS resolution.
+  # endpoint_overrides: Hostname-to-IP mappings that bypass DNS resolution.
   # Useful for S3 PrivateLink where the proxy cannot use DNS to resolve S3 endpoints
   # to PrivateLink ENI IPs (e.g., on-prem deployments without Route 53 Resolver).
-  # Each hostname maps to a list of IP addresses. The proxy load-balances across them.
+  # Each key maps to a list of IP addresses. The proxy load-balances across them.
+  #
+  # Keys starting with "*." are suffix patterns — they match any hostname ending
+  # with that suffix. Exact matches take precedence over suffix matches; among
+  # suffix matches the longest (most specific) suffix wins.
+  #
+  # When any overrides are configured, outbound TLS is locked to 1.2 for VPC
+  # interface endpoint compatibility.
+  #
   # endpoint_overrides:
+  #   # Exact match — single specific hostname
   #   "s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
-  #   "s3.eu-west-1.amazonaws.com": ["10.0.3.100", "10.0.4.100"]
+  #
+  #   # Suffix match — all virtual-hosted bucket hostnames in a region
+  #   "*.s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
+  #
+  #   # Suffix match — all MRAP hostnames via the global accesspoint VPCE
+  #   "*.accesspoint.s3-global.amazonaws.com": ["10.0.3.100"]
+  #
+  #   # Suffix match — regional access points
+  #   "*.s3-accesspoint.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
+  #
+  #   # Cross-region bucket access
+  #   "*.s3.eu-west-1.amazonaws.com": ["10.0.4.100", "10.0.4.101"]
   # IP Distribution: create separate hyper connection pools per S3 IP address.
   # When enabled, the proxy rewrites request URI authorities from hostname to individual
   # IP addresses, causing hyper to maintain per-IP connection pools. This distributes

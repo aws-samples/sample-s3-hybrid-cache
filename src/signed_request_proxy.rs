@@ -17,12 +17,23 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
-/// Check if a request is signed with AWS Signature Version 4
+/// Check whether an Authorization header value uses an AWS SigV4-family algorithm.
+///
+/// Recognizes both classic SigV4 (`AWS4-HMAC-SHA256`) and SigV4A
+/// (`AWS4-ECDSA-P256-SHA256`), which the AWS CLI uses by default for
+/// Multi-Region Access Point (MRAP) requests. Both share the same
+/// `Credential=.../SignedHeaders=.../Signature=...` wire format, so every
+/// downstream parser that treats them identically is correct.
+pub fn is_sigv4_algorithm(auth: &str) -> bool {
+    auth.contains("AWS4-HMAC-SHA256") || auth.contains("AWS4-ECDSA-P256-SHA256")
+}
+
+/// Check if a request is signed with AWS Signature Version 4 (or SigV4A)
 pub fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
     headers
         .get("authorization")
         .or_else(|| headers.get("Authorization"))
-        .map(|auth| auth.contains("AWS4-HMAC-SHA256"))
+        .map(|auth| is_sigv4_algorithm(auth))
         .unwrap_or(false)
 }
 
@@ -31,6 +42,10 @@ pub fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
 /// This function parses the Authorization header to determine if the Range
 /// header was included in the signature calculation. If so, modifying the
 /// Range header would invalidate the signature.
+///
+/// Accepts both SigV4 (`AWS4-HMAC-SHA256`) and SigV4A
+/// (`AWS4-ECDSA-P256-SHA256`); the `SignedHeaders=...` portion has identical
+/// syntax in both.
 ///
 /// # Arguments
 /// * `headers` - Request headers including Authorization
@@ -61,8 +76,8 @@ pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
         None => return false, // No Authorization header (Requirement 1.5)
     };
 
-    // Check if this is AWS SigV4
-    if !auth_value.contains("AWS4-HMAC-SHA256") {
+    // Check if this is a SigV4-family signature (SigV4 or SigV4A)
+    if !is_sigv4_algorithm(auth_value) {
         return false; // Not SigV4 signature (Requirement 1.5)
     }
 
@@ -211,7 +226,7 @@ pub async fn forward_signed_request(
             let auth_value = headers.get("authorization")
                 .and_then(|v| v.to_str().ok());
             if let Some(auth) = auth_value {
-                if auth.contains("AWS4-HMAC-SHA256") {
+                if is_sigv4_algorithm(auth) {
                     if let Some(pos) = auth.find("SignedHeaders=") {
                         let after_param = &auth[pos + 14..];
                         let end = after_param.find(',')
@@ -338,7 +353,7 @@ pub async fn forward_signed_request_with_body(
             let auth_value = headers.get("authorization")
                 .and_then(|v| v.to_str().ok());
             if let Some(auth) = auth_value {
-                if auth.contains("AWS4-HMAC-SHA256") {
+                if is_sigv4_algorithm(auth) {
                     if let Some(pos) = auth.find("SignedHeaders=") {
                         let after_param = &auth[pos + 14..];
                         let end = after_param.find(',')
@@ -1110,6 +1125,59 @@ mod tests {
         // Test with different auth type
         headers.insert("authorization".to_string(), "Bearer token123".to_string());
         assert!(!is_aws_sigv4_signed(&headers));
+    }
+
+    #[test]
+    fn test_is_aws_sigv4_signed_accepts_sigv4a() {
+        // SigV4A (AWS4-ECDSA-P256-SHA256) is used by default for MRAP requests.
+        // The algorithm string differs from classic SigV4 but the rest of the
+        // Authorization header follows the same Credential/SignedHeaders/Signature format.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "AWS4-ECDSA-P256-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, \
+             Signature=abcdef1234567890" // #gitleaks:allow
+                .to_string(),
+        );
+        assert!(is_aws_sigv4_signed(&headers));
+    }
+
+    #[test]
+    fn test_is_range_signed_with_sigv4a_range_signed() {
+        // Range in SignedHeaders under a SigV4A Authorization header should still be detected.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "AWS4-ECDSA-P256-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;range;x-amz-content-sha256;x-amz-date;x-amz-region-set, \
+             Signature=abcdef1234567890" // #gitleaks:allow
+                .to_string(),
+        );
+        assert!(is_range_signed(&headers));
+    }
+
+    #[test]
+    fn test_is_range_signed_with_sigv4a_range_not_signed() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "AWS4-ECDSA-P256-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, \
+             Signature=abcdef1234567890" // #gitleaks:allow
+                .to_string(),
+        );
+        assert!(!is_range_signed(&headers));
+    }
+
+    #[test]
+    fn test_is_sigv4_algorithm_helper() {
+        assert!(is_sigv4_algorithm("AWS4-HMAC-SHA256 Credential=..."));
+        assert!(is_sigv4_algorithm("AWS4-ECDSA-P256-SHA256 Credential=..."));
+        assert!(!is_sigv4_algorithm("Bearer token"));
+        assert!(!is_sigv4_algorithm(""));
+        // Guard against partial/misspelled algorithms
+        assert!(!is_sigv4_algorithm("AWS4-ECDSA Credential=..."));
     }
 
     #[test]

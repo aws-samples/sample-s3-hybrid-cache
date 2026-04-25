@@ -604,6 +604,8 @@ Examples:
 
 S3 Access Point and Multi-Region Access Point (MRAP) requests use a different URL structure than regular bucket requests. The endpoint identity appears in the Host header (virtual-hosted style) or the first path segment (path-style with alias), not in the bucket position. The proxy detects these patterns and generates cache key folders with AWS reserved suffixes to prevent namespace collisions with S3 bucket names.
 
+The AWS CLI uses SigV4A (`AWS4-ECDSA-P256-SHA256`) by default for MRAP requests. The proxy recognizes both SigV4 and SigV4A signatures — signed headers, range signatures, referer injection guards, and `aws-chunked` streaming payload detection all work identically for both algorithms.
+
 Per the [S3 bucket naming rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html), the suffixes `-s3alias` and `.mrap` are reserved by AWS for access point alias names and cannot appear in general purpose bucket names. The proxy appends these suffixes to all AP/MRAP cache key folders, guaranteeing no collision with bucket-derived cache keys.
 
 **Scope**: This caching solution supports S3 general purpose buckets only. S3 Tables buckets, S3 directory buckets, and S3 Vectors buckets are not supported.
