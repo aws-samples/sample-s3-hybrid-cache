@@ -5,6 +5,11 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.3] - 2026-04-25
+
+### Changed
+- **Per-destination TLS version selection for PrivateLink**: TLS 1.3 is now used for regular S3 endpoints while PrivateLink destinations (matched by `endpoint_overrides`) use TLS 1.2. Previously, when any `endpoint_overrides` were configured, all outbound TLS was locked to 1.2. The proxy now builds two TLS connectors at startup — a default (1.2+1.3) and a PrivateLink-only (1.2) — and selects per connection based on whether the target hostname matches an override. Applies to the hyper connection pool (`CustomHttpsConnector`), signed PUT forwarding, and signed GET forwarding paths.
+
 ## [1.11.2] - 2026-04-25
 
 ### Added

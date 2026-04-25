@@ -2170,12 +2170,22 @@ impl HttpProxy {
                             .with_root_certificates(root_store)
                             .with_no_client_auth()
                     } else {
-                        // VPC interface endpoints (PrivateLink) only support TLS 1.2
-                        rustls::ClientConfig::builder_with_protocol_versions(
-                            &[&rustls::version::TLS12],
-                        )
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth()
+                        // Check if this specific host is a PrivateLink destination
+                        let pool = s3_client.get_connection_pool();
+                        let pm = pool.read().await;
+                        if pm.resolve_override(&host).is_some() {
+                            drop(pm);
+                            rustls::ClientConfig::builder_with_protocol_versions(
+                                &[&rustls::version::TLS12],
+                            )
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth()
+                        } else {
+                            drop(pm);
+                            rustls::ClientConfig::builder()
+                                .with_root_certificates(root_store)
+                                .with_no_client_auth()
+                        }
                     };
 
                     let tls_connector =
@@ -7140,12 +7150,22 @@ impl HttpProxy {
                 }
 
                 let tls_config = if s3_client.has_endpoint_overrides() {
-                    // VPC interface endpoints (PrivateLink) only support TLS 1.2
-                    rustls::ClientConfig::builder_with_protocol_versions(
-                        &[&rustls::version::TLS12],
-                    )
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth()
+                    // Check if this specific host is a PrivateLink destination
+                    let pool = s3_client.get_connection_pool();
+                    let pm = pool.read().await;
+                    if pm.resolve_override(&host).is_some() {
+                        drop(pm);
+                        rustls::ClientConfig::builder_with_protocol_versions(
+                            &[&rustls::version::TLS12],
+                        )
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth()
+                    } else {
+                        drop(pm);
+                        rustls::ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth()
+                    }
                 } else {
                     rustls::ClientConfig::builder()
                         .with_root_certificates(root_store)

@@ -152,20 +152,30 @@ impl S3Client {
                 .map_err(|e| ProxyError::TlsError(format!("Failed to add cert: {}", e)))?;
         }
 
-        let tls_config = if config.endpoint_overrides.is_empty() {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        } else {
-            info!(
-                "Endpoint overrides configured — locking outbound TLS to 1.2 for PrivateLink compatibility"
-            );
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
+        // Build TLS connectors. Default uses TLS 1.2+1.3. When endpoint
+        // overrides are configured, also build a TLS 1.2-only connector
+        // for PrivateLink destinations (VPC interface endpoints don't
+        // support TLS 1.3).
+        let tls_default = {
+            let cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store.clone())
+                .with_no_client_auth();
+            TlsConnector::from(Arc::new(cfg))
         };
 
-        let tls_connector = TlsConnector::from(Arc::new(tls_config));
+        let tls_privatelink = if !config.endpoint_overrides.is_empty() {
+            info!(
+                "Endpoint overrides configured — building TLS 1.2 connector for PrivateLink destinations"
+            );
+            let cfg = rustls::ClientConfig::builder_with_protocol_versions(
+                &[&rustls::version::TLS12],
+            )
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+            Some(TlsConnector::from(Arc::new(cfg)))
+        } else {
+            None
+        };
 
         // Create shared metrics manager reference that can be set later
         let metrics_ref = Arc::new(tokio::sync::RwLock::new(metrics_manager.clone()));
@@ -173,7 +183,8 @@ impl S3Client {
         // Create custom HTTPS connector with pool manager, health tracker, and config
         let mut https_connector = CustomHttpsConnector::new(
             Arc::clone(&pool_manager),
-            tls_connector,
+            tls_default,
+            tls_privatelink,
             config.clone(),
             Arc::clone(&health_tracker),
         );

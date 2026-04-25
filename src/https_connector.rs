@@ -85,7 +85,11 @@ impl Connection for HttpsStream {
 /// Records connection failures in IpHealthTracker for automatic IP exclusion.
 pub struct CustomHttpsConnector {
     pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
-    tls_connector: TlsConnector,
+    /// Default TLS connector (TLS 1.2 + 1.3)
+    tls_default: TlsConnector,
+    /// TLS 1.2-only connector for VPC interface endpoints (PrivateLink).
+    /// None when no endpoint_overrides are configured.
+    tls_privatelink: Option<TlsConnector>,
     config: ConnectionPoolConfig,
     health_tracker: Arc<IpHealthTracker>,
     metrics_manager:
@@ -95,13 +99,15 @@ pub struct CustomHttpsConnector {
 impl CustomHttpsConnector {
     pub fn new(
         pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
-        tls_connector: TlsConnector,
+        tls_default: TlsConnector,
+        tls_privatelink: Option<TlsConnector>,
         config: ConnectionPoolConfig,
         health_tracker: Arc<IpHealthTracker>,
     ) -> Self {
         Self {
             pool_manager,
-            tls_connector,
+            tls_default,
+            tls_privatelink,
             config,
             health_tracker,
             metrics_manager: Arc::new(tokio::sync::RwLock::new(None)),
@@ -165,7 +171,8 @@ impl Service<Uri> for CustomHttpsConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let pool_manager = Arc::clone(&self.pool_manager);
-        let tls_connector = self.tls_connector.clone();
+        let tls_default = self.tls_default.clone();
+        let tls_privatelink = self.tls_privatelink.clone();
         let metrics_manager = self.metrics_manager.clone();
         let config = self.config.clone();
         let health_tracker = Arc::clone(&self.health_tracker);
@@ -258,6 +265,23 @@ impl Service<Uri> for CustomHttpsConnector {
                 connect_ip
             );
 
+            // Select TLS connector: use TLS 1.2-only for PrivateLink destinations,
+            // default (1.2+1.3) for everything else.
+            let tls_connector = if let Some(ref pl) = tls_privatelink {
+                let pm = pool_manager.read().await;
+                if pm.resolve_override(&tls_hostname).is_some() {
+                    debug!(
+                        "[HTTPS_CONNECTOR] Using TLS 1.2 connector for PrivateLink destination: {}",
+                        tls_hostname
+                    );
+                    pl.clone()
+                } else {
+                    tls_default.clone()
+                }
+            } else {
+                tls_default.clone()
+            };
+
             // TLS handshake
             let server_name =
                 ServerName::try_from(tls_hostname.clone()).map_err(|e| {
@@ -314,7 +338,8 @@ impl Clone for CustomHttpsConnector {
     fn clone(&self) -> Self {
         Self {
             pool_manager: Arc::clone(&self.pool_manager),
-            tls_connector: self.tls_connector.clone(),
+            tls_default: self.tls_default.clone(),
+            tls_privatelink: self.tls_privatelink.clone(),
             config: self.config.clone(),
             health_tracker: Arc::clone(&self.health_tracker),
             metrics_manager: self.metrics_manager.clone(),
@@ -348,7 +373,7 @@ mod tests {
         let health_tracker = Arc::new(IpHealthTracker::new(3));
 
         let connector =
-            CustomHttpsConnector::new(pool_manager, tls_connector, config, health_tracker);
+            CustomHttpsConnector::new(pool_manager, tls_connector, None, config, health_tracker);
 
         let _connector2 = connector.clone();
     }
