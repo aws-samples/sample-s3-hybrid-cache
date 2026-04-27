@@ -8,7 +8,7 @@ use crate::{
     cache::CacheManager,
     cache_types::{CacheMetadata, ObjectExpirationResult},
     config::Config,
-    disk_cache::DiskCacheManager,
+    disk_cache::{DiskCacheManager, IncrementalRangeWriter},
     inflight_tracker::{FetchRole, InFlightTracker},
     logging::LoggerManager,
     range_handler::{RangeHandler, RangeParseResult, RangeSpec},
@@ -354,7 +354,7 @@ impl HttpProxy {
             config.cache.max_cache_size,
             eviction_algorithm,
             1024, // 1KB compression threshold
-            true, // compression enabled
+            config.compression.enabled, // compression enabled (from config.compression.enabled)
             config.cache.get_ttl,
             config.cache.head_ttl,
             config.cache.put_ttl,
@@ -368,6 +368,7 @@ impl HttpProxy {
             config.cache.eviction_target_percent,
             config.cache.read_cache_enabled,
             config.cache.bucket_settings_staleness_threshold,
+            config.cache.compression_batch_size,
         ));
 
         // Create S3 client (metrics will be set later via set_metrics_manager)
@@ -2980,7 +2981,7 @@ impl HttpProxy {
         range_spec: RangeSpec,
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<S3Client>,
-        config: Arc<Config>,
+        _config: Arc<Config>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let mut response_builder = Response::builder().status(s3_response.status);
         let headers_clone = s3_response.headers.clone();
@@ -3007,61 +3008,118 @@ impl HttpProxy {
         let body = match s3_response.body {
             Some(S3ResponseBody::Streaming(incoming)) => {
                 // Create channel for cache data
-                let (cache_tx, mut cache_rx) = mpsc::channel::<Bytes>(100);
+                let (cache_tx, cache_rx) = mpsc::channel::<Bytes>(100);
 
                 // Metadata will be extracted from headers in the spawned task using s3_client
 
-                // Spawn background task to collect and cache data
+                // Spawn background task to incrementally write cache data as chunks arrive
                 let cache_key_clone = cache_key.clone();
                 let start = range_spec.start;
                 let end = range_spec.end;
-                let ttl = config.cache.get_ttl;
                 let s3_client_clone = s3_client.clone();
                 let disk_cache = Arc::clone(range_handler.get_disk_cache_manager());
                 let cache_manager = Arc::clone(range_handler.get_cache_manager());
                 tokio::spawn(async move {
-                    let mut accumulated = Vec::new();
-                    while let Some(chunk) = cache_rx.recv().await {
-                        accumulated.extend_from_slice(&chunk);
+                    let expected_size = end - start + 1;
+                    let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
+
+                    // Check capacity and evict if needed before beginning the write.
+                    // `expected_size` is an upper bound on the bytes that will land on disk
+                    // (compressed size is only known at commit).
+                    if let Err(e) = cache_manager.evict_if_needed(expected_size).await {
+                        warn!("Eviction failed before caching range: {}", e);
                     }
 
-                    if !accumulated.is_empty() {
-                        let mut object_metadata =
-                            s3_client_clone.extract_object_metadata_from_response(&headers_clone);
-                        object_metadata.upload_state = crate::cache_types::UploadState::Complete;
-                        object_metadata.cumulative_size = object_metadata.content_length;
-                        object_metadata.compression_algorithm =
-                            crate::compression::CompressionAlgorithm::Lz4;
-                        object_metadata.compressed_size = 0;
-
-                        // Check capacity and evict if needed before caching
-                        if let Err(e) =
-                            cache_manager.evict_if_needed(accumulated.len() as u64).await
-                        {
-                            warn!("Eviction failed before caching range: {}", e);
+                    // Begin incremental write
+                    let disk_cache_guard = disk_cache.read().await;
+                    let writer = match disk_cache_guard
+                        .begin_incremental_range_write(
+                            &cache_key_clone,
+                            start,
+                            end,
+                            resolved.compression_enabled,
+                        )
+                        .await
+                    {
+                        Ok(w) => w,
+                        Err(e) => {
+                            warn!(
+                                "Failed to begin incremental cache write for range {}-{}: {}",
+                                start, end, e
+                            );
+                            return;
                         }
+                    };
+                    drop(disk_cache_guard);
 
-                        let mut disk_cache_guard = disk_cache.write().await;
-                        let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
-                        if let Err(e) = disk_cache_guard
-                            .store_range(
-                                &cache_key_clone,
-                                start,
-                                end,
-                                &accumulated,
-                                object_metadata,
-                                ttl,
-                                resolved.compression_enabled,
-                            )
-                            .await
-                        {
-                            warn!("Failed to cache streamed range {}-{}: {}", start, end, e);
-                        } else {
+                    // Drive chunk writes on a blocking thread so per-chunk LZ4 encode +
+                    // sync file I/O does not stall a tokio worker. The writer is returned
+                    // from the blocking task on success (or on per-chunk failure so we can
+                    // abort and clean up the .tmp file).
+                    let write_result = tokio::task::spawn_blocking(
+                        move || -> (IncrementalRangeWriter, Result<()>) {
+                            let mut writer = writer;
+                            let mut rx = cache_rx;
+                            while let Some(chunk) = rx.blocking_recv() {
+                                if let Err(e) =
+                                    DiskCacheManager::write_range_chunk(&mut writer, &chunk)
+                                {
+                                    return (writer, Err(e));
+                                }
+                            }
+                            (writer, Ok(()))
+                        },
+                    )
+                    .await;
+
+                    let writer = match write_result {
+                        Ok((w, Ok(()))) => w,
+                        Ok((w, Err(e))) => {
+                            warn!(
+                                "Failed to write incremental cache chunk for range {}-{}: {}",
+                                start, end, e
+                            );
+                            DiskCacheManager::abort_incremental_range(w);
+                            return;
+                        }
+                        Err(join_err) => {
+                            warn!(
+                                "Cache-write blocking task panicked for range {}-{}: {}",
+                                start, end, join_err
+                            );
+                            return;
+                        }
+                    };
+
+                    // Build object metadata for commit.
+                    let mut object_metadata =
+                        s3_client_clone.extract_object_metadata_from_response(&headers_clone);
+                    object_metadata.upload_state = crate::cache_types::UploadState::Complete;
+                    object_metadata.cumulative_size = object_metadata.content_length;
+
+                    // Commit on the async side — uses &self (read lock), internal locks
+                    // serialize the journal append and size accumulator.
+                    let disk_cache_guard = disk_cache.read().await;
+                    if let Err(e) = disk_cache_guard
+                        .commit_incremental_range(writer, object_metadata, resolved.get_ttl)
+                        .await
+                    {
+                        if e.to_string().contains("size mismatch") {
                             debug!(
-                                "Successfully cached streamed range {}-{} ({} bytes)",
-                                start, end, accumulated.len()
+                                "Incremental cache write incomplete for range {}-{}: {}",
+                                start, end, e
+                            );
+                        } else {
+                            warn!(
+                                "Failed to commit incremental cache write for range {}-{}: {}",
+                                start, end, e
                             );
                         }
+                    } else {
+                        debug!(
+                            "Successfully cached streamed range {}-{} via incremental write",
+                            start, end
+                        );
                     }
                 });
 
@@ -6121,7 +6179,7 @@ impl HttpProxy {
                                     // Begin incremental write
                                     let disk_cache = range_handler_clone.get_disk_cache_manager().read().await;
                                     let resolved = cache_manager_clone.resolve_settings(&cache_key_clone).await;
-                                    let mut writer = match disk_cache.begin_incremental_range_write(
+                                    let writer = match disk_cache.begin_incremental_range_write(
                                         &cache_key_clone, start, end, resolved.compression_enabled,
                                     ).await {
                                         Ok(w) => w,
@@ -6132,14 +6190,41 @@ impl HttpProxy {
                                     };
                                     drop(disk_cache);
 
-                                    // Write chunks as they arrive
-                                    while let Some(chunk) = cache_rx.recv().await {
-                                        if let Err(e) = DiskCacheManager::write_range_chunk(&mut writer, &chunk) {
+                                    // Drive chunk writes on a blocking thread so per-chunk LZ4
+                                    // encode + sync file I/O does not stall a tokio worker. The
+                                    // writer is returned from the blocking task on success (or on
+                                    // per-chunk failure so we can abort and clean up the .tmp file).
+                                    let write_result = tokio::task::spawn_blocking(
+                                        move || -> (IncrementalRangeWriter, Result<()>) {
+                                            let mut writer = writer;
+                                            let mut rx = cache_rx;
+                                            while let Some(chunk) = rx.blocking_recv() {
+                                                if let Err(e) =
+                                                    DiskCacheManager::write_range_chunk(
+                                                        &mut writer,
+                                                        &chunk,
+                                                    )
+                                                {
+                                                    return (writer, Err(e));
+                                                }
+                                            }
+                                            (writer, Ok(()))
+                                        },
+                                    )
+                                    .await;
+
+                                    let writer = match write_result {
+                                        Ok((w, Ok(()))) => w,
+                                        Ok((w, Err(e))) => {
                                             warn!("Failed to write cache chunk for GET response: cache_key={}, error={}", cache_key_clone, e);
-                                            DiskCacheManager::abort_incremental_range(writer);
+                                            DiskCacheManager::abort_incremental_range(w);
                                             return;
                                         }
-                                    }
+                                        Err(join_err) => {
+                                            warn!("Cache-write blocking task panicked for GET response: cache_key={}, error={}", cache_key_clone, join_err);
+                                            return;
+                                        }
+                                    };
 
                                     // Build object metadata for commit
                                     let mut object_metadata =
@@ -6150,7 +6235,13 @@ impl HttpProxy {
                                     object_metadata.cumulative_size = object_metadata.content_length;
 
                                     // Commit incremental write
-                                    let mut disk_cache = range_handler_clone.get_disk_cache_manager().write().await;
+                                    //
+                                    // Uses a read lock (not write) on the DiskCacheManager:
+                                    // `commit_incremental_range` now takes `&self`, and all
+                                    // internal mutation is already serialized by finer-grained
+                                    // locks (HybridMetadataWriter mutex, SizeAccumulator atomics).
+                                    // Concurrent commits of distinct ranges proceed in parallel.
+                                    let disk_cache = range_handler_clone.get_disk_cache_manager().read().await;
                                     if let Err(e) = disk_cache.commit_incremental_range(writer, object_metadata, resolved.get_ttl).await {
                                         if e.to_string().contains("size mismatch") {
                                             debug!(
@@ -6503,57 +6594,121 @@ impl HttpProxy {
                         let cache_key_clone = cache_key.clone();
                         let range_spec_clone = range_spec.clone();
                         let _etag_clone = etag.clone().unwrap();
-                        let ttl = config.cache.get_ttl;
 
                         // Extract complete object metadata from S3 response headers to preserve all headers
                         let object_metadata =
                             s3_client.extract_object_metadata_from_response(&s3_response.headers);
 
                         // Create channel for cache data
-                        let (cache_tx, mut cache_rx) = mpsc::channel::<Bytes>(100);
+                        let (cache_tx, cache_rx) = mpsc::channel::<Bytes>(100);
 
-                        // Spawn background task to collect and cache data
+                        // Spawn background task to incrementally write cache data as chunks arrive
                         tokio::spawn(async move {
-                            let mut data = Vec::new();
-                            while let Some(chunk) = cache_rx.recv().await {
-                                data.extend_from_slice(&chunk);
+                            let start = range_spec_clone.start;
+                            let end = range_spec_clone.end;
+                            let expected_size = end - start + 1;
+                            let resolved =
+                                cache_manager.resolve_settings(&cache_key_clone).await;
+
+                            // Check capacity and evict if needed before beginning the write.
+                            // `expected_size` is an upper bound on the bytes that will land on
+                            // disk (compressed size is only known at commit).
+                            if let Err(e) = cache_manager.evict_if_needed(expected_size).await {
+                                warn!("Eviction failed before caching range: {}", e);
                             }
 
-                            // Write to cache as a range
-                            if !data.is_empty() {
-                                // Check capacity and evict if needed before caching
-                                if let Err(e) =
-                                    cache_manager.evict_if_needed(data.len() as u64).await
-                                {
-                                    warn!("Eviction failed before caching range: {}", e);
-                                }
-
-                                // Use the extracted object metadata to preserve all S3 response headers
-
-                                let mut disk_cache_guard = disk_cache.write().await;
-                                let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
-                                if let Err(e) = disk_cache_guard
-                                    .store_range(
-                                        &cache_key_clone,
-                                        range_spec_clone.start,
-                                        range_spec_clone.end,
-                                        &data,
-                                        object_metadata,
-                                        ttl,
-                                        resolved.compression_enabled,
-                                    )
-                                    .await
-                                {
+                            // Begin incremental write
+                            let disk_cache_guard = disk_cache.read().await;
+                            let writer = match disk_cache_guard
+                                .begin_incremental_range_write(
+                                    &cache_key_clone,
+                                    start,
+                                    end,
+                                    resolved.compression_enabled,
+                                )
+                                .await
+                            {
+                                Ok(w) => w,
+                                Err(e) => {
                                     warn!(
-                                        "Failed to cache signed range response: cache_key={}, error={}",
-                                        cache_key_clone, e
+                                        "Failed to begin incremental cache write for signed range \
+                                         response: cache_key={}, range={}-{}, error={}",
+                                        cache_key_clone, start, end, e
+                                    );
+                                    return;
+                                }
+                            };
+                            drop(disk_cache_guard);
+
+                            // Drive chunk writes on a blocking thread so per-chunk LZ4 encode +
+                            // sync file I/O does not stall a tokio worker.
+                            let write_result = tokio::task::spawn_blocking(
+                                move || -> (IncrementalRangeWriter, Result<()>) {
+                                    let mut writer = writer;
+                                    let mut rx = cache_rx;
+                                    while let Some(chunk) = rx.blocking_recv() {
+                                        if let Err(e) = DiskCacheManager::write_range_chunk(
+                                            &mut writer,
+                                            &chunk,
+                                        ) {
+                                            return (writer, Err(e));
+                                        }
+                                    }
+                                    (writer, Ok(()))
+                                },
+                            )
+                            .await;
+
+                            let writer = match write_result {
+                                Ok((w, Ok(()))) => w,
+                                Ok((w, Err(e))) => {
+                                    warn!(
+                                        "Failed to write incremental cache chunk for signed \
+                                         range response: cache_key={}, range={}-{}, error={}",
+                                        cache_key_clone, start, end, e
+                                    );
+                                    DiskCacheManager::abort_incremental_range(w);
+                                    return;
+                                }
+                                Err(join_err) => {
+                                    warn!(
+                                        "Cache-write blocking task panicked for signed range \
+                                         response: cache_key={}, range={}-{}, error={}",
+                                        cache_key_clone, start, end, join_err
+                                    );
+                                    return;
+                                }
+                            };
+
+                            // Commit on the async side — uses &self (read lock), internal locks
+                            // serialize the journal append and size accumulator.
+                            let disk_cache_guard = disk_cache.read().await;
+                            if let Err(e) = disk_cache_guard
+                                .commit_incremental_range(
+                                    writer,
+                                    object_metadata,
+                                    resolved.get_ttl,
+                                )
+                                .await
+                            {
+                                if e.to_string().contains("size mismatch") {
+                                    debug!(
+                                        "Incremental cache write incomplete for signed range \
+                                         response: cache_key={}, range={}-{}, error={}",
+                                        cache_key_clone, start, end, e
                                     );
                                 } else {
-                                    debug!(
-                                        "Cached signed range response: cache_key={}, range={}-{}, size={}",
-                                                cache_key_clone, range_spec_clone.start, range_spec_clone.end, data.len()
-                                            );
+                                    warn!(
+                                        "Failed to commit incremental cache write for signed \
+                                         range response: cache_key={}, range={}-{}, error={}",
+                                        cache_key_clone, start, end, e
+                                    );
                                 }
+                            } else {
+                                debug!(
+                                    "Cached signed range response: cache_key={}, range={}-{}",
+                                    cache_key_clone, start, end
+                                );
                             }
                         });
 

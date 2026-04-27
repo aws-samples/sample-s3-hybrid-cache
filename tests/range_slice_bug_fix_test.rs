@@ -34,6 +34,7 @@ fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheManager>
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     ))
 }
 
@@ -48,7 +49,7 @@ async fn test_range_slice_single_cached_range_larger_than_requested() {
 
     // Create disk cache manager
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576),
     ));
 
     // Create range handler
@@ -155,7 +156,7 @@ async fn test_range_slice_middle_of_cached_range() {
 
     // Create disk cache manager
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576),
     ));
 
     // Create range handler
@@ -247,7 +248,7 @@ async fn test_range_slice_end_of_cached_range() {
 
     // Create disk cache manager
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576),
     ));
 
     // Create range handler
@@ -339,7 +340,7 @@ async fn test_range_slice_exact_match_no_slicing() {
 
     // Create disk cache manager
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576),
     ));
 
     // Create range handler
@@ -427,7 +428,7 @@ async fn test_range_slice_multiple_cached_ranges() {
 
     // Create disk cache manager
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576),
     ));
 
     // Create range handler
@@ -606,7 +607,7 @@ async fn test_range_slice_multiple_cached_ranges_with_gaps() {
 
     // Create disk cache manager
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576),
     ));
 
     // Create range handler

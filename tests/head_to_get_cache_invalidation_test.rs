@@ -26,7 +26,7 @@ async fn test_get_cache_invalidated_by_head_etag_mismatch() {
     let old_last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
 
     let mut disk_cache_manager =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     disk_cache_manager.initialize().await.unwrap();
 
     // Store a range with old metadata
@@ -101,7 +101,7 @@ async fn test_get_cache_invalidated_by_head_last_modified_mismatch() {
     let old_last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
 
     let mut disk_cache_manager =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     disk_cache_manager.initialize().await.unwrap();
 
     // Store a range with old metadata
@@ -174,7 +174,7 @@ async fn test_get_cache_not_invalidated_when_head_matches() {
     let last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
 
     let mut disk_cache_manager =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     disk_cache_manager.initialize().await.unwrap();
 
     // Store a range
@@ -250,7 +250,7 @@ async fn test_validation_with_no_get_cache() {
     let cache_key = "test-bucket/test-object-4";
 
     let disk_cache_manager =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     disk_cache_manager.initialize().await.unwrap();
 
     // No GET cache stored, only HEAD cache using unified method
@@ -304,7 +304,7 @@ async fn test_direct_validation_call() {
     let old_last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
 
     let mut disk_cache_manager =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     disk_cache_manager.initialize().await.unwrap();
 
     // Store a range with old metadata

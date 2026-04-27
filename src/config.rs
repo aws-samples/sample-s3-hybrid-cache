@@ -749,6 +749,14 @@ fn default_disk_streaming_threshold() -> u64 {
     1_048_576 // 1 MiB
 }
 
+/// Default compression batch size: 1 MiB
+/// Bytes are accumulated in RAM before being compressed and flushed as a single
+/// LZ4 frame. Larger batches improve compression ratio and throughput at the
+/// cost of higher transient memory use per in-flight writer.
+fn default_compression_batch_size() -> usize {
+    1_048_576 // 1 MiB
+}
+
 /// Default eviction trigger percentage: 95%
 /// Eviction triggers when cache size exceeds this percentage of max_cache_size
 /// Requirement: 3.1
@@ -1040,6 +1048,7 @@ fn default_bucket_settings_staleness_threshold() -> Duration {
 
 /// Cache configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CacheConfig {
     #[serde(deserialize_with = "pathbuf_serde::deserialize")]
     pub cache_dir: PathBuf,
@@ -1152,6 +1161,14 @@ pub struct CacheConfig {
     /// Requirement: 5.5
     #[serde(default = "default_disk_streaming_threshold")]
     pub disk_streaming_threshold: u64,
+    /// Compression batch size in bytes (default: 1 MiB)
+    /// Bytes are accumulated in RAM up to this size, then compressed as a single
+    /// LZ4 frame and appended to the cache file. Larger batches improve compression
+    /// ratio and throughput; smaller batches reduce transient memory per in-flight writer.
+    /// Valid range: 64 KiB to 16 MiB inclusive.
+    /// Requirement: 5.1
+    #[serde(default = "default_compression_batch_size")]
+    pub compression_batch_size: usize,
     /// Enable read caching for GET responses (default: true)
     /// When false, no buckets are read-cached unless explicitly enabled via bucket settings.
     /// This allows an "allowlist" pattern where only specific buckets have caching enabled.
@@ -1196,9 +1213,35 @@ impl Default for CacheConfig {
             eviction_target_percent: default_eviction_target_percent(),
             full_object_check_threshold: default_full_object_check_threshold(),
             disk_streaming_threshold: default_disk_streaming_threshold(),
+            compression_batch_size: default_compression_batch_size(),
             read_cache_enabled: default_read_cache_enabled(),
             bucket_settings_staleness_threshold: default_bucket_settings_staleness_threshold(),
         }
+    }
+}
+
+impl CacheConfig {
+    /// Validate cache configuration values.
+    ///
+    /// Currently validates:
+    /// - `compression_batch_size` must be between 64 KiB and 16 MiB inclusive
+    ///   (Requirements: 5.1, 5.2, 5.3, 5.4)
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        // Validate compression_batch_size (64 KiB to 16 MiB inclusive)
+        const MIN_COMPRESSION_BATCH_SIZE: usize = 64 * 1024; // 64 KiB
+        const MAX_COMPRESSION_BATCH_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+        if self.compression_batch_size < MIN_COMPRESSION_BATCH_SIZE
+            || self.compression_batch_size > MAX_COMPRESSION_BATCH_SIZE
+        {
+            return Err(format!(
+                "cache.compression_batch_size must be between {} and {} bytes, got {}",
+                MIN_COMPRESSION_BATCH_SIZE,
+                MAX_COMPRESSION_BATCH_SIZE,
+                self.compression_batch_size
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -1268,6 +1311,7 @@ fn default_access_log_file_rotation_interval() -> Duration {
 
 /// Logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggingConfig {
     #[serde(deserialize_with = "pathbuf_serde::deserialize")]
     pub access_log_dir: PathBuf,
@@ -1385,6 +1429,7 @@ impl Default for LoggingConfig {
 
 /// Connection pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConnectionPoolConfig {
     pub max_connections_per_ip: usize,
     #[serde(deserialize_with = "duration_serde::deserialize")]
@@ -1696,6 +1741,7 @@ impl Default for Config {
                 eviction_target_percent: 80,                    // Reduce to 80% after eviction
                 full_object_check_threshold: 67_108_864,        // 64 MiB
                 disk_streaming_threshold: 1_048_576,            // 1 MiB
+                compression_batch_size: 1_048_576,              // 1 MiB
                 read_cache_enabled: true,                       // Read caching enabled by default
                 bucket_settings_staleness_threshold: Duration::from_secs(60), // 60 seconds
             },
@@ -3439,6 +3485,31 @@ metrics:
             config.cache.write_cache_enabled, true,
             "write_cache_enabled should default to true when missing (write caching is complete)"
         );
+    }
+
+    #[test]
+    fn test_minimal_config_fills_struct_defaults() {
+        // Regression test: a config that only specifies the essential path fields
+        // should deserialize successfully, with every other field falling back to
+        // its struct-level Default impl (enabled by #[serde(default)] on the struct).
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).expect("minimal config must parse");
+
+        // Spot-check fields that previously had no field-level serde default.
+        assert_eq!(config.cache.write_cache_percent, 10.0);
+        assert_eq!(config.cache.write_cache_max_object_size, 256 * 1024 * 1024);
+        assert_eq!(config.cache.max_cache_size, 10 * 1024 * 1024 * 1024);
+        assert_eq!(config.cache.ram_cache_enabled, false);
+        assert_eq!(config.logging.access_log_enabled, true);
+        assert_eq!(config.logging.log_level, "info");
+        assert_eq!(config.connection_pool.max_connections_per_ip, 10);
     }
 
     #[test]
@@ -5257,6 +5328,105 @@ metrics:
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
         assert_eq!(config.server.mode, ServerMode::ProxyOnly);
         assert_eq!(config.server.proxy_port, 4000);
+    }
+
+    #[test]
+    fn test_compression_batch_size_default() {
+        // Requirement 5.1: default compression_batch_size is 1 MiB
+        assert_eq!(CacheConfig::default().compression_batch_size, 1_048_576);
+        // Default value is valid per the validation range
+        assert!(CacheConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_compression_batch_size_missing_from_yaml_uses_default() {
+        // Requirement 5.2: when the field is not present in YAML, the default
+        // (1 MiB) is used via `#[serde(default = "default_compression_batch_size")]`.
+        let yaml = r#"
+server:
+  http_port: 8000
+  https_port: 8443
+  https_mode: "passthrough"
+  max_concurrent_requests: 200
+  request_timeout: "30s"
+cache:
+  cache_dir: "./cache"
+  max_cache_size: 1073741824
+  ram_cache_enabled: false
+  max_ram_cache_size: 268435456
+  eviction_algorithm: "lru"
+  write_cache_enabled: true
+  write_cache_percent: 10.0
+  write_cache_max_object_size: 268435456
+  put_ttl: "1h"
+  get_ttl: "315360000s"
+  head_ttl: "1h"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+  access_log_enabled: true
+  access_log_mode: "all"
+  log_level: "info"
+connection_pool:
+  max_connections_per_ip: 10
+  dns_refresh_interval: "1m"
+  connection_timeout: "30s"
+  idle_timeout: "2m"
+compression:
+  enabled: true
+  threshold: 1024
+  preferred_algorithm: "lz4"
+  content_aware: true
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  check_interval: "1m"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 8080
+  collection_interval: "5m"
+  include_cache_stats: true
+  include_compression_stats: true
+  include_connection_stats: true
+  otlp:
+    enabled: false
+    endpoint: "http://localhost:4318"
+    export_interval: "1m"
+    timeout: "30s"
+    compression: "none"
+    headers: {}
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        assert_eq!(config.cache.compression_batch_size, 1_048_576);
+    }
+
+    #[test]
+    fn test_compression_batch_size_below_range_rejected() {
+        // Requirement 5.4: values below 64 KiB must be rejected.
+        let mut cfg = CacheConfig::default();
+        cfg.compression_batch_size = 32 * 1024; // 32 KiB, below the 64 KiB minimum
+        let err = cfg.validate().expect_err("32 KiB must fail validation");
+        assert!(
+            err.contains("compression_batch_size"),
+            "error should mention the field name, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_compression_batch_size_above_range_rejected() {
+        // Requirement 5.4: values above 16 MiB must be rejected.
+        let mut cfg = CacheConfig::default();
+        cfg.compression_batch_size = 32 * 1024 * 1024; // 32 MiB, above the 16 MiB maximum
+        let err = cfg.validate().expect_err("32 MiB must fail validation");
+        assert!(
+            err.contains("compression_batch_size"),
+            "error should mention the field name, got: {}",
+            err
+        );
     }
 }
 

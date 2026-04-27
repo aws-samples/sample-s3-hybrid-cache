@@ -9,7 +9,7 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn test_stream_range_data_8mib_uncompressed() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/large-object.bin";
@@ -108,7 +108,7 @@ async fn test_stream_range_data_8mib_uncompressed() {
 #[tokio::test]
 async fn test_stream_range_data_compressed() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, true); // compression enabled
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, true, 1_048_576); // compression enabled
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/compressed-object.txt";
@@ -187,7 +187,7 @@ async fn test_stream_range_data_compressed() {
 #[tokio::test]
 async fn test_stream_range_data_missing_file() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     // Create a fake RangeSpec pointing to a non-existent file

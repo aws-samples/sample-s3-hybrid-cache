@@ -123,7 +123,7 @@ async fn test_cached_range_hit_logging() {
 
     // Store a range in cache using the new storage format
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false, 1_048_576),
     ));
 
     let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(
@@ -233,7 +233,7 @@ async fn test_complete_cache_hit_metrics() {
 
     // Store multiple ranges that cover the entire requested range
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false),
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false, 1_048_576),
     ));
 
     let range_handler = Arc::new(s3_proxy::range_handler::RangeHandler::new(

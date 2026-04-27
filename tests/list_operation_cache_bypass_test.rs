@@ -136,6 +136,7 @@ async fn test_get_object_part_bypasses_cache() -> Result<(), Box<dyn std::error:
         80,  // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = CacheManager::generate_cache_key("/my-bucket/my-object", None);
@@ -179,6 +180,7 @@ async fn test_metadata_operations_bypass_cache() -> Result<(), Box<dyn std::erro
         80,  // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = CacheManager::generate_cache_key("/my-bucket/my-object", None);
@@ -222,6 +224,7 @@ async fn test_cache_state_after_bypass_operations() -> Result<(), Box<dyn std::e
         80,  // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // Get initial cache statistics
@@ -299,6 +302,7 @@ async fn test_head_object_is_cached() -> Result<(), Box<dyn std::error::Error>> 
         80,  // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // Object path (not root) for HeadObject

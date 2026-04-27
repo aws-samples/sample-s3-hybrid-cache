@@ -80,7 +80,7 @@ fn prop_ttl_refresh_uses_resolved_ttl(input: ArbitraryTtlRefreshInput) -> TestRe
             Err(_) => return TestResult::discard(),
         };
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), false, 0, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), false, 0, false, 1_048_576);
         if cache_manager.initialize().await.is_err() {
             return TestResult::discard();
         }

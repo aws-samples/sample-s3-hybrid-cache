@@ -18,7 +18,7 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn test_corrupted_metadata_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -48,7 +48,7 @@ async fn test_corrupted_metadata_handling() {
 #[tokio::test]
 async fn test_empty_metadata_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -73,7 +73,7 @@ async fn test_empty_metadata_handling() {
 #[tokio::test]
 async fn test_missing_range_file_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -131,7 +131,7 @@ async fn test_missing_range_file_handling() {
 #[tokio::test]
 async fn test_disk_space_exhaustion_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -177,7 +177,7 @@ async fn test_disk_space_exhaustion_handling() {
 #[tokio::test]
 async fn test_inconsistent_metadata_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -255,7 +255,7 @@ async fn test_inconsistent_metadata_handling() {
 #[tokio::test]
 async fn test_all_ranges_missing() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -306,7 +306,7 @@ async fn test_all_ranges_missing() {
 #[tokio::test]
 async fn test_cleanup_temp_files() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -351,7 +351,7 @@ async fn test_cleanup_temp_files() {
 #[tokio::test]
 async fn test_comprehensive_cache_cleanup() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -424,7 +424,7 @@ async fn test_comprehensive_cache_cleanup() {
 #[tokio::test]
 async fn test_cleanup_preserves_valid_entries() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -476,7 +476,7 @@ async fn test_cleanup_preserves_valid_entries() {
 #[tokio::test]
 async fn test_error_recovery_no_crash() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     // Create multiple corrupted metadata files
@@ -509,7 +509,7 @@ async fn test_error_recovery_no_crash() {
 #[tokio::test]
 async fn test_partial_write_cleanup() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";

@@ -107,6 +107,7 @@ fn create_test_cache_config() -> CacheConfig {
         eviction_target_percent: 80,  // Reduce to 80% after eviction
         full_object_check_threshold: 67_108_864, // 64 MiB
         disk_streaming_threshold: 1_048_576, // 1 MiB
+        compression_batch_size: 1_048_576, // 1 MiB
         read_cache_enabled: true,
         bucket_settings_staleness_threshold: Duration::from_secs(60),
         download_coordination: s3_proxy::config::DownloadCoordinationConfig::default(),

@@ -40,7 +40,7 @@ fn make_object_metadata(content_length: u64) -> ObjectMetadata {
 async fn setup_disk_cache_with_journal(temp_dir: &std::path::Path) -> DiskCacheManager {
     let cache_dir = temp_dir.to_path_buf();
 
-    let mut cache_manager = DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+    let mut cache_manager = DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let lock_manager = Arc::new(MetadataLockManager::new(

@@ -125,7 +125,7 @@ fn prop_store_range_produces_valid_bin_file() {
         rt.block_on(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let mut cache_manager =
-                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             cache_manager.initialize().await.unwrap();
 
             let cache_key = "test-bucket/preservation-store-range";
@@ -217,7 +217,7 @@ fn prop_store_range_leaves_zero_tmp_files() {
         rt.block_on(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let mut cache_manager =
-                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             cache_manager.initialize().await.unwrap();
 
             let cache_key = "test-bucket/preservation-tmp-cleanup";
@@ -285,8 +285,8 @@ fn prop_single_task_incremental_equivalent_to_store_range() {
         rt.block_on(async {
             // --- Incremental write (single task, no contention) ---
             let incr_dir = tempfile::TempDir::new().unwrap();
-            let mut incr_cache =
-                DiskCacheManager::new(incr_dir.path().to_path_buf(), true, 1024, false);
+            let incr_cache =
+                DiskCacheManager::new(incr_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             incr_cache.initialize().await.unwrap();
 
             let cache_key = "test-bucket/preservation-equivalence";
@@ -327,7 +327,7 @@ fn prop_single_task_incremental_equivalent_to_store_range() {
             // --- Single-shot store_range ---
             let shot_dir = tempfile::TempDir::new().unwrap();
             let mut shot_cache =
-                DiskCacheManager::new(shot_dir.path().to_path_buf(), true, 1024, false);
+                DiskCacheManager::new(shot_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             shot_cache.initialize().await.unwrap();
 
             if let Err(e) = shot_cache

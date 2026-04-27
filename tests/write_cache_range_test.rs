@@ -43,6 +43,7 @@ async fn test_range_request_from_write_cache() {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     ));
 
     // Create disk cache manager for range handler
@@ -51,6 +52,7 @@ async fn test_range_request_from_write_cache() {
         true,
         1024,
         false,
+        1_048_576,
     )));
     disk_cache_manager.write().await.initialize().await.unwrap();
 
@@ -269,6 +271,7 @@ async fn test_full_object_range_from_write_cache() {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     ));
 
     // Create disk cache manager
@@ -277,6 +280,7 @@ async fn test_full_object_range_from_write_cache() {
         true,
         1024,
         false,
+        1_048_576,
     )));
     disk_cache_manager.write().await.initialize().await.unwrap();
 

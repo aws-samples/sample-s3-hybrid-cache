@@ -45,6 +45,7 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(DiskCacheManager::new(
@@ -52,6 +53,7 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
         true,
         1024,
         false,
+        1_048_576,
     )));
 
     let cache_key = "/test-bucket/test-object.txt";
@@ -157,6 +159,7 @@ async fn test_invalidate_stale_ranges() -> Result<()> {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/test-object.txt";
@@ -247,6 +250,7 @@ async fn test_invalidate_stale_ranges_no_mismatch() -> Result<()> {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/test-object.txt";
@@ -326,6 +330,7 @@ async fn test_invalidate_stale_ranges_no_metadata() -> Result<()> {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/nonexistent-object.txt";

@@ -5,6 +5,52 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.1] - 2026-04-27
+
+### Fixed
+- **`config.compression.enabled` now actually disables compression**: The CacheManager constructor in `http_proxy.rs` passed a hardcoded `true` for `compression_enabled`, ignoring the YAML setting. Setting `compression.enabled: false` had no effect on the incremental cache-write path. The constructor now reads `config.compression.enabled`. Per-bucket `_settings.json` overrides continue to take precedence.
+- **Minimal config files now actually work**: `CacheConfig`, `LoggingConfig`, and `ConnectionPoolConfig` required every field in YAML despite having complete `Default` impls, because the struct-level `#[serde(default)]` attribute was missing. All three structs now carry `#[serde(default)]`, so omitted fields fall through to the `Default` impl. A three-field config (`cache.cache_dir`, `logging.access_log_dir`, `logging.app_log_dir`) now parses successfully.
+
+### Changed
+- **Async file close in `commit_incremental_range`**: The NFS4 `close()` syscall triggers synchronous dirty-page writeback (`nfs4_file_flush` → `nfs_wb_all`), which accounted for ~29% of sampled CPU during cache-miss workloads. The file close is now deferred to a fire-and-forget `spawn_blocking` task after `flush()` + rename. `flush()` remains synchronous (pushes data to the NFS client cache before the `.bin` becomes visible via rename). If the proxy crashes before the deferred close completes, the `.bin` may be truncated — readers get a decompression error and re-fetch from S3 (additional cache miss, never incorrect client data).
+
+### Performance
+Measured on 3× m6in.2xlarge proxies with FSx for OpenZFS (10 GiB/s, 64k IOPS), m6in.16xlarge client, CRT transfer client (`target_bandwidth = 100Gb/s`), syncing 40 GiB (8× 5 GiB files) from eu-west-1 to us-west-2 through the proxy fleet:
+
+| Config | Cache miss throughput |
+|---|---|
+| 1.12.0 compression-on (README baseline) | ~1.1 GiB/s |
+| 1.13.1 compression-on | ~1.25 GiB/s |
+| 1.13.1 compression-off | ~1.25 GiB/s |
+
+At 8× m6in.2xlarge proxies (same FSx):
+
+| Config | Cache miss throughput |
+|---|---|
+| 1.12.0 compression-on (README baseline) | ~2.0 GiB/s |
+| 1.13.1 compression-on | ~2.1 GiB/s |
+| 1.13.1 compression-off | ~2.4 GiB/s avg (1.8–2.7 range) |
+
+Flamegraph profiling with compression disabled shows the proxy at ~0.76 of 8 vCPUs utilized. The dominant remaining cost is NFS `close()` → `nfs4_file_flush` → `nfs_wb_all` (synchronous dirty-page writeback on file close during `commit_incremental_range`), accounting for ~29% of sampled CPU. This is the next optimization target.
+
+## [1.13.0] - 2026-04-27
+
+Cache-miss throughput improvements: all three cache-miss write paths now use incremental, batched, non-blocking writes, and cache-commit concurrency no longer serializes through a global write lock.
+
+### Added
+- **`cache.compression_batch_size` config field** (default 1 MiB, valid range 64 KiB to 16 MiB). Controls how many bytes the incremental cache writer accumulates in RAM before producing a single LZ4 frame. Larger values improve compression ratio and reduce per-frame overhead; smaller values reduce per-request peak memory. Documented in `config/config.example.yaml` and `docs/CONFIGURATION.md`. Rejected with a descriptive error at startup if outside the valid range.
+
+### Changed
+- **Batched LZ4 framing in `IncrementalRangeWriter`**: Previously `write_range_chunk` produced one LZ4 frame per hyper body chunk (~8–64 KiB), so a 100 MiB range emitted thousands of tiny frames. The writer now accumulates incoming bytes into an in-memory buffer sized by `compression_batch_size` and emits one LZ4 frame per buffer-fill. `commit_incremental_range` flushes any residual buffer as a final frame. On-disk wire format is unchanged (concatenated LZ4 frames); no cache invalidation required.
+- **`commit_incremental_range` now takes `&self`**: Relaxed from `&mut self`. All internal mutation is serialized by finer-grained locks (`HybridMetadataWriter` async `Mutex`, `SizeAccumulator` atomics + dedup set). All three production call sites now acquire a read lock instead of a write lock, so N concurrent cache-miss commits proceed in parallel.
+- **Partial-range and signed-range cache-miss paths converted to incremental writes**: Previously accumulated the full range body into a `Vec<u8>` before calling `store_range`. Both paths now use `begin_incremental_range_write` → `spawn_blocking` chunk loop → `commit_incremental_range(&self)`. Cache writes overlap S3 transfer; per-request peak memory is bounded by `compression_batch_size` regardless of range size.
+- **Non-blocking cache-write I/O**: All three miss paths now drive LZ4 encoding and sync file I/O from `spawn_blocking` tasks, so per-chunk compression + NFS writes don't stall Tokio runtime workers.
+
+### Testing
+- Property tests: batched-write byte-identity, equivalence to single-shot `store_range`, residual flush on commit, concurrent commit size accounting (distinct ranges), dedup under concurrent commit (same range), `compression_batch_size` validation. All use `quickcheck` with 4–16 concurrent commits.
+- Integration test `tests/cache_miss_incremental_e2e.rs` exercises the partial-range and signed-range flows end to end with a 50 MiB body.
+- Inline unit tests in `src/disk_cache.rs` for below-threshold, at-threshold, residual-flush, compression-disabled, and abort-after-partial-batch scenarios.
+
 ## [1.12.1] - 2026-04-27
 
 ### Security

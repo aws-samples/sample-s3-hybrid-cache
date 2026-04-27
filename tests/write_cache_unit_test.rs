@@ -43,6 +43,7 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // Test data
@@ -133,6 +134,7 @@ async fn test_upload_state_is_complete() {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/complete-state.txt";
@@ -201,6 +203,7 @@ async fn test_put_ttl_is_used_for_expiration() {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/ttl-test.txt";
@@ -298,6 +301,7 @@ async fn test_put_cached_objects_not_in_ram_cache() {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/no-ram-cache.txt";
@@ -370,6 +374,7 @@ async fn test_put_storage_with_headers() {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/with-headers.txt";
@@ -439,6 +444,7 @@ async fn test_multiple_put_operations_same_key() {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "/test-bucket/overwrite-test.txt";

@@ -498,6 +498,12 @@ pub struct CacheManager {
     >,
     // Eviction lock file handle (kept open while lock is held)
     eviction_lock_file: Arc<Mutex<Option<std::fs::File>>>,
+    // Size of the in-memory compression batch used by the incremental range writer.
+    // Incoming body chunks are accumulated into a batch buffer and flushed as a
+    // single LZ4 frame once the buffer reaches this size. Forwarded to
+    // `DiskCacheManager` in `create_configured_disk_cache_manager`.
+    // See the `cache-miss-throughput` spec, Requirement 5.1.
+    compression_batch_size: usize,
     // Bucket-level settings manager for per-bucket/prefix cache configuration
     bucket_settings_manager: Arc<crate::bucket_settings::BucketSettingsManager>,
     // Use Arc<Mutex<>> for thread-safe interior mutability
@@ -610,6 +616,7 @@ impl CacheManager {
             80,                                            // Default eviction target at 80%
             true,                                          // Default read cache enabled
             std::time::Duration::from_secs(60),            // Default 60s bucket settings staleness
+            1_048_576,                                     // Default 1 MiB compression batch size
         )
     }
 
@@ -635,6 +642,7 @@ impl CacheManager {
         eviction_target_percent: u8,
         read_cache_enabled: bool,
         bucket_settings_staleness_threshold: std::time::Duration,
+        compression_batch_size: usize,
     ) -> Self {
         let mut ram_cache_manager = RamCacheManager::default();
         ram_cache_manager.max_size = max_ram_cache_size;
@@ -711,6 +719,7 @@ impl CacheManager {
             )),
             bucket_settings_manager,
             eviction_lock_file: Arc::new(Mutex::new(None)),
+            compression_batch_size,
             inner: Arc::new(Mutex::new(inner)),
         }
     }
@@ -722,6 +731,7 @@ impl CacheManager {
             true, // compression_enabled
             1024, // compression_threshold
             self.write_cache_enabled,
+            self.compression_batch_size,
         );
 
         // Set metrics manager if available
@@ -1000,6 +1010,7 @@ impl CacheManager {
             eviction_target_percent: 80,  // Default: reduce to 80% after eviction
             full_object_check_threshold: 67_108_864, // 64 MiB
             disk_streaming_threshold: 1_048_576, // 1 MiB
+            compression_batch_size: 1_048_576, // 1 MiB
             read_cache_enabled: true, // Default enabled
             bucket_settings_staleness_threshold: std::time::Duration::from_secs(60), // Default 60s
         };
@@ -3683,6 +3694,7 @@ impl CacheManager {
                 true,  // compression_enabled
                 4096,  // compression_threshold
                 false, // write_cache_enabled
+                1_048_576, // compression_batch_size (default 1 MiB)
             );
             let dirs_removed = disk_cache.batch_cleanup_empty_directories(&all_deleted_paths);
             if dirs_removed > 0 {
@@ -4421,6 +4433,7 @@ impl CacheManager {
             true,  // compression_enabled
             4096,  // compression_threshold
             false, // write_cache_enabled (not needed for eviction)
+            1_048_576, // compression_batch_size (default 1 MiB)
         );
 
         // Call DiskCacheManager.batch_delete_ranges()
@@ -4606,6 +4619,7 @@ impl CacheManager {
             true, // compression enabled
             1024, // compression threshold
             true, // write cache enabled
+            1_048_576, // compression_batch_size (default 1 MiB)
         );
         disk_cache.get_new_metadata_file_path(cache_key)
     }
@@ -5726,6 +5740,7 @@ impl CacheManager {
             true,  // compression_enabled
             1024,  // compression_threshold
             false, // actively_remove_cached_data
+            1_048_576, // compression_batch_size (default 1 MiB)
         );
 
         let overlapping_ranges = match disk_cache.find_cached_ranges(cache_key, start, end, None).await {
@@ -9251,7 +9266,7 @@ impl CacheManager {
 
         // Use the disk cache manager to store the range
         let mut disk_cache_manager =
-            crate::disk_cache::DiskCacheManager::new(self.cache_dir.clone(), true, 1024, false);
+            crate::disk_cache::DiskCacheManager::new(self.cache_dir.clone(), true, 1024, false, 1_048_576);
 
         disk_cache_manager
             .store_range(
@@ -10141,6 +10156,7 @@ mod cache_key_sanitization_tests {
                 true,  // compression enabled
                 1024,  // compression threshold
                 false, // write cache disabled
+                1_048_576, // compression_batch_size (default 1 MiB)
             );
             disk_cache.initialize().await.unwrap();
 
@@ -10289,7 +10305,8 @@ mod cache_key_sanitization_tests {
                 temp_dir.path().to_path_buf(),
                 true, // compression enabled
                 1024, // compression threshold - small to ensure compression happens
-                false // write cache disabled
+                false, // write cache disabled
+                1_048_576 // compression_batch_size (default 1 MiB)
             );
             disk_cache.initialize().await.unwrap();
 
@@ -10408,6 +10425,7 @@ mod cache_key_sanitization_tests {
                 true,  // compression enabled
                 1024,  // compression threshold
                 false, // write cache disabled
+                1_048_576, // compression_batch_size (default 1 MiB)
             );
             disk_cache.initialize().await.unwrap();
 
@@ -10691,6 +10709,7 @@ mod cache_key_sanitization_tests {
             true,  // compression_enabled
             1024,  // compression_threshold
             false, // actively_remove_cached_data
+            1_048_576, // compression_batch_size (default 1 MiB)
         );
 
         disk_cache
@@ -10871,6 +10890,7 @@ mod cache_key_sanitization_tests {
                 true,  // compression_enabled
                 1024,  // compression_threshold
                 false, // actively_remove_cached_data
+                1_048_576, // compression_batch_size (default 1 MiB)
             );
 
             match disk_cache
@@ -11104,6 +11124,7 @@ mod cache_key_sanitization_tests {
                 true,  // compression_enabled
                 1024,  // compression_threshold
                 false, // actively_remove_cached_data
+                1_048_576, // compression_batch_size (default 1 MiB)
             );
 
             match disk_cache

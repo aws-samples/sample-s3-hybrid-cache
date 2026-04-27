@@ -22,6 +22,7 @@ async fn test_range_stored_with_configured_ttl() {
         true,  // compression_enabled
         1024,  // compression_threshold
         false, // write_cache_enabled
+        1_048_576, // compression_batch_size
     );
 
     disk_cache.initialize().await.unwrap();
@@ -101,6 +102,7 @@ async fn test_range_with_short_ttl_expires() {
         true,  // compression_enabled
         1024,  // compression_threshold
         false, // write_cache_enabled
+        1_048_576, // compression_batch_size
     );
 
     disk_cache.initialize().await.unwrap();
@@ -174,6 +176,7 @@ async fn test_object_level_ttl_applies_to_all_ranges() {
         true,  // compression_enabled
         1024,  // compression_threshold
         false, // write_cache_enabled
+        1_048_576, // compression_batch_size
     );
 
     disk_cache.initialize().await.unwrap();

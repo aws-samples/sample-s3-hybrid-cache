@@ -10,7 +10,7 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn test_mpus_in_progress_directory_not_created_when_disabled() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     cache_manager.initialize().await.unwrap();
 
@@ -37,7 +37,7 @@ async fn test_mpus_in_progress_directory_not_created_when_disabled() {
 #[tokio::test]
 async fn test_mpus_in_progress_directory_created_when_enabled() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, true);
+    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, true, 1_048_576);
 
     cache_manager.initialize().await.unwrap();
 

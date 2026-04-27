@@ -96,8 +96,8 @@ fn prop_incremental_write_round_trip() {
 
         rt.block_on(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let mut cache_manager =
-                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            let cache_manager =
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             cache_manager.initialize().await.unwrap();
 
             let cache_key = "test-bucket/prop-test-incremental";
@@ -238,8 +238,8 @@ fn prop_incremental_write_equivalence_to_single_shot() {
         rt.block_on(async {
             // --- Incremental write ---
             let incr_dir = tempfile::TempDir::new().unwrap();
-            let mut incr_cache =
-                DiskCacheManager::new(incr_dir.path().to_path_buf(), true, 1024, false);
+            let incr_cache =
+                DiskCacheManager::new(incr_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             incr_cache.initialize().await.unwrap();
 
             let cache_key = "test-bucket/prop-test-equivalence";
@@ -289,7 +289,7 @@ fn prop_incremental_write_equivalence_to_single_shot() {
             // --- Single-shot write ---
             let shot_dir = tempfile::TempDir::new().unwrap();
             let mut shot_cache =
-                DiskCacheManager::new(shot_dir.path().to_path_buf(), true, 1024, false);
+                DiskCacheManager::new(shot_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             shot_cache.initialize().await.unwrap();
 
             if let Err(e) = shot_cache

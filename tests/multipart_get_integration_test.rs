@@ -37,7 +37,7 @@ fn create_test_cache_manager() -> (
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(DiskCacheManager::new(
-        cache_dir, true, 1024, false,
+        cache_dir, true, 1024, false, 1_048_576,
     )));
 
     (cache_manager, disk_cache_manager, temp_dir)

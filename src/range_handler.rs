@@ -476,7 +476,7 @@ mod tests {
         let cache_dir = temp_dir.path().to_path_buf();
         let cache_manager = Arc::new(CacheManager::new_with_defaults(cache_dir.clone(), false, 0));
         let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(DiskCacheManager::new(
-            cache_dir, true, 1024, false,
+            cache_dir, true, 1024, false, 1_048_576,
         )));
         RangeHandler::new(cache_manager, disk_cache_manager)
     }

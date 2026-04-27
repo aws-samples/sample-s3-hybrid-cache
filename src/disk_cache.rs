@@ -45,6 +45,23 @@ pub struct IncrementalRangeWriter {
     /// Path extracted from cache key for content-aware compression decisions
     #[allow(dead_code)]
     content_path: String,
+    /// In-memory accumulation buffer for batched LZ4 compression.
+    /// Incoming chunks are appended here and flushed as a single LZ4 frame
+    /// once `batch_buf.len() >= batch_size`. Unused when `compression_enabled == false`.
+    /// See the `cache-miss-throughput` spec, Requirement 2.1.
+    batch_buf: Vec<u8>,
+    /// Target size (in bytes) at which `batch_buf` is flushed as one LZ4 frame.
+    /// Seeded from `DiskCacheManager::compression_batch_size` at writer creation.
+    batch_size: usize,
+}
+
+impl IncrementalRangeWriter {
+    /// Returns the number of bytes currently held in the compression batch
+    /// buffer (not yet flushed to disk). Primarily used by tests to verify
+    /// batching behavior. Always `0` when compression is disabled.
+    pub fn batch_buf_len(&self) -> usize {
+        self.batch_buf.len()
+    }
 }
 
 /// Disk cache manager for file-based cache operations
@@ -63,6 +80,11 @@ pub struct DiskCacheManager {
     /// Optional JournalConsolidator for direct size tracking
     /// When set, size is updated directly when storing new ranges (bypasses journal-based tracking)
     journal_consolidator: Option<Arc<crate::journal_consolidator::JournalConsolidator>>,
+    /// Target size for the in-memory compression batch used by `IncrementalRangeWriter`.
+    /// Incoming body chunks are accumulated into a batch buffer and flushed as a single
+    /// LZ4 frame once the buffer reaches this size. Plumbed from `CacheConfig::compression_batch_size`.
+    /// See the `cache-miss-throughput` spec, Requirement 5.1.
+    compression_batch_size: usize,
 }
 
 impl DiskCacheManager {
@@ -72,6 +94,7 @@ impl DiskCacheManager {
         compression_enabled: bool,
         compression_threshold: usize,
         write_cache_enabled: bool,
+        compression_batch_size: usize,
     ) -> Self {
         Self {
             cache_dir,
@@ -85,6 +108,7 @@ impl DiskCacheManager {
             hybrid_metadata_writer: None,
             cache_hit_update_buffer: None,
             journal_consolidator: None,
+            compression_batch_size,
         }
     }
 
@@ -1584,16 +1608,25 @@ impl DiskCacheManager {
             end,
             compression_enabled,
             content_path,
+            batch_buf: Vec::with_capacity(self.compression_batch_size),
+            batch_size: self.compression_batch_size,
         })
     }
 
     /// Write a chunk to the incremental range writer.
     ///
-    /// When compression is enabled, each chunk is independently compressed into its own
-    /// LZ4 frame and appended to the `.tmp` file. The resulting file contains multiple
-    /// concatenated LZ4 frames, which `FrameDecoder` reads through transparently.
+    /// When compression is enabled, chunk bytes are accumulated into an in-memory
+    /// batch buffer and flushed as a single LZ4 frame once the buffer reaches
+    /// `batch_size`. Residual bytes remaining at commit time are flushed by
+    /// `commit_incremental_range`. This produces fewer, larger frames (better
+    /// compression ratio + fewer syscalls) versus the previous one-frame-per-chunk
+    /// approach. `FrameDecoder` reads concatenated frames transparently on load.
     ///
-    /// When compression is disabled, the raw chunk bytes are appended directly.
+    /// When compression is disabled, raw chunk bytes are appended directly.
+    ///
+    /// `writer.bytes_written` always tracks the logical uncompressed total and is
+    /// updated on every chunk. `writer.compressed_bytes_written` is updated when
+    /// a batch is flushed (or per-chunk in the raw passthrough path).
     pub fn write_range_chunk(
         writer: &mut IncrementalRangeWriter,
         chunk: &[u8],
@@ -1604,39 +1637,10 @@ impl DiskCacheManager {
             return Ok(());
         }
 
-        if writer.compression_enabled {
-            // Compress this chunk as an independent LZ4 frame
-            use lz4_flex::frame::{BlockMode, FrameEncoder, FrameInfo};
+        writer.bytes_written += chunk.len() as u64;
 
-            let mut frame_info = FrameInfo::new();
-            frame_info.content_checksum = true;
-            frame_info.block_mode = BlockMode::Independent;
-
-            let mut frame_buf = Vec::new();
-            let mut encoder = FrameEncoder::with_frame_info(frame_info, &mut frame_buf);
-            encoder.write_all(chunk).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to compress chunk in incremental write: {}",
-                    e
-                ))
-            })?;
-            encoder.finish().map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to finish LZ4 frame in incremental write: {}",
-                    e
-                ))
-            })?;
-
-            // Append compressed frame to .tmp file
-            writer.file.write_all(&frame_buf).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to write compressed chunk to tmp file: {}",
-                    e
-                ))
-            })?;
-            writer.compressed_bytes_written += frame_buf.len() as u64;
-        } else {
-            // No compression — write raw bytes
+        if !writer.compression_enabled {
+            // No compression — write raw bytes (unchanged passthrough path)
             writer.file.write_all(chunk).map_err(|e| {
                 ProxyError::CacheError(format!(
                     "Failed to write chunk to tmp file: {}",
@@ -1644,23 +1648,89 @@ impl DiskCacheManager {
                 ))
             })?;
             writer.compressed_bytes_written += chunk.len() as u64;
+            return Ok(());
         }
 
-        writer.bytes_written += chunk.len() as u64;
+        // Compression enabled: accumulate into batch buffer, flush at threshold.
+        writer.batch_buf.extend_from_slice(chunk);
+        if writer.batch_buf.len() >= writer.batch_size {
+            Self::flush_batch(writer)?;
+        }
+        Ok(())
+    }
+
+    /// Compress `writer.batch_buf` as a single LZ4 frame and append it to the `.tmp`
+    /// file. Updates `writer.compressed_bytes_written` by the frame length and clears
+    /// `batch_buf`. No-op when the buffer is empty.
+    ///
+    /// Called from `write_range_chunk` when the batch threshold is reached, and from
+    /// `commit_incremental_range` to flush any residual bytes before the final rename.
+    fn flush_batch(writer: &mut IncrementalRangeWriter) -> Result<()> {
+        if writer.batch_buf.is_empty() {
+            return Ok(());
+        }
+        use lz4_flex::frame::{BlockMode, FrameEncoder, FrameInfo};
+        use std::io::Write;
+
+        let mut frame_info = FrameInfo::new();
+        frame_info.content_checksum = true;
+        frame_info.block_mode = BlockMode::Independent;
+
+        let mut frame_buf = Vec::with_capacity(writer.batch_buf.len());
+        let mut encoder = FrameEncoder::with_frame_info(frame_info, &mut frame_buf);
+        encoder.write_all(&writer.batch_buf).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to compress batch in incremental write: {}",
+                e
+            ))
+        })?;
+        encoder.finish().map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to finish LZ4 frame in batched incremental write: {}",
+                e
+            ))
+        })?;
+
+        writer.file.write_all(&frame_buf).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to write compressed batch to tmp file: {}",
+                e
+            ))
+        })?;
+        writer.compressed_bytes_written += frame_buf.len() as u64;
+        writer.batch_buf.clear();
         Ok(())
     }
 
     /// Validate total size, flush file, atomic rename `.tmp` → `.bin`, and write journal entry.
     ///
     /// Returns an error (and cleans up the `.tmp` file) if `bytes_written != end - start + 1`.
+    ///
+    /// Takes `&self` rather than `&mut self` — no `DiskCacheManager` field is mutated here.
+    /// All internal mutation is serialized by finer-grained locks: `HybridMetadataWriter`'s
+    /// async `Mutex` for the journal append, and `SizeAccumulator`'s internal atomics + dedup
+    /// `HashSet` for size tracking. This lets callers hold a read lock (or plain `Arc` deref)
+    /// during commit instead of a write lock, so concurrent commits of distinct ranges
+    /// proceed in parallel.
     pub async fn commit_incremental_range(
-        &mut self,
-        writer: IncrementalRangeWriter,
+        &self,
+        mut writer: IncrementalRangeWriter,
         object_metadata: crate::cache_types::ObjectMetadata,
         ttl: Duration,
     ) -> Result<()> {
         use crate::cache_types::RangeSpec;
         use std::io::Write;
+
+        // Flush any residual bytes in the batch buffer as a final LZ4 frame.
+        // Must happen before the size check + rename so the compressed file is
+        // complete when the rename makes it visible. No-op if compression is
+        // disabled or the buffer is empty.
+        if writer.compression_enabled && !writer.batch_buf.is_empty() {
+            if let Err(e) = Self::flush_batch(&mut writer) {
+                let _ = std::fs::remove_file(&writer.tmp_path);
+                return Err(e);
+            }
+        }
 
         let expected_size = writer.end - writer.start + 1;
         if writer.bytes_written != expected_size {
@@ -1672,13 +1742,26 @@ impl DiskCacheManager {
             )));
         }
 
-        // Flush file to ensure all data is written
+        // Flush file to ensure all buffered data reaches the NFS write cache.
+        // This is synchronous and must complete before the rename so the
+        // .bin file is readable after it becomes visible.
         let mut file = writer.file;
         file.flush().map_err(|e| {
             let _ = std::fs::remove_file(&writer.tmp_path);
             ProxyError::CacheError(format!("Failed to flush incremental tmp file: {}", e))
         })?;
-        drop(file);
+
+        // Defer the file close to a background blocking task. NFS4 close
+        // triggers synchronous dirty-page writeback (nfs4_file_flush →
+        // nfs_wb_all) which dominated ~29% of sampled CPU in profiling.
+        // The flush() above already pushed data to the NFS client cache;
+        // close() just ensures durability on the server. If the proxy
+        // crashes before close completes, the .bin file may be truncated
+        // — readers will get a decompression error and re-fetch from S3
+        // (cache miss, never incorrect data). The fd is freed when the
+        // blocking task runs; under max_concurrent_requests=500 this adds
+        // at most ~500 open fds, well within the typical 65536 ulimit.
+        tokio::task::spawn_blocking(move || drop(file));
 
         let compression_algorithm = if writer.compression_enabled {
             crate::compression::CompressionAlgorithm::Lz4
@@ -7437,7 +7520,7 @@ mod tests {
     async fn test_disk_cache_basic_operations() {
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Initialize
         cache_manager.initialize().await.unwrap();
@@ -7484,7 +7567,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_key_sanitization() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let unsafe_key = "bucket/path:with*special?chars<>|";
         let safe_key = cache_manager.sanitize_cache_key(unsafe_key);
@@ -7500,7 +7583,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_type_determination() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test basic cache types
         assert_eq!(
@@ -7539,7 +7622,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_metadata_file_path_generation() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let path = cache_manager.get_new_metadata_file_path(cache_key);
@@ -7576,7 +7659,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_range_file_path_generation() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let start = 0u64;
@@ -7617,7 +7700,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_basic() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let key = "bucket:object";
         let sanitized = cache_manager.sanitize_cache_key_new(key);
@@ -7630,7 +7713,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_special_characters() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test all special characters that need sanitization
         let key = "bucket:path/with?query&param=value";
@@ -7652,7 +7735,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_filesystem_unsafe_chars() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test filesystem-unsafe characters
         let key = r#"bucket\path*with<special>chars|and"quotes"#;
@@ -7678,7 +7761,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_url_special_chars() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test URL-related special characters
         let key = "bucket#fragment%20space{brace}[bracket]$dollar!exclaim";
@@ -7705,7 +7788,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_whitespace() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test whitespace characters
         let key = "bucket with spaces\tand\ttabs\nand\nnewlines\rand\rreturns";
@@ -7727,7 +7810,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_empty_string() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let key = "";
         let sanitized = cache_manager.sanitize_cache_key_new(key);
@@ -7737,7 +7820,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_already_safe() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test key that's already safe
         let key = "bucket-object-name_with_underscores.and.dots";
@@ -7748,7 +7831,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_deterministic() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object?query=value";
         let start = 1024u64;
@@ -7775,7 +7858,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_different_ranges() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
 
@@ -7796,7 +7879,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_different_keys() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let start = 0u64;
         let end = 1023u64;
@@ -7814,7 +7897,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_large_ranges() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/large-object";
 
@@ -7832,7 +7915,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_full_object_as_range() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let content_length = 10485760u64; // 10MB
@@ -7846,7 +7929,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_complex_s3_key() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Complex S3 key with multiple path segments and special characters
         let cache_key = "my-bucket/path/to/deeply/nested/object-with-dashes_and_underscores.tar.gz?versionId=abc123&partNumber=5";
@@ -7883,7 +7966,7 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_unicode() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test with unicode characters
         let key = "bucket:文件/объект/αρχείο";
@@ -7920,7 +8003,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -7977,7 +8060,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8033,7 +8116,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8127,7 +8210,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8179,7 +8262,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8242,7 +8325,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8297,7 +8380,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8363,6 +8446,7 @@ mod tests {
             true,
             1024,
             false,
+            1_048_576,
         )));
         cache_manager.lock().await.initialize().await.unwrap();
 
@@ -8445,7 +8529,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_metadata_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/nonexistent-object";
 
@@ -8463,7 +8547,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8512,7 +8596,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8569,7 +8653,7 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8614,7 +8698,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_metadata_corrupted_json() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8635,7 +8719,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_metadata_empty_file() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8663,7 +8747,7 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/corrupted-object";
@@ -8687,7 +8771,7 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/wrong-schema-object";
@@ -8711,7 +8795,7 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/nonexistent-object";
@@ -8730,7 +8814,7 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/empty-metadata-object";
@@ -8754,7 +8838,7 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8811,7 +8895,7 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8876,7 +8960,7 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8922,7 +9006,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         // Don't initialize - test that update_metadata creates directories
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let now = SystemTime::now();
@@ -8962,7 +9046,7 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9054,7 +9138,7 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         // Cache key with special characters
@@ -9095,7 +9179,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_cached_ranges_no_metadata() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/nonexistent-object";
@@ -9118,7 +9202,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9162,7 +9246,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9210,7 +9294,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9263,7 +9347,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9307,7 +9391,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9351,7 +9435,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9405,7 +9489,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9462,7 +9546,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9525,7 +9609,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9576,7 +9660,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_cached_ranges_invalid_range() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9592,7 +9676,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9648,7 +9732,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9723,7 +9807,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9768,7 +9852,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9831,7 +9915,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9929,7 +10013,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10009,7 +10093,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10063,7 +10147,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10119,7 +10203,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 100, false); // Low threshold to force compression
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 100, false, 1_048_576); // Low threshold to force compression
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object.txt"; // .txt extension to enable compression
@@ -10182,7 +10266,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), false, 1024, false); // Compression disabled
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), false, 1024, false, 1_048_576); // Compression disabled
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10237,7 +10321,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         // Create a range spec pointing to a non-existent file
@@ -10269,7 +10353,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10325,7 +10409,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10378,7 +10462,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10434,7 +10518,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 100, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 100, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let object_metadata = ObjectMetadata {
@@ -10495,7 +10579,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10549,7 +10633,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10605,7 +10689,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10665,7 +10749,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         // Manually create a range file with wrong size
@@ -10714,6 +10798,7 @@ mod tests {
             true,
             1024,
             false,
+            1_048_576,
         )));
         cache_manager.lock().await.initialize().await.unwrap();
 
@@ -10791,7 +10876,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10846,7 +10931,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/empty-object";
@@ -10896,7 +10981,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -10943,7 +11028,7 @@ mod tests {
     async fn test_get_full_object_as_range_not_found() {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/nonexistent-object";
@@ -10965,7 +11050,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/empty-object";
@@ -11012,7 +11097,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11084,7 +11169,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11188,7 +11273,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11292,7 +11377,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11351,7 +11436,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11392,7 +11477,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11470,7 +11555,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_cache_entry_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/nonexistent-object";
@@ -11489,7 +11574,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11548,7 +11633,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11626,7 +11711,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11683,7 +11768,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11781,7 +11866,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11845,7 +11930,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11892,7 +11977,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -11951,7 +12036,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -12034,7 +12119,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -12096,7 +12181,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_orphaned_files() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -12139,7 +12224,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -12239,6 +12324,7 @@ mod tests {
                 true,  // compression_enabled
                 1024,  // compression_threshold
                 false, // write_cache_enabled
+                1_048_576, // compression_batch_size (default 1 MiB)
             );
 
             if use_shared_storage {
@@ -12370,7 +12456,7 @@ mod tests {
     async fn test_batch_delete_ranges_multiple_files() {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/batch-delete-object";
@@ -12506,7 +12592,7 @@ mod tests {
     async fn test_batch_delete_ranges_missing_files() {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/batch-delete-missing";
@@ -12630,7 +12716,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         // Write random/corrupt bytes that are not valid LZ4
@@ -12687,7 +12773,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         // Compress 0 bytes with LZ4 to get a valid empty compressed file
@@ -12752,7 +12838,7 @@ mod tests {
     async fn test_stream_range_data_missing_file_error() {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         // Create a RangeSpec pointing to a non-existent file
@@ -12816,7 +12902,7 @@ mod tests {
     async fn test_incremental_write_abort_cleanup() {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/abort-test-object";
@@ -12873,8 +12959,8 @@ mod tests {
         use crate::cache_types::ObjectMetadata;
 
         let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/size-mismatch-object";
@@ -12947,8 +13033,8 @@ mod tests {
         use crate::cache_types::{ObjectMetadata, RangeSpec};
 
         let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/single-byte-object";
@@ -13015,7 +13101,7 @@ mod tests {
     async fn test_incremental_write_concurrent_unique_tmp_paths() {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/concurrent-object";
@@ -13068,6 +13154,331 @@ mod tests {
             tmp_files.is_empty(),
             "No .tmp files should remain after aborting both writers, found: {:?}",
             tmp_files
+        );
+    }
+
+    // ============================================================================
+    // Tests for Batched LZ4 Compression in IncrementalRangeWriter (Task 3.7)
+    // Validates: Requirements 1.3, 2.1, 2.2, 2.3, 2.4
+    // ============================================================================
+
+    /// Chunks whose total size is less than `batch_size` must stay in `batch_buf`
+    /// without producing any LZ4 frame: the `.tmp` file must be zero-length,
+    /// `compressed_bytes_written` must be 0, while `bytes_written` tracks the
+    /// logical uncompressed total.
+    /// Validates: Requirement 2.1
+    #[tokio::test]
+    async fn test_write_range_chunk_below_batch_size_does_not_flush() {
+        let temp_dir = TempDir::new().unwrap();
+        // Small batch_size so the test is fast but still exercises the threshold.
+        let batch_size = 8192usize;
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/below-batch-object";
+        let start = 0u64;
+        let end = 3999u64; // 4000 bytes total — well below batch_size
+
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // Write two chunks that sum to less than batch_size (1500 + 2500 = 4000)
+        let chunk1 = vec![0x11u8; 1500];
+        let chunk2 = vec![0x22u8; 2500];
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk1).unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk2).unwrap();
+
+        // Logical uncompressed bytes must include everything we pushed
+        assert_eq!(writer.bytes_written, 4000, "bytes_written tracks logical total");
+        // Nothing has been flushed yet, so no compressed bytes accounted for
+        assert_eq!(
+            writer.compressed_bytes_written, 0,
+            "compressed_bytes_written must be 0 until a batch is flushed"
+        );
+        // The full input should still be buffered in memory
+        assert_eq!(
+            writer.batch_buf.len(),
+            4000,
+            "batch_buf should hold all accumulated bytes when under threshold"
+        );
+
+        // The `.tmp` file on disk must be empty — no frame written yet
+        let tmp_len = std::fs::metadata(&writer.tmp_path).unwrap().len();
+        assert_eq!(
+            tmp_len, 0,
+            ".tmp file must be zero-length when all chunks fit inside the batch buffer"
+        );
+
+        // Clean up — we don't commit this one
+        DiskCacheManager::abort_incremental_range(writer);
+    }
+
+    /// A chunk whose size is exactly `batch_size` (or fills `batch_buf` to the
+    /// threshold) must trigger exactly one frame flush, producing a non-zero
+    /// `.tmp` file and `compressed_bytes_written > 0`. After flush, `batch_buf`
+    /// must be empty.
+    /// Validates: Requirements 2.1, 2.2
+    #[tokio::test]
+    async fn test_write_range_chunk_exactly_at_batch_size_flushes() {
+        let temp_dir = TempDir::new().unwrap();
+        let batch_size = 4096usize;
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/at-batch-object";
+        let start = 0u64;
+        let end = (batch_size as u64) - 1; // Exactly batch_size bytes
+
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // One chunk that exactly fills the batch buffer — threshold check is `>=`
+        let chunk = vec![0x7Eu8; batch_size];
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk).unwrap();
+
+        assert_eq!(writer.bytes_written, batch_size as u64);
+        assert!(
+            writer.compressed_bytes_written > 0,
+            "exactly-full batch must flush: compressed_bytes_written should be > 0"
+        );
+        assert!(
+            writer.batch_buf.is_empty(),
+            "batch_buf must be drained after a flush, got {} bytes",
+            writer.batch_buf.len()
+        );
+
+        // `.tmp` file must contain the compressed frame
+        let tmp_len = std::fs::metadata(&writer.tmp_path).unwrap().len();
+        assert!(
+            tmp_len > 0,
+            ".tmp file must contain a compressed frame after batch flush"
+        );
+        assert_eq!(
+            tmp_len, writer.compressed_bytes_written,
+            ".tmp file size must equal the compressed bytes counter"
+        );
+
+        DiskCacheManager::abort_incremental_range(writer);
+    }
+
+    /// After committing an incremental write whose total size is not a multiple
+    /// of `batch_size`, the residual bytes in `batch_buf` must be flushed as a
+    /// final LZ4 frame by `commit_incremental_range`, and the resulting `.bin`
+    /// file must decompress to the full input via `load_range_data`.
+    /// Validates: Requirements 2.3, 1.3 (byte-identity via round-trip)
+    #[tokio::test]
+    async fn test_commit_flushes_residual_batch() {
+        use crate::cache_types::{ObjectMetadata, RangeSpec};
+
+        let temp_dir = TempDir::new().unwrap();
+        let batch_size = 4096usize;
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/residual-batch-object";
+        let start = 0u64;
+        // 10_000 bytes total. We feed it in chunks of 4096 + 2000 + 4096 + (−192 invalid).
+        // Simpler: feed as [5000, 5000] bytes.
+        //   After chunk 1 (5000 bytes): batch_buf=5000, >=4096 → flush → batch_buf=0.
+        //   After chunk 2 (5000 bytes): batch_buf=5000, >=4096 → flush → batch_buf=0.
+        // That produces no residual. To guarantee residual, use [5000, 1000, 1000]
+        // totaling 7000 bytes:
+        //   After chunk 1 (5000): flushes, buf=0.
+        //   After chunk 2 (1000): buf=1000, no flush.
+        //   After chunk 3 (1000): buf=2000, no flush, 2000 < batch_size.
+        // 2000 bytes residual at commit time.
+        let total_len: usize = 7_000;
+        let end = (total_len as u64) - 1;
+
+        // Deterministic, non-constant input so a byte-identity round-trip is meaningful.
+        let input: Vec<u8> = (0..total_len).map(|i| (i % 251) as u8).collect();
+
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // Feed the input in the specific partition [5000, 1000, 1000] so
+        // there's guaranteed residual left in batch_buf pre-commit.
+        DiskCacheManager::write_range_chunk(&mut writer, &input[0..5000]).unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &input[5000..6000]).unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &input[6000..7000]).unwrap();
+
+        // Before commit, some residual bytes must still be buffered: chunks
+        // of 1337 bytes are written, and when accumulated batch_buf crosses
+        // the 4096-byte threshold, flush occurs. The residual post-last-chunk
+        // is bounded by batch_size (never >= one full batch), but the exact
+        // value depends on chunk/threshold alignment, not just `total % batch`.
+        assert!(
+            writer.batch_buf_len() < batch_size,
+            "batch_buf must be under batch_size pre-commit (got {}, batch_size {})",
+            writer.batch_buf_len(),
+            batch_size
+        );
+        assert!(
+            writer.batch_buf_len() > 0,
+            "some residual must still be buffered for this test to exercise commit flush"
+        );
+        let pre_commit_compressed = writer.compressed_bytes_written;
+        assert!(
+            pre_commit_compressed > 0,
+            "at least one full batch should have been flushed before commit"
+        );
+
+        let object_metadata = ObjectMetadata {
+            etag: "test-etag".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: total_len as u64,
+            content_type: Some("application/octet-stream".to_string()),
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: total_len as u64,
+            parts: Vec::new(),
+            ..Default::default()
+        };
+
+        // Snapshot compressed_bytes_written by re-reading it after commit via
+        // the `.bin` file on disk — the writer is consumed by commit.
+        cache_manager
+            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        // Round-trip via load_range_data: construct a RangeSpec pointing at
+        // the committed `.bin` file and confirm byte-identical decode.
+        let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+        let ranges_dir = temp_dir.path().join("ranges");
+        let relative_path = final_path
+            .strip_prefix(&ranges_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let bin_len = std::fs::metadata(&final_path).unwrap().len();
+        assert!(
+            bin_len > pre_commit_compressed,
+            "commit must have appended a residual frame: bin={} > pre-commit compressed={}",
+            bin_len,
+            pre_commit_compressed
+        );
+
+        let range_spec = RangeSpec::new(
+            start,
+            end,
+            relative_path,
+            CompressionAlgorithm::Lz4,
+            bin_len,
+            total_len as u64,
+        );
+
+        let loaded = cache_manager.load_range_data(&range_spec).await.unwrap();
+        assert_eq!(
+            loaded, input,
+            "decoded bytes must be byte-identical to original input"
+        );
+    }
+
+    /// When compression is disabled for a range, the batched path must be
+    /// bypassed entirely: `batch_buf` stays empty, raw bytes are written
+    /// directly to `.tmp`, and `compressed_bytes_written == bytes_written`.
+    /// Validates: Requirement 2.4
+    #[tokio::test]
+    async fn test_compression_disabled_skips_batching() {
+        let temp_dir = TempDir::new().unwrap();
+        let batch_size = 4096usize;
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/no-compression-object";
+        let start = 0u64;
+        let end = 4999u64; // 5000 bytes total
+
+        // compression_enabled = false → raw passthrough path
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, false)
+            .await
+            .unwrap();
+
+        let chunk1 = vec![0xA1u8; 2000];
+        let chunk2 = vec![0xB2u8; 1500];
+        let chunk3 = vec![0xC3u8; 1500];
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk1).unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk2).unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk3).unwrap();
+
+        let expected_total = (chunk1.len() + chunk2.len() + chunk3.len()) as u64;
+        assert_eq!(writer.bytes_written, expected_total);
+        // Raw passthrough: compressed == uncompressed
+        assert_eq!(
+            writer.compressed_bytes_written, expected_total,
+            "raw passthrough: compressed_bytes_written must equal bytes_written"
+        );
+        // Batch buffer must never be touched when compression is disabled
+        assert!(
+            writer.batch_buf.is_empty(),
+            "batch_buf must stay empty when compression is disabled"
+        );
+
+        // `.tmp` file must contain exactly the raw bytes we wrote
+        let tmp_len = std::fs::metadata(&writer.tmp_path).unwrap().len();
+        assert_eq!(
+            tmp_len, expected_total,
+            ".tmp file size must equal sum of raw chunk lengths in passthrough mode"
+        );
+
+        DiskCacheManager::abort_incremental_range(writer);
+    }
+
+    /// Aborting an incremental write after some bytes have been buffered but
+    /// never flushed must remove the `.tmp` file from disk (and drop the
+    /// in-memory `batch_buf`, which happens automatically via `Drop`).
+    /// Validates: Requirement 1.3
+    #[tokio::test]
+    async fn test_abort_after_partial_batch_leaves_no_tmp_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let batch_size = 8192usize;
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/abort-partial-batch-object";
+        let start = 0u64;
+        let end = 2047u64; // 2048 bytes — less than batch_size, so no flush happens
+
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+
+        // Accumulate some bytes in batch_buf without reaching the threshold.
+        let chunk = vec![0x5Au8; 1024];
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk).unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &chunk).unwrap();
+
+        // Precondition: bytes are buffered, `.tmp` exists but empty.
+        assert_eq!(writer.batch_buf.len(), 2048);
+        assert_eq!(writer.compressed_bytes_written, 0);
+        let tmp_path = writer.tmp_path.clone();
+        assert!(tmp_path.exists(), ".tmp file should exist before abort");
+        assert_eq!(
+            std::fs::metadata(&tmp_path).unwrap().len(),
+            0,
+            ".tmp file must still be empty (no flush yet)"
+        );
+
+        // Abort — writer (and its batch_buf) is dropped; `.tmp` is removed.
+        DiskCacheManager::abort_incremental_range(writer);
+
+        assert!(
+            !tmp_path.exists(),
+            ".tmp file must be removed after abort, still present at {:?}",
+            tmp_path
         );
     }
 }

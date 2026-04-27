@@ -35,6 +35,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     )
 }
 

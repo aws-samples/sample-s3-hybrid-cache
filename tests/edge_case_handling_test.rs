@@ -24,14 +24,14 @@ async fn test_corrupted_metadata_handling() {
     let cache_key = "test-bucket/test-object";
 
     let disk_cache_temp =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
     let metadata_path = disk_cache_temp.get_new_metadata_file_path(cache_key);
 
     std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
     std::fs::write(&metadata_path, "{ invalid json }").unwrap();
 
     let disk_cache =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
 
     let result = disk_cache.get_metadata(cache_key).await.unwrap();
     assert!(result.is_none(), "Should return None for corrupted metadata");
@@ -59,7 +59,7 @@ async fn test_stale_metadata_lock_handling() {
     let cache_dir = temp_dir.path().to_path_buf();
 
     let mut disk_cache =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
 
     disk_cache.initialize().await.unwrap();
 
@@ -140,6 +140,7 @@ async fn test_bin_file_deletion_on_eviction() {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // Create a range with .bin file
@@ -148,7 +149,7 @@ async fn test_bin_file_deletion_on_eviction() {
     let range_end = 1023u64;
 
     let mut disk_cache =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
 
     let object_metadata = s3_proxy::cache_types::ObjectMetadata::new(
         "test-etag".to_string(),
@@ -223,6 +224,7 @@ async fn test_meta_file_deletion_on_last_range_eviction() {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // Create a range with .bin file
@@ -231,7 +233,7 @@ async fn test_meta_file_deletion_on_last_range_eviction() {
     let range_end = 1023u64;
 
     let mut disk_cache =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
 
     let object_metadata = s3_proxy::cache_types::ObjectMetadata::new(
         "test-etag".to_string(),
@@ -306,6 +308,7 @@ async fn test_stale_eviction_lock_handling() {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // Create a stale eviction lock
@@ -375,12 +378,13 @@ async fn test_multiple_range_eviction_meta_deletion() {
         80,                                    // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // Create multiple ranges
     let cache_key = "test-bucket/test-object";
     let mut disk_cache =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
 
     let object_metadata = s3_proxy::cache_types::ObjectMetadata::new(
         "test-etag".to_string(),

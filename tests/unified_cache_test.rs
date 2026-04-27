@@ -37,6 +37,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         80,  // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     )
 }
 
@@ -161,6 +162,7 @@ async fn test_independent_head_get_ttls() {
         80,  // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "test-bucket/ttl-test-object.txt";
@@ -299,6 +301,7 @@ async fn test_metadata_cache_integration() {
         80,  // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     let cache_key = "test-bucket/metadata-cache-test.txt";

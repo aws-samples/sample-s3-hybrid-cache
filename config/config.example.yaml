@@ -298,6 +298,14 @@ cache:
   # Reduces memory usage for large range responses under high concurrency.
   disk_streaming_threshold: 1048576  # 1 MiB in bytes
 
+  # Size of compression batches during cache writes (default: 1 MiB).
+  # Each cache miss write groups incoming S3 bytes into batches of this size
+  # before producing an LZ4 frame. Larger batches give better compression
+  # ratio and less per-frame overhead; smaller batches reduce per-request
+  # peak memory.
+  # Valid range: 65536 (64 KiB) to 16777216 (16 MiB).
+  compression_batch_size: 1048576
+
 logging:
   access_log_dir: "./tmp/logs/access"  # Local development; use absolute path for production (e.g., "/mnt/logs/access")
   app_log_dir: "./tmp/logs/app"        # Local development; use absolute path for production (e.g., "/mnt/logs/app")

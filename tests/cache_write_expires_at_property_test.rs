@@ -88,7 +88,7 @@ fn prop_cache_write_sets_expires_at(input: ArbitraryCacheWriteInput) -> TestResu
             Err(_) => return TestResult::discard(),
         };
         let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), false, 0, false);
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), false, 0, false, 1_048_576);
         if cache_manager.initialize().await.is_err() {
             return TestResult::discard();
         }

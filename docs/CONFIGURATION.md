@@ -654,6 +654,19 @@ Cached ranges at or above this size are streamed from disk in 512 KiB chunks ins
 
 Set lower for memory-constrained environments with many concurrent large-range requests. Set higher if memory is abundant and you prefer simpler response handling.
 
+### Compression Batch Size
+
+```yaml
+cache:
+  compression_batch_size: 1048576  # 1 MiB (default)
+```
+
+Size of compression batches during cache writes. Incoming S3 bytes are accumulated in RAM up to this size and then compressed as a single LZ4 frame before being appended to the cache file. Larger batches produce a better compression ratio and lower per-frame overhead; smaller batches reduce per-request peak memory.
+
+**Valid range**: `65536` (64 KiB) to `16777216` (16 MiB) inclusive. Values outside this range are rejected at startup.
+
+Set lower for memory-constrained environments with many concurrent writers. Set higher if memory is abundant and you want to maximize compression ratio on highly compressible content.
+
 ### Consolidation Cycle Timeout
 
 ```yaml

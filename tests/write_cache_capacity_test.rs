@@ -28,6 +28,7 @@ async fn test_get_write_cache_capacity_default() -> Result<()> {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
 
     // With no total cache size set, should use 1GB default
@@ -62,6 +63,7 @@ async fn test_get_write_cache_capacity_with_total_size() -> Result<()> {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await?;
@@ -99,6 +101,7 @@ async fn test_get_write_cache_capacity_different_percentages() -> Result<()> {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
     cache_manager.update_total_cache_size(1024 * 1024 * 1024); // 1GB
 
@@ -132,6 +135,7 @@ async fn test_get_write_cache_capacity_consistency() -> Result<()> {
         80, // eviction_target_percent
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                                     // compression_batch_size
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await?;

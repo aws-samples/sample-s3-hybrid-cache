@@ -53,7 +53,7 @@ fn prop_streaming_decompression_byte_identity() {
         rt.block_on(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let cache_manager =
-                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false);
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             cache_manager.initialize().await.unwrap();
 
             // Compress the data with LZ4

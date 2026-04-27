@@ -275,7 +275,7 @@ fn create_test_metadata_with_ranges(
     range_sizes: &[u64],
 ) -> Result<(Vec<(u64, u64)>, PathBuf), String> {
     let now = SystemTime::now();
-    let disk_cache = DiskCacheManager::new(cache_dir.clone(), false, 0, false);
+    let disk_cache = DiskCacheManager::new(cache_dir.clone(), false, 0, false, 1_048_576);
 
     let object_metadata = ObjectMetadata::new(
         format!("etag-{}", cache_key),
@@ -528,7 +528,7 @@ fn prop_metadata_removes_evicted_ranges(config: MetadataUpdateConfig) -> TestRes
     let rt = Runtime::new().expect("Failed to create runtime");
     rt.block_on(async {
         let (_temp_dir, cache_dir) = create_test_cache_dir();
-        let disk_cache = DiskCacheManager::new(cache_dir.clone(), false, 0, false);
+        let disk_cache = DiskCacheManager::new(cache_dir.clone(), false, 0, false, 1_048_576);
 
         if disk_cache.initialize().await.is_err() {
             return TestResult::discard();
@@ -607,7 +607,7 @@ fn prop_metadata_preserves_object_metadata(config: MetadataUpdateConfig) -> Test
     let rt = Runtime::new().expect("Failed to create runtime");
     rt.block_on(async {
         let (_temp_dir, cache_dir) = create_test_cache_dir();
-        let disk_cache = DiskCacheManager::new(cache_dir.clone(), false, 0, false);
+        let disk_cache = DiskCacheManager::new(cache_dir.clone(), false, 0, false, 1_048_576);
 
         if disk_cache.initialize().await.is_err() {
             return TestResult::discard();

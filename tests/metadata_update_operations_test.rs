@@ -18,6 +18,7 @@ async fn create_test_cache_manager() -> (s3_proxy::disk_cache::DiskCacheManager,
         cache_dir, true,  // compression_enabled
         1024,  // compression_threshold
         false, // write_cache_enabled
+        1_048_576, // compression_batch_size
     );
 
     // Initialize the cache directory structure
@@ -299,7 +300,7 @@ async fn test_concurrent_metadata_updates() {
 
     // Create a second manager pointing to the same cache directory
     let mut manager2 =
-        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false);
+        s3_proxy::disk_cache::DiskCacheManager::new(cache_dir.clone(), true, 1024, false, 1_048_576);
 
     let cache_key = "test-bucket/test-object";
 
@@ -336,7 +337,7 @@ async fn test_concurrent_metadata_updates() {
     handle2.await.unwrap();
 
     // Create a third manager to read the final state
-    let manager3 = s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false);
+    let manager3 = s3_proxy::disk_cache::DiskCacheManager::new(cache_dir, true, 1024, false, 1_048_576);
 
     // Verify access count was incremented correctly
     // Should be 1 (initial) + 5 + 5 = 11
