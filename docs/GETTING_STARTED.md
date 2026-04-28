@@ -23,10 +23,13 @@ Quick start guide for installing, configuring, and running S3 Proxy.
   - [AWS CLI Environment Variable](#aws-cli-environment-variable)
   - [s5cmd Configuration](#s5cmd-configuration)
   - [Minio Go Client (Forgejo, Gitea, etc.)](#minio-go-client-forgejo-gitea-etc)
+  - [boto3 Per-Client Configuration](#boto3-per-client-configuration)
   - [Mountpoint for Amazon S3](#mountpoint-for-amazon-s3)
   - [Shell Profile Configuration](#shell-profile-configuration)
   - [Check Cache Performance](#check-cache-performance)
 - [Port Configuration Options](#port-configuration-options)
+  - [Recommended: Standard Ports (80/443)](#recommended-standard-ports-80443)
+  - [Custom Ports](#custom-ports)
 - [Proxy-Only Mode](#proxy-only-mode)
   - [Configuration](#configuration)
   - [Client Configuration](#client-configuration)
@@ -120,7 +123,7 @@ The `--endpoint-url http://s3.region.amazonaws.com` is required so the SDK signs
 
 `NO_PROXY=169.254.169.254` prevents EC2 instance metadata (IMDS) requests from being sent through the proxy. Without this, credential retrieval from the instance metadata service will fail.
 
-**Why `HTTP_PROXY`, not `HTTPS_PROXY`?** When `HTTPS_PROXY` is set, the SDK sends a `CONNECT` request asking the proxy to establish a TCP tunnel to S3. The traffic inside the tunnel is end-to-end encrypted between the client and S3 — the proxy cannot decrypt, inspect, or cache it. The TLS proxy listener handles `CONNECT` as a passthrough tunnel (same as port 443), so the request succeeds but bypasses the cache entirely. Use `HTTP_PROXY` for caching. Use `HTTP_PROXY` instead. The `HTTP_PROXY` variable controls where the SDK sends HTTP requests, regardless of whether the proxy URL uses `http://` or `https://`. With `HTTP_PROXY=https://proxy:3129`, the client opens a TLS connection to the proxy, then sends plaintext HTTP inside that tunnel. The proxy decrypts the TLS layer and sees the HTTP request for caching.
+**Why `HTTP_PROXY`, not `HTTPS_PROXY`?** When `HTTPS_PROXY` is set, the SDK sends a `CONNECT` request asking the proxy to establish a TCP tunnel to S3. The traffic inside the tunnel is end-to-end encrypted between the client and S3 — the proxy cannot decrypt, inspect, or cache it. The TLS proxy listener handles `CONNECT` as a passthrough tunnel (same as port 443), so the request succeeds but bypasses the cache entirely. Use `HTTP_PROXY` instead. The `HTTP_PROXY` variable controls where the SDK sends HTTP requests, regardless of whether the proxy URL uses `http://` or `https://`. With `HTTP_PROXY=https://proxy:3129`, the client opens a TLS connection to the proxy, then sends plaintext HTTP inside that tunnel. The proxy decrypts the TLS layer and sees the HTTP request for caching.
 
 ##### TLS Proxy Listener Configuration
 
@@ -581,6 +584,25 @@ MINIO_USE_SSL = false
 
 For Go applications using minio-go directly, set `Secure: false` in `minio.Options`.
 
+### boto3 Per-Client Configuration
+
+boto3 clients accept `endpoint_url` at creation time, so a single application can route some S3 traffic through the proxy while keeping other traffic direct:
+
+```python
+import boto3
+
+# Cached: reads go through proxy
+s3_cached = boto3.client('s3',
+    endpoint_url='http://s3.us-east-1.amazonaws.com',
+    region_name='us-east-1'
+)
+
+# Direct: writes bypass proxy entirely
+s3_direct = boto3.client('s3', region_name='us-east-1')
+```
+
+This avoids the all-or-nothing behavior of environment variables like `AWS_ENDPOINT_URL_S3`.
+
 ### Mountpoint for Amazon S3
 
 [Mountpoint for Amazon S3](https://github.com/awslabs/mountpoint-s3) is a file client that mounts S3 buckets as local filesystems. To enable caching through the proxy, use the `--endpoint-url` flag with HTTP:
@@ -616,7 +638,7 @@ export S3_ENDPOINT_URL=http://s3.us-east-1.amazonaws.com
 # View real-time dashboard (open in browser)
 open http://<proxy-ip>:8081
 
-# View cache metrics (Prometheus format)
+# View cache metrics (JSON format)
 curl http://<proxy-ip>:9090/metrics | grep cache_hit_rate
 
 # Check proxy health
@@ -637,20 +659,9 @@ server:
 - **Pros**: Works with all S3 clients, HTTPS passthrough on standard port
 - **Cons**: Requires `sudo` for privileged ports
 
-### Development: Non-Privileged Ports
-
-```yaml
-server:
-  http_port: 8081
-  https_port: 3129
-```
-
-- **Pros**: No `sudo` required
-- **Cons**: HTTPS clients may fail if they can't configure port 3129
-
 ### Custom Ports
 
-Possible but not recommended. HTTP clients can use `--endpoint-url`, but HTTPS clients with non-configurable endpoints will fail.
+Custom port numbers are possible but not recommended. HTTP clients can use `--endpoint-url` with a custom port, but HTTPS clients with non-configurable endpoints will fail. For development or environments where `sudo` is not available, use [Proxy-Only Mode](#proxy-only-mode) instead.
 
 ## Proxy-Only Mode
 
@@ -681,7 +692,9 @@ Start the proxy (no `sudo` required):
 cargo run --release -- -c config.yaml
 ```
 
-The proxy listens on port 3128. Optionally enable the TLS listener on port 3129 for encrypted client-to-proxy traffic:
+The proxy listens on port 3128 for unencrypted HTTP forward proxy traffic.
+
+To add encrypted client-to-proxy connections, enable the TLS proxy listener:
 
 ```yaml
 server:
@@ -694,9 +707,11 @@ server:
     key_path: "/etc/proxy/tls/key.pem"
 ```
 
+This starts both listeners — port 3128 (unencrypted) and port 3129 (TLS-terminated). The TLS listener terminates TLS using the proxy's own certificate, then processes decrypted HTTP through the caching pipeline. See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for certificate generation and client trust configuration.
+
 ### Client Configuration
 
-Set `HTTP_PROXY` to route S3 traffic through the proxy. Use `--endpoint-url` so the SDK signs requests against the real S3 hostname.
+Set `HTTP_PROXY` to route S3 traffic through the proxy. Use `--endpoint-url` so the SDK signs requests against the real S3 hostname (not the proxy hostname). SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer, so they remain valid regardless of whether the client connects via HTTP or TLS.
 
 **Unencrypted (private networks or localhost):**
 
@@ -708,7 +723,7 @@ aws s3 cp s3://bucket/key ./local \
   --region us-east-1
 ```
 
-**Encrypted via TLS listener:**
+**Encrypted via TLS listener (recommended):**
 
 ```bash
 export HTTP_PROXY=https://127.0.0.1:3129
@@ -719,7 +734,11 @@ aws s3 cp s3://bucket/key ./local \
   --region us-east-1
 ```
 
-See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for details on `--endpoint-url`, `NO_PROXY`, `HTTP_PROXY` vs `HTTPS_PROXY`, TLS certificate generation, and client trust configuration.
+**Why `HTTP_PROXY`, not `HTTPS_PROXY`?** See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for why `HTTP_PROXY` is required instead of `HTTPS_PROXY`.
+
+`NO_PROXY=169.254.169.254` prevents EC2 instance metadata (IMDS) requests from being sent through the proxy. Without this, credential retrieval from the instance metadata service will fail.
+
+See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for TLS certificate generation, self-signed certificate SANs, and client trust configuration details.
 
 ### High Availability: Shared NFS Cache Pattern
 
@@ -798,7 +817,8 @@ tail -f <access-log-dir>/$(date +%Y/%m/%d)/*
    sudo cargo run --release -- -c config/config.example.yaml
    ```
 
-2. **AWS credentials not configured**:
+2. **AWS credentials not configured on the client**:
+   The proxy does not use AWS credentials — it forwards pre-signed requests from clients. Ensure credentials are configured on the *client* machine:
    ```bash
    aws configure
    # or set environment variables
