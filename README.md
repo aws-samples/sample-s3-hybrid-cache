@@ -199,15 +199,15 @@ See [this article](https://repost.aws/articles/ARRnpZ4QYrS9CtnYyTleS5bg/storage-
 
 ### Multi-Client Request Time And Efficiency Testing
 
-100 clients (c7gn.large) each seqentially downloading the same 100 (0.1–100 MB) files, i.e. 'thundering herd'. 3 proxies (m6in.2xlarge) with shared NFS cache:
+100 clients (c7gn.large) each sequentially downloading the same 100 (0.1–100 MB) files, i.e. 'thundering herd'. 3 proxies (m6in.2xlarge) with shared EFS cache:
 
 | Scenario | p50 | p95 | p99 | Throughput |
 |----------|-----|-----|-----|------------|
-| Direct to S3 (no proxy) | 634 ms | 1,988 ms | 2,540 ms | 1.6 GiB/s |
-| Proxy, cold cache | 627 ms | 4,469 ms | 6,409 ms | 1.1 GiB/s |
+| Direct to S3 (no proxy) | 659 ms | 1,407 ms | 1,620 ms | 1.5 GiB/s |
+| Proxy, cold cache | 712 ms | 2,551 ms | 4,005 ms | 1.2 GiB/s |
 | Proxy, warm cache | 578 ms | 839 ms | 1,247 ms | 1.9 GiB/s |
 
-Warm cache delivered 22% higher throughput and 2.4× lower p95 latency than direct S3 access. Download coordination coalesced 94% of concurrent cache-miss requests during the cold-cache run (4,323 of ~4,600 requests served from cache after waiting, only 272 actual S3 fetches). 6.3 GB downloaded from S3 to serve 137 GB (22× data transfer reduction). 
+Warm cache delivered 22% higher throughput and 2.4× lower p95 latency than direct S3 access. Download coordination coalesces concurrent cache-miss requests — only one client fetches from S3 while others wait for the cached result.
 
 ## FAQ
 
