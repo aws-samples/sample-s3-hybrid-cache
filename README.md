@@ -175,7 +175,7 @@ See [Security Considerations](docs/ARCHITECTURE.md#security-considerations) for 
 
 ### Single-Client Throughput Testing
 
-Single client downloading large files (up to 5 GiB) using AWS CLI with [CRT](https://aws.amazon.com/blogs/storage/improving-amazon-s3-throughput-for-the-aws-cli-and-boto3-with-the-aws-common-runtime/), 8 proxies (m6in.2xlarge), with FSx for OpenZFS (10 GiB/s) as shared cache.
+Single client downloading large files (up to 5 GiB) using AWS CLI with [CRT](https://aws.amazon.com/blogs/storage/improving-amazon-s3-throughput-for-the-aws-cli-and-boto3-with-the-aws-common-runtime/), 8 proxies (m6in.2xlarge), with FSx for OpenZFS (10 GiB/s) as shared cache. All tests are cross-region (S3 bucket in eu-west-1, proxies and clients in us-west-2). For more on this subject see [Cost effective methods for accessing S3 buckets cross-region](https://repost.aws/articles/ARjzluyMS8RbeOOK4MGXRG6Q/cost-effective-methods-for-accessing-s3-buckets-cross-region).
 
 **m6in.4xlarge client (up to 50 Gbps)**
 
@@ -193,13 +193,13 @@ Single client downloading large files (up to 5 GiB) using AWS CLI with [CRT](htt
 | Cache miss (proxy → S3) | ~2.0 GiB/s |
 | Cache hit (proxy → FSx) | ~5.5 GiB/s |
 
-Cache hit throughput exceeded direct S3 throughput. Cache miss throughput is proxy-limited (S3 fetch + TLS + LZ4 compression + cache write). Compared to a 3-proxy configuration (which achieved ~1.1 GiB/s cache miss and ~2.4 GiB/s cache hit), scaling to 8 proxies approximately doubled  throughput. 
+Cache hit throughput exceeded direct S3 throughput. Cache miss throughput is proxy-limited (S3 fetch + TLS + LZ4 compression + cache write). Compared to a 3-proxy configuration (which achieved ~1.1 GiB/s cache miss and ~2.4 GiB/s cache hit), scaling to 8 proxies approximately doubled throughput.
 
 See [this article](https://repost.aws/articles/ARRnpZ4QYrS9CtnYyTleS5bg/storage-benchmarking-downloading-deepseek-v3-0324-from-amazon-s3-to-local-storage-at-8-1-gib-s) for guidance on configuring the AWS CLI CRT transfer client for high throughput.
 
 ### Multi-Client Request Time And Efficiency Testing
 
-100 clients (c7gn.large) each sequentially downloading the same 100 (0.1–100 MB) files, i.e. 'thundering herd'. 3 proxies (m6in.2xlarge) with shared EFS cache:
+100 clients (c7gn.large) each sequentially downloading the same 100 (0.1–100 MB) files, i.e. 'thundering herd'. 3 proxies (m6in.2xlarge) with shared EFS cache. Cross-region (eu-west-1 bucket, us-west-2 proxies):
 
 | Scenario | p50 | p95 | p99 | Throughput |
 |----------|-----|-----|-----|------------|
