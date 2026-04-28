@@ -211,7 +211,7 @@ See [this article](https://repost.aws/articles/ARRnpZ4QYrS9CtnYyTleS5bg/storage-
 | Proxy, cold cache | 712 ms | 2,551 ms | 4,005 ms | 1.2 GiB/s |
 | Proxy, warm cache | 578 ms | 839 ms | 1,247 ms | 1.9 GiB/s |
 
-Warm cache delivered 22% higher throughput and 2.4× lower p95 latency than direct S3 access. Download coordination coalesces concurrent cache-miss requests — only one client fetches from S3 while others wait for the cached result.
+Warm cache delivered 27% higher throughput and 1.7× lower p95 latency than direct S3 access. Download coordination coalesces concurrent cache-miss requests — only one client fetches from S3 while others wait for the cached result.
 
 ## FAQ
 
