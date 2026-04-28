@@ -4,6 +4,8 @@ A high-performance, transparent S3 caching proxy with intelligent multi-tier cac
 
 📖 Read the introductory blog post: [Introducing S3 Hybrid Cache: An Intelligent Caching Proxy for Amazon S3](https://repost.aws/articles/ARaWiUYarLQSanDgHfMAfbsA)
 
+>Important: S3 Hybrid Cache is sample code provided for demonstration and educational purposes. It is not intended for production use without thorough testing, security review, and validation for your specific use case and environment. You are responsible for evaluating whether this solution meets your requirements before deploying it.
+
 ## The Problem
 
 Users with hybrid or on-premises workloads face challenges leveraging Amazon S3 due to latency, bandwidth constraints, and data transfer out (DTO) costs—especially for repeat-read and read-after-write workflows.
@@ -231,7 +233,7 @@ A: Nothing about this solution is specific to Amazon S3. Any origin compatible w
 
 ## Status
 
-**Beta Status**: This is sample code demonstrating S3 caching concepts. Not recommended for production use without thorough testing and validation for your specific use case.
+S3 Hybrid Cache is sample code provided for demonstration and educational purposes. It is not intended for production use without thorough testing, security review, and validation for your specific use case and environment. You are responsible for evaluating whether this solution meets your requirements before deploying it.
 
 ## Author
 
