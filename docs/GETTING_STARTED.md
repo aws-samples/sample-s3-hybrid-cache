@@ -615,7 +615,7 @@ mount-s3 --endpoint-url http://s3.us-east-1.amazonaws.com \
   your-bucket /mnt/s3
 ```
 
-**Important**: Mountpoint uses HTTPS by default, which bypasses the cache (TCP passthrough on port 443). The `--endpoint-url` flag with HTTP is required for caching when using DNS routing. Alternatively, configure Mountpoint to use `HTTP_PROXY=https://proxy:3129` with the TLS proxy listener for encrypted caching.
+**Important**: Mountpoint uses HTTPS by default, which bypasses the cache regardless of routing mode — HTTPS connections use TCP passthrough (port 443) with DNS routing, or `CONNECT` tunneling with `HTTPS_PROXY`. The `--endpoint-url` flag with HTTP is required for caching with both DNS routing and proxy mode. For encrypted client-to-proxy transport, combine `--endpoint-url http://...` with `HTTP_PROXY=https://proxy:3129` and the TLS proxy listener.
 
 **DNS routing**: If using Route53 private hosted zones or hosts file DNS routing, the endpoint URL should match your configured DNS zone. The proxy will cache HEAD responses (metadata) and range requests from Mountpoint, significantly improving performance for repeated reads.
 
