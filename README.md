@@ -1,6 +1,8 @@
 # S3 Hybrid Cache - Intelligent, Transparent Caching for Amazon S3
 
-A high-performance, transparent S3 caching proxy with intelligent multi-tier caching, streaming architecture, and comprehensive observability.
+A high-performance, transparent S3 caching proxy with intelligent multi-tier caching, streaming architecture, and comprehensive observability. 
+
+📖 Read the introductory blog post: [Introducing S3 Hybrid Cache: An Intelligent Caching Proxy for Amazon S3](https://repost.aws/articles/ARaWiUYarLQSanDgHfMAfbsA)
 
 ## The Problem
 
