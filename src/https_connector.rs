@@ -208,29 +208,24 @@ impl Service<Uri> for CustomHttpsConnector {
                     }
                 }
             } else {
-                // URI host is a regular hostname — connect directly via DNS
+                // URI host is a regular hostname — resolve via the pool manager's
+                // configured DNS resolver (Google/Cloudflare/custom), which bypasses
+                // /etc/hosts. This matches the HTTP proxy's resolution behaviour.
                 debug!(
-                    "[HTTPS_CONNECTOR] Connecting to hostname directly: {}",
+                    "[HTTPS_CONNECTOR] Resolving hostname via configured DNS: {}",
                     uri_host
                 );
-                // Resolve hostname to IP for connect — use first resolved address
-                let addrs: Vec<std::net::SocketAddr> =
-                    tokio::net::lookup_host(format!("{}:443", uri_host))
-                        .await
-                        .map_err(|e| {
-                            ProxyError::ConnectionError(format!(
-                                "DNS resolution failed for {}: {}",
-                                uri_host, e
-                            ))
-                        })?
-                        .collect();
-                let addr = addrs.first().ok_or_else(|| {
+                let ips = {
+                    let pm = pool_manager.read().await;
+                    pm.resolve_endpoint(uri_host).await?
+                };
+                let ip = *ips.first().ok_or_else(|| {
                     ProxyError::ConnectionError(format!(
                         "No addresses found for {}",
                         uri_host
                     ))
                 })?;
-                (addr.ip(), uri_host.to_string())
+                (ip, uri_host.to_string())
             };
 
             // Establish TCP connection

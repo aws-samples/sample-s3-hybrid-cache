@@ -357,8 +357,9 @@ impl ConnectionPoolManager {
         !self.overrides.is_empty()
     }
 
-    /// Resolve endpoint to IP addresses
-    async fn resolve_endpoint(&self, endpoint: &str) -> Result<Vec<IpAddr>> {
+    /// Resolve endpoint to IP addresses using the configured DNS resolver
+    /// (bypasses /etc/hosts). Checks endpoint overrides first, then falls back to DNS.
+    pub async fn resolve_endpoint(&self, endpoint: &str) -> Result<Vec<IpAddr>> {
         // Check overrides (exact then suffix)
         if let Some(ips) = self.overrides.resolve(endpoint) {
             info!("Using endpoint override for {}: {:?}", endpoint, ips);

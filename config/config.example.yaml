@@ -335,6 +335,11 @@ connection_pool:
   max_idle_per_host: 100  # More idle connections = more memory, fewer TLS handshakes during bursts
   max_lifetime: "300s"
   pool_check_interval: "10s"
+  # Custom DNS servers for S3 endpoint resolution (default: Google DNS + Cloudflare DNS)
+  # The proxy bypasses /etc/hosts and uses these servers to resolve S3 endpoints.
+  # Format: list of IP addresses. Empty list uses default (Google DNS + Cloudflare DNS).
+  # For PrivateLink deployments, point at Route 53 Resolver inbound endpoint IPs.
+  # dns_servers: ["10.0.1.50", "10.0.2.50"]
   # endpoint_overrides: Hostname-to-IP mappings that bypass DNS resolution.
   # Useful for S3 PrivateLink where the proxy cannot use DNS to resolve S3 endpoints
   # to PrivateLink ENI IPs (e.g., on-prem deployments without Route 53 Resolver).
@@ -368,7 +373,7 @@ connection_pool:
   # connections across all S3 frontend servers instead of concentrating on a subset.
   # Improves reliability by avoiding per-IP throttling and follows aws-c-s3 best practices.
   # TLS SNI and Host headers are preserved for AWS SigV4 compatibility.
-  ip_distribution_enabled: false  # Enable per-IP connection pool distribution (default: false)
+  ip_distribution_enabled: true  # Enable per-IP connection pool distribution (default: true)
   # Maximum idle connections per IP when IP distribution is enabled (default: 10)
   # With N S3 IPs (typically ~8), total idle connections ≈ N × max_idle_per_ip (~80).
   # When IP distribution is disabled, max_idle_per_host (above) is used instead.

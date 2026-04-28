@@ -5,6 +5,15 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.2] - 2026-04-28
+
+### Fixed
+- **HTTPS connector used OS resolver instead of configured DNS**: The `CustomHttpsConnector` hostname fallback path (used when IP distribution has not yet resolved IPs, or when `ip_distribution_enabled: false`) called `tokio::net::lookup_host()`, which reads `/etc/hosts`. If `/etc/hosts` mapped S3 hostnames to `127.0.0.1` (common in proxy deployments), outbound HTTPS requests failed with `TLS handshake failed ... received fatal alert: InternalError`. The connector now uses the pool manager's `trust_dns_resolver` (Google/Cloudflare DNS by default, bypasses `/etc/hosts`), matching the HTTP proxy's resolution behaviour.
+- **Example config had `ip_distribution_enabled: false`**: The example config incorrectly set `ip_distribution_enabled: false` with a comment claiming the default was `false`. The actual code default is `true`. Users copying from the example config got IP distribution disabled, routing all requests through the hostname resolution path (which had the DNS bug above). Fixed to `true` with correct comment.
+
+### Changed
+- **Added `dns_servers` to example config**: The `connection_pool.dns_servers` setting was supported in code and documented but missing from `config/config.example.yaml`. Added it as a commented-out option with a note about PrivateLink use cases.
+
 ## [1.13.1] - 2026-04-27
 
 ### Fixed
