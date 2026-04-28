@@ -584,6 +584,8 @@ MINIO_USE_SSL = false
 
 For Go applications using minio-go directly, set `Secure: false` in `minio.Options`.
 
+`HTTP_PROXY` does not help here — Go's `net/http` sends a `CONNECT` tunnel for HTTPS targets, which bypasses caching. `MINIO_USE_SSL = false` is required.
+
 ### boto3 Per-Client Configuration
 
 boto3 clients accept `endpoint_url` at creation time, so a single application can route some S3 traffic through the proxy while keeping other traffic direct:
