@@ -22,6 +22,7 @@ Quick start guide for installing, configuring, and running S3 Proxy.
 - [Simplifying Client Configuration](#simplifying-client-configuration)
   - [AWS CLI Environment Variable](#aws-cli-environment-variable)
   - [s5cmd Configuration](#s5cmd-configuration)
+  - [Minio Go Client (Forgejo, Gitea, etc.)](#minio-go-client-forgejo-gitea-etc)
   - [Mountpoint for Amazon S3](#mountpoint-for-amazon-s3)
   - [Shell Profile Configuration](#shell-profile-configuration)
   - [Check Cache Performance](#check-cache-performance)
@@ -569,6 +570,16 @@ s5cmd ls s3://your-bucket/
 ```
 
 The same region limitation applies - the endpoint URL must match the bucket's region.
+
+### Minio Go Client (Forgejo, Gitea, etc.)
+
+Applications using the [Minio Go client](https://github.com/minio/minio-go) (including Forgejo and Gitea) default to HTTPS, which bypasses the cache. Set `MINIO_USE_SSL = false` to use HTTP:
+
+```ini
+MINIO_USE_SSL = false
+```
+
+For Go applications using minio-go directly, set `Secure: false` in `minio.Options`.
 
 ### Mountpoint for Amazon S3
 
