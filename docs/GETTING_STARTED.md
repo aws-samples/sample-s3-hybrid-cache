@@ -47,7 +47,7 @@ Quick start guide for installing, configuring, and running S3 Proxy.
 
 ## Prerequisites
 
-- **Rust 1.70+** toolchain
+- **Rust 1.89+** toolchain (earlier versions fail to compile: `std::fs::File::unlock` was stabilized in 1.89 and collides with the `fs2` crate's `FileExt::unlock`)
 - **sudo access** (required for ports 80/443)
 
 ## Installation
@@ -511,6 +511,10 @@ The CLI resolves the alias to `mfzwi23gnjvgw.accesspoint.s3-global.amazonaws.com
 | MRAP alias | `http://accesspoint.s3-global.amazonaws.com` | ✅ Yes | CLI builds correct Host from alias. |
 | MRAP ARN | `http://accesspoint.s3-global.amazonaws.com` | ✅ Yes | CLI builds correct Host from ARN. |
 | Any AP/MRAP | *(none — default HTTPS)* | ❌ No | HTTPS uses TCP passthrough, bypassing cache. |
+
+#### S3 Transfer Acceleration
+
+Transfer Acceleration endpoints (`<bucket>.s3-accelerate.amazonaws.com` and `<bucket>.s3-accelerate.dualstack.amazonaws.com`) are not supported. Clients should target regional endpoints (`s3.<region>.amazonaws.com` or `<bucket>.s3.<region>.amazonaws.com`).
 
 ## Basic Usage
 

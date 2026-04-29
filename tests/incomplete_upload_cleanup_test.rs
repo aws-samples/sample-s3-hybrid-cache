@@ -36,6 +36,7 @@ async fn test_cleanup_incomplete_uploads_basic() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/test-object";
@@ -107,6 +108,7 @@ async fn test_cleanup_incomplete_uploads_preserves_recent() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/recent-upload";
@@ -162,6 +164,7 @@ async fn test_cleanup_incomplete_uploads_with_parts() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/upload-with-parts";
@@ -242,6 +245,7 @@ async fn test_cleanup_incomplete_uploads_preserves_completed() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/completed-upload";
@@ -316,6 +320,7 @@ async fn test_cleanup_incomplete_uploads_multiple() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     // Create multiple incomplete uploads
@@ -391,6 +396,7 @@ async fn test_cleanup_incomplete_uploads_integrated_with_maintenance() -> Result
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/maintenance-test";
@@ -464,6 +470,7 @@ async fn test_cleanup_incomplete_uploads_bypassed_state() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/bypassed-upload";

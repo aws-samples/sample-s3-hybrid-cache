@@ -76,6 +76,7 @@ fn create_shared_cache_config(shared_dir: PathBuf, _instance_id: &str) -> CacheC
         read_cache_enabled: true,
         bucket_settings_staleness_threshold: Duration::from_secs(60),
         download_coordination: s3_proxy::config::DownloadCoordinationConfig::default(),
+        evaluate_conditions_from_cache: false,
     }
 }
 

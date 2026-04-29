@@ -141,6 +141,7 @@ async fn test_bin_file_deletion_on_eviction() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     // Create a range with .bin file
@@ -225,6 +226,7 @@ async fn test_meta_file_deletion_on_last_range_eviction() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     // Create a range with .bin file
@@ -309,6 +311,7 @@ async fn test_stale_eviction_lock_handling() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     // Create a stale eviction lock
@@ -379,6 +382,7 @@ async fn test_multiple_range_eviction_meta_deletion() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     // Create multiple ranges

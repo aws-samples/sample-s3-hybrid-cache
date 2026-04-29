@@ -1042,6 +1042,13 @@ fn default_read_cache_enabled() -> bool {
     true // Enabled by default - read caching for GET responses
 }
 
+fn default_evaluate_conditions_from_cache() -> bool {
+    // Disabled by default — strict RFC 7232 semantics, proxy forwards all conditional
+    // requests to S3. Opt in via config to let the cache answer conditional headers
+    // locally from unexpired metadata.
+    false
+}
+
 fn default_bucket_settings_staleness_threshold() -> Duration {
     Duration::from_secs(60) // 60 seconds
 }
@@ -1174,6 +1181,26 @@ pub struct CacheConfig {
     /// This allows an "allowlist" pattern where only specific buckets have caching enabled.
     #[serde(default = "default_read_cache_enabled")]
     pub read_cache_enabled: bool,
+    /// Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since,
+    /// If-Unmodified-Since) against cached metadata instead of forwarding to S3
+    /// (default: false).
+    ///
+    /// When false (default — "always forward"): every conditional GET/HEAD is forwarded
+    /// to S3 with the client's headers intact. S3 is the authoritative decider. Strict
+    /// RFC 7232 compliance and strongest consistency — the proxy cannot serve stale data
+    /// based on a stale cached ETag.
+    ///
+    /// When true ("cache evaluates conditions"): if the cached object is unexpired
+    /// (within get_ttl/head_ttl and has ETag + Last-Modified recorded), the proxy
+    /// evaluates the client's conditional headers against cached metadata and returns
+    /// 304 / 412 / 200 locally without contacting S3. Expired cache entries and entries
+    /// lacking required validators fall back to forward-to-S3 behavior. Client bypass
+    /// headers (Cache-Control: no-cache/no-store, Pragma: no-cache) also force forward.
+    /// Reduces S3 round trips for conditional requests at the cost of strict freshness.
+    /// Not recommended with get_ttl = "0s" (every request would fall back to forward
+    /// anyway, defeating the purpose).
+    #[serde(default = "default_evaluate_conditions_from_cache")]
+    pub evaluate_conditions_from_cache: bool,
     /// How long cached bucket settings are considered fresh before re-reading from disk (default: 60s)
     #[serde(
         default = "default_bucket_settings_staleness_threshold",
@@ -1215,6 +1242,7 @@ impl Default for CacheConfig {
             disk_streaming_threshold: default_disk_streaming_threshold(),
             compression_batch_size: default_compression_batch_size(),
             read_cache_enabled: default_read_cache_enabled(),
+            evaluate_conditions_from_cache: default_evaluate_conditions_from_cache(),
             bucket_settings_staleness_threshold: default_bucket_settings_staleness_threshold(),
         }
     }
@@ -1744,6 +1772,7 @@ impl Default for Config {
                 compression_batch_size: 1_048_576,              // 1 MiB
                 read_cache_enabled: true,                       // Read caching enabled by default
                 bucket_settings_staleness_threshold: Duration::from_secs(60), // 60 seconds
+                evaluate_conditions_from_cache: false,          // Strict always-forward by default
             },
             logging: LoggingConfig {
                 access_log_dir: PathBuf::from("/logs/access"),

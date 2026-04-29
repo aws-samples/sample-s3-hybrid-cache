@@ -800,21 +800,42 @@ When an expired entry is accessed in lazy mode, the proxy uses HTTP conditional 
 
 This approach minimizes bandwidth usage while ensuring cache freshness and consistency.
 
-**Client Conditional Requests:**
-When clients provide conditional headers (If-None-Match, If-Modified-Since, If-Match, If-Unmodified-Since), the proxy uses an always-forward approach to ensure perfect HTTP compliance:
+The proxy handles conditional headers in three semantically distinct ways, configurable via `cache.evaluate_conditions_from_cache` (default `false`).
 
-- **ALL conditional requests are forwarded to S3** with the client's original headers
-- **The proxy never makes conditional decisions** based on cached metadata
-- **S3 makes the authoritative decision** about whether conditions are met
-- **Cache management is based solely on S3's response:**
-  - **S3 returns 200 OK** → Return data to client, invalidate old cache, cache new data
-  - **S3 returns 304 Not Modified** → Return 304 to client, refresh cache TTL
-  - **S3 returns 412 Precondition Failed** → Return 412 to client, do NOT invalidate cache
-  - **S3 returns 403 Forbidden / 401 Unauthorized** → Return error to client, do NOT invalidate cache (credentials issue, not a data change)
+### Default: always forward to S3 (`evaluate_conditions_from_cache = false`)
 
-This approach eliminates edge cases and ensures the proxy never provides incorrect responses based on potentially stale cached metadata. The proxy acts as a transparent forwarder for all conditional requests, letting S3 handle the complex HTTP conditional logic.
+Requests on the GET/HEAD path that carry `If-Match`, `If-None-Match`, `If-Modified-Since`, or `If-Unmodified-Since` are forwarded to S3 with the client's headers intact, regardless of whether they also carry a `Range` header. S3 is the sole judge. The proxy takes cache action based only on S3's response:
 
-**Important**: GET_TTL only affects GET requests. HEAD requests use HEAD_TTL independently.
+- **S3 returns 200 OK** → return data to client, invalidate old cache, cache new data
+- **S3 returns 304 Not Modified** → return 304 to client, refresh cache TTL
+- **S3 returns 412 Precondition Failed** → return 412 to client, cache unchanged
+- **S3 returns 403 / 401** → return error to client, cache unchanged (credentials issue is not a data change)
+
+Strict RFC 7232 compliance and strongest consistency — the proxy cannot serve stale data based on a stale cached ETag. Costs one S3 round trip per conditional request.
+
+### Opt-in: cache evaluates conditions locally (`evaluate_conditions_from_cache = true`)
+
+Configured globally or per-bucket/prefix. When enabled and the cached object is unexpired AND cached metadata has the validator the client referenced (ETag for `If-Match` / `If-None-Match`, Last-Modified for `If-Modified-Since` / `If-Unmodified-Since`), the proxy evaluates the client's conditional headers against cached metadata and returns 304 / 412 / 200 locally without contacting S3. Precedence follows RFC 7232 §6:
+
+1. `If-Match` (strong compare against cached ETag) → 412 on mismatch, else continue
+2. `If-Unmodified-Since` (only if `If-Match` absent) → 412 if cached Last-Modified is later
+3. `If-None-Match` (weak compare) → 304 for GET/HEAD, 412 for others, on match
+4. `If-Modified-Since` (only if `If-None-Match` absent, GET/HEAD only) → 304 if cached Last-Modified ≤ provided
+
+If required validators are missing from cache, or if the cached object is expired, the proxy falls back to the always-forward path for that request. Client cache-bypass headers (`Cache-Control: no-cache/no-store`, `Pragma: no-cache`) also force forward.
+
+Trades strict freshness for lower latency. The proxy can serve a 412 or 304 based on a cached ETag that is no longer current on S3 if the cached TTL has not expired. Appropriate when the operator trusts TTL to bound staleness. Not recommended with `get_ttl: "0s"` — every request would fall back to forward anyway, defeating the purpose.
+
+### Proxy-internal conditional injection (independent of the above)
+
+Regardless of the `evaluate_conditions_from_cache` setting, the proxy injects conditional headers on its own S3 requests in two narrow cases:
+
+1. **TTL-expired revalidation**: when cached data is accessed past its TTL under lazy expiration, the proxy sends `If-None-Match: <cached-etag>` + `If-Modified-Since: <cached-last-modified>` to get a 304 on match (RFC 7232 §3.2).
+2. **Partial-cache merge**: when partial cached ranges exist for a request and the proxy must fetch the missing bytes from S3, it injects `If-Match: <cached-etag>` so S3 refuses (412) rather than return data from a newer object version — which would corrupt the merged response. On 412, the proxy invalidates the stale cache and retries once without `If-Match`. The client never sees the 412.
+
+Client-supplied conditional headers are always preserved exactly; proxy-injected headers are internal and never visible to the client.
+
+**Important**: `get_ttl` only affects GET requests. HEAD requests use `head_ttl` independently.
 
 ### HEAD TTL (`head_ttl`)
 
@@ -1030,28 +1051,31 @@ Client GET with If-Match: "old-etag"
           → Proxy returns S3's response to client
 ```
 
-The proxy never makes conditional decisions - S3 always makes the authoritative determination. This ensures perfect HTTP compliance and eliminates edge cases where the proxy might make incorrect decisions based on cached metadata.
+The proxy forwards the client's conditional request to S3 verbatim; S3 evaluates the condition. The proxy takes cache action based solely on S3's response. A client-supplied `If-Match` that produces 412 is passed through to the client unchanged; the cache is not modified.
 
-**Cache Invalidation Behavior:** When cache invalidation occurs due to ETag or Last-Modified mismatch, all cached ranges for that object are immediately removed (metadata file + all range binary files). The proxy does not attempt selective range invalidation — any version mismatch triggers a complete cache purge for that object.
+**Cache Invalidation Behavior:** When the proxy decides to invalidate cache (on ETag or Last-Modified mismatch detected via response comparison, or after a proxy-injected `If-Match` produces 412 on the partial-cache-merge path), all cached ranges for that object are removed (metadata file + all range binary files). The proxy does not attempt selective range invalidation — any version mismatch triggers a complete cache purge for that object.
 
 #### Scenario 3a: Partial Cache Hit with Cache Validation
 
-When the proxy has partial cache coverage and needs to fetch from S3, it adds an `If-Match` header with the cached ETag to ensure the object hasn't changed since caching:
+When the proxy has partial cache coverage and needs to fetch missing bytes from S3, it injects an `If-Match: <cached-etag>` header on the S3 sub-fetch (unless the client already supplied one of their own) to prevent a newer object version's bytes from being merged with the older cached bytes:
 
 ```
 Client GET for bytes 0-41943039 (40MB)
           → Proxy checks cache
           → Found cached ranges: 0-8388607, 16777216-25165823, 33554432-41943039
           → Missing ranges: 8388608-16777215, 25165824-33554431
-          → Proxy adds If-Match header with cached ETag (if client didn't specify one)
-          → Forward original request to S3 unchanged
+          → Proxy injects If-Match: <cached-etag> on the S3 sub-fetch (client had no If-Match)
           → S3 validates If-Match:
-             - 200 OK: Object unchanged, cache new data, merge and serve
-             - 412 Precondition Failed: Object changed, invalidate cache, retry without If-Match
+             - 200 / 206: Object unchanged, merge cached + fetched bytes, serve
+             - 412: Object changed on S3 between cache population and now
+                   → Proxy invalidates all cached ranges for the object
+                   → Proxy retries the S3 fetch once WITHOUT the injected If-Match
+                   → Serves fresh data to the client, caches fresh ranges
+                   → Client never sees 412 (they did not send a conditional header)
           → Return complete response
 ```
 
-The `If-Match` validation ensures cached data is consistent with S3. If the object changed (412 response), all cached ranges are invalidated and the request is retried fresh.
+An injected `If-Match` that fails guarantees the client receives fresh data, never a corrupt merge or a surprising 412. A client-supplied `If-Match` is always preserved and its 412 is passed through.
 
 #### Scenario 3b: Fully Cached Non-Contiguous Ranges
 
@@ -1322,81 +1346,70 @@ aws s3api get-object --bucket my-bucket --key test.txt \
 
 ## Conditional Headers Handling
 
-### Always-Forward Approach
+### Three Distinct Uses of Conditional Headers
 
-The proxy implements an always-forward approach for client conditional headers to ensure perfect HTTP compliance and eliminate edge cases. This approach was implemented to fix incorrect behavior where the proxy would make conditional decisions based on potentially stale cached metadata.
+The proxy handles conditional headers in three semantically distinct ways. The first is pure pass-through; the other two are narrow proxy-internal optimizations that never leak conditional behavior back to the client.
+
+#### 1. Client-supplied conditional headers (pass-through)
+
+Requests on the GET/HEAD path without a `Range` header that carry `If-Match`, `If-None-Match`, `If-Modified-Since`, or `If-Unmodified-Since` are forwarded to S3 with the client's headers intact. S3 is the sole judge. The proxy takes cache action based only on S3's response:
+
+| S3 response | Action | Cache |
+|---|---|---|
+| 200 OK | Stream data to client, cache new data | Old data invalidated |
+| 304 Not Modified | Return 304 to client, refresh TTL | Valid |
+| 412 Precondition Failed | Return 412 to client | Unchanged |
+| 403 / 401 | Return error to client | Unchanged (credentials ≠ data change) |
+
+Range requests with client conditional headers are handled by the range-merge path, which preserves the client's conditional headers exactly on every outbound S3 fetch.
+
+#### 2. TTL-expired revalidation (proxy-injected `If-None-Match` + `If-Modified-Since`)
+
+When cached data is accessed past its TTL under lazy expiration, the proxy issues a conditional GET with the cached ETag and Last-Modified to save bandwidth on unchanged objects:
+
+```
+Expired cache entry → Proxy sends If-None-Match: <etag> + If-Modified-Since: <lm>
+  → 304: refresh TTL, serve cached data
+  → 200: invalidate old cache, fetch fresh, cache new
+  → 403/401: surface error, keep cache (credentials issue)
+```
+
+This matches RFC 7232 §3.2 and saves egress when objects are immutable. The client never sees the injected headers and never sees a 304 caused by revalidation (they see fresh data or cached data equivalently).
+
+#### 3. Partial-cache merge (proxy-injected `If-Match`, with 412-retry)
+
+When only some bytes of a requested range are cached and the rest must be fetched from S3, the proxy protects the merge against mid-flight object changes by injecting `If-Match: <cached-etag>` on the S3 sub-fetch (unless the client already supplied `If-Match`):
+
+```
+Partial cache hit → Fetch missing bytes with injected If-Match
+  → 200/206: merge cached + fresh bytes, serve, cache missing
+  → 412: object changed on S3 → invalidate all cached ranges for the key,
+         retry the fetch once WITHOUT the injected If-Match, serve fresh data
+```
+
+The client never sees the 412 caused by the proxy-injected header. A client-supplied `If-Match` is always preserved verbatim and its 412 is passed through.
 
 ### Supported Conditional Headers
 
-The proxy detects and forwards all standard HTTP conditional headers:
-
-- **If-Match**: Forwards to S3, lets S3 validate ETag matches
-- **If-None-Match**: Forwards to S3, lets S3 validate ETag mismatches  
-- **If-Modified-Since**: Forwards to S3, lets S3 validate modification time
-- **If-Unmodified-Since**: Forwards to S3, lets S3 validate modification time
-
-### Behavior Changes
-
-**Previous Behavior (Incorrect)**:
-- Proxy would compare client conditional headers against cached metadata
-- Proxy would return 412 Precondition Failed immediately for If-Match mismatches
-- Proxy would invalidate cache based on client header values
-- Could lead to incorrect responses when cached metadata was stale
-
-**New Behavior (Correct)**:
-- ALL conditional requests are forwarded to S3 with original client headers
-- S3 makes the authoritative decision about condition evaluation
-- Cache is managed based solely on S3's response, not client headers
-- Ensures perfect HTTP semantics and eliminates edge cases
-
-### Cache Management Based on S3 Response
-
-| S3 Response | Action | Cache Invalidation |
-|-------------|--------|-------------------|
-| 200 OK | Return data to client, cache new data | Yes - old data invalidated |
-| 304 Not Modified | Return 304 to client, refresh TTL | No - cache remains valid |
-| 412 Precondition Failed | Return 412 to client | No - cache unchanged |
-
-### Benefits
-
-1. **Perfect HTTP Compliance**: S3 handles all conditional logic according to HTTP standards
-2. **Eliminates Edge Cases**: No risk of proxy making incorrect decisions
-3. **Transparent Operation**: Clients receive the same responses as direct S3 access
-4. **Cache Consistency**: Cache is only invalidated when S3 confirms data is stale
-5. **Simplified Logic**: Proxy acts as transparent forwarder for conditional requests
+All four standard headers from RFC 7232 are detected and forwarded: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`. S3 evaluates precedence per RFC 7232 §6; the proxy does not re-evaluate.
 
 ### Performance Impact
 
-- **Minimal Overhead**: Conditional header detection adds <1ms per request
-- **Optimized for Common Cases**: Non-conditional requests use existing fast paths
-- **S3 Request Efficiency**: Only forwards when client provides conditional headers
-- **Cache Efficiency**: Preserves cache when S3 returns 304 or 412 responses
+- Conditional-header detection adds <1 ms per request.
+- Non-conditional requests use the existing cache fast paths.
+- 304 responses from revalidation save the full response body transfer.
+- 412 responses on a proxy-injected `If-Match` incur one extra S3 round-trip (the retry), but only on the rare case that an object changed on S3 mid-partial-merge.
 
 ### Logging
 
-Conditional request handling is logged at INFO level for observability:
-
 ```
-INFO Conditional request forwarded to S3: method=GET path=/bucket/object.txt 
-     headers="If-Match: \"abc123\"" cache_key=/bucket/object.txt
-
-INFO S3 conditional response: method=GET path=/bucket/object.txt status=304 
-     cache_action="TTL refreshed" cache_key=/bucket/object.txt
-
-INFO S3 conditional response: method=GET path=/bucket/object.txt status=200 
-     cache_action="invalidated and updated" cache_key=/bucket/object.txt
-
-INFO S3 conditional response: method=GET path=/bucket/object.txt status=412 
-     cache_action="no change" cache_key=/bucket/object.txt
+INFO Forwarding conditional request to S3: method=GET path=/bucket/obj conditional_headers=[if-match="abc"]
+INFO S3 conditional response: method=GET path=/bucket/obj status=304 cache_action="TTL refreshed"
+INFO S3 conditional response: method=GET path=/bucket/obj status=200 cache_action="invalidated and updated"
+INFO S3 conditional response: method=GET path=/bucket/obj status=412 cache_action="no change"
+WARN S3 returned 412 on proxy-injected If-Match; invalidating cache and retrying without If-Match: cache_key=/bucket/obj
 ```
 
-**Log Fields:**
-- **method**: HTTP method (GET, HEAD)
-- **path**: Request path
-- **headers**: Conditional headers detected (sanitized for logging)
-- **status**: S3 response status code
-- **cache_action**: Action taken on cache based on S3 response
-- **cache_key**: Cache key for the object
 
 ## Cache Types
 
@@ -1435,6 +1448,16 @@ Both the streaming path (ranges >= 1 MiB) and the buffered path (ranges < 1 MiB)
 The proxy implements intelligent range merging to optimize partial cache hits. When a GET request requires bytes that are partially cached (some bytes in cache, some missing), the system serves cached portions and only fetches missing bytes from S3, then merges them into a complete response.
 
 **Range Merge Optimization**: Simple cache hits (where the requested range exactly matches or is fully contained within a single cached range) bypass merge operations entirely, eliminating unnecessary processing overhead.
+
+#### Full-Object GETs with Partial Cache Coverage
+
+A GET without a `Range` header whose cache has partial coverage can also benefit from the merge path. The proxy synthesizes `Range: bytes=0-{total_size-1}` and routes through the same merge machinery, subject to three hard-coded gates:
+
+1. **Signature preservation**: `range` must not appear in the request's SigV4 SignedHeaders. AWS SDKs do not sign `Range` when no `Range` header is present, so the common hot path passes this gate.
+2. **Cached fraction ≥ 10 %**: sum of cached range bytes must be at least 10 % of `total_size`.
+3. **Object size ≤ 128 MiB**: the merge path buffers the reconstructed response; a 128 MiB cap avoids memory pressure. Larger objects fall through to an unconditional S3 fetch as before.
+
+If any gate fails, the request falls through to an unconditional S3 fetch (pre-1.14.0 behavior). These thresholds are fixed in code, not exposed in configuration.
 
 #### How Range Merging Works
 
@@ -2195,6 +2218,14 @@ The proxy intelligently bypasses cache for S3 operations that return dynamic or 
 - **GetObjectRetention** (query parameter: `retention`)
 - **GetObjectTagging** (query parameter: `tagging`)
 - **GetObjectTorrent** (query parameter: `torrent`)
+
+**Operations with Customer-Provided Encryption Keys** (always bypass):
+- Any GET, HEAD, or PUT carrying any of the SSE-C request headers:
+  - `x-amz-server-side-encryption-customer-algorithm`
+  - `x-amz-server-side-encryption-customer-key`
+  - `x-amz-server-side-encryption-customer-key-md5`
+
+  The proxy has no way to decrypt SSE-C data, and the cache key is path-only — caching plaintext obtained under one key and serving it under a different (or missing) key would leak data. SSE-C requests are forwarded to S3 verbatim, and S3 enforces key matching end-to-end. Existing non-SSE-C cache entries for a path remain; an SSE-C request to that same path goes straight to S3 and S3's response determines what the client sees.
 
 **Part Operations** (cached):
 - **GetObjectPart** (query parameter: `partNumber`) - Cached as ranges using existing range storage architecture

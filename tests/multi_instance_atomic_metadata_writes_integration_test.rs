@@ -233,6 +233,7 @@ fn create_test_cache_config(cache_dir: std::path::PathBuf) -> CacheConfig {
         read_cache_enabled: true,
         bucket_settings_staleness_threshold: Duration::from_secs(60),
         download_coordination: s3_proxy::config::DownloadCoordinationConfig::default(),
+        evaluate_conditions_from_cache: false,
     }
 }
 

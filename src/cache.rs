@@ -617,6 +617,7 @@ impl CacheManager {
             true,                                          // Default read cache enabled
             std::time::Duration::from_secs(60),            // Default 60s bucket settings staleness
             1_048_576,                                     // Default 1 MiB compression batch size
+            false,                                         // Default: don't evaluate conditions from cache
         )
     }
 
@@ -643,6 +644,7 @@ impl CacheManager {
         read_cache_enabled: bool,
         bucket_settings_staleness_threshold: std::time::Duration,
         compression_batch_size: usize,
+        evaluate_conditions_from_cache: bool,
     ) -> Self {
         let mut ram_cache_manager = RamCacheManager::default();
         ram_cache_manager.max_size = max_ram_cache_size;
@@ -684,6 +686,7 @@ impl CacheManager {
             write_cache_enabled,
             compression_enabled,
             ram_cache_enabled,
+            evaluate_conditions_from_cache,
         };
         let bucket_settings_manager = Arc::new(
             crate::bucket_settings::BucketSettingsManager::new(
@@ -1013,6 +1016,7 @@ impl CacheManager {
             compression_batch_size: 1_048_576, // 1 MiB
             read_cache_enabled: true, // Default enabled
             bucket_settings_staleness_threshold: std::time::Duration::from_secs(60), // Default 60s
+            evaluate_conditions_from_cache: false, // Default: strict always-forward
         };
 
         // Create coordinator

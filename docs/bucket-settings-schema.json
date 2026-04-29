@@ -44,6 +44,10 @@
       "type": "boolean",
       "description": "Whether range data from this bucket can be stored in RAM cache. Set to false to reserve RAM cache for higher-priority buckets. Automatically forced to false when get_ttl is \"0s\" or read_cache_enabled is false. Default: true."
     },
+    "evaluate_conditions_from_cache": {
+      "type": "boolean",
+      "description": "Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since) against cached metadata instead of forwarding to S3. When true, the proxy returns 304/412/200 locally from unexpired cache; when false (default), all conditional requests are forwarded to S3 for strict RFC 7232 semantics. Falls back to forward when cache metadata is expired or missing validators."
+    },
     "prefix_overrides": {
       "type": "array",
       "description": "Per-prefix settings overrides within this bucket. When a request path matches a prefix, the prefix settings take precedence over bucket-level settings. If multiple prefixes match, the longest (most specific) prefix wins.",
@@ -95,6 +99,10 @@
         "ram_cache_eligible": {
           "type": "boolean",
           "description": "RAM cache eligibility for this prefix."
+        },
+        "evaluate_conditions_from_cache": {
+          "type": "boolean",
+          "description": "Evaluate client conditional headers locally against cached metadata for this prefix. See top-level field for full semantics."
         }
       }
     }

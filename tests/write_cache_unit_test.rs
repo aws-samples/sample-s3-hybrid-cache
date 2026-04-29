@@ -44,6 +44,7 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     // Test data
@@ -135,6 +136,7 @@ async fn test_upload_state_is_complete() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/complete-state.txt";
@@ -204,6 +206,7 @@ async fn test_put_ttl_is_used_for_expiration() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/ttl-test.txt";
@@ -302,6 +305,7 @@ async fn test_put_cached_objects_not_in_ram_cache() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/no-ram-cache.txt";
@@ -375,6 +379,7 @@ async fn test_put_storage_with_headers() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/with-headers.txt";
@@ -445,6 +450,7 @@ async fn test_multiple_put_operations_same_key() {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/overwrite-test.txt";

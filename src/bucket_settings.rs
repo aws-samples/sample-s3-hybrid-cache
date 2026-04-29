@@ -125,13 +125,17 @@ pub struct BucketSettings {
     /// Whether range data from this bucket can be stored in RAM cache
     pub ram_cache_eligible: Option<bool>,
 
+    /// Evaluate client conditional headers against cached metadata instead of forwarding
+    /// to S3. See `CacheConfig::evaluate_conditions_from_cache` for full semantics.
+    pub evaluate_conditions_from_cache: Option<bool>,
+
     /// Per-prefix overrides within this bucket
     #[serde(default)]
     pub prefix_overrides: Vec<PrefixOverride>,
 }
 
 /// Per-prefix settings override within a bucket.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct PrefixOverride {
     /// Prefix path (e.g., "/temp/", "/static/assets/")
     pub prefix: String,
@@ -164,6 +168,7 @@ pub struct PrefixOverride {
     pub write_cache_enabled: Option<bool>,
     pub compression_enabled: Option<bool>,
     pub ram_cache_eligible: Option<bool>,
+    pub evaluate_conditions_from_cache: Option<bool>,
 }
 
 /// Fully resolved settings for a specific bucket+path combination.
@@ -177,6 +182,7 @@ pub struct ResolvedSettings {
     pub write_cache_enabled: bool,
     pub compression_enabled: bool,
     pub ram_cache_eligible: bool,
+    pub evaluate_conditions_from_cache: bool,
     /// Tracks which level provided the settings
     pub source: SettingsSource,
 }
@@ -199,6 +205,7 @@ pub struct GlobalDefaults {
     pub write_cache_enabled: bool,
     pub compression_enabled: bool,
     pub ram_cache_enabled: bool,
+    pub evaluate_conditions_from_cache: bool,
 }
 
 /// Cached bucket settings entry with load timestamp and fallback.
@@ -539,6 +546,11 @@ impl BucketSettingsManager {
             .or(settings.and_then(|s| s.ram_cache_eligible))
             .unwrap_or(g.ram_cache_enabled);
 
+        let evaluate_conditions_from_cache = prefix_match
+            .and_then(|po| po.evaluate_conditions_from_cache)
+            .or(settings.and_then(|s| s.evaluate_conditions_from_cache))
+            .unwrap_or(g.evaluate_conditions_from_cache);
+
         // Enforce invariants after cascade:
         // - Zero get_ttl → RAM range cache ineligible (RAM cache bypasses revalidation)
         // - Read cache disabled → RAM range cache ineligible
@@ -560,6 +572,7 @@ impl BucketSettingsManager {
             write_cache_enabled,
             compression_enabled,
             ram_cache_eligible,
+            evaluate_conditions_from_cache,
             source: source.clone(),
         };
 
@@ -585,6 +598,7 @@ impl BucketSettingsManager {
             || s.write_cache_enabled.is_some()
             || s.compression_enabled.is_some()
             || s.ram_cache_eligible.is_some()
+            || s.evaluate_conditions_from_cache.is_some()
             || !s.prefix_overrides.is_empty()
     }
 }
@@ -638,6 +652,7 @@ mod tests {
                     write_cache_enabled: None,
                     compression_enabled: None,
                     ram_cache_eligible: None,
+                    evaluate_conditions_from_cache: None,
                 },
                 PrefixOverride {
                     prefix: "/static/assets/".to_string(),
@@ -648,6 +663,7 @@ mod tests {
                     write_cache_enabled: None,
                     compression_enabled: None,
                     ram_cache_eligible: None,
+                    evaluate_conditions_from_cache: None,
                 },
             ],
             ..Default::default()
@@ -667,6 +683,7 @@ mod tests {
                 write_cache_enabled: None,
                 compression_enabled: None,
                 ram_cache_eligible: None,
+                evaluate_conditions_from_cache: None,
             }],
             ..Default::default()
         };
@@ -688,6 +705,7 @@ mod tests {
                 write_cache_enabled: None,
                 compression_enabled: None,
                 ram_cache_eligible: None,
+                evaluate_conditions_from_cache: None,
             }],
             ..Default::default()
         };
@@ -708,6 +726,7 @@ mod tests {
                     write_cache_enabled: None,
                     compression_enabled: None,
                     ram_cache_eligible: None,
+                    evaluate_conditions_from_cache: None,
                 },
                 PrefixOverride {
                     prefix: "/valid/".to_string(),
@@ -718,6 +737,7 @@ mod tests {
                     write_cache_enabled: None,
                     compression_enabled: None,
                     ram_cache_eligible: None,
+                    evaluate_conditions_from_cache: None,
                 },
                 PrefixOverride {
                     prefix: "no-slash".to_string(),
@@ -728,6 +748,7 @@ mod tests {
                     write_cache_enabled: None,
                     compression_enabled: None,
                     ram_cache_eligible: None,
+                    evaluate_conditions_from_cache: None,
                 },
             ],
             ..Default::default()
@@ -754,6 +775,7 @@ mod tests {
                 write_cache_enabled: None,
                 compression_enabled: None,
                 ram_cache_eligible: None,
+                evaluate_conditions_from_cache: None,
             }],
             ..Default::default()
         };
@@ -800,6 +822,7 @@ mod tests {
             write_cache_enabled: true,
             compression_enabled: true,
             ram_cache_enabled: true,
+            evaluate_conditions_from_cache: false,
         }
     }
 

@@ -1980,6 +1980,9 @@ impl RangeHandler {
                         "Range".to_string(),
                         format!("bytes={}-{}", range_spec.start, range_spec.end),
                     );
+                    // Strip the proxy's internal sentinels before sending to S3.
+                    s3_headers.remove("x-proxy-injected-if-match");
+                    s3_headers.remove("x-proxy-injected-if-unmodified-since");
 
                     let mut context = crate::s3_client::build_s3_request_context(
                         hyper::Method::GET,
@@ -2260,6 +2263,9 @@ impl RangeHandler {
             "range".to_string(),
             format!("bytes={}-{}", requested_range.start, requested_range.end),
         );
+        // Strip the proxy's internal sentinels before sending to S3.
+        s3_headers.remove("x-proxy-injected-if-match");
+        s3_headers.remove("x-proxy-injected-if-unmodified-since");
 
         let mut context = crate::s3_client::build_s3_request_context(
             hyper::Method::GET,

@@ -67,6 +67,7 @@ impl Arbitrary for ArbitraryPrefixOverride {
             write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
             compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
             ram_cache_eligible: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+            evaluate_conditions_from_cache: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
         })
     }
 }
@@ -97,6 +98,7 @@ impl Arbitrary for ArbitraryBucketSettings {
             write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
             compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
             ram_cache_eligible: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+            evaluate_conditions_from_cache: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
             prefix_overrides,
         })
     }
@@ -183,6 +185,7 @@ impl Arbitrary for ArbitraryInvalidBucketSettings {
             write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
             compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
             ram_cache_eligible: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+            evaluate_conditions_from_cache: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
         };
 
         let insert_pos = if overrides.is_empty() {
@@ -252,6 +255,7 @@ impl Arbitrary for ArbitraryGlobalDefaults {
             write_cache_enabled: bool::arbitrary(g),
             compression_enabled: bool::arbitrary(g),
             ram_cache_enabled: bool::arbitrary(g),
+            evaluate_conditions_from_cache: bool::arbitrary(g),
         })
     }
 }
@@ -542,6 +546,7 @@ impl Arbitrary for ArbitraryZeroTtlInput {
                         write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
                         compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
                         ram_cache_eligible: Some(true), // explicitly true to test override
+                        evaluate_conditions_from_cache: None,
                     };
                     bucket_settings.prefix_overrides.push(po);
                 } else {
@@ -735,6 +740,7 @@ impl Arbitrary for ArbitraryReadCacheDisabledInput {
                         write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
                         compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
                         ram_cache_eligible: Some(true), // explicitly true to test override
+                        evaluate_conditions_from_cache: None,
                     };
                     // Ensure non-zero get_ttl on the new prefix
                     bucket_settings.prefix_overrides.push(po);
@@ -921,6 +927,7 @@ impl Arbitrary for ArbitraryLongestPrefixInput {
             write_cache_enabled: None,
             compression_enabled: None,
             ram_cache_eligible: None,
+            evaluate_conditions_from_cache: None,
         };
 
         let long_override = PrefixOverride {
@@ -932,6 +939,7 @@ impl Arbitrary for ArbitraryLongestPrefixInput {
             write_cache_enabled: None,
             compression_enabled: None,
             ram_cache_eligible: None,
+            evaluate_conditions_from_cache: None,
         };
 
         // Randomize the order of prefix overrides to ensure ordering doesn't matter
@@ -950,6 +958,7 @@ impl Arbitrary for ArbitraryLongestPrefixInput {
             write_cache_enabled: None,
             compression_enabled: None,
             ram_cache_eligible: None,
+            evaluate_conditions_from_cache: None,
             prefix_overrides,
         };
 

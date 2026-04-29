@@ -174,6 +174,70 @@ pub fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
     Some((start, end, total))
 }
 
+/// Result of evaluating client conditional headers against cached metadata
+/// in Mode B (`evaluate_conditions_from_cache = true`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalEvalResult {
+    /// All preconditions passed; caller should serve from cache.
+    Fresh,
+    /// 304 Not Modified — caller should return 304 with appropriate headers.
+    NotModified,
+    /// 412 Precondition Failed — caller should return 412.
+    PreconditionFailed,
+    /// Cache data insufficient to decide (missing ETag or Last-Modified, unparseable
+    /// date, etc.). Caller should fall back to Mode A (forward to S3).
+    FallbackToForward,
+}
+
+/// Strong ETag comparison per RFC 7232 §2.3.2.
+///
+/// Strong match requires both tags to be strong (not prefixed with `W/`) and to
+/// match character-by-character. `*` matches any current representation.
+///
+/// Tolerance note: RFC 7232 requires etags on the wire to be quoted
+/// (`"opaque"`), but some clients (notably AWS CLI v2's `--if-match` /
+/// `--if-none-match` flags) strip the quotes before sending the header. We
+/// normalize by stripping a single pair of surrounding double-quotes from
+/// either side before comparison, so a client-supplied `abc` matches a cached
+/// `"abc"` and vice versa.
+fn etag_strong_match(client: &str, cached: &str) -> bool {
+    let client_trim = client.trim();
+    if client_trim == "*" {
+        return true;
+    }
+    // Strong requires no W/ prefix on either side
+    if client_trim.starts_with("W/") || cached.starts_with("W/") {
+        return false;
+    }
+    strip_etag_quotes(client_trim) == strip_etag_quotes(cached)
+}
+
+/// Weak ETag comparison per RFC 7232 §2.3.2.
+///
+/// Weak match compares opaque-tag values, ignoring the `W/` prefix on either side.
+/// `*` matches any current representation. Surrounding double-quotes are stripped
+/// on both sides (see `etag_strong_match` for tolerance rationale).
+fn etag_weak_match(client: &str, cached: &str) -> bool {
+    let client_trim = client.trim();
+    if client_trim == "*" {
+        return true;
+    }
+    let client_opaque = client_trim.strip_prefix("W/").unwrap_or(client_trim);
+    let cached_opaque = cached.strip_prefix("W/").unwrap_or(cached);
+    strip_etag_quotes(client_opaque) == strip_etag_quotes(cached_opaque)
+}
+
+/// Strip a single pair of surrounding double-quotes, if present.
+///
+/// `"abc"` -> `abc`, `abc` -> `abc`, `"` -> `"`, `""` -> empty.
+fn strip_etag_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 /// Conditionally add a Referer header for proxy identification in S3 Server Access Logs.
 ///
 /// Adds the header only when:
@@ -369,6 +433,7 @@ impl HttpProxy {
             config.cache.read_cache_enabled,
             config.cache.bucket_settings_staleness_threshold,
             config.cache.compression_batch_size,
+            config.cache.evaluate_conditions_from_cache,
         ));
 
         // Create S3 client (metrics will be set later via set_metrics_manager)
@@ -1045,6 +1110,36 @@ impl HttpProxy {
         }
     }
 
+    /// Detect SSE-C (server-side encryption with customer-provided keys) headers.
+    ///
+    /// Returns `true` if any of the three SSE-C request headers is present:
+    ///   - `x-amz-server-side-encryption-customer-algorithm`
+    ///   - `x-amz-server-side-encryption-customer-key`
+    ///   - `x-amz-server-side-encryption-customer-key-md5`
+    ///
+    /// Presence of any one is sufficient. Header name matching is case-insensitive
+    /// per RFC 9110. Header values are not inspected — the proxy does not handle
+    /// the encryption key, it only routes the request.
+    ///
+    /// SSE-C requests must bypass the cache entirely:
+    ///   - GET/HEAD: the proxy cannot decrypt, and caching plaintext obtained via a
+    ///     different SSE-C key would leak data to callers presenting a different or
+    ///     no SSE-C key.
+    ///   - PUT: response body is just the object metadata, but caching write-through
+    ///     plaintext for SSE-C PUTs would leak data on later GETs.
+    ///
+    /// Because SSE-C headers are always in SignedHeaders (AWS SDKs include them in
+    /// every SSE-C request), S3 enforces the key match end-to-end. The proxy's role
+    /// is simply to forward verbatim and never serve cached data for these requests.
+    pub fn has_sse_c_headers(headers: &HashMap<String, String>) -> bool {
+        headers.keys().any(|k| {
+            let k_lower = k.to_ascii_lowercase();
+            k_lower == "x-amz-server-side-encryption-customer-algorithm"
+                || k_lower == "x-amz-server-side-encryption-customer-key"
+                || k_lower == "x-amz-server-side-encryption-customer-key-md5"
+        })
+    }
+
     /// Determine if a request should bypass cache based on S3 operation type
     ///
     /// Returns (should_bypass, operation_type, reason)
@@ -1168,6 +1263,98 @@ impl HttpProxy {
             || headers.contains_key("if-unmodified-since")
     }
 
+    /// Evaluate client conditional headers against cached metadata (Mode B).
+    ///
+    /// Called only when `evaluate_conditions_from_cache` is enabled and the cache has
+    /// unexpired data for the key. Follows the RFC 7232 §6 precedence order:
+    ///
+    /// 1. If-Match present → strong compare cached ETag. Mismatch → 412.
+    /// 2. If-Match absent and If-Unmodified-Since present → compare Last-Modified.
+    ///    Cached Last-Modified later than provided → 412.
+    /// 3. If-None-Match present → weak compare cached ETag. Match → 304 for GET/HEAD,
+    ///    412 for other methods.
+    /// 4. If-None-Match absent and If-Modified-Since present (GET/HEAD only) →
+    ///    compare Last-Modified. Not modified since provided → 304.
+    ///
+    /// Returns `FallbackToForward` if required validators are missing from cache.
+    /// Returns `Fresh` if all preconditions pass (caller should serve from cache).
+    fn evaluate_client_conditions_against_cache(
+        method: &Method,
+        client_headers: &HashMap<String, String>,
+        cached_etag: Option<&str>,
+        cached_last_modified: Option<&str>,
+    ) -> ConditionalEvalResult {
+        let cached_etag = cached_etag.unwrap_or("");
+        let cached_last_modified = cached_last_modified.unwrap_or("");
+
+        // RFC 7232 §6 precedence
+
+        // Step 1: If-Match
+        if let Some(if_match) = client_headers.get("if-match") {
+            if cached_etag.is_empty() {
+                return ConditionalEvalResult::FallbackToForward;
+            }
+            if !etag_strong_match(if_match, cached_etag) {
+                return ConditionalEvalResult::PreconditionFailed;
+            }
+            // Fall through — If-Match matched, continue to step 3 (skip If-Unmodified-Since per §6)
+        } else if let Some(ius) = client_headers.get("if-unmodified-since") {
+            // Step 2: If-Unmodified-Since (only if If-Match absent)
+            if cached_last_modified.is_empty() {
+                return ConditionalEvalResult::FallbackToForward;
+            }
+            match (
+                httpdate::parse_http_date(cached_last_modified),
+                httpdate::parse_http_date(ius),
+            ) {
+                (Ok(cache_time), Ok(request_time)) => {
+                    if cache_time > request_time {
+                        return ConditionalEvalResult::PreconditionFailed;
+                    }
+                }
+                _ => return ConditionalEvalResult::FallbackToForward,
+            }
+        }
+
+        // Step 3: If-None-Match
+        if let Some(if_none_match) = client_headers.get("if-none-match") {
+            if cached_etag.is_empty() {
+                return ConditionalEvalResult::FallbackToForward;
+            }
+            if etag_weak_match(if_none_match, cached_etag) {
+                if *method == Method::GET || *method == Method::HEAD {
+                    return ConditionalEvalResult::NotModified;
+                } else {
+                    return ConditionalEvalResult::PreconditionFailed;
+                }
+            }
+            // Fall through — no match, proceed (skip If-Modified-Since per §6)
+            return ConditionalEvalResult::Fresh;
+        } else if let Some(ims) = client_headers.get("if-modified-since") {
+            // Step 4: If-Modified-Since (GET/HEAD only, If-None-Match absent)
+            if *method != Method::GET && *method != Method::HEAD {
+                // Ignore per RFC 7232 §3.3
+                return ConditionalEvalResult::Fresh;
+            }
+            if cached_last_modified.is_empty() {
+                return ConditionalEvalResult::FallbackToForward;
+            }
+            match (
+                httpdate::parse_http_date(cached_last_modified),
+                httpdate::parse_http_date(ims),
+            ) {
+                (Ok(cache_time), Ok(request_time)) => {
+                    if cache_time <= request_time {
+                        return ConditionalEvalResult::NotModified;
+                    }
+                }
+                _ => return ConditionalEvalResult::FallbackToForward,
+            }
+        }
+
+        ConditionalEvalResult::Fresh
+    }
+
     /// Detect GetObjectPart requests and extract part number
     ///
     /// Returns Some(part_number) if:
@@ -1230,10 +1417,40 @@ impl HttpProxy {
         let headers = req.headers();
 
         // Convert headers to HashMap for easier processing
-        let header_map: HashMap<String, String> = headers
+        let mut header_map: HashMap<String, String> = headers
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
+
+        // SSE-C bypass: any request carrying customer-provided encryption key headers
+        // must not consult or populate the cache. The proxy cannot decrypt SSE-C data,
+        // and the cache key is path-only — caching plaintext obtained under one key and
+        // serving it under a different (or missing) key would leak data. S3 enforces
+        // the key end-to-end because SSE-C headers are in SignedHeaders. Forward
+        // verbatim to S3 with no cache lookup, no cache write, no merge.
+        if Self::has_sse_c_headers(&header_map) {
+            info!(
+                "Cache bypass: SSE-C request forwarded to S3 without caching: method={} path={}",
+                method, path
+            );
+            if let Some(metrics_mgr) = metrics_manager.clone() {
+                let reason = "sse-c".to_string();
+                tokio::spawn(async move {
+                    let mgr = metrics_mgr.read().await;
+                    mgr.record_cache_bypass(&reason).await;
+                });
+            }
+            return Self::forward_get_head_to_s3_without_caching(
+                method,
+                uri,
+                host,
+                header_map,
+                s3_client,
+                Some("SSE-C"),
+                proxy_referer,
+            )
+            .await;
+        }
 
         // Check for cache bypass headers (Cache-Control: no-cache/no-store, Pragma: no-cache)
         // Requirements: 1.1, 1.2, 2.1, 2.2, 3.1, 3.2
@@ -1327,13 +1544,11 @@ impl HttpProxy {
             }
         }
 
-        // Check for Range header first - range requests should be handled by range logic even if they have conditional headers
-        let has_range_header = headers.get("range").is_some();
-
-        // Check for conditional headers - Requirements 1.1, 2.1, 3.1, 4.1, 5.1, 5.2, 5.3
-        // But only route to conditional path if this is NOT a range request
-        if Self::has_conditional_headers(&header_map) && !has_range_header {
-            // Requirement 8.1: Log when conditional request is forwarded to S3 with the conditional headers
+        // Check for conditional headers — RFC 7232 semantics apply to range and
+        // non-range requests uniformly. Per cache config, handle either by forwarding
+        // to S3 (Mode A, default) or by evaluating against cached metadata (Mode B).
+        if Self::has_conditional_headers(&header_map) {
+            // Log conditional headers for observability
             let conditional_headers: Vec<String> = header_map
                 .iter()
                 .filter(|(k, _)| {
@@ -1346,18 +1561,23 @@ impl HttpProxy {
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
 
-            info!(
-                "Forwarding conditional request to S3: method={} path={} conditional_headers=[{}]",
-                method,
-                path,
-                conditional_headers.join(", ")
-            );
-
             // Generate cache key for conditional request handling
             let cache_key = CacheManager::generate_cache_key(path, Some(&host));
 
-            // Record HEAD cache bypass metrics for conditional headers - Requirement 8.4: Include HEAD request bypasses in statistics
-            if method == Method::HEAD {
+            // Resolve per-bucket/prefix setting for condition-evaluation mode.
+            let resolved_settings = cache_manager.resolve_settings(path).await;
+            let mode_b = resolved_settings.evaluate_conditions_from_cache;
+
+            info!(
+                "Conditional request: method={} path={} mode={} conditional_headers=[{}]",
+                method,
+                path,
+                if mode_b { "evaluate-from-cache" } else { "forward-to-s3" },
+                conditional_headers.join(", ")
+            );
+
+            // Record HEAD cache bypass metric for Mode A (we won't look up RAM cache)
+            if method == Method::HEAD && !mode_b {
                 if let Some(metrics_mgr) = metrics_manager.clone() {
                     let bypass_reason = "conditional headers - bypass RAM cache".to_string();
                     tokio::spawn(async move {
@@ -1367,18 +1587,134 @@ impl HttpProxy {
                 }
             }
 
-            // Always forward conditional requests to S3 with proper cache management - Requirements 5.1, 5.3, 6.1, 6.2, 6.3
-            return Self::forward_conditional_request_to_s3(
-                method,
-                uri,
-                host,
-                header_map,
-                cache_key,
-                cache_manager,
-                s3_client,
-                proxy_referer,
-            )
-            .await;
+            // Mode B: evaluate conditions against cached metadata when possible.
+            // Set to true when the evaluator returns Fresh; we then fall through to the
+            // normal cache-hit path. Other outcomes either return early (412/304) or
+            // leave this false so we forward to S3 below.
+            let mut mode_b_fresh = false;
+            if mode_b {
+                // Load metadata (RAM-cached fast path).
+                let cached_metadata = cache_manager.get_metadata_cached(&cache_key).await.ok().flatten();
+                if let Some(meta) = cached_metadata.as_ref() {
+                    // Check freshness: only evaluate from cache if object is unexpired.
+                    // For HEAD requests use head expiration; for GET use object expiration.
+                    let is_fresh = if method == Method::HEAD {
+                        !meta.is_head_expired()
+                    } else {
+                        meta.expires_at > std::time::SystemTime::now()
+                    };
+                    if is_fresh {
+                        let etag = if meta.object_metadata.etag.is_empty() {
+                            None
+                        } else {
+                            Some(meta.object_metadata.etag.as_str())
+                        };
+                        let last_modified = if meta.object_metadata.last_modified.is_empty() {
+                            None
+                        } else {
+                            Some(meta.object_metadata.last_modified.as_str())
+                        };
+                        let result = Self::evaluate_client_conditions_against_cache(
+                            &method,
+                            &header_map,
+                            etag,
+                            last_modified,
+                        );
+                        match result {
+                            ConditionalEvalResult::PreconditionFailed => {
+                                info!(
+                                    "Mode B: precondition failed locally, returning 412: cache_key={}",
+                                    cache_key
+                                );
+                                return Ok(Self::build_error_response(
+                                    StatusCode::PRECONDITION_FAILED,
+                                    "PreconditionFailed",
+                                    "At least one of the preconditions you specified did not hold.",
+                                    None,
+                                ));
+                            }
+                            ConditionalEvalResult::NotModified => {
+                                info!(
+                                    "Mode B: not modified locally, returning 304: cache_key={}",
+                                    cache_key
+                                );
+                                let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+                                if !meta.object_metadata.etag.is_empty() {
+                                    builder = builder.header("etag", &meta.object_metadata.etag);
+                                }
+                                if !meta.object_metadata.last_modified.is_empty() {
+                                    builder = builder
+                                        .header("last-modified", &meta.object_metadata.last_modified);
+                                }
+                                let response = builder
+                                    .body(
+                                        Full::new(Bytes::new())
+                                            .map_err(|never| match never {})
+                                            .boxed(),
+                                    )
+                                    .unwrap();
+                                return Ok(response);
+                            }
+                            ConditionalEvalResult::Fresh => {
+                                // All preconditions passed. Strip the conditional headers from
+                                // the local header_map so the downstream non-conditional path
+                                // serves from cache without re-routing. Downstream code reads
+                                // conditional headers from header_map, not from req.headers(),
+                                // so we don't need to mutate req.
+                                info!(
+                                    "Mode B: conditions met locally, serving from cache: cache_key={}",
+                                    cache_key
+                                );
+                                header_map.remove("if-match");
+                                header_map.remove("if-none-match");
+                                header_map.remove("if-modified-since");
+                                header_map.remove("if-unmodified-since");
+                                mode_b_fresh = true;
+                            }
+                            ConditionalEvalResult::FallbackToForward => {
+                                debug!(
+                                    "Mode B: cache data insufficient, falling back to Mode A forward: cache_key={}",
+                                    cache_key
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            "Mode B: cached metadata present but expired, falling back to forward: cache_key={}",
+                            cache_key
+                        );
+                    }
+                } else {
+                    debug!(
+                        "Mode B: no cached metadata, falling back to forward: cache_key={}",
+                        cache_key
+                    );
+                }
+            }
+
+            if !mode_b_fresh {
+                // Mode A (default) or Mode B FallbackToForward: forward to S3.
+                //
+                // For range requests with conditional headers we still forward, but the
+                // response is NOT cached by the conditional-forward path because
+                // cache_response_appropriately assumes the body is a full object.
+                // This sacrifices some cache population in the rare case of a range GET
+                // with client conditional headers; the next non-conditional range request
+                // populates the cache as usual.
+                return Self::forward_conditional_request_to_s3(
+                    method,
+                    uri,
+                    host,
+                    header_map,
+                    cache_key,
+                    cache_manager,
+                    s3_client,
+                    proxy_referer,
+                )
+                .await;
+            }
+            // else: fall through to non-conditional handling, which will find the
+            // cached entry and serve it.
         }
 
         // Parse query parameters from URI - Requirement 7.1
@@ -2083,9 +2419,122 @@ impl HttpProxy {
                                 .await;
                             }
                         }
-                        Ok(_) => {
-                            // Partial cache coverage - fall through to S3
-                            debug!("Partial cache coverage for full object: {}", cache_key);
+                        Ok(overlap) => {
+                            // Partial cache coverage for a full-object (no-Range) GET.
+                            // If the cached fraction is material and the total size fits
+                            // in memory for buffered merge, synthesize a Range and route
+                            // through the partial-merge path to fetch only the missing bytes.
+                            // Hard-coded gates:
+                            //   - Request's Range header must not be in SignedHeaders
+                            //     (synthesizing a Range would otherwise break the signature).
+                            //     For a no-Range GET, client SignedHeaders normally does
+                            //     not include `range`, but guard defensively.
+                            //   - cached fraction >= 10% of total_size
+                            //   - total_size <= 128 MiB (avoid buffering huge objects)
+                            const PARTIAL_MERGE_MIN_FRACTION_NUMERATOR: u64 = 1;
+                            const PARTIAL_MERGE_MIN_FRACTION_DENOMINATOR: u64 = 10; // 10%
+                            const PARTIAL_MERGE_MAX_SIZE_BYTES: u64 = 128 * 1024 * 1024;
+
+                            let cached_bytes: u64 = overlap
+                                .cached_ranges
+                                .iter()
+                                .map(|r| r.end - r.start + 1)
+                                .sum();
+
+                            let range_is_signed =
+                                crate::signed_request_proxy::is_range_signed(&header_map);
+
+                            let fraction_ok = cached_bytes
+                                * PARTIAL_MERGE_MIN_FRACTION_DENOMINATOR
+                                >= total_size * PARTIAL_MERGE_MIN_FRACTION_NUMERATOR;
+                            let size_ok = total_size <= PARTIAL_MERGE_MAX_SIZE_BYTES;
+
+                            if !range_is_signed && fraction_ok && size_ok && total_size > 0 {
+                                debug!(
+                                    "Full-object partial-merge: cache_key={} total_size={} cached_bytes={} fraction={:.2}% — synthesizing Range and routing through merge path",
+                                    cache_key,
+                                    total_size,
+                                    cached_bytes,
+                                    (cached_bytes as f64 / total_size as f64) * 100.0
+                                );
+
+                                // Synthesize a Range covering the whole object.
+                                let mut synthesized_headers = header_map.clone();
+                                synthesized_headers.retain(|k, _| k.to_lowercase() != "range");
+                                synthesized_headers.insert(
+                                    "Range".to_string(),
+                                    format!("bytes=0-{}", total_size - 1),
+                                );
+
+                                // Build conditional headers to protect the merged response
+                                // against mid-flight ETag drift on S3. build_conditional_headers_for_range
+                                // injects If-Match and If-Unmodified-Since independently, only when
+                                // the client did not already supply each one.
+                                let client_had_if_match =
+                                    synthesized_headers.contains_key("if-match");
+                                let client_had_if_unmodified_since =
+                                    synthesized_headers.contains_key("if-unmodified-since");
+                                let conditional = range_handler
+                                    .build_conditional_headers_for_range(
+                                        &synthesized_headers,
+                                        &overlap.cached_ranges,
+                                    );
+                                for (k, v) in conditional {
+                                    synthesized_headers.insert(k, v);
+                                }
+                                // Mark each proxy-injected precondition so the fetch
+                                // code can strip it and retry without leaking 412.
+                                if !client_had_if_match
+                                    && synthesized_headers.contains_key("if-match")
+                                {
+                                    synthesized_headers.insert(
+                                        "x-proxy-injected-if-match".to_string(),
+                                        "1".to_string(),
+                                    );
+                                }
+                                if !client_had_if_unmodified_since
+                                    && synthesized_headers.contains_key("if-unmodified-since")
+                                {
+                                    synthesized_headers.insert(
+                                        "x-proxy-injected-if-unmodified-since".to_string(),
+                                        "1".to_string(),
+                                    );
+                                }
+
+                                return Self::forward_range_with_coordination(
+                                    method,
+                                    uri,
+                                    host,
+                                    synthesized_headers,
+                                    cache_key,
+                                    full_range,
+                                    overlap,
+                                    cache_manager,
+                                    range_handler,
+                                    s3_client,
+                                    config.clone(),
+                                    false, // not signed (guarded above)
+                                    preloaded_metadata.as_ref(),
+                                    inflight_tracker,
+                                    metrics_manager,
+                                    proxy_referer,
+                                )
+                                .await;
+                            }
+
+                            debug!(
+                                "Partial cache coverage for full object, skipping merge: cache_key={} total_size={} cached_bytes={} fraction={:.2}% size_ok={} signed={}",
+                                cache_key,
+                                total_size,
+                                cached_bytes,
+                                if total_size > 0 {
+                                    (cached_bytes as f64 / total_size as f64) * 100.0
+                                } else {
+                                    0.0
+                                },
+                                size_ok,
+                                range_is_signed
+                            );
                         }
                         Err(e) => {
                             // Cache error - log and fall through to S3
@@ -2158,6 +2607,40 @@ impl HttpProxy {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
+
+        // SSE-C bypass: PUT requests carrying customer-provided encryption key headers
+        // must not be write-cached. Caching plaintext from an SSE-C PUT would allow a
+        // later GET (with or without the correct key) to receive data the client
+        // never decrypted. Forward the signed request verbatim to S3 and invalidate
+        // any existing cache entry on success so stale plaintext is not served.
+        if Self::has_sse_c_headers(&headers) {
+            info!(
+                "Cache bypass: SSE-C PUT forwarded to S3 without caching: path={}",
+                path
+            );
+            if let Some(metrics_mgr) = metrics_manager.clone() {
+                let reason = "sse-c".to_string();
+                tokio::spawn(async move {
+                    let mgr = metrics_mgr.read().await;
+                    mgr.record_cache_bypass(&reason).await;
+                });
+            }
+            let host_for_cache = host.clone();
+            let response = Self::forward_signed_request(req, host, s3_client, proxy_referer).await?;
+            if response.status().is_success() {
+                let cache_key = CacheManager::generate_cache_key(path, Some(&host_for_cache));
+                if let Err(e) = cache_manager
+                    .invalidate_cache_unified_for_operation(&cache_key, "PUT")
+                    .await
+                {
+                    warn!(
+                        "Failed to invalidate cache after SSE-C PUT: cache_key={}, error={}",
+                        cache_key, e
+                    );
+                }
+            }
+            return Ok(response);
+        }
 
         // Check if this is an AWS SigV4 signed request
         if crate::signed_request_proxy::is_aws_sigv4_signed(&headers) {
@@ -3717,8 +4200,29 @@ impl HttpProxy {
                             // Merge conditional headers with original client headers
                             // We need ALL headers (especially Authorization) plus the conditional headers
                             let mut merged_headers = client_headers.clone();
+                            let client_had_if_match = client_headers.contains_key("if-match");
+                            let client_had_if_unmodified_since =
+                                client_headers.contains_key("if-unmodified-since");
                             for (key, value) in conditional_headers {
                                 merged_headers.insert(key, value);
+                            }
+
+                            // Mark each proxy-injected precondition so the fetch code can
+                            // invalidate-and-retry on 412 without leaking it to the client.
+                            // Sentinels are stripped from outbound S3 requests before forwarding.
+                            if !client_had_if_match && merged_headers.contains_key("if-match") {
+                                merged_headers.insert(
+                                    "x-proxy-injected-if-match".to_string(),
+                                    "1".to_string(),
+                                );
+                            }
+                            if !client_had_if_unmodified_since
+                                && merged_headers.contains_key("if-unmodified-since")
+                            {
+                                merged_headers.insert(
+                                    "x-proxy-injected-if-unmodified-since".to_string(),
+                                    "1".to_string(),
+                                );
                             }
 
                             // Use download coordination for unsigned range requests
@@ -4785,7 +5289,6 @@ impl HttpProxy {
                             body: None,
                             host: host.to_string(),
                             request_size: None,
-                            conditional_headers: None,
                             operation_type: None,
                             allow_streaming: true, // Enable streaming for range fetches
                         };
@@ -7206,6 +7709,13 @@ impl HttpProxy {
             format!("bytes={}-{}", range_spec.start, range_spec.end),
         );
 
+        // Strip the internal sentinels before sending to S3. They are only meaningful
+        // inside the proxy to signal that `if-match` and/or `if-unmodified-since` were
+        // proxy-injected.
+        let proxy_injected_if_match = s3_headers.remove("x-proxy-injected-if-match").is_some();
+        let proxy_injected_if_unmodified_since =
+            s3_headers.remove("x-proxy-injected-if-unmodified-since").is_some();
+
         let mut context =
             build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host.clone());
         context.allow_streaming = true; // Enable streaming for immediate byte flow
@@ -7250,7 +7760,53 @@ impl HttpProxy {
                         config,
                     )
                     .await
+                } else if s3_response.status == StatusCode::PRECONDITION_FAILED
+                    && (proxy_injected_if_match || proxy_injected_if_unmodified_since)
+                {
+                    // Proxy injected a precondition (If-Match and/or If-Unmodified-Since)
+                    // for cache-consistency protection on a partial cache hit. S3 says
+                    // the cache is stale. Invalidate and retry once without the proxy-
+                    // injected headers. Do not leak 412 to the client — the client did
+                    // not send any conditional header that triggered this 412.
+                    warn!(
+                        "S3 returned 412 on proxy-injected precondition (injected_if_match={}, injected_if_unmodified_since={}); invalidating cache and retrying: cache_key={}",
+                        proxy_injected_if_match, proxy_injected_if_unmodified_since, cache_key
+                    );
+                    {
+                        let disk_cache = range_handler.get_disk_cache_manager().read().await;
+                        if let Err(e) = disk_cache.invalidate_all_ranges(&cache_key).await {
+                            warn!(
+                                "Failed to invalidate stale cache after 412 retry: cache_key={}, error={}",
+                                cache_key, e
+                            );
+                        }
+                    }
+                    // Strip only the proxy-injected preconditions; preserve any
+                    // client-supplied conditional headers.
+                    let mut retry_headers = headers.clone();
+                    if proxy_injected_if_match {
+                        retry_headers.remove("if-match");
+                    }
+                    if proxy_injected_if_unmodified_since {
+                        retry_headers.remove("if-unmodified-since");
+                    }
+                    retry_headers.remove("x-proxy-injected-if-match");
+                    retry_headers.remove("x-proxy-injected-if-unmodified-since");
+                    return Box::pin(Self::stream_range_from_s3_with_caching(
+                        method,
+                        uri,
+                        host,
+                        retry_headers,
+                        cache_key,
+                        range_spec,
+                        range_handler,
+                        s3_client,
+                        config,
+                    ))
+                    .await;
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED {
+                    // Client sent their own If-Match and S3 rejected it. Forward the
+                    // 412 to the client unchanged; cache is not touched.
                     warn!("S3 returned 412 Precondition Failed, returning to client without invalidating cache");
 
                     Ok(Self::build_error_response(
@@ -7304,7 +7860,12 @@ impl HttpProxy {
             format!("bytes={}-{}", range_spec.start, range_spec.end),
         );
 
-        let context = build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host);
+        // Strip the internal sentinels before sending to S3.
+        let proxy_injected_if_match = s3_headers.remove("x-proxy-injected-if-match").is_some();
+        let proxy_injected_if_unmodified_since =
+            s3_headers.remove("x-proxy-injected-if-unmodified-since").is_some();
+
+        let context = build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host.clone());
 
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
@@ -7324,8 +7885,49 @@ impl HttpProxy {
                         config.clone(),
                     )
                     .await
+                } else if s3_response.status == StatusCode::PRECONDITION_FAILED
+                    && (proxy_injected_if_match || proxy_injected_if_unmodified_since)
+                {
+                    // Proxy-injected precondition rejected by S3. Invalidate stale cache
+                    // and retry once without the injected headers. See
+                    // stream_range_from_s3_with_caching for the same pattern.
+                    warn!(
+                        "S3 returned 412 on proxy-injected precondition (fallback path, injected_if_match={}, injected_if_unmodified_since={}); invalidating cache and retrying: cache_key={}",
+                        proxy_injected_if_match, proxy_injected_if_unmodified_since, cache_key
+                    );
+                    {
+                        let disk_cache = range_handler.get_disk_cache_manager().read().await;
+                        if let Err(e) = disk_cache.invalidate_all_ranges(&cache_key).await {
+                            warn!(
+                                "Failed to invalidate stale cache after 412 retry (fallback): cache_key={}, error={}",
+                                cache_key, e
+                            );
+                        }
+                    }
+                    let mut retry_headers = headers.clone();
+                    if proxy_injected_if_match {
+                        retry_headers.remove("if-match");
+                    }
+                    if proxy_injected_if_unmodified_since {
+                        retry_headers.remove("if-unmodified-since");
+                    }
+                    retry_headers.remove("x-proxy-injected-if-match");
+                    retry_headers.remove("x-proxy-injected-if-unmodified-since");
+                    return Box::pin(Self::fetch_complete_range_from_s3(
+                        method,
+                        uri,
+                        host,
+                        retry_headers,
+                        cache_key,
+                        range_spec,
+                        _cache_manager,
+                        range_handler,
+                        s3_client,
+                        config,
+                    ))
+                    .await;
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED {
-                    // Handle 412 response by returning to client without invalidating cache - Requirements 3.2, 4.2, 5.4
+                    // Client sent their own If-Match and S3 rejected it. Pass 412 through.
                     warn!("S3 returned 412 Precondition Failed, returning to client without invalidating cache");
 
                     Ok(Self::build_error_response(
@@ -7472,6 +8074,338 @@ impl HttpProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_has_sse_c_headers_algorithm() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            "AES256".to_string(),
+        );
+        assert!(HttpProxy::has_sse_c_headers(&headers));
+    }
+
+    #[test]
+    fn test_has_sse_c_headers_key() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key".to_string(),
+            "base64key".to_string(),
+        );
+        assert!(HttpProxy::has_sse_c_headers(&headers));
+    }
+
+    #[test]
+    fn test_has_sse_c_headers_key_md5() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5".to_string(),
+            "md5".to_string(),
+        );
+        assert!(HttpProxy::has_sse_c_headers(&headers));
+    }
+
+    #[test]
+    fn test_has_sse_c_headers_case_insensitive() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "X-Amz-Server-Side-Encryption-Customer-Algorithm".to_string(),
+            "AES256".to_string(),
+        );
+        assert!(HttpProxy::has_sse_c_headers(&headers));
+    }
+
+    #[test]
+    fn test_has_sse_c_headers_absent() {
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "example.com".to_string());
+        headers.insert("authorization".to_string(), "AWS4-HMAC-SHA256 ...".to_string());
+        assert!(!HttpProxy::has_sse_c_headers(&headers));
+    }
+
+    #[test]
+    fn test_has_sse_c_headers_similar_but_not_sse_c() {
+        // Server-side encryption headers without the "customer" portion must not match
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption".to_string(),
+            "AES256".to_string(),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
+            "arn:aws:kms:...".to_string(),
+        );
+        assert!(!HttpProxy::has_sse_c_headers(&headers));
+    }
+
+    // ========================================================================
+    // Mode B: evaluate_client_conditions_against_cache (cache-local evaluation)
+    // ========================================================================
+
+    fn eval_headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn eval_if_match_strong_matching_etag_is_fresh() {
+        let headers = eval_headers(&[("if-match", "\"abc\"")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(r, ConditionalEvalResult::Fresh);
+    }
+
+    #[test]
+    fn eval_if_match_mismatch_is_412() {
+        let headers = eval_headers(&[("if-match", "\"abc\"")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"xyz\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::PreconditionFailed);
+    }
+
+    #[test]
+    fn eval_if_match_star_matches_any() {
+        let headers = eval_headers(&[("if-match", "*")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::Fresh);
+    }
+
+    #[test]
+    fn eval_if_match_weak_cached_etag_is_never_strong_match() {
+        // A weak cached ETag can never satisfy If-Match (strong compare) per RFC 7232 §2.3.2.
+        let headers = eval_headers(&[("if-match", "\"abc\"")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("W/\"abc\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::PreconditionFailed);
+    }
+
+    #[test]
+    fn eval_if_match_missing_cached_etag_falls_back() {
+        let headers = eval_headers(&[("if-match", "\"abc\"")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            None,
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::FallbackToForward);
+    }
+
+    #[test]
+    fn eval_if_none_match_matching_get_is_304() {
+        let headers = eval_headers(&[("if-none-match", "\"abc\"")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::NotModified);
+    }
+
+    #[test]
+    fn eval_if_none_match_weak_comparison_matches() {
+        // Weak compare: W/"abc" matches "abc" per RFC 7232 §2.3.2.
+        let headers = eval_headers(&[("if-none-match", "W/\"abc\"")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::NotModified);
+    }
+
+    #[test]
+    fn eval_if_none_match_mismatch_is_fresh() {
+        let headers = eval_headers(&[("if-none-match", "\"abc\"")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"xyz\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::Fresh);
+    }
+
+    #[test]
+    fn eval_if_none_match_star_matches() {
+        // * matches any current representation.
+        let headers = eval_headers(&[("if-none-match", "*")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::NotModified);
+    }
+
+    #[test]
+    fn eval_if_modified_since_not_modified_is_304() {
+        let headers =
+            eval_headers(&[("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"), // equal
+        );
+        assert_eq!(r, ConditionalEvalResult::NotModified);
+    }
+
+    #[test]
+    fn eval_if_modified_since_modified_is_fresh() {
+        let headers =
+            eval_headers(&[("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            Some("Thu, 22 Oct 2015 07:28:00 GMT"), // later
+        );
+        assert_eq!(r, ConditionalEvalResult::Fresh);
+    }
+
+    #[test]
+    fn eval_if_unmodified_since_stale_cache_is_412() {
+        let headers =
+            eval_headers(&[("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            None,
+            Some("Thu, 22 Oct 2015 07:28:00 GMT"), // later = precondition failed
+        );
+        assert_eq!(r, ConditionalEvalResult::PreconditionFailed);
+    }
+
+    #[test]
+    fn eval_if_match_present_overrides_if_unmodified_since() {
+        // Per RFC 7232 §6: when If-Match is present, If-Unmodified-Since is ignored.
+        let headers = eval_headers(&[
+            ("if-match", "\"abc\""),
+            ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"abc\""),
+            Some("Thu, 22 Oct 2015 07:28:00 GMT"), // would 412 via If-Unmodified-Since
+        );
+        // If-Match passes, If-Unmodified-Since is skipped, Fresh.
+        assert_eq!(r, ConditionalEvalResult::Fresh);
+    }
+
+    #[test]
+    fn eval_if_none_match_present_overrides_if_modified_since() {
+        // Per RFC 7232 §6: If-None-Match overrides If-Modified-Since.
+        let headers = eval_headers(&[
+            ("if-none-match", "\"abc\""),
+            ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ]);
+        // Cached ETag mismatches → If-None-Match produces Fresh; If-Modified-Since skipped.
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"different\""),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(r, ConditionalEvalResult::Fresh);
+    }
+
+    #[test]
+    fn etag_strong_match_helper() {
+        assert!(super::etag_strong_match("\"abc\"", "\"abc\""));
+        assert!(!super::etag_strong_match("\"abc\"", "W/\"abc\""));
+        assert!(!super::etag_strong_match("W/\"abc\"", "\"abc\""));
+        assert!(super::etag_strong_match("*", "\"whatever\""));
+        assert!(!super::etag_strong_match("\"abc\"", "\"xyz\""));
+    }
+
+    #[test]
+    fn etag_weak_match_helper() {
+        assert!(super::etag_weak_match("\"abc\"", "\"abc\""));
+        assert!(super::etag_weak_match("\"abc\"", "W/\"abc\""));
+        assert!(super::etag_weak_match("W/\"abc\"", "\"abc\""));
+        assert!(super::etag_weak_match("W/\"abc\"", "W/\"abc\""));
+        assert!(super::etag_weak_match("*", "\"anything\""));
+        assert!(!super::etag_weak_match("\"abc\"", "\"xyz\""));
+    }
+
+    #[test]
+    fn etag_strong_match_tolerates_unquoted_client_etag() {
+        // AWS CLI v2 strips surrounding quotes from --if-match before sending.
+        // The cached etag from S3 is stored with quotes. These must match.
+        assert!(super::etag_strong_match("abc", "\"abc\""));
+        assert!(super::etag_strong_match("\"abc\"", "abc"));
+        assert!(super::etag_strong_match("abc", "abc"));
+        assert!(!super::etag_strong_match("abc", "\"xyz\""));
+        // W/ prefix still disqualifies a strong match.
+        assert!(!super::etag_strong_match("W/abc", "\"abc\""));
+        assert!(!super::etag_strong_match("abc", "W/\"abc\""));
+    }
+
+    #[test]
+    fn etag_weak_match_tolerates_unquoted_client_etag() {
+        // Same tolerance for weak matches.
+        assert!(super::etag_weak_match("abc", "\"abc\""));
+        assert!(super::etag_weak_match("\"abc\"", "abc"));
+        assert!(super::etag_weak_match("abc", "W/\"abc\""));
+        assert!(super::etag_weak_match("W/abc", "\"abc\""));
+        assert!(super::etag_weak_match("abc", "abc"));
+        assert!(!super::etag_weak_match("abc", "\"xyz\""));
+    }
+
+    #[test]
+    fn strip_etag_quotes_edge_cases() {
+        // Normal cases.
+        assert_eq!(super::strip_etag_quotes("\"abc\""), "abc");
+        assert_eq!(super::strip_etag_quotes("abc"), "abc");
+        assert_eq!(super::strip_etag_quotes(""), "");
+        // Single character that is a quote — must not strip to empty
+        // (a single `"` is not a quoted pair).
+        assert_eq!(super::strip_etag_quotes("\""), "\"");
+        // Empty quoted string.
+        assert_eq!(super::strip_etag_quotes("\"\""), "");
+        // Lopsided quotes — leave alone.
+        assert_eq!(super::strip_etag_quotes("\"abc"), "\"abc");
+        assert_eq!(super::strip_etag_quotes("abc\""), "abc\"");
+    }
+
+    #[test]
+    fn eval_if_none_match_unquoted_client_etag_matches_quoted_cache() {
+        // Reproduces the real AWS-CLI-on-the-wire case: client sends
+        // `If-None-Match: e0b1...3f3` (unquoted), cached etag stored as
+        // `"e0b1...3f3"` (quoted). Must evaluate to 304 Not Modified.
+        let headers = eval_headers(&[("if-none-match", "e0b1d12fd86284b73d5b40c144e373f3")]);
+        let r = HttpProxy::evaluate_client_conditions_against_cache(
+            &Method::GET,
+            &headers,
+            Some("\"e0b1d12fd86284b73d5b40c144e373f3\""),
+            None,
+        );
+        assert_eq!(r, ConditionalEvalResult::NotModified);
+    }
 
     #[test]
     fn test_has_conditional_headers_if_match() {

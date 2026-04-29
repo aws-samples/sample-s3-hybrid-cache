@@ -289,6 +289,20 @@ cache:
   # This allows an "allowlist" pattern where only specific buckets have caching enabled.
   read_cache_enabled: true
 
+  # Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since,
+  # If-Unmodified-Since) against cached metadata instead of forwarding to S3 (default: false).
+  #
+  # When false (default — "always forward"): every conditional GET/HEAD is forwarded to S3.
+  # Strict RFC 7232 semantics; the proxy never decides based on cached metadata.
+  #
+  # When true ("cache evaluates"): if the cached object is unexpired and has ETag +
+  # Last-Modified recorded, the proxy returns 304/412/200 locally without contacting S3
+  # (RFC 7232 §6 precedence). Expired cache, missing validators, and client cache-bypass
+  # headers fall back to forward. Reduces S3 round trips at the cost of strict freshness.
+  # Not recommended with get_ttl: "0s" (fall-back would trigger on every request anyway).
+  # Per-bucket override available in _settings.json.
+  evaluate_conditions_from_cache: false
+
   # How long cached bucket settings (_settings.json) are considered fresh before re-reading from disk (default: 60s)
   # Controls lazy reload — settings changes take effect after this threshold expires.
   bucket_settings_staleness_threshold: "60s"

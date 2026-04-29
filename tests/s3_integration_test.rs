@@ -83,6 +83,7 @@ fn create_test_config() -> Config {
             read_cache_enabled: true,
             bucket_settings_staleness_threshold: Duration::from_secs(60),
             download_coordination: s3_proxy::config::DownloadCoordinationConfig::default(),
+            evaluate_conditions_from_cache: false,
         },
         logging: LoggingConfig {
             access_log_dir: PathBuf::from("/tmp/s3_proxy_test_logs/access"),

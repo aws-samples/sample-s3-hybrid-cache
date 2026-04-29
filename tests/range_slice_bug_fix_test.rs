@@ -35,6 +35,7 @@ fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheManager>
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     ))
 }
 

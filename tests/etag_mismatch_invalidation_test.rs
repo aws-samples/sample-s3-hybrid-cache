@@ -46,6 +46,7 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(DiskCacheManager::new(
@@ -160,6 +161,7 @@ async fn test_invalidate_stale_ranges() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/test-object.txt";
@@ -251,6 +253,7 @@ async fn test_invalidate_stale_ranges_no_mismatch() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/test-object.txt";
@@ -331,6 +334,7 @@ async fn test_invalidate_stale_ranges_no_metadata() -> Result<()> {
         true,                                          // read_cache_enabled
         std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
         1_048_576,                                     // compression_batch_size
+        false, // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/nonexistent-object.txt";

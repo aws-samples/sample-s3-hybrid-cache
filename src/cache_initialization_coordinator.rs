@@ -3345,6 +3345,7 @@ mod tests {
             compression_batch_size: 1_048_576, // 1 MiB
             read_cache_enabled: true,
             bucket_settings_staleness_threshold: Duration::from_secs(60),
+            evaluate_conditions_from_cache: false,
         }
     }
 

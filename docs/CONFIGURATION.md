@@ -464,6 +464,13 @@ cache:
   # This allows an "allowlist" pattern where only specific buckets have caching enabled.
   read_cache_enabled: true
 
+  # Evaluate client conditional headers against cached metadata (default: false)
+  # When true, the proxy decides 304 / 412 / 200 locally using cached ETag + Last-Modified
+  # and does not forward the conditional request to S3 (unless cache is expired or the
+  # required validators are missing). Default false preserves strict RFC 7232 consistency.
+  # See CACHING.md "Conditional Headers Handling" for full semantics.
+  evaluate_conditions_from_cache: false
+
   # How long cached bucket settings are considered fresh before re-reading from disk (default: 60s)
   # Controls lazy reload — settings changes take effect after this threshold expires.
   bucket_settings_staleness_threshold: "60s"
@@ -483,6 +490,7 @@ Place a `_settings.json` file at `cache_dir/metadata/{bucket}/_settings.json`. A
   "write_cache_enabled": true,
   "compression_enabled": false,
   "ram_cache_eligible": true,
+  "evaluate_conditions_from_cache": false,
   "prefix_overrides": [
     {
       "prefix": "/temp/",
@@ -492,13 +500,14 @@ Place a `_settings.json` file at `cache_dir/metadata/{bucket}/_settings.json`. A
     {
       "prefix": "/static/assets/",
       "get_ttl": "7d",
-      "compression_enabled": true
+      "compression_enabled": true,
+      "evaluate_conditions_from_cache": true
     }
   ]
 }
 ```
 
-**Supported fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `prefix_overrides`
+**Supported fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `prefix_overrides`
 
 **Duration format**: Same as global config — `"0s"`, `"30s"`, `"5m"`, `"1h"`, `"7d"`
 
@@ -990,6 +999,8 @@ Keys starting with `*.` are suffix patterns — they match any hostname ending w
 When any `endpoint_overrides` are configured, outbound TLS is locked to version 1.2 for VPC interface endpoint compatibility (interface endpoints do not support TLS 1.3). Regular S3 endpoints support TLS 1.2, so there is no functional regression.
 
 Overrides apply to both the HTTP caching path and the HTTPS passthrough handler (port 443).
+
+**S3 Transfer Acceleration not supported**: The `*.s3-accelerate.amazonaws.com` and `*.s3-accelerate.dualstack.amazonaws.com` hostnames are not supported. See [Getting Started - S3 Transfer Acceleration](GETTING_STARTED.md#s3-transfer-acceleration).
 
 See [Getting Started - S3 PrivateLink](GETTING_STARTED.md#s3-privatelink-interface-vpc-endpoints) for setup details and verification steps.
 

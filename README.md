@@ -231,6 +231,10 @@ A: As the cache is transparent and has no credentials of its own, it cannot requ
 
 A: Nothing about this solution is specific to Amazon S3. Any origin compatible with the S3 API should work.
 
+**Q: Does S3 Transfer Acceleration work with the proxy?**
+
+A: No. Transfer Acceleration endpoints (`<bucket>.s3-accelerate.amazonaws.com` and the `.dualstack` variant) are not supported — target regional endpoints (`s3.<region>.amazonaws.com`) instead. See [Getting Started - S3 Transfer Acceleration](docs/GETTING_STARTED.md#s3-transfer-acceleration).
+
 ## Status
 
 S3 Hybrid Cache is sample code provided for demonstration and educational purposes. It is not intended for production use without thorough testing, security review, and validation for your specific use case and environment. You are responsible for evaluating whether this solution meets your requirements before deploying it.

@@ -45,26 +45,8 @@ pub struct S3RequestContext {
     pub body: Option<Bytes>,
     pub host: String,
     pub request_size: Option<u64>,
-    pub conditional_headers: Option<ConditionalHeaders>,
     pub operation_type: Option<String>,
     pub allow_streaming: bool, // If false, always buffer response
-}
-
-/// Conditional headers for cache validation
-#[derive(Debug, Clone)]
-pub struct ConditionalHeaders {
-    pub if_match: Option<String>,
-    pub if_none_match: Option<String>,
-    pub if_modified_since: Option<String>,
-    pub if_unmodified_since: Option<String>,
-}
-
-/// Result of conditional header validation
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConditionalValidationResult {
-    Valid,              // Conditions are satisfied, proceed with request
-    NotModified,        // Return 304 Not Modified
-    PreconditionFailed, // Return 412 Precondition Failed
 }
 
 /// S3 response body - either buffered or streaming
@@ -593,153 +575,6 @@ impl S3Client {
         self.health_tracker.clear();
         Ok(())
     }
-    /// Build conditional request headers for cache validation (Requirements 4.1, 4.2, 4.3, 4.4, 3.6, 3.8)
-    pub fn build_conditional_headers(
-        original_headers: &HashMap<String, String>,
-        cache_metadata: Option<&CacheMetadata>,
-    ) -> HashMap<String, String> {
-        let mut headers = original_headers.clone();
-
-        // If we have cache metadata, add conditional headers for validation
-        // but only for conditions not already specified by the client (Requirements 3.6, 3.8)
-        if let Some(metadata) = cache_metadata {
-            // Only add If-Unmodified-Since if client hasn't specified it
-            if !metadata.last_modified.is_empty() && !headers.contains_key("if-unmodified-since") {
-                headers.insert(
-                    "if-unmodified-since".to_string(),
-                    metadata.last_modified.clone(),
-                );
-            }
-
-            // Only add If-Match if client hasn't specified it
-            if !metadata.etag.is_empty() && !headers.contains_key("if-match") {
-                headers.insert("if-match".to_string(), metadata.etag.clone());
-            }
-        }
-
-        headers
-    }
-
-    /// Validate conditional headers against cache metadata (Requirements 4.1, 4.2, 4.3, 4.4)
-    pub fn validate_conditional_headers(
-        &self,
-        conditional_headers: &ConditionalHeaders,
-        cache_metadata: &CacheMetadata,
-    ) -> Result<ConditionalValidationResult> {
-        // If-Match validation (Requirement 4.1)
-        if let Some(if_match) = &conditional_headers.if_match {
-            if !cache_metadata.etag.is_empty()
-                && cache_metadata.etag != *if_match
-                && if_match != "*"
-            {
-                return Ok(ConditionalValidationResult::PreconditionFailed);
-            }
-        }
-
-        // If-None-Match validation (Requirement 4.2)
-        if let Some(if_none_match) = &conditional_headers.if_none_match {
-            if !cache_metadata.etag.is_empty()
-                && (cache_metadata.etag == *if_none_match || if_none_match == "*")
-            {
-                return Ok(ConditionalValidationResult::NotModified);
-            }
-        }
-
-        // If-Modified-Since validation (Requirement 4.3)
-        if let Some(if_modified_since) = &conditional_headers.if_modified_since {
-            if !cache_metadata.last_modified.is_empty() {
-                // Parse timestamps and compare
-                if let (Ok(cache_time), Ok(request_time)) = (
-                    self.parse_http_date(&cache_metadata.last_modified),
-                    self.parse_http_date(if_modified_since),
-                ) {
-                    if cache_time <= request_time {
-                        return Ok(ConditionalValidationResult::NotModified);
-                    }
-                }
-            }
-        }
-
-        // If-Unmodified-Since validation (Requirement 4.4)
-        if let Some(if_unmodified_since) = &conditional_headers.if_unmodified_since {
-            if !cache_metadata.last_modified.is_empty() {
-                // Parse timestamps and compare
-                if let (Ok(cache_time), Ok(request_time)) = (
-                    self.parse_http_date(&cache_metadata.last_modified),
-                    self.parse_http_date(if_unmodified_since),
-                ) {
-                    if cache_time > request_time {
-                        return Ok(ConditionalValidationResult::PreconditionFailed);
-                    }
-                }
-            }
-        }
-
-        Ok(ConditionalValidationResult::Valid)
-    }
-
-    /// Parse HTTP date string to SystemTime (RFC 7231 format)
-    fn parse_http_date(&self, date_str: &str) -> Result<std::time::SystemTime> {
-        httpdate::parse_http_date(date_str).map_err(|e| {
-            ProxyError::HttpError(format!("Failed to parse HTTP date '{}': {}", date_str, e))
-        })
-    }
-
-    /// Extract conditional headers from request headers
-    pub fn extract_conditional_headers(
-        headers: &HashMap<String, String>,
-    ) -> Option<ConditionalHeaders> {
-        let if_match = headers.get("if-match").cloned();
-        let if_none_match = headers.get("if-none-match").cloned();
-        let if_modified_since = headers.get("if-modified-since").cloned();
-        let if_unmodified_since = headers.get("if-unmodified-since").cloned();
-
-        if if_match.is_some()
-            || if_none_match.is_some()
-            || if_modified_since.is_some()
-            || if_unmodified_since.is_some()
-        {
-            Some(ConditionalHeaders {
-                if_match,
-                if_none_match,
-                if_modified_since,
-                if_unmodified_since,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Check if S3 response metadata differs from cached metadata (Requirement 6.6)
-    pub fn detect_metadata_mismatch(
-        &self,
-        s3_response_headers: &HashMap<String, String>,
-        cached_metadata: &CacheMetadata,
-    ) -> bool {
-        // Extract ETag and Last-Modified from S3 response
-        let s3_etag = s3_response_headers
-            .get("etag")
-            .or_else(|| s3_response_headers.get("ETag"))
-            .cloned()
-            .unwrap_or_default();
-
-        let s3_last_modified = s3_response_headers
-            .get("last-modified")
-            .or_else(|| s3_response_headers.get("Last-Modified"))
-            .cloned()
-            .unwrap_or_default();
-
-        // Check for mismatches
-        let etag_mismatch = !s3_etag.is_empty()
-            && !cached_metadata.etag.is_empty()
-            && s3_etag != cached_metadata.etag;
-
-        let last_modified_mismatch = !s3_last_modified.is_empty()
-            && !cached_metadata.last_modified.is_empty()
-            && s3_last_modified != cached_metadata.last_modified;
-
-        etag_mismatch || last_modified_mismatch
-    }
 
     /// Extract metadata from S3 response headers
     /// Parse Content-Range header to extract total object size
@@ -961,7 +796,6 @@ pub fn build_s3_request_context(
     host: String,
 ) -> S3RequestContext {
     let request_size = body.as_ref().map(|b| b.len() as u64);
-    let conditional_headers = S3Client::extract_conditional_headers(&headers);
 
     // Build absolute URI for S3 request if the URI is relative
     let absolute_uri = if uri.scheme().is_none() {
@@ -989,7 +823,6 @@ pub fn build_s3_request_context(
         body,
         host,
         request_size,
-        conditional_headers,
         operation_type: None,
         allow_streaming: true, // Stream by default — buffering delays time-to-first-byte
     }
@@ -1005,7 +838,6 @@ pub fn build_s3_request_context_with_operation(
     operation_type: Option<String>,
 ) -> S3RequestContext {
     let request_size = body.as_ref().map(|b| b.len() as u64);
-    let conditional_headers = S3Client::extract_conditional_headers(&headers);
 
     // Build absolute URI for S3 request if the URI is relative
     let absolute_uri = if uri.scheme().is_none() {
@@ -1033,7 +865,6 @@ pub fn build_s3_request_context_with_operation(
         body,
         host,
         request_size,
-        conditional_headers,
         operation_type,
         allow_streaming: true, // Enable streaming for bypass operations
     }
@@ -1139,43 +970,6 @@ mod tests {
         // The TLS connector should be initialized (we can't directly test it without making a connection,
         // but we can verify the client was created successfully which means TLS setup worked)
         assert_eq!(client.request_timeout, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn test_conditional_headers_extraction() {
-        let mut headers = HashMap::new();
-        headers.insert("if-match".to_string(), "\"etag123\"".to_string());
-        headers.insert("if-none-match".to_string(), "\"etag456\"".to_string());
-        headers.insert(
-            "if-modified-since".to_string(),
-            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        );
-        headers.insert(
-            "if-unmodified-since".to_string(),
-            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        );
-
-        let conditional = S3Client::extract_conditional_headers(&headers);
-
-        assert!(conditional.is_some());
-        let cond = conditional.unwrap();
-        assert_eq!(cond.if_match, Some("\"etag123\"".to_string()));
-        assert_eq!(cond.if_none_match, Some("\"etag456\"".to_string()));
-        assert_eq!(
-            cond.if_modified_since,
-            Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string())
-        );
-        assert_eq!(
-            cond.if_unmodified_since,
-            Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string())
-        );
-    }
-
-    #[test]
-    fn test_conditional_headers_extraction_empty() {
-        let headers = HashMap::new();
-        let conditional = S3Client::extract_conditional_headers(&headers);
-        assert!(conditional.is_none());
     }
 
     #[test]
