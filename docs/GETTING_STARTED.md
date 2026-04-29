@@ -512,9 +512,19 @@ The CLI resolves the alias to `mfzwi23gnjvgw.accesspoint.s3-global.amazonaws.com
 | MRAP ARN | `http://accesspoint.s3-global.amazonaws.com` | ✅ Yes | CLI builds correct Host from ARN. |
 | Any AP/MRAP | *(none — default HTTPS)* | ❌ No | HTTPS uses TCP passthrough, bypassing cache. |
 
+All addressing styles — path-style (`s3.{region}.amazonaws.com/{bucket}/{key}`), regional virtual-hosted (`{bucket}.s3.{region}.amazonaws.com/{key}`), accelerate (`{bucket}.s3-accelerate.amazonaws.com/{key}`), and legacy global (`{bucket}.s3.amazonaws.com/{key}`) — share cache entries for the same bucket and key. Accessing the same object through any combination of these styles hits the same cache slot.
+
 #### S3 Transfer Acceleration
 
-Transfer Acceleration endpoints (`<bucket>.s3-accelerate.amazonaws.com` and `<bucket>.s3-accelerate.dualstack.amazonaws.com`) are not supported. Clients should target regional endpoints (`s3.<region>.amazonaws.com` or `<bucket>.s3.<region>.amazonaws.com`).
+The proxy extracts the bucket from accelerate hostnames (`<bucket>.s3-accelerate.amazonaws.com` and `<bucket>.s3-accelerate.dualstack.amazonaws.com`) and caches accelerate requests against the same entries as path-style and regional virtual-hosted requests for the same bucket and key. Getting accelerate traffic to the proxy uses the same three routing options as regular S3 traffic — [Option A (HTTP_PROXY)](#option-a-http_proxy-single-instance--no-dns-changes), [Option B (DNS Zone)](#option-b-dns-zone-production-deployments), or [Option C (Hosts File)](#option-c-hosts-file-testingdevelopment) — with one wrinkle: Option B via Route 53 does not work for the accelerate name. Route 53 refuses private hosted zones for `s3-accelerate.amazonaws.com` because its canonical target (CloudFront) is outside AWS region routing. For Option B on accelerate, use a VPC-level resolver (CoreDNS, Unbound) instead of Route 53. Options A and C work unchanged.
+
+Enable acceleration at the SDK/CLI level (`use_accelerate_endpoint = true`) and pass `--endpoint-url http://s3-accelerate.amazonaws.com` to force HTTP.
+
+**Recommendation**
+
+For most deployments, target regional virtual-hosted endpoints (`<bucket>.s3.<region>.amazonaws.com`) instead. They reuse the existing regional DNS routing, cache correctly (from 1.14.1 onwards), and share cache entries with path-style and accelerate access for the same bucket and key. The latency benefit of accelerate **through a proxy that lives in a VPC** is rarely worth the routing work — the proxy-to-S3 leg for accelerate targets a CloudFront edge PoP rather than the bucket's home region, and whether that's faster depends entirely on the proxy's network location. Clients that want the fastest proxy-to-S3 path should target the bucket's regional endpoint directly.
+
+Clients that prefer path-style over virtual-hosted addressing can still use `--endpoint-url http://s3.<region>.amazonaws.com`. This works and caches correctly — it is a valid choice rather than a workaround for a caching limitation.
 
 ## Basic Usage
 
@@ -608,6 +618,36 @@ s3_direct = boto3.client('s3', region_name='us-east-1')
 ```
 
 This avoids the all-or-nothing behavior of environment variables like `AWS_ENDPOINT_URL_S3`.
+
+#### Per-Client Proxy Configuration
+
+boto3 does not accept `http_proxy` as a keyword argument on `boto3.client()`. Proxy settings are configured through a `botocore.config.Config` object passed via `config=`, which is the per-client equivalent of `HTTP_PROXY` / `HTTPS_PROXY` environment variables:
+
+```python
+import boto3
+from botocore.config import Config
+
+cfg = Config(
+    proxies={
+        'http':  'http://<proxy-ip>:80',
+        'https': 'http://<proxy-ip>:80',
+    },
+)
+
+s3 = boto3.client('s3',
+    endpoint_url='http://s3.us-east-1.amazonaws.com',
+    region_name='us-east-1',
+    config=cfg,
+)
+```
+
+Notes:
+
+- The `https` proxy URL typically uses the `http://` scheme — that is the scheme of the proxy connection, not the target.
+- For encrypted client-to-proxy transport, point the proxy URL at the TLS proxy listener (e.g., `'https://<proxy-ip>:3129'`) and set `AWS_CA_BUNDLE` or pass `verify=` on the client.
+- Without `config=`, boto3 picks up `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` from the environment. The per-client `Config` only overrides proxy settings for that specific client, leaving other clients in the same process unaffected.
+- Set `NO_PROXY=169.254.169.254` to keep IMDS credential retrieval off the proxy path.
+- Use `proxies_config={'proxy_use_forwarding_for_https': False}` (the default) to make HTTPS requests tunnel via `CONNECT`. Setting it to `True` switches to forward-proxy style, which bypasses caching.
 
 ### Mountpoint for Amazon S3
 

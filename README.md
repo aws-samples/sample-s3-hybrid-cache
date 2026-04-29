@@ -233,7 +233,7 @@ A: Nothing about this solution is specific to Amazon S3. Any origin compatible w
 
 **Q: Does S3 Transfer Acceleration work with the proxy?**
 
-A: No. Transfer Acceleration endpoints (`<bucket>.s3-accelerate.amazonaws.com` and the `.dualstack` variant) are not supported — target regional endpoints (`s3.<region>.amazonaws.com`) instead. See [Getting Started - S3 Transfer Acceleration](docs/GETTING_STARTED.md#s3-transfer-acceleration).
+A: The proxy caches accelerate requests correctly **if** they reach it. Use any of the three standard client routing options (HTTP_PROXY, DNS zone, or hosts file — see Getting Started) to send accelerate traffic to the proxy. The only wrinkle: Route 53 does not host a private zone for `s3-accelerate.amazonaws.com`, so the DNS zone option needs a VPC-level resolver (CoreDNS, Unbound) for that name specifically. For most deployments, targeting regional virtual-hosted endpoints (`<bucket>.s3.<region>.amazonaws.com`) is the easier path — they reuse the existing regional DNS routing and share cache entries with accelerate access for the same object. See [Getting Started - S3 Transfer Acceleration](docs/GETTING_STARTED.md#s3-transfer-acceleration).
 
 ## Status
 

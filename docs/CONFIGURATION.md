@@ -1000,7 +1000,7 @@ When any `endpoint_overrides` are configured, outbound TLS is locked to version 
 
 Overrides apply to both the HTTP caching path and the HTTPS passthrough handler (port 443).
 
-**S3 Transfer Acceleration not supported**: The `*.s3-accelerate.amazonaws.com` and `*.s3-accelerate.dualstack.amazonaws.com` hostnames are not supported. See [Getting Started - S3 Transfer Acceleration](GETTING_STARTED.md#s3-transfer-acceleration).
+**Note on virtual-hosted regional traffic**: `*.s3.<region>.amazonaws.com` wildcards have always carried virtual-hosted regional traffic (`<bucket>.s3.<region>.amazonaws.com`) to the proxy. Before 1.14.1 that traffic was forwarded correctly but the proxy produced a flat, un-prefixed cache key — requests succeeded but nothing was written to the cache. From 1.14.1 onwards the bucket is extracted from the Host and caching works for all virtual-hosted styles.
 
 See [Getting Started - S3 PrivateLink](GETTING_STARTED.md#s3-privatelink-interface-vpc-endpoints) for setup details and verification steps.
 

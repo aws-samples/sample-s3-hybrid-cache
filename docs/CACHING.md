@@ -591,14 +591,14 @@ cache_dir/
 
 #### Bucket-First Organization
 
-**Cache Key Format**: `/bucket/object_key`
+**Cache Key Format**: `{bucket}/{object_key}`
 
-For regular path-style and virtual-hosted-style requests, the cache key is the S3 request path (e.g., `/my-bucket/path/to/object.txt`).
+The cache key always starts with a `{bucket}/` prefix. For path-style requests (`s3.{region}.amazonaws.com/{bucket}/{key}`) the bucket is taken from the first path segment; for virtual-hosted styles — regional, regional dualstack, accelerate, accelerate dualstack, and legacy global — it is extracted from the leading label of the Host header. All four styles produce the same cache key for the same bucket and object, so cache entries are shared across addressing styles (see *Regular Bucket Requests* below).
 
 Examples:
-- `/my-bucket/path/to/object.txt`
-- `/my-bucket/file.jpg`
-- `/my.bucket.name/deeply/nested/path/data.bin`
+- `my-bucket/path/to/object.txt`
+- `my-bucket/file.jpg`
+- `my.bucket.name/deeply/nested/path/data.bin`
 
 #### Access Point and MRAP Cache Key Prefixing
 
@@ -666,9 +666,18 @@ Alias-based (path-style):   my-ap-abcdef123456-s3alias/data/file.txt
 
 Both cache key folders end with `-s3alias`, so neither collides with bucket names. The divergence causes a minor cache efficiency loss (same object cached twice under different keys) but is not a correctness issue.
 
-**Regular Bucket Requests**
+**Regular Bucket Requests (Shared Cache Entries Across Addressing Styles)**
 
-Regular path-style requests (`s3.{region}.amazonaws.com`) and virtual-hosted-style requests (`{bucket}.s3.{region}.amazonaws.com`) are unaffected — their cache keys remain path-only with no prefix or suffix appended.
+Regular bucket requests produce a cache key of the form `{bucket}/{object_key}`. The proxy extracts the bucket from whichever part of the request carries it for the addressing style in use:
+
+- **Path-style** (`s3.{region}.amazonaws.com/{bucket}/{key}`, `s3.amazonaws.com/{bucket}/{key}`, `s3.dualstack.{region}.amazonaws.com/{bucket}/{key}`) — bucket is the first path segment.
+- **Regional virtual-hosted** (`{bucket}.s3.{region}.amazonaws.com/{key}`, `{bucket}.s3.dualstack.{region}.amazonaws.com/{key}`) — bucket is the leading label of the Host header. Dots are allowed in bucket names per general-purpose naming rules (`my.company.logs.s3.us-east-1.amazonaws.com` parses to bucket `my.company.logs`).
+- **S3 Transfer Acceleration** (`{bucket}.s3-accelerate.amazonaws.com/{key}`, `{bucket}.s3-accelerate.dualstack.amazonaws.com/{key}`) — bucket is the leading label of the Host header. Accelerate requires DNS-compliant bucket names, so bucket labels containing dots are rejected as malformed.
+- **Legacy global** (`{bucket}.s3.amazonaws.com/{key}`) — bucket is the leading label of the Host header.
+
+All four styles produce the identical cache key for the same bucket and object. A request for `my-bucket/file.txt` through path-style, regional virtual-hosted, accelerate, and legacy global endpoints hits the same cache slot, so cache entries are shared across addressing styles. This means a client that uses accelerate for writes and regional virtual-hosted for reads (or vice versa) benefits from one cached copy rather than four.
+
+For non-AWS S3-compatible hostnames (MinIO, R2, etc.) and any Host the proxy does not recognise as an AWS S3 endpoint, the cache key falls back to the bare normalised path. This keeps the proxy functional against S3-compatible storage but without shared cache entries across addressing styles.
 
 **Path Resolution**:
 1. Parse cache key on first `/` after bucket to extract bucket and object key

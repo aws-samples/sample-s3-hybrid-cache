@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "1.14.0"
+version = "1.14.1"
 edition = "2021"
 # MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
 # Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.

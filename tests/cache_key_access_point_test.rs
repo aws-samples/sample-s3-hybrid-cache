@@ -309,13 +309,16 @@ fn test_path_style_cache_key_preservation() {
 }
 
 // ============================================================================
-// Property 2b: Virtual-hosted-style S3 hosts — cache key equals
-// normalize_cache_key(path)
+// Property 2b: Virtual-hosted-style S3 hosts — cache key is bucket-prefixed
 //
 // For hosts matching `{bucket}.s3.{region}.amazonaws.com`, the cache key for
-// any path is simply the path with the leading slash stripped.
+// any path is `{bucket}/{normalize_cache_key(path)}` — the bucket from the
+// Host header is prepended so cache entries are shared with path-style
+// requests for the same bucket+key. Updated in the s3-transfer-acceleration-
+// support spec (see .kiro/specs/s3-transfer-acceleration-support/) to reflect
+// the new virtual-hosted bucket extraction behaviour.
 //
-// **Validates: Requirements 3.2**
+// **Validates: Requirement 4.1 (s3-transfer-acceleration-support spec)**
 // ============================================================================
 
 fn prop_virtual_hosted_preservation(
@@ -325,9 +328,10 @@ fn prop_virtual_hosted_preservation(
 ) -> TestResult {
     let host = format!("{}.s3.{}.amazonaws.com", bucket.0, region.0);
 
-    // Virtual-hosted path is just the object key (e.g., /data/file.txt)
+    // Virtual-hosted path is just the object key (e.g., /data/file.txt).
+    // Cache key should be `{bucket}/{normalize_cache_key(path)}`.
     let cache_key = CacheManager::generate_cache_key(&path.0, Some(&host));
-    let expected = normalize_cache_key(&path.0);
+    let expected = format!("{}/{}", bucket.0, normalize_cache_key(&path.0));
 
     TestResult::from_bool(cache_key == expected)
 }

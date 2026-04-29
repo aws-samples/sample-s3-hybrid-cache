@@ -77,6 +77,86 @@ pub fn extract_access_point_prefix(host: &str) -> Option<String> {
     None
 }
 
+/// Extract a bucket name from the Host header for virtual-hosted-style S3 requests.
+///
+/// Recognises three hostname families and returns the bucket segment used for
+/// cache-key generation:
+///
+/// 1. **Accelerate** (`<bucket>.s3-accelerate.amazonaws.com` and the dualstack
+///    variant `<bucket>.s3-accelerate.dualstack.amazonaws.com`). S3 Transfer
+///    Acceleration requires DNS-compliant bucket names, so buckets containing
+///    dots are rejected — a multi-label prefix cannot be a valid S3TA bucket.
+/// 2. **Regional virtual-hosted** (`<bucket>.s3.<region>.amazonaws.com` and
+///    the dualstack variant `<bucket>.s3.dualstack.<region>.amazonaws.com`).
+///    Bucket may contain dots per general-purpose bucket naming rules.
+/// 3. **Legacy global** (`<bucket>.s3.amazonaws.com`). Bucket may contain dots.
+///
+/// Returns `None` for:
+/// - Path-style hosts (`s3.<region>.amazonaws.com`, `s3.amazonaws.com`, etc.)
+/// - AP/MRAP hosts (these are handled by `extract_access_point_prefix`)
+/// - Empty bucket prefixes (e.g., `.s3-accelerate.amazonaws.com`)
+/// - Accelerate hosts whose bucket prefix contains a dot
+/// - Any non-S3 host
+///
+/// Order of checks matters: the most specific suffix is checked first so that
+/// the dualstack variants are not swallowed by the non-dualstack branches.
+pub fn extract_virtual_hosted_bucket(host: &str) -> Option<&str> {
+    // --- Accelerate (dualstack first — more specific suffix) ---
+    if let Some(bucket) = host.strip_suffix(".s3-accelerate.dualstack.amazonaws.com") {
+        // S3TA requires DNS-compliant (no-dot) bucket names.
+        if !bucket.is_empty() && !bucket.contains('.') {
+            return Some(bucket);
+        }
+        return None;
+    }
+    if let Some(bucket) = host.strip_suffix(".s3-accelerate.amazonaws.com") {
+        if !bucket.is_empty() && !bucket.contains('.') {
+            return Some(bucket);
+        }
+        return None;
+    }
+
+    // --- Regional virtual-hosted / legacy global ---
+    // Pattern: <bucket>.s3.<region>.amazonaws.com
+    //     or: <bucket>.s3.dualstack.<region>.amazonaws.com
+    //     or: <bucket>.s3.amazonaws.com (legacy global)
+    //
+    // <bucket> may contain dots (general-purpose bucket naming rules).
+    // <region> may not be empty and must not contain a dot.
+    if let Some(without_tld) = host.strip_suffix(".amazonaws.com") {
+        // Peel off "<region>" (last dot-separated label) and check whether the
+        // remainder ends with ".s3" or ".s3.dualstack".
+        if let Some((before_region, region)) = without_tld.rsplit_once('.') {
+            if !region.is_empty() && !region.contains('.') {
+                // dualstack variant
+                if let Some(bucket) = before_region.strip_suffix(".s3.dualstack") {
+                    if !bucket.is_empty() {
+                        return Some(bucket);
+                    }
+                    return None;
+                }
+                // regional variant
+                if let Some(bucket) = before_region.strip_suffix(".s3") {
+                    if !bucket.is_empty() {
+                        return Some(bucket);
+                    }
+                    return None;
+                }
+            }
+        }
+
+        // --- Legacy global <bucket>.s3.amazonaws.com ---
+        if let Some(bucket) = without_tld.strip_suffix(".s3") {
+            if !bucket.is_empty() {
+                return Some(bucket);
+            }
+            return None;
+        }
+    }
+
+    None
+}
+
 
 /// Multipart information extracted from S3 response headers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1443,6 +1523,9 @@ impl CacheManager {
         if let Some(h) = host {
             if let Some(prefix) = extract_access_point_prefix(h) {
                 return format!("{}/{}", prefix, normalized_path);
+            }
+            if let Some(bucket) = extract_virtual_hosted_bucket(h) {
+                return format!("{}/{}", bucket, normalized_path);
             }
         }
         normalized_path
