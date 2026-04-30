@@ -12,7 +12,7 @@ server:
   proxy_port: 3128
   http_port: 80
   https_port: 443
-  https_mode: "passthrough"  # Only option: "passthrough" (TCP passthrough)
+  https_mode: "passthrough"  # TCP passthrough to S3 (no caching on the HTTPS listener)
   # Maximum concurrent requests (default: 200)
   # Each concurrent request uses approximately 5 MiB of memory:
   #   - Cache hit: ~1 MiB streaming decompression buffer + ~4 MiB channel backpressure
@@ -94,13 +94,10 @@ cache:
   # ============================================================================
   # SHARED STORAGE CONFIGURATION
   # ============================================================================
-  # Controls coordination features for multi-instance deployments where multiple
-  # proxy instances share a cache volume (NFS, shared PersistentVolume).
-  #
-  # Journal-based metadata writes and distributed eviction locking are always
-  # enabled for consistency across all deployment modes. This ensures reliable
-  # cache coordination whether running single-instance or multi-instance.
-  #
+  # Coordination settings for the journal-based metadata system and distributed
+  # eviction locking. These are always active — they provide the consistency
+  # guarantees needed for multi-instance deployments sharing a cache volume
+  # (NFS, shared PersistentVolume) and also apply to single-instance setups.
   # ============================================================================
   shared_storage:
     
@@ -188,6 +185,30 @@ cache:
     # How often to run background validation of metadata consistency.
     # Valid range: 1-168 hours
     validation_frequency: "23h"
+
+    # --------------------------------------------------------------------------
+    # ORPHAN RECOVERY CONFIGURATION
+    # --------------------------------------------------------------------------
+    # Background scan that finds .bin range files not referenced by any metadata
+    # (e.g. crashed writers, consolidation lag) and either reconciles them into
+    # metadata or removes them. Runs one shard per cycle to spread I/O load.
+
+    # Enable background orphan recovery (default: true)
+    orphan_recovery_enabled: true
+
+    # Interval between orphan recovery scans (default: 300s = 5 minutes)
+    # Valid range: 60-3600 seconds
+    orphan_recovery_interval: "300s"
+
+    # Maximum time to spend scanning per cycle (default: 30s)
+    # Prevents long scans from blocking other operations.
+    # Valid range: 5-300 seconds
+    orphan_scan_timeout: "30s"
+
+    # Maximum orphans to process per recovery cycle (default: 100)
+    # Remaining orphans are processed in subsequent cycles.
+    # Valid range: 10-1000
+    orphan_max_per_cycle: 100
   
     # Maximum duration for a single validation scan cycle (default: 4h).
     # This is the single knob for self-tuning mode selection:
@@ -221,25 +242,27 @@ cache:
   
   # Eviction buffer percentage (default: 5)
   eviction_buffer_percent: 5
+
+  # Eviction trigger / target (percent of max_cache_size)
+  # Eviction begins when cache usage reaches eviction_trigger_percent and continues
+  # until usage drops to eviction_target_percent. Keeping a gap between the two
+  # prevents thrashing where eviction starts and stops repeatedly near the limit.
+  # eviction_trigger_percent: valid range 50-100 (default: 95)
+  # eviction_target_percent:  valid range 50-99, must be less than trigger (default: 80)
+  eviction_trigger_percent: 95
+  eviction_target_percent: 80
+
+  # Honour client cache-bypass request headers (default: true)
+  # When true, a request carrying `Cache-Control: no-cache`, `Pragma: no-cache`, or
+  # `Cache-Control: no-store` bypasses the cache for that request. Set to false to
+  # ignore these headers (clients cannot opt out of caching).
+  cache_bypass_headers_enabled: true
   
   # Cache initialization configuration
   initialization:
     parallel_scan: true
     scan_timeout: "30s"
     progress_logging: true
-  
-  # ============================================================================
-  # SIZE TRACKING BUFFER CONFIGURATION
-  # ============================================================================
-  # NOTE: Size tracking is now handled by the JournalConsolidator.
-  # The consolidator calculates size deltas from journal entries during each
-  # consolidation cycle (every 5 seconds by default). Size state is persisted
-  # to size_tracking/size_state.json after each cycle.
-  #
-  # The following deprecated options have been removed:
-  # - size_tracking_flush_interval (replaced by shared_storage.consolidation_interval)
-  # - size_tracking_buffer_size (no longer needed - journal entries are processed directly)
-  # ============================================================================
   
   # ============================================================================
   # RAM METADATA CACHE CONFIGURATION
