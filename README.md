@@ -99,6 +99,8 @@ sudo cargo run --release -- -c config/config.example.yaml
 
 **Alternative: HTTP_PROXY routing** — Instead of DNS routing, you can point clients at the proxy using the `HTTP_PROXY` environment variable. This avoids DNS or hosts file changes entirely and works well for single-instance deployments. With the optional TLS proxy listener enabled, use `HTTP_PROXY=https://proxy-host:3129` for encrypted client-to-proxy traffic with full caching. See the [Getting Started Guide](docs/GETTING_STARTED.md) for configuration details.
 
+**Deployment**: `target/release/s3-proxy` is a single portable binary (same arch and Linux, glibc ≥ build host). Upgrading is rebuild, replace the binary, restart — config is backward-compatible across versions. See [Binary Portability](docs/GETTING_STARTED.md#binary-portability) and [Upgrading](docs/GETTING_STARTED.md#upgrading).
+
 **Next Steps**: See [Getting Started Guide](docs/GETTING_STARTED.md) for detailed installation and configuration.
 
 ## Architecture

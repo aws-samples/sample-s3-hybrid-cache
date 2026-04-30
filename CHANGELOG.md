@@ -5,6 +5,12 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.2] - 2026-04-30
+
+### Changed
+- **Deployment documentation**: Added `Binary Portability` and `Upgrading` sections to `docs/GETTING_STARTED.md` covering the portable `target/release/s3-proxy` executable (glibc/arch constraints), the rebuild → replace → restart flow, `--version` and startup-log verification, and rolling-restart guidance for multi-instance fleets. README `Quick Start` points at the new sections. Establishes the upgrade contract: config is backward-compatible across versions, so no config edits are required on upgrade.
+- **New steering rule `config-compatibility.md`**: Codifies the contract above as a design requirement — all new config fields must have `#[serde(default)]` or `#[serde(default = ...)]`, no breaking renames without a deprecation alias, no semantic changes to existing fields. Motivated by the 1.13.1 regression where missing struct-level `#[serde(default)]` on `CacheConfig` / `LoggingConfig` / `ConnectionPoolConfig` broke minimal configs.
+
 ## [1.14.1] - 2026-04-29
 
 ### Fixed

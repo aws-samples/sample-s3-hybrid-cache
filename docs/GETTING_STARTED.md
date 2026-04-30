@@ -7,6 +7,8 @@ Quick start guide for installing, configuring, and running S3 Proxy.
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
   - [1. Clone and Build](#1-clone-and-build)
+  - [Binary Portability](#binary-portability)
+  - [Upgrading](#upgrading)
   - [2. Start the Proxy](#2-start-the-proxy)
   - [3. Configure Client Routing](#3-configure-client-routing)
     - [Option A: HTTP_PROXY (Single-Instance / No DNS Changes)](#option-a-http_proxy-single-instance--no-dns-changes)
@@ -62,6 +64,38 @@ cd s3-proxy
 # Build release binary
 cargo build --release
 ```
+
+### Binary Portability
+
+`cargo build --release` produces a single self-contained executable at `target/release/s3-proxy` (around 20 MB). It statically links the Rust standard library and all crates, and dynamically links only against glibc and a small set of standard Linux libraries.
+
+You can build on one host and copy the binary to others, provided:
+
+- Same CPU architecture (x86_64 or aarch64 — don't mix)
+- Same operating system family (Linux)
+- Target host's glibc version is the same or newer than the build host's
+
+The binary has no bundled assets. At runtime it needs a config file, cache directory, log directories, and — if the TLS proxy listener is enabled — a certificate and key. All paths are supplied via the config file.
+
+### Upgrading
+
+Configuration is backward-compatible: new options always have defaults, so existing config files keep working across versions. Review `CHANGELOG.md` for new features and tuning knobs, but no config edits are required to upgrade.
+
+The upgrade flow is: rebuild, replace the binary, restart.
+
+```bash
+git pull                                                 # Sync latest source
+cargo build --release                                    # Rebuild release binary
+sudo cp target/release/s3-proxy /usr/local/bin/s3-proxy  # Replace binary
+sudo systemctl restart s3-proxy                          # Restart service
+/usr/local/bin/s3-proxy --version                        # Verify new version
+```
+
+The proxy also logs its version and build timestamp on startup (`Starting S3 Proxy server v<version> (built: <timestamp>)`), so `journalctl -u s3-proxy | grep Starting` confirms which binary is actually running.
+
+For multi-instance deployments, restart one proxy at a time. Clients using the AWS CRT transfer client fail over to the remaining instances via DNS multi-value routing while each instance restarts. The shared cache is preserved across restarts — the journal system handles concurrent reads and consolidation without coordination.
+
+Build once and copy the binary to each target host (same architecture and glibc rules as [Binary Portability](#binary-portability)) rather than rebuilding in place on every host.
 
 ### 2. Start the Proxy
 
