@@ -79,7 +79,7 @@ The binary has no bundled assets. At runtime it needs a config file, cache direc
 
 ### Upgrading
 
-Configuration is backward-compatible: new options always have defaults, so existing config files keep working across versions. Review `CHANGELOG.md` for new features and tuning knobs, but no config edits are required to upgrade.
+Configuration is backward-compatible: new options always have defaults, so existing config files keep working across versions. Review `CHANGELOG.md` and `config/config.example.yaml` for new features and tuning knobs, but no config edits are required to upgrade.
 
 The upgrade flow is: rebuild, replace the binary, restart.
 
