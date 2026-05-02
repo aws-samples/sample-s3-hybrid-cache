@@ -1,6 +1,6 @@
 # Developer Documentation
 
-Implementation details, architectural decisions, and technical notes for S3 Proxy developers.
+Implementation details, architectural decisions, and technical notes for S3 Hybrid Cache developers.
 
 ## Table of Contents
 

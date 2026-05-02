@@ -1,4 +1,4 @@
-//! S3 Proxy - High-performance HTTP/HTTPS proxy for S3 with intelligent caching
+//! S3 Hybrid Cache - High-performance HTTP/HTTPS proxy for S3 with intelligent caching
 //!
 //! This library provides the core functionality for the S3 proxy server,
 //! including HTTP/HTTPS request handling, caching, compression, and logging.

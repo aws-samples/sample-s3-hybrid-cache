@@ -154,7 +154,7 @@ async fn main() -> Result<()> {
     logger.initialize()?;
 
     info!(
-        "Starting S3 Proxy server v{} (built: {})",
+        "Starting S3 Hybrid Cache server v{} (built: {})",
         env!("CARGO_PKG_VERSION"),
         env!("BUILD_TIMESTAMP")
     );
@@ -675,6 +675,6 @@ async fn main() -> Result<()> {
     // Give server tasks a moment to finish after receiving their shutdown signals
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    info!("S3 Proxy shutdown complete");
+    info!("S3 Hybrid Cache shutdown complete");
     Ok(())
 }

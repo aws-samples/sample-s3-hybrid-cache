@@ -1,6 +1,6 @@
-# S3 Proxy Documentation
+# S3 Hybrid Cache Documentation
 
-Welcome to the S3 Proxy documentation. This guide provides comprehensive information about the S3 Proxy's architecture, configuration, and usage.
+Welcome to the S3 Hybrid Cache documentation. This guide provides comprehensive information about S3 Hybrid Cache's architecture, configuration, and usage.
 
 ## Table of Contents
 

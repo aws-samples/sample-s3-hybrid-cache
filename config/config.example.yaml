@@ -1,4 +1,4 @@
-# S3 Proxy Configuration Example
+# S3 Hybrid Cache Configuration Example
 # This file demonstrates all available configuration options
 
 server:

@@ -1,6 +1,6 @@
-# S3 Proxy Architecture
+# S3 Hybrid Cache Architecture
 
-Technical architecture overview and design principles for S3 Proxy.
+Technical architecture overview and design principles for S3 Hybrid Cache.
 
 ## Table of Contents
 
@@ -47,7 +47,7 @@ Technical architecture overview and design principles for S3 Proxy.
             │                         │                          │
             ▼                         ▼                          ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                          S3 Proxy (1..N)                                   │
+│                       S3 Hybrid Cache (1..N)                               │
 │                                                                            │
 │  ┌────────────────────┐ ┌─────────────────────┐ ┌───────────────────────┐  │
 │  │ HTTP (Port 80)     │ │ TLS Proxy (Port 3129)│ │ HTTPS (Port 443)     │  │
@@ -292,7 +292,7 @@ Each instance operates independently - the shared storage is the only integratio
 **Implementation**:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         S3 Proxy Instance                       │
+│                      S3 Hybrid Cache Instance                   │
 │  ┌─────────────────────┐    ┌─────────────────────────────────┐ │
 │  │  Request Handler    │    │  Cache Operations               │ │
 │  │                     │    │                                 │ │

@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/s3-proxy/bucket-settings-schema.json",
-  "title": "S3 Proxy Bucket Settings",
-  "description": "Per-bucket cache configuration for S3 Proxy. Place this file at cache_dir/metadata/{bucket}/_settings.json to override global cache settings for a specific bucket.",
+  "$id": "https://github.com/aws-samples/sample-s3-hybrid-cache/bucket-settings-schema.json",
+  "title": "S3 Hybrid Cache Bucket Settings",
+  "description": "Per-bucket cache configuration for S3 Hybrid Cache. Place this file at cache_dir/metadata/{bucket}/_settings.json to override global cache settings for a specific bucket.",
   "type": "object",
   "additionalProperties": false,
   "properties": {

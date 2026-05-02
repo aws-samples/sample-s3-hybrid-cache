@@ -1,6 +1,6 @@
 # OTLP Metrics Export
 
-The S3 Proxy supports exporting metrics using OpenTelemetry Protocol (OTLP), providing visibility into proxy requests, S3 API calls, cache performance, and system health.
+S3 Hybrid Cache supports exporting metrics using OpenTelemetry Protocol (OTLP), providing visibility into proxy requests, S3 API calls, cache performance, and system health.
 
 ## Enabling OTLP Metrics
 

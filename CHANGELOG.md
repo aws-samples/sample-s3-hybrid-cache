@@ -5,6 +5,11 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-05-02
+
+### Changed
+- **Product display name**: Renamed user-facing strings from "S3 Proxy" to "S3 Hybrid Cache" across `README.md`, `docs/*.md`, `docs/bucket-settings-schema.json`, `config/config.example.yaml`, the library header doc comment (`src/lib.rs`), and the startup/shutdown log lines in `src/main.rs` (startup log is now `Starting S3 Hybrid Cache server v<version> (built: <timestamp>)`). The Cargo package name (`s3-proxy`), the produced binary filename (`target/release/s3-proxy`), systemd unit (`s3-proxy.service`), and all deployment scripts are unchanged — this is a display-only rename and does not affect the upgrade contract. Upgrade is still `cargo build --release` → copy binary → `systemctl restart`, no config edits required. The `journalctl -u s3-proxy | grep Starting` verification command continues to work; its expected output string is now "Starting S3 Hybrid Cache server".
+
 ## [1.14.2] - 2026-04-30
 
 ### Changed

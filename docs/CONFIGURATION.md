@@ -1,6 +1,6 @@
 # Configuration Reference
 
-Complete configuration guide for S3 Proxy including cache behavior, TTL management, and performance tuning.
+Complete configuration guide for S3 Hybrid Cache including cache behavior, TTL management, and performance tuning.
 
 ## Table of Contents
 
@@ -39,7 +39,7 @@ Complete configuration guide for S3 Proxy including cache behavior, TTL manageme
 
 ## Configuration Methods
 
-S3 Proxy supports three-layer configuration with precedence:
+S3 Hybrid Cache supports three-layer configuration with precedence:
 
 1. **YAML file** (base configuration)
 2. **Environment variables** (override YAML)
@@ -219,7 +219,7 @@ TTL (Time-To-Live) controls how long cached data is served to clients without re
 
 ### TTL Types
 
-S3 Proxy uses three independent TTL values:
+S3 Hybrid Cache uses three independent TTL values:
 
 ```yaml
 cache:
