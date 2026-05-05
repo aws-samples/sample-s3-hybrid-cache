@@ -1,6 +1,6 @@
 # S3 Hybrid Cache Documentation
 
-Welcome to the S3 Hybrid Cache documentation. This guide provides comprehensive information about S3 Hybrid Cache's architecture, configuration, and usage.
+Deep-dive reference documentation for S3 Hybrid Cache. For an overview and quick start, see the [project README](../README.md).
 
 ## Table of Contents
 
@@ -15,9 +15,9 @@ Welcome to the S3 Hybrid Cache documentation. This guide provides comprehensive 
 - [Connection Pooling](CONNECTION_POOLING.md) - Connection management and load balancing
 
 ### Advanced Features
-- [Write-Through Caching](CACHING.md#write-cache-configuration) - PUT operation caching
+- [Write-Through Caching](CACHING.md#write-through-cache) - PUT operation caching
 - [Multipart Upload Caching](MULTIPART_UPLOAD.md) - Multipart upload cache internals and correctness model
-- [Range Request Optimization](CACHING.md#range-request-optimization) - Intelligent range handling
+- [Range Request Optimization](CACHING.md#intelligent-range-merging) - Intelligent range handling
 - [Compression Optimization](COMPRESSION.md#ram-cache-compression-optimization) - Efficient memory usage
 - [Dashboard](DASHBOARD.md) - Web-based monitoring interface
 - [OTLP Metrics](OTLP_METRICS.md) - OpenTelemetry metrics export
@@ -28,7 +28,7 @@ Welcome to the S3 Hybrid Cache documentation. This guide provides comprehensive 
 - [Developer Guide](DEVELOPER.md) - Implementation details and development notes
 
 ### Reference
-- [Troubleshooting Guide](ERROR_HANDLING.md#troubleshooting) - Common issues and solutions
+- [Error Handling](ERROR_HANDLING.md) - Error recovery and maintenance operations
 - [Performance Tuning](CONFIGURATION.md#cache-hit-performance-tuning) - Optimization guidelines
 
 ---
