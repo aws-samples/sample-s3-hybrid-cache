@@ -20,6 +20,8 @@ Complete configuration guide for S3 Hybrid Cache including cache behavior, TTL m
 - [Cache Size Tracking Configuration](#cache-size-tracking-configuration)
 - [Compression Configuration](#compression-configuration)
 - [Connection Pooling](#connection-pooling)
+- [DNS Server Configuration](#dns-server-configuration)
+- [S3 PrivateLink (Interface VPC Endpoints)](#s3-privatelink-interface-vpc-endpoints)
 - [IP Distribution](#ip-distribution)
 - [Logging Configuration](#logging-configuration)
   - [Buffered Access Logging](#buffered-access-logging)
@@ -945,7 +947,7 @@ connection_pool:
   # dns_servers: ["8.8.8.8", "1.1.1.1"]
 ```
 
-### DNS Server Configuration
+## DNS Server Configuration
 
 **Purpose**: Configure DNS servers for S3 endpoint resolution
 
@@ -963,7 +965,7 @@ connection_pool:
 - Corporate environments with internal DNS
 - S3 PrivateLink (interface VPC endpoints) — see below
 
-### S3 PrivateLink (Interface VPC Endpoints)
+## S3 PrivateLink (Interface VPC Endpoints)
 
 When using S3 interface VPC endpoints (PrivateLink), the proxy must resolve S3 endpoints to the PrivateLink ENI IPs instead of public S3 IPs. The default external DNS servers (Google, Cloudflare) return public IPs, bypassing PrivateLink entirely.
 
@@ -1050,7 +1052,7 @@ Distributes outgoing S3 connections across all resolved IP addresses for an endp
 
 ```yaml
 connection_pool:
-  ip_distribution_enabled: false  # Enable per-IP connection pools (default: false)
+  ip_distribution_enabled: true   # Per-IP connection pools (default: true)
   max_idle_per_ip: 10             # Idle connections per IP pool (default: 10, range: 1-100)
 ```
 
