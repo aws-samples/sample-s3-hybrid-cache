@@ -1088,6 +1088,13 @@ S3 typically returns ~8 IPs per endpoint, so the default of 10 yields ~80 total 
 - Preserves Host header for AWS SigV4 signature validity
 - IP set updates automatically on DNS refresh; stale IPs are removed within one refresh cycle
 
+### PrivateLink (endpoint_overrides) Interaction
+
+When `endpoint_overrides` provides the IP set, IP distribution round-robins across the listed ENI IPs identically to DNS-resolved IPs. Two differences from DNS-based distribution:
+
+1. **Eager initialization**: Exact-match overrides seed the distributor at startup. Suffix (`*.`) overrides create distributors lazily on first matching request.
+2. **Health exclusion is permanent until restart**: DNS-refreshed endpoints automatically restore excluded IPs every `dns_refresh_interval`. Static overrides have no DNS refresh, so an excluded ENI IP stays excluded until the proxy restarts. If you have only 1–2 ENI IPs, a transient network issue could exclude all of them — the proxy falls back to hostname-based routing (which still works, but loses per-IP pool separation). Monitor the health check endpoint for excluded IPs in PrivateLink deployments.
+
 ## Logging Configuration
 
 ```yaml
