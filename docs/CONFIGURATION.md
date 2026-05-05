@@ -947,6 +947,36 @@ connection_pool:
   # dns_servers: ["8.8.8.8", "1.1.1.1"]
 ```
 
+### Connection Keepalive
+
+**Purpose**: Reuse TCP/TLS connections to eliminate handshake overhead
+
+**Benefits**:
+- 150-200ms latency reduction per request
+- 50-100% throughput increase
+- First request: Full handshake (~250-350ms)
+- Subsequent requests: Reuse connection (~100-150ms)
+
+**Tuning guide**:
+
+| Setting | Low Value | High Value | Recommendation |
+|---------|-----------|------------|----------------|
+| max_idle_per_host | Less memory/FDs | More concurrent reuse | 10 (default), reduce for memory-constrained environments |
+| max_lifetime | More frequent rotation | Less overhead | 300s (5 min) for stable endpoints |
+| pool_check_interval | More responsive cleanup | Less CPU overhead | 10s for balanced performance |
+
+**Traffic-based tuning**:
+- Low traffic: 1-2 connections per IP
+- Medium traffic: 2-5 connections per IP
+- High traffic: 5-10 connections per IP
+
+**Endpoint stability tuning**:
+- Frequent DNS changes: 60-120s lifetime
+- Stable endpoints: 300-600s lifetime
+- Very stable endpoints: 600-3600s lifetime
+
+Set `keepalive_enabled: false` to disable connection reuse (useful for debugging connection issues).
+
 ## DNS Server Configuration
 
 **Purpose**: Configure DNS servers for S3 endpoint resolution
@@ -1005,46 +1035,6 @@ Overrides apply to both the HTTP caching path and the HTTPS passthrough handler 
 **Note on virtual-hosted regional traffic**: `*.s3.<region>.amazonaws.com` wildcards have always carried virtual-hosted regional traffic (`<bucket>.s3.<region>.amazonaws.com`) to the proxy. Before 1.14.1 that traffic was forwarded correctly but the proxy produced a flat, un-prefixed cache key — requests succeeded but nothing was written to the cache. From 1.14.1 onwards the bucket is extracted from the Host and caching works for all virtual-hosted styles.
 
 See [Getting Started - S3 PrivateLink](GETTING_STARTED.md#s3-privatelink-interface-vpc-endpoints) for setup details and verification steps.
-
-### Connection Keepalive
-
-**Purpose**: Reuse TCP/TLS connections to eliminate handshake overhead
-
-**Benefits**:
-- 150-200ms latency reduction per request
-- 50-100% throughput increase
-- First request: Full handshake (~250-350ms)
-- Subsequent requests: Reuse connection (~100-150ms)
-
-**Tuning guide**:
-
-| Setting | Low Value | High Value | Recommendation |
-|---------|-----------|------------|----------------|
-| max_idle_per_host | Less memory/FDs | More concurrent reuse | 10 (default), reduce for memory-constrained environments |
-| max_lifetime | More frequent rotation | Less overhead | 300s (5 min) for stable endpoints |
-| pool_check_interval | More responsive cleanup | Less CPU overhead | 10s for balanced performance |
-
-**Traffic-based tuning**:
-- Low traffic: 1-2 connections per IP
-- Medium traffic: 2-5 connections per IP
-- High traffic: 5-10 connections per IP
-
-**Endpoint stability tuning**:
-- Frequent DNS changes: 60-120s lifetime
-- Stable endpoints: 300-600s lifetime
-- Very stable endpoints: 600-3600s lifetime
-
-### Disabling Keepalive
-
-```yaml
-connection_pool:
-  keepalive_enabled: false
-```
-
-Creates new connections for every request. Useful for:
-- Debugging connection issues
-- Testing without connection reuse
-- Specific deployment scenarios
 
 ## IP Distribution
 
