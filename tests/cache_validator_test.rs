@@ -4,15 +4,11 @@
 //! consistent behavior across WriteCacheManager and CacheSizeTracker.
 
 use s3_proxy::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
-use s3_proxy::cache_validator::{
-    CacheFileCategory, CacheFileResult, CacheValidator,
-};
+use s3_proxy::cache_validator::{CacheFileCategory, CacheFileResult, CacheValidator};
 use s3_proxy::compression::CompressionAlgorithm;
-use serde_json;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
-use tokio;
 
 /// Create a test metadata object for testing
 fn create_test_metadata(
@@ -767,7 +763,7 @@ mod error_handling_tests {
                 .await
                 .unwrap();
             // May be empty due to permission issues, but shouldn't panic
-            assert!(result.len() == 0);
+            assert!(result.is_empty());
         }
     }
 

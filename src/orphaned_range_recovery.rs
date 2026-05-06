@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-
 /// Orphaned range recovery manager
 pub struct OrphanedRangeRecovery {
     cache_dir: PathBuf,
@@ -724,17 +723,14 @@ impl OrphanedRangeRecovery {
     /// Estimate access frequency based on file metadata
     async fn estimate_access_frequency(&self, file_path: &Path) -> u64 {
         // Simple heuristic: use file access time if available
-        match std::fs::metadata(file_path) {
-            Ok(metadata) => {
-                if let Ok(accessed) = metadata.accessed() {
-                    if let Ok(duration) = SystemTime::now().duration_since(accessed) {
-                        // More recent access = higher frequency score
-                        let days_since_access = duration.as_secs() / 86400;
-                        return (100_u64).saturating_sub(days_since_access);
-                    }
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            if let Ok(accessed) = metadata.accessed() {
+                if let Ok(duration) = SystemTime::now().duration_since(accessed) {
+                    // More recent access = higher frequency score
+                    let days_since_access = duration.as_secs() / 86400;
+                    return (100_u64).saturating_sub(days_since_access);
                 }
             }
-            Err(_) => {}
         }
 
         // Default frequency
@@ -779,7 +775,7 @@ impl OrphanedRangeRecovery {
                 &orphan.cache_key,
                 updated_range_spec.clone(),
                 crate::hybrid_metadata_writer::WriteMode::Hybrid,
-                None, // No object_metadata available for orphaned ranges
+                None,                      // No object_metadata available for orphaned ranges
                 std::time::Duration::ZERO, // Force revalidation since original TTL is unknown
             )
             .await
@@ -792,20 +788,17 @@ impl OrphanedRangeRecovery {
     /// Detect compression algorithm from file content
     async fn detect_compression(&self, file_path: &Path) -> CompressionAlgorithm {
         // Read first few bytes to detect compression
-        match std::fs::File::open(file_path) {
-            Ok(mut file) => {
-                use std::io::Read;
-                let mut buffer = [0u8; 16];
-                if let Ok(bytes_read) = file.read(&mut buffer) {
-                    if bytes_read >= 4 {
-                        // Check for LZ4 magic number
-                        if &buffer[0..4] == b"\x04\"M\x18" {
-                            return CompressionAlgorithm::Lz4;
-                        }
+        if let Ok(mut file) = std::fs::File::open(file_path) {
+            use std::io::Read;
+            let mut buffer = [0u8; 16];
+            if let Ok(bytes_read) = file.read(&mut buffer) {
+                if bytes_read >= 4 {
+                    // Check for LZ4 magic number
+                    if &buffer[0..4] == b"\x04\"M\x18" {
+                        return CompressionAlgorithm::Lz4;
                     }
                 }
             }
-            Err(_) => {}
         }
 
         CompressionAlgorithm::Lz4

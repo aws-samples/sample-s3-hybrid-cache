@@ -124,7 +124,8 @@ impl RamCache {
                 Ok(compressed_data) => {
                     compressed_entry.data = compressed_data;
                     compressed_entry.compressed = true;
-                    compressed_entry.compression_algorithm = compression_handler.get_preferred_algorithm().clone();
+                    compressed_entry.compression_algorithm =
+                        compression_handler.get_preferred_algorithm().clone();
                 }
                 Err(e) => {
                     debug!("RAM cache compression failed, storing uncompressed: {}", e);
@@ -377,7 +378,6 @@ impl RamCache {
 
         base_size + key_size + data_size + metadata_size
     }
-
 
     /// Parse a range cache key to extract base key, start, and end
     ///
@@ -678,9 +678,9 @@ mod tests {
         let mut compression_handler = CompressionHandler::new(1000, false); // Disable compression for predictable sizes
 
         // Add entries that will exceed cache size
-        let entry1 = create_test_entry("test:key1", &vec![b'A'; 50]);
-        let entry2 = create_test_entry("test:key2", &vec![b'B'; 50]);
-        let entry3 = create_test_entry("test:key3", &vec![b'C'; 50]);
+        let entry1 = create_test_entry("test:key1", &[b'A'; 50]);
+        let entry2 = create_test_entry("test:key2", &[b'B'; 50]);
+        let entry3 = create_test_entry("test:key3", &[b'C'; 50]);
 
         cache.put(entry1, &mut compression_handler).unwrap();
         cache.put(entry2, &mut compression_handler).unwrap();
@@ -704,10 +704,10 @@ mod tests {
         let mut cache = RamCache::new(200, CacheEvictionAlgorithm::TinyLFU);
         let mut compression_handler = CompressionHandler::new(100, false);
 
-        let entry1 = create_test_entry("test:key1", &vec![b'A'; 50]);
-        let entry2 = create_test_entry("test:key2", &vec![b'B'; 50]);
-        let entry3 = create_test_entry("test:key3", &vec![b'C'; 50]);
-        let entry4 = create_test_entry("test:key4", &vec![b'D'; 50]);
+        let entry1 = create_test_entry("test:key1", &[b'A'; 50]);
+        let entry2 = create_test_entry("test:key2", &[b'B'; 50]);
+        let entry3 = create_test_entry("test:key3", &[b'C'; 50]);
+        let entry4 = create_test_entry("test:key4", &[b'D'; 50]);
 
         cache.put(entry1, &mut compression_handler).unwrap();
         cache.put(entry2, &mut compression_handler).unwrap();
@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(cache.get_utilization(), 0.0);
 
         // Add entry that uses about 10% of cache
-        let entry = create_test_entry("test:key1", &vec![b'A'; 50]); // Plus metadata overhead
+        let entry = create_test_entry("test:key1", &[b'A'; 50]); // Plus metadata overhead
         cache.put(entry, &mut compression_handler).unwrap();
 
         let utilization = cache.get_utilization();
@@ -912,14 +912,14 @@ mod eviction_property_tests {
         let mut compression_handler = CompressionHandler::new(1000, false);
 
         // Add entries to fill cache
-        let entry1 = create_test_entry("test:object1:range:0:1000", &vec![b'A'; 50]);
-        let entry2 = create_test_entry("test:object2:range:0:1000", &vec![b'B'; 50]);
+        let entry1 = create_test_entry("test:object1:range:0:1000", &[b'A'; 50]);
+        let entry2 = create_test_entry("test:object2:range:0:1000", &[b'B'; 50]);
 
         cache.put(entry1, &mut compression_handler).unwrap();
         cache.put(entry2, &mut compression_handler).unwrap();
 
         // Add entry3 to force eviction of entry1 (LRU)
-        let entry3 = create_test_entry("test:object3:range:0:1000", &vec![b'C'; 50]);
+        let entry3 = create_test_entry("test:object3:range:0:1000", &[b'C'; 50]);
         cache.put(entry3, &mut compression_handler).unwrap();
 
         // Verify eviction occurred - entry1 should be evicted (LRU)
@@ -938,8 +938,8 @@ mod eviction_property_tests {
         let mut compression_handler = CompressionHandler::new(1000, false);
 
         // Add entries to fill cache
-        let entry1 = create_test_entry("test:object1:range:0:1000", &vec![b'A'; 50]);
-        let entry2 = create_test_entry("test:object2:range:0:1000", &vec![b'B'; 50]);
+        let entry1 = create_test_entry("test:object1:range:0:1000", &[b'A'; 50]);
+        let entry2 = create_test_entry("test:object2:range:0:1000", &[b'B'; 50]);
 
         cache.put(entry1, &mut compression_handler).unwrap();
         cache.put(entry2, &mut compression_handler).unwrap();
@@ -948,7 +948,7 @@ mod eviction_property_tests {
         let start = std::time::Instant::now();
 
         // Add entry3 to force eviction
-        let entry3 = create_test_entry("test:object3:range:0:1000", &vec![b'C'; 50]);
+        let entry3 = create_test_entry("test:object3:range:0:1000", &[b'C'; 50]);
         cache.put(entry3, &mut compression_handler).unwrap();
 
         let elapsed = start.elapsed();
@@ -977,7 +977,7 @@ mod eviction_property_tests {
         // Add entries
         for i in 0..entry_count {
             let key = format!("test:object{}:range:0:1000", i);
-            let entry = create_test_entry(&key, &vec![b'A'; 30]);
+            let entry = create_test_entry(&key, &[b'A'; 30]);
             cache.put(entry, &mut compression_handler).unwrap();
         }
 
@@ -986,7 +986,7 @@ mod eviction_property_tests {
         // Force eviction by adding more entries
         for i in entry_count..(entry_count + 5) {
             let key = format!("test:object{}:range:0:1000", i);
-            let entry = create_test_entry(&key, &vec![b'A'; 30]);
+            let entry = create_test_entry(&key, &[b'A'; 30]);
             cache.put(entry, &mut compression_handler).unwrap();
         }
 
@@ -1008,14 +1008,14 @@ mod eviction_property_tests {
             let mut compression_handler = CompressionHandler::new(1000, false);
 
             // Add entries
-            let entry1 = create_test_entry("test:obj1:range:0:1000", &vec![b'A'; 50]);
-            let entry2 = create_test_entry("test:obj2:range:0:1000", &vec![b'B'; 50]);
+            let entry1 = create_test_entry("test:obj1:range:0:1000", &[b'A'; 50]);
+            let entry2 = create_test_entry("test:obj2:range:0:1000", &[b'B'; 50]);
 
             cache.put(entry1, &mut compression_handler).unwrap();
             cache.put(entry2, &mut compression_handler).unwrap();
 
             // Force eviction
-            let entry3 = create_test_entry("test:obj3:range:0:1000", &vec![b'C'; 50]);
+            let entry3 = create_test_entry("test:obj3:range:0:1000", &[b'C'; 50]);
             cache.put(entry3, &mut compression_handler).unwrap();
 
             // Cache should still be functional

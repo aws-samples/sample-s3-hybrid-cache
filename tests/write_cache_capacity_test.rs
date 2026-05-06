@@ -24,12 +24,12 @@ async fn test_get_write_cache_capacity_default() -> Result<()> {
         true,                       // write_cache_enabled
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     // With no total cache size set, should use 1GB default
@@ -60,12 +60,12 @@ async fn test_get_write_cache_capacity_with_total_size() -> Result<()> {
         true,                       // write_cache_enabled
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await?;
@@ -99,12 +99,12 @@ async fn test_get_write_cache_capacity_different_percentages() -> Result<()> {
         true,                       // write_cache_enabled
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
     cache_manager.update_total_cache_size(1024 * 1024 * 1024); // 1GB
 
@@ -134,12 +134,12 @@ async fn test_get_write_cache_capacity_consistency() -> Result<()> {
         true,                       // write_cache_enabled
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await?;

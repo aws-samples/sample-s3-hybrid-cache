@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::debug;
 
+/// Type alias for the pending send future used for backpressure.
+type PendingSendFuture =
+    Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Bytes>>> + Send + Sync>>;
+
 /// A stream that tees data to a channel while passing it through.
 ///
 /// Uses backpressure-aware sends: when the cache channel is full, the stream
@@ -32,7 +36,7 @@ pub struct TeeStream<S> {
     bytes_sent: usize,
     /// Stored send future for backpressure — when the channel is full, we store
     /// the pending send and the frame to return, then poll the send on subsequent calls.
-    pending_send: Option<Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Bytes>>> + Send + Sync>>>,
+    pending_send: Option<PendingSendFuture>,
     pending_frame: Option<Bytes>,
     /// Track backpressure timing for observability
     backpressure_wait: Duration,
@@ -134,9 +138,8 @@ where
                                 // Create a send future and store it
                                 let sender = self.sender.clone();
                                 let bytes_to_send = bytes.clone();
-                                let send_fut = Box::pin(async move {
-                                    sender.send(bytes_to_send).await
-                                });
+                                let send_fut =
+                                    Box::pin(async move { sender.send(bytes_to_send).await });
                                 self.pending_send = Some(send_fut);
                                 self.pending_frame = Some(bytes);
 

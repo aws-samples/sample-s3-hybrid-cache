@@ -186,9 +186,7 @@ pub fn decode_aws_chunked(body: &[u8]) -> Result<Vec<u8>, AwsChunkedError> {
         pos = chunk_end;
 
         // Skip trailing \r\n after chunk data — reject overflow as EOF.
-        let trailer_end = pos
-            .checked_add(2)
-            .ok_or(AwsChunkedError::UnexpectedEof)?;
+        let trailer_end = pos.checked_add(2).ok_or(AwsChunkedError::UnexpectedEof)?;
         if trailer_end > body.len() {
             return Err(AwsChunkedError::UnexpectedEof);
         }

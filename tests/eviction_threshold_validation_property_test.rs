@@ -51,14 +51,14 @@ fn validate_eviction_thresholds(trigger: u8, target: u8) -> (u8, u8) {
 /// **Validates: Requirements 3.5, 3.7**
 fn prop_trigger_in_valid_range(trigger: u8, target: u8) -> TestResult {
     let (validated_trigger, _) = validate_eviction_thresholds(trigger, target);
-    TestResult::from_bool(validated_trigger >= 50 && validated_trigger <= 100)
+    TestResult::from_bool((50..=100).contains(&validated_trigger))
 }
 
 /// Property: Target is always in range [50, 99] after validation
 /// **Validates: Requirements 3.6, 3.8**
 fn prop_target_in_valid_range(trigger: u8, target: u8) -> TestResult {
     let (_, validated_target) = validate_eviction_thresholds(trigger, target);
-    TestResult::from_bool(validated_target >= 50 && validated_target <= 99)
+    TestResult::from_bool((50..=99).contains(&validated_target))
 }
 
 /// Property: Target is always less than trigger, OR target == 50 when trigger == 50
@@ -79,7 +79,7 @@ fn prop_target_less_than_trigger(trigger: u8, target: u8) -> TestResult {
 /// **Validates: Requirements 3.5, 3.7**
 fn prop_valid_trigger_preserved(trigger: u8) -> TestResult {
     // Only test values in valid range
-    if trigger < 50 || trigger > 100 {
+    if !(50..=100).contains(&trigger) {
         return TestResult::discard();
     }
 
@@ -93,7 +93,7 @@ fn prop_valid_trigger_preserved(trigger: u8) -> TestResult {
 /// **Validates: Requirements 3.6, 3.8**
 fn prop_valid_target_preserved(target: u8) -> TestResult {
     // Only test values in valid range
-    if target < 50 || target > 99 {
+    if !(50..=99).contains(&target) {
         return TestResult::discard();
     }
 
@@ -169,10 +169,10 @@ fn prop_all_invariants_hold(trigger: u8, target: u8) -> TestResult {
     let (validated_trigger, validated_target) = validate_eviction_thresholds(trigger, target);
 
     // Invariant 1: trigger in [50, 100]
-    let trigger_valid = validated_trigger >= 50 && validated_trigger <= 100;
+    let trigger_valid = (50..=100).contains(&validated_trigger);
 
     // Invariant 2: target in [50, 99]
-    let target_valid = validated_target >= 50 && validated_target <= 99;
+    let target_valid = (50..=99).contains(&validated_target);
 
     // Invariant 3: target < trigger OR (target == 50 AND trigger == 50)
     let relationship_valid = if validated_trigger == 50 {

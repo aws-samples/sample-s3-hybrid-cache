@@ -103,7 +103,8 @@ async fn test_non_aligned_range_request() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -111,7 +112,7 @@ async fn test_non_aligned_range_request() {
     // Step 3: Request a non-aligned range that crosses the 8MB boundary
     // Request: 1MB (1048576) to 10MB-1 (10485759)
     // This crosses the boundary at 8MB (8388608)
-    let requested_start = 1 * mb;
+    let requested_start = mb;
     let requested_end = 10 * mb - 1;
     let requested_range = RangeSpec {
         start: requested_start as u64,
@@ -166,7 +167,7 @@ async fn test_non_aligned_range_request() {
         .unwrap();
 
     // Requirement 2.2, 2.3: Verify correct bytes are extracted from each cached range
-    let expected_size = (requested_end - requested_start + 1) as usize;
+    let expected_size = requested_end - requested_start + 1;
     assert_eq!(
         merge_result.data.len(),
         expected_size,
@@ -268,7 +269,8 @@ async fn test_non_aligned_range_multiple_boundaries() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -308,7 +310,7 @@ async fn test_non_aligned_range_multiple_boundaries() {
         .unwrap();
 
     // Verify correctness
-    let expected_size = (requested_end - requested_start + 1) as usize;
+    let expected_size = requested_end - requested_start + 1;
     assert_eq!(merge_result.data.len(), expected_size);
 
     let expected_data = &full_data[requested_start..=requested_end];
@@ -375,7 +377,8 @@ async fn test_non_aligned_range_at_start() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -406,7 +409,7 @@ async fn test_non_aligned_range_at_start() {
         .await
         .unwrap();
 
-    let expected_size = (requested_end - requested_start + 1) as usize;
+    let expected_size = requested_end - requested_start + 1;
     assert_eq!(merge_result.data.len(), expected_size);
 
     let expected_data = &full_data[requested_start..=requested_end];
@@ -468,7 +471,8 @@ async fn test_non_aligned_range_at_end() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -499,7 +503,7 @@ async fn test_non_aligned_range_at_end() {
         .await
         .unwrap();
 
-    let expected_size = (requested_end - requested_start + 1) as usize;
+    let expected_size = requested_end - requested_start + 1;
     assert_eq!(merge_result.data.len(), expected_size);
 
     let expected_data = &full_data[requested_start..=requested_end];

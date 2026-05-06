@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Test configuration for S3 integration tests
+#[allow(dead_code)]
 struct S3TestConfig {
     endpoint: String,
     bucket: String,
@@ -149,11 +150,14 @@ fn create_test_config() -> Config {
 #[tokio::test]
 async fn test_tcp_passthrough_mode() {
     // Test TCP passthrough mode (default HTTPS behavior)
-    let config = create_test_config();
+    let _config = create_test_config();
     let tcp_addr = SocketAddr::from(([127, 0, 0, 1], 8443));
 
     // Create TCP proxy for passthrough mode
-    let tcp_proxy = TcpProxy::new(tcp_addr, s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()));
+    let _tcp_proxy = TcpProxy::new(
+        tcp_addr,
+        s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+    );
 
     // Verify TCP proxy can be created and configured
     // Note: TCP proxy doesn't expose bind_address method, but creation success indicates proper setup
@@ -213,7 +217,11 @@ async fn test_load_balancing_across_ips() {
     // Collect 6 IPs — should cycle through all 3 twice
     let mut ips = Vec::new();
     for _ in 0..6 {
-        ips.push(manager.get_distributed_ip("s3.us-west-2.amazonaws.com").unwrap());
+        ips.push(
+            manager
+                .get_distributed_ip("s3.us-west-2.amazonaws.com")
+                .unwrap(),
+        );
     }
 
     // Each IP should appear exactly twice
@@ -240,7 +248,7 @@ async fn test_http_proxy_with_caching() {
     );
 
     // Create cache manager for testing
-    let cache_manager = CacheManager::new_with_defaults(
+    let _cache_manager = CacheManager::new_with_defaults(
         config.cache.cache_dir.clone(),
         config.cache.ram_cache_enabled,
         config.cache.max_ram_cache_size,
@@ -252,12 +260,8 @@ async fn test_http_proxy_with_caching() {
     assert_eq!(test_key, "test-bucket/test-object");
 
     // Test cache key with params
-    let key_with_params = CacheManager::generate_cache_key_with_params(
-        "/test-bucket/test-object",
-        None,
-        None,
-        None,
-    );
+    let key_with_params =
+        CacheManager::generate_cache_key_with_params("/test-bucket/test-object", None, None, None);
     assert_eq!(key_with_params, "test-bucket/test-object");
 
     println!("HTTP proxy with caching configured successfully");
@@ -281,11 +285,13 @@ async fn test_end_to_end_proxy_setup() {
 
     // TCP proxy setup (for HTTPS passthrough)
     let tcp_addr = SocketAddr::from(([127, 0, 0, 1], 8443));
-    let _tcp_proxy = TcpProxy::new(tcp_addr, s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()));
+    let _tcp_proxy = TcpProxy::new(
+        tcp_addr,
+        s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+    );
 
     // Connection pool manager setup
-    let manager =
-        ConnectionPoolManager::new().expect("Failed to create connection pool manager");
+    let manager = ConnectionPoolManager::new().expect("Failed to create connection pool manager");
 
     // Verify manager starts with no distributors
     let stats = manager.get_ip_distribution_stats();
@@ -302,10 +308,7 @@ async fn test_s3_compatible_services() {
     let mut manager =
         ConnectionPoolManager::new().expect("Failed to create connection pool manager");
 
-    let ips = vec![
-        "10.0.0.1".parse().unwrap(),
-        "10.0.0.2".parse().unwrap(),
-    ];
+    let ips = vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
     manager.ip_distributors.insert(
         "s3.amazonaws.com".to_string(),
         s3_proxy::connection_pool::IpDistributor::new(ips),

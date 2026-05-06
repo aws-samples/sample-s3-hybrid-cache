@@ -3,7 +3,6 @@
 use s3_proxy::{cache::CacheManager, cache_types::CacheMetadata, Result};
 
 use tempfile::TempDir;
-use tokio;
 
 #[tokio::test]
 async fn test_write_lock_coordination() -> Result<()> {
@@ -106,7 +105,7 @@ async fn test_coordinated_cache_cleanup() -> Result<()> {
     assert!(cached_entry.is_some(), "Cache entry should exist");
 
     // Run coordinated cleanup (should not remove non-expired entries)
-    let cleaned_count = cache_manager.coordinate_cleanup().await?;
+    let _cleaned_count = cache_manager.coordinate_cleanup().await?;
 
     // Entry should still exist (not expired)
     let cached_entry_after_cleanup = cache_manager.get_cached_response(cache_key).await?;
@@ -188,7 +187,7 @@ async fn test_coordination_statistics() -> Result<()> {
     assert!(initial_stats.contains_key("cache_misses"));
     assert!(initial_stats.contains_key("expired_entries"));
 
-    let initial_hits = *initial_stats.get("cache_hits").unwrap();
+    let _initial_hits = *initial_stats.get("cache_hits").unwrap();
 
     // Acquire a lock (this creates the locks directory)
     let cache_key = "test-bucket/stats-test";

@@ -5,14 +5,15 @@
 
 use crate::{ProxyError, Result};
 use dashmap::DashMap;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
-use trust_dns_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use trust_dns_resolver::TokioAsyncResolver;
 
 // ---------------------------------------------------------------------------
 // EndpointOverrides — shared exact + suffix hostname-to-IP resolution
@@ -235,7 +236,7 @@ impl IpHealthTracker {
 /// - Per-endpoint IpDistributor for round-robin IP selection
 /// - Hostname lookup for TLS SNI when URI authority is rewritten to IP
 pub struct ConnectionPoolManager {
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
     default_dns_refresh_interval: Duration,
     dns_refresh_count: u64,
     /// Parsed endpoint overrides (exact + suffix) for PrivateLink etc.
@@ -251,16 +252,24 @@ pub struct ConnectionPoolManager {
 impl ConnectionPoolManager {
     /// Create a new connection pool manager with external DNS servers
     pub fn new() -> Result<Self> {
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfigGroup::google().into_inner()[0].clone());
-        config.add_name_server(NameServerConfigGroup::google().into_inner()[1].clone());
-        config.add_name_server(NameServerConfigGroup::cloudflare().into_inner()[0].clone());
-        config.add_name_server(NameServerConfigGroup::cloudflare().into_inner()[1].clone());
+        use hickory_resolver::config::{ResolveHosts, CLOUDFLARE, GOOGLE};
+        let mut config = ResolverConfig::default();
+        for ns in GOOGLE.udp_and_tcp() {
+            config.add_name_server(ns);
+        }
+        for ns in CLOUDFLARE.udp_and_tcp() {
+            config.add_name_server(ns);
+        }
 
         let mut opts = ResolverOpts::default();
-        opts.use_hosts_file = false;
+        opts.use_hosts_file = ResolveHosts::Never;
 
-        let resolver = TokioAsyncResolver::tokio(config, opts);
+        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .map_err(|e| {
+                ProxyError::ConnectionError(format!("Failed to build DNS resolver: {}", e))
+            })?;
         info!("DNS resolver initialized with external servers (bypassing /etc/hosts)");
 
         Ok(Self {
@@ -276,31 +285,22 @@ impl ConnectionPoolManager {
 
     /// Create a new connection pool manager with configuration
     pub fn new_with_config(config: crate::config::ConnectionPoolConfig) -> Result<Self> {
-        let mut resolver_config = ResolverConfig::new();
+        use hickory_resolver::config::{NameServerConfig, ResolveHosts, CLOUDFLARE, GOOGLE};
+        let mut resolver_config = ResolverConfig::default();
 
         if config.dns_servers.is_empty() {
-            resolver_config
-                .add_name_server(NameServerConfigGroup::google().into_inner()[0].clone());
-            resolver_config
-                .add_name_server(NameServerConfigGroup::google().into_inner()[1].clone());
-            resolver_config
-                .add_name_server(NameServerConfigGroup::cloudflare().into_inner()[0].clone());
-            resolver_config
-                .add_name_server(NameServerConfigGroup::cloudflare().into_inner()[1].clone());
+            for ns in GOOGLE.udp_and_tcp() {
+                resolver_config.add_name_server(ns);
+            }
+            for ns in CLOUDFLARE.udp_and_tcp() {
+                resolver_config.add_name_server(ns);
+            }
             info!("DNS resolver initialized with default servers: Google DNS + Cloudflare DNS (bypassing /etc/hosts)");
         } else {
-            use trust_dns_resolver::config::{NameServerConfig, Protocol};
             for dns_server in &config.dns_servers {
                 match dns_server.parse::<std::net::IpAddr>() {
                     Ok(ip) => {
-                        let socket_addr = std::net::SocketAddr::new(ip, 53);
-                        let ns_config = NameServerConfig {
-                            socket_addr,
-                            protocol: Protocol::Udp,
-                            tls_dns_name: None,
-                            trust_negative_responses: true,
-                            bind_addr: None,
-                        };
+                        let ns_config = NameServerConfig::udp_and_tcp(ip);
                         resolver_config.add_name_server(ns_config);
                     }
                     Err(e) => {
@@ -315,9 +315,15 @@ impl ConnectionPoolManager {
         }
 
         let mut opts = ResolverOpts::default();
-        opts.use_hosts_file = false;
+        opts.use_hosts_file = ResolveHosts::Never;
 
-        let resolver = TokioAsyncResolver::tokio(resolver_config, opts);
+        let resolver =
+            TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+                .with_options(opts)
+                .build()
+                .map_err(|e| {
+                    ProxyError::ConnectionError(format!("Failed to build DNS resolver: {}", e))
+                })?;
 
         // Parse endpoint overrides (exact + suffix patterns)
         let overrides = EndpointOverrides::from_config(&config.endpoint_overrides);
@@ -402,7 +408,10 @@ impl ConnectionPoolManager {
         }
         info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
         if let Err(e) = self.refresh_endpoint_dns(endpoint).await {
-            warn!("Initial DNS resolution failed for endpoint {}: {}", endpoint, e);
+            warn!(
+                "Initial DNS resolution failed for endpoint {}: {}",
+                endpoint, e
+            );
         }
     }
 
@@ -416,8 +425,7 @@ impl ConnectionPoolManager {
                 self.last_dns_refresh
                     .get(*endpoint)
                     .map(|last| {
-                        now.duration_since(*last)
-                            .unwrap_or(Duration::ZERO)
+                        now.duration_since(*last).unwrap_or(Duration::ZERO)
                             >= self.default_dns_refresh_interval
                     })
                     .unwrap_or(true)
@@ -677,7 +685,7 @@ mod tests {
 
         assert!(!tracker.record_failure(&ip)); // 1
         assert!(!tracker.record_failure(&ip)); // 2
-        assert!(tracker.record_failure(&ip));  // 3 — threshold reached
+        assert!(tracker.record_failure(&ip)); // 3 — threshold reached
     }
 
     #[test]
@@ -692,8 +700,8 @@ mod tests {
         // ip1 has 1 failure, ip2 has 1 failure — neither at threshold (3)
         assert!(!tracker.record_failure(&ip1)); // ip1 now at 2
         assert!(!tracker.record_failure(&ip2)); // ip2 now at 2
-        assert!(tracker.record_failure(&ip1));  // ip1 now at 3 — threshold
-        assert!(tracker.record_failure(&ip2));  // ip2 now at 3 — threshold
+        assert!(tracker.record_failure(&ip1)); // ip1 now at 3 — threshold
+        assert!(tracker.record_failure(&ip2)); // ip2 now at 3 — threshold
     }
 
     #[test]
@@ -725,7 +733,7 @@ mod tests {
 
         let manager = ConnectionPoolManager::new_with_config(config).unwrap();
 
-        let expected_ips = vec![
+        let expected_ips = [
             IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100)),
             IpAddr::V4(Ipv4Addr::new(10, 0, 2, 100)),
         ];
@@ -744,7 +752,10 @@ mod tests {
     fn test_get_distributed_ip_returns_none_no_distributor() {
         let config = crate::config::ConnectionPoolConfig::default();
         let manager = ConnectionPoolManager::new_with_config(config).unwrap();
-        assert_eq!(manager.get_distributed_ip("s3.eu-west-1.amazonaws.com"), None);
+        assert_eq!(
+            manager.get_distributed_ip("s3.eu-west-1.amazonaws.com"),
+            None
+        );
     }
 
     #[test]
@@ -755,8 +766,14 @@ mod tests {
         };
         let manager = ConnectionPoolManager::new_with_config(config).unwrap();
 
-        assert_eq!(manager.get_distributed_ip("s3.eu-west-1.amazonaws.com"), None);
-        assert_eq!(manager.get_distributed_ip("s3.us-east-1.amazonaws.com"), None);
+        assert_eq!(
+            manager.get_distributed_ip("s3.eu-west-1.amazonaws.com"),
+            None
+        );
+        assert_eq!(
+            manager.get_distributed_ip("s3.us-east-1.amazonaws.com"),
+            None
+        );
     }
 
     #[test]
@@ -773,8 +790,14 @@ mod tests {
             .ip_distributors
             .insert(endpoint.to_string(), IpDistributor::new(ips.clone()));
 
-        assert_eq!(manager.get_hostname_for_ip(&ips[0]), Some(endpoint.to_string()));
-        assert_eq!(manager.get_hostname_for_ip(&ips[1]), Some(endpoint.to_string()));
+        assert_eq!(
+            manager.get_hostname_for_ip(&ips[0]),
+            Some(endpoint.to_string())
+        );
+        assert_eq!(
+            manager.get_hostname_for_ip(&ips[1]),
+            Some(endpoint.to_string())
+        );
     }
 
     #[test]
@@ -811,7 +834,11 @@ mod tests {
         let mut overrides = std::collections::HashMap::new();
         overrides.insert(
             "s3.eu-west-1.amazonaws.com".to_string(),
-            vec!["10.0.0.1".to_string(), "10.0.0.2".to_string(), "10.0.0.3".to_string()],
+            vec![
+                "10.0.0.1".to_string(),
+                "10.0.0.2".to_string(),
+                "10.0.0.3".to_string(),
+            ],
         );
 
         let config = crate::config::ConnectionPoolConfig {
@@ -916,17 +943,16 @@ mod tests {
     #[test]
     fn test_endpoint_overrides_longest_suffix_wins() {
         let mut raw = HashMap::new();
-        raw.insert(
-            "*.amazonaws.com".to_string(),
-            vec!["10.0.0.1".to_string()],
-        );
+        raw.insert("*.amazonaws.com".to_string(), vec!["10.0.0.1".to_string()]);
         raw.insert(
             "*.accesspoint.s3-global.amazonaws.com".to_string(),
             vec!["10.0.0.2".to_string()],
         );
         let eo = EndpointOverrides::from_config(&raw);
         // MRAP hostname should match the more specific suffix
-        let ips = eo.resolve("myalias.mrap.accesspoint.s3-global.amazonaws.com").unwrap();
+        let ips = eo
+            .resolve("myalias.mrap.accesspoint.s3-global.amazonaws.com")
+            .unwrap();
         assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         // Regular S3 hostname matches the shorter suffix
         let ips2 = eo.resolve("mybucket.s3.us-west-2.amazonaws.com").unwrap();
@@ -939,7 +965,10 @@ mod tests {
         assert!(eo.is_empty());
 
         let mut raw = HashMap::new();
-        raw.insert("*.s3.us-west-2.amazonaws.com".to_string(), vec!["10.0.0.1".to_string()]);
+        raw.insert(
+            "*.s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.0.1".to_string()],
+        );
         let eo2 = EndpointOverrides::from_config(&raw);
         assert!(!eo2.is_empty());
     }

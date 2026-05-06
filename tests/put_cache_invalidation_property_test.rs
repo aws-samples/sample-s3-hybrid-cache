@@ -83,7 +83,7 @@ fn prop_invalidation_operation_types(operation_type: String) -> TestResult {
 #[quickcheck]
 fn prop_cache_invalidation_regardless_of_write_cache_setting(
     path_suffix: String,
-    write_cache_enabled: bool,
+    _write_cache_enabled: bool,
 ) -> TestResult {
     // Skip empty strings and strings with problematic characters
     if path_suffix.is_empty() || path_suffix.len() > 50 || path_suffix.contains('\0') {
@@ -137,7 +137,7 @@ fn prop_failed_put_preserves_cache(path_suffix: String, status_code: u16) -> Tes
     }
 
     // Only test with actual HTTP error status codes (4xx, 5xx)
-    if status_code < 400 || status_code >= 600 {
+    if !(400..600).contains(&status_code) {
         return TestResult::discard();
     }
 

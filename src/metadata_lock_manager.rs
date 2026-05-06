@@ -1250,6 +1250,9 @@ mod tests {
             MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
 
         let result = manager.get_metadata_file_path("noslash");
-        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
+        assert!(
+            result.is_err(),
+            "Malformed cache key must return Err, got Ok"
+        );
     }
 }

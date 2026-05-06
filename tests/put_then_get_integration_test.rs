@@ -31,12 +31,12 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     )
 }
 
@@ -232,7 +232,7 @@ async fn test_multiple_put_then_get_workflow() -> Result<()> {
     let cache_manager = create_test_cache_manager(&temp_dir);
 
     // Test multiple files
-    let test_files = vec![
+    let test_files = [
         ("test-bucket/file1.txt", b"Content of file 1".to_vec()),
         ("test-bucket/file2.txt", b"Content of file 2".to_vec()),
         ("test-bucket/file3.txt", b"Content of file 3".to_vec()),

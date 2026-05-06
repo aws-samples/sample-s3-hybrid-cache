@@ -98,17 +98,17 @@ fn calculate_jitter_range_ms(base_delay_ms: u64) -> u64 {
 /// The actual delay in milliseconds (always >= 1)
 fn calculate_delay_with_jitter(base_delay_ms: u64, jitter_factor: f64) -> u64 {
     let jitter_range = calculate_jitter_range_ms(base_delay_ms);
-    
+
     if jitter_range == 0 {
         return base_delay_ms;
     }
-    
+
     // jitter_factor is 0.0 to 1.0, map to -jitter_range to +jitter_range
     // When jitter_factor = 0.0, jitter = -jitter_range
     // When jitter_factor = 0.5, jitter = 0
     // When jitter_factor = 1.0, jitter = +jitter_range
     let jitter = ((jitter_factor * 2.0 - 1.0) * jitter_range as f64) as i64;
-    
+
     // Apply jitter to base delay, ensuring result is at least 1
     (base_delay_ms as i64 + jitter).max(1) as u64
 }
@@ -136,14 +136,14 @@ fn max_delay_for_attempt(attempt: u32) -> u64 {
 /// **Validates: Requirements 2.2**
 fn prop_base_delays_exponential(attempt: AttemptNumber) -> TestResult {
     let attempt_num = attempt.0;
-    
+
     // Validate attempt is in valid range
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
-    
+
     // Expected delays: 100ms, 200ms, 400ms
     let expected = match attempt_num {
         1 => 100,
@@ -151,7 +151,7 @@ fn prop_base_delays_exponential(attempt: AttemptNumber) -> TestResult {
         3 => 400,
         _ => return TestResult::discard(),
     };
-    
+
     TestResult::from_bool(base_delay == expected)
 }
 
@@ -159,17 +159,17 @@ fn prop_base_delays_exponential(attempt: AttemptNumber) -> TestResult {
 /// **Validates: Requirements 2.4**
 fn prop_jitter_within_bounds(attempt: AttemptNumber, jitter: JitterFactor) -> TestResult {
     let attempt_num = attempt.0;
-    
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
     let actual_delay = calculate_delay_with_jitter(base_delay, jitter.0);
-    
+
     let min_allowed = min_delay_for_attempt(attempt_num);
     let max_allowed = max_delay_for_attempt(attempt_num);
-    
+
     TestResult::from_bool(actual_delay >= min_allowed && actual_delay <= max_allowed)
 }
 
@@ -185,7 +185,7 @@ fn prop_delays_double_each_attempt() -> bool {
     let delay1 = calculate_base_delay_ms(1);
     let delay2 = calculate_base_delay_ms(2);
     let delay3 = calculate_base_delay_ms(3);
-    
+
     // Verify exponential pattern: each delay is 2x the previous
     delay2 == delay1 * 2 && delay3 == delay2 * 2
 }
@@ -194,14 +194,14 @@ fn prop_delays_double_each_attempt() -> bool {
 /// **Validates: Requirements 2.2, 2.4**
 fn prop_delay_always_positive(attempt: AttemptNumber, jitter: JitterFactor) -> TestResult {
     let attempt_num = attempt.0;
-    
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
     let actual_delay = calculate_delay_with_jitter(base_delay, jitter.0);
-    
+
     TestResult::from_bool(actual_delay >= 1)
 }
 
@@ -209,17 +209,17 @@ fn prop_delay_always_positive(attempt: AttemptNumber, jitter: JitterFactor) -> T
 /// **Validates: Requirements 2.4**
 fn prop_jitter_range_is_20_percent(attempt: AttemptNumber) -> TestResult {
     let attempt_num = attempt.0;
-    
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
     let jitter_range = calculate_jitter_range_ms(base_delay);
-    
+
     // Expected jitter range is 20% of base delay
     let expected_range = (base_delay as f64 * 0.2) as u64;
-    
+
     TestResult::from_bool(jitter_range == expected_range)
 }
 
@@ -227,16 +227,16 @@ fn prop_jitter_range_is_20_percent(attempt: AttemptNumber) -> TestResult {
 /// **Validates: Requirements 2.4**
 fn prop_min_jitter_produces_min_delay(attempt: AttemptNumber) -> TestResult {
     let attempt_num = attempt.0;
-    
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
     // jitter_factor = 0.0 should produce minimum delay
     let actual_delay = calculate_delay_with_jitter(base_delay, 0.0);
     let expected_min = min_delay_for_attempt(attempt_num);
-    
+
     TestResult::from_bool(actual_delay == expected_min)
 }
 
@@ -244,16 +244,16 @@ fn prop_min_jitter_produces_min_delay(attempt: AttemptNumber) -> TestResult {
 /// **Validates: Requirements 2.4**
 fn prop_max_jitter_produces_max_delay(attempt: AttemptNumber) -> TestResult {
     let attempt_num = attempt.0;
-    
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
     // jitter_factor = 1.0 should produce maximum delay
     let actual_delay = calculate_delay_with_jitter(base_delay, 1.0);
     let expected_max = max_delay_for_attempt(attempt_num);
-    
+
     TestResult::from_bool(actual_delay == expected_max)
 }
 
@@ -261,15 +261,15 @@ fn prop_max_jitter_produces_max_delay(attempt: AttemptNumber) -> TestResult {
 /// **Validates: Requirements 2.4**
 fn prop_middle_jitter_produces_base_delay(attempt: AttemptNumber) -> TestResult {
     let attempt_num = attempt.0;
-    
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
     // jitter_factor = 0.5 should produce base delay (no jitter)
     let actual_delay = calculate_delay_with_jitter(base_delay, 0.5);
-    
+
     TestResult::from_bool(actual_delay == base_delay)
 }
 
@@ -279,13 +279,13 @@ fn prop_middle_jitter_produces_base_delay(attempt: AttemptNumber) -> TestResult 
 fn prop_attempt_delays_dont_overlap() -> bool {
     // Max delay for attempt N should be less than min delay for attempt N+1
     // This ensures the exponential backoff is meaningful
-    
+
     let max_delay_1 = max_delay_for_attempt(1); // 100 + 20 = 120
     let min_delay_2 = min_delay_for_attempt(2); // 200 - 40 = 160
-    
+
     let max_delay_2 = max_delay_for_attempt(2); // 200 + 40 = 240
     let min_delay_3 = min_delay_for_attempt(3); // 400 - 80 = 320
-    
+
     max_delay_1 < min_delay_2 && max_delay_2 < min_delay_3
 }
 
@@ -293,26 +293,26 @@ fn prop_attempt_delays_dont_overlap() -> bool {
 /// **Validates: Requirements 2.1, 2.2, 2.4**
 fn prop_all_retry_invariants(attempt: AttemptNumber, jitter: JitterFactor) -> TestResult {
     let attempt_num = attempt.0;
-    
-    if attempt_num < 1 || attempt_num > MAX_ATTEMPTS {
+
+    if !(1..=MAX_ATTEMPTS).contains(&attempt_num) {
         return TestResult::discard();
     }
-    
+
     let base_delay = calculate_base_delay_ms(attempt_num);
     let actual_delay = calculate_delay_with_jitter(base_delay, jitter.0);
-    
+
     // Invariant 1: Base delay follows exponential pattern
     let expected_base = BASE_DELAY_MS * (1 << (attempt_num - 1));
     let base_correct = base_delay == expected_base;
-    
+
     // Invariant 2: Actual delay is within jitter bounds
     let min_allowed = min_delay_for_attempt(attempt_num);
     let max_allowed = max_delay_for_attempt(attempt_num);
     let within_bounds = actual_delay >= min_allowed && actual_delay <= max_allowed;
-    
+
     // Invariant 3: Delay is always positive
     let positive = actual_delay >= 1;
-    
+
     TestResult::from_bool(base_correct && within_bounds && positive)
 }
 
@@ -496,11 +496,11 @@ mod unit_tests {
     fn test_delay_ranges_dont_overlap() {
         // Verify that delay ranges for different attempts don't overlap
         // This ensures exponential backoff is meaningful
-        
+
         // Attempt 1: 80-120ms
         // Attempt 2: 160-240ms
         // Attempt 3: 320-480ms
-        
+
         assert!(max_delay_for_attempt(1) < min_delay_for_attempt(2));
         assert!(max_delay_for_attempt(2) < min_delay_for_attempt(3));
     }
@@ -511,7 +511,7 @@ mod unit_tests {
         let delay1 = calculate_base_delay_ms(1);
         let delay2 = calculate_base_delay_ms(2);
         let delay3 = calculate_base_delay_ms(3);
-        
+
         assert_eq!(delay2 / delay1, 2);
         assert_eq!(delay3 / delay2, 2);
     }
@@ -540,7 +540,11 @@ mod unit_tests {
         for attempt in 1..=MAX_ATTEMPTS {
             let base = calculate_base_delay_ms(attempt);
             let min_delay = calculate_delay_with_jitter(base, 0.0);
-            assert!(min_delay >= 1, "Delay for attempt {} should be at least 1ms", attempt);
+            assert!(
+                min_delay >= 1,
+                "Delay for attempt {} should be at least 1ms",
+                attempt
+            );
         }
     }
 
@@ -548,7 +552,8 @@ mod unit_tests {
     fn test_total_max_delay_time() {
         // Calculate maximum total delay across all retries
         // This helps understand worst-case retry duration
-        let total_max = max_delay_for_attempt(1) + max_delay_for_attempt(2) + max_delay_for_attempt(3);
+        let total_max =
+            max_delay_for_attempt(1) + max_delay_for_attempt(2) + max_delay_for_attempt(3);
         // 120 + 240 + 480 = 840ms
         assert_eq!(total_max, 840);
     }
@@ -556,7 +561,8 @@ mod unit_tests {
     #[test]
     fn test_total_min_delay_time() {
         // Calculate minimum total delay across all retries
-        let total_min = min_delay_for_attempt(1) + min_delay_for_attempt(2) + min_delay_for_attempt(3);
+        let total_min =
+            min_delay_for_attempt(1) + min_delay_for_attempt(2) + min_delay_for_attempt(3);
         // 80 + 160 + 320 = 560ms
         assert_eq!(total_min, 560);
     }
@@ -568,11 +574,15 @@ mod unit_tests {
             let base = calculate_base_delay_ms(attempt);
             let min = min_delay_for_attempt(attempt);
             let max = max_delay_for_attempt(attempt);
-            
+
             // Distance from base to min should equal distance from base to max
             let dist_to_min = base - min;
             let dist_to_max = max - base;
-            assert_eq!(dist_to_min, dist_to_max, "Jitter should be symmetric for attempt {}", attempt);
+            assert_eq!(
+                dist_to_min, dist_to_max,
+                "Jitter should be symmetric for attempt {}",
+                attempt
+            );
         }
     }
 }

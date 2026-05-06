@@ -19,11 +19,11 @@ use std::time::Duration;
 fn arbitrary_duration(g: &mut Gen) -> Duration {
     let unit = u8::arbitrary(g) % 5;
     match unit {
-        0 => Duration::from_secs(u64::arbitrary(g) % 86400),       // 0..86399 seconds
+        0 => Duration::from_secs(u64::arbitrary(g) % 86400), // 0..86399 seconds
         1 => Duration::from_secs((u64::arbitrary(g) % 1440) * 60), // 0..1439 minutes
         2 => Duration::from_secs((u64::arbitrary(g) % 168) * 3600), // 0..167 hours
         3 => Duration::from_secs((u64::arbitrary(g) % 365) * 86400), // 0..364 days
-        _ => Duration::from_millis(u64::arbitrary(g) % 10000),      // 0..9999 ms
+        _ => Duration::from_millis(u64::arbitrary(g) % 10000), // 0..9999 ms
     }
 }
 
@@ -63,11 +63,31 @@ impl Arbitrary for ArbitraryPrefixOverride {
             get_ttl: arbitrary_optional_duration(g),
             head_ttl: arbitrary_optional_duration(g),
             put_ttl: arbitrary_optional_duration(g),
-            read_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            ram_cache_eligible: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            evaluate_conditions_from_cache: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+            read_cache_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            write_cache_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            compression_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            ram_cache_eligible: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            evaluate_conditions_from_cache: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
         })
     }
 }
@@ -94,11 +114,31 @@ impl Arbitrary for ArbitraryBucketSettings {
             get_ttl: arbitrary_optional_duration(g),
             head_ttl: arbitrary_optional_duration(g),
             put_ttl: arbitrary_optional_duration(g),
-            read_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            ram_cache_eligible: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            evaluate_conditions_from_cache: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+            read_cache_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            write_cache_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            compression_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            ram_cache_eligible: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            evaluate_conditions_from_cache: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
             prefix_overrides,
         })
     }
@@ -181,11 +221,31 @@ impl Arbitrary for ArbitraryInvalidBucketSettings {
             get_ttl: arbitrary_optional_duration(g),
             head_ttl: arbitrary_optional_duration(g),
             put_ttl: arbitrary_optional_duration(g),
-            read_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            ram_cache_eligible: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-            evaluate_conditions_from_cache: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+            read_cache_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            write_cache_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            compression_enabled: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            ram_cache_eligible: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
+            evaluate_conditions_from_cache: if bool::arbitrary(g) {
+                Some(bool::arbitrary(g))
+            } else {
+                None
+            },
         };
 
         let insert_pos = if overrides.is_empty() {
@@ -217,14 +277,11 @@ fn prop_validation_rejects_invalid_field_values(arb: ArbitraryInvalidBucketSetti
 
 #[test]
 fn test_property_validation_rejects_invalid_field_values() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(
-            prop_validation_rejects_invalid_field_values
-                as fn(ArbitraryInvalidBucketSettings) -> TestResult,
-        );
+    QuickCheck::new().tests(100).quickcheck(
+        prop_validation_rejects_invalid_field_values
+            as fn(ArbitraryInvalidBucketSettings) -> TestResult,
+    );
 }
-
 
 // ============================================================================
 // Property 2: Settings cascade resolution
@@ -311,11 +368,7 @@ impl Arbitrary for ArbitraryResolveInput {
 
 /// Compute the expected cascade value for an Option field:
 /// prefix (longest match) → bucket → global.
-fn expected_cascade_opt<T: Copy>(
-    prefix_val: Option<T>,
-    bucket_val: Option<T>,
-    global_val: T,
-) -> T {
+fn expected_cascade_opt<T: Copy>(prefix_val: Option<T>, bucket_val: Option<T>, global_val: T) -> T {
     prefix_val.or(bucket_val).unwrap_or(global_val)
 }
 
@@ -349,33 +402,28 @@ fn prop_settings_cascade_resolution(input: ArbitraryResolveInput) -> TestResult 
         std::fs::write(&settings_path, &json).unwrap();
 
         // Create manager with a very long staleness threshold (no reload during test)
-        let manager = BucketSettingsManager::new(
-            cache_dir,
-            input.global.clone(),
-            Duration::from_secs(3600),
-        );
+        let manager =
+            BucketSettingsManager::new(cache_dir, input.global.clone(), Duration::from_secs(3600));
 
         let resolved = manager.resolve(bucket, &input.path).await;
 
         // Find the longest matching prefix for this path
-        let prefix_match = find_longest_prefix_match(
-            &input.bucket_settings.prefix_overrides,
-            &input.path,
-        );
+        let prefix_match =
+            find_longest_prefix_match(&input.bucket_settings.prefix_overrides, &input.path);
 
         let g = &input.global;
         let b = &input.bucket_settings;
 
         // Verify each field independently: prefix → bucket → global
-        let expected_get_ttl = expected_cascade_opt(
-            prefix_match.and_then(|p| p.get_ttl),
-            b.get_ttl,
-            g.get_ttl,
-        );
+        let expected_get_ttl =
+            expected_cascade_opt(prefix_match.and_then(|p| p.get_ttl), b.get_ttl, g.get_ttl);
         if resolved.get_ttl != expected_get_ttl {
             return TestResult::error(format!(
                 "get_ttl mismatch: resolved={:?}, expected={:?}\npath={:?}, prefix_match={:?}",
-                resolved.get_ttl, expected_get_ttl, input.path, prefix_match.map(|p| &p.prefix)
+                resolved.get_ttl,
+                expected_get_ttl,
+                input.path,
+                prefix_match.map(|p| &p.prefix)
             ));
         }
 
@@ -391,11 +439,8 @@ fn prop_settings_cascade_resolution(input: ArbitraryResolveInput) -> TestResult 
             ));
         }
 
-        let expected_put_ttl = expected_cascade_opt(
-            prefix_match.and_then(|p| p.put_ttl),
-            b.put_ttl,
-            g.put_ttl,
-        );
+        let expected_put_ttl =
+            expected_cascade_opt(prefix_match.and_then(|p| p.put_ttl), b.put_ttl, g.put_ttl);
         if resolved.put_ttl != expected_put_ttl {
             return TestResult::error(format!(
                 "put_ttl mismatch: resolved={:?}, expected={:?}",
@@ -456,9 +501,12 @@ fn prop_settings_cascade_resolution(input: ArbitraryResolveInput) -> TestResult 
             return TestResult::error(format!(
                 "ram_cache_eligible mismatch: resolved={}, expected={}\n\
                  get_ttl={:?}, read_cache_enabled={}, path={:?}, prefix_match={:?}",
-                resolved.ram_cache_eligible, expected_ram,
-                expected_get_ttl, expected_read_cache,
-                input.path, prefix_match.map(|p| &p.prefix)
+                resolved.ram_cache_eligible,
+                expected_ram,
+                expected_get_ttl,
+                expected_read_cache,
+                input.path,
+                prefix_match.map(|p| &p.prefix)
             ));
         }
 
@@ -470,9 +518,7 @@ fn prop_settings_cascade_resolution(input: ArbitraryResolveInput) -> TestResult 
 fn test_property_settings_cascade_resolution() {
     QuickCheck::new()
         .tests(100)
-        .quickcheck(
-            prop_settings_cascade_resolution as fn(ArbitraryResolveInput) -> TestResult,
-        );
+        .quickcheck(prop_settings_cascade_resolution as fn(ArbitraryResolveInput) -> TestResult);
 }
 
 // ============================================================================
@@ -543,8 +589,16 @@ impl Arbitrary for ArbitraryZeroTtlInput {
                         head_ttl: arbitrary_optional_duration(g),
                         put_ttl: arbitrary_optional_duration(g),
                         read_cache_enabled: Some(true),
-                        write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-                        compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+                        write_cache_enabled: if bool::arbitrary(g) {
+                            Some(bool::arbitrary(g))
+                        } else {
+                            None
+                        },
+                        compression_enabled: if bool::arbitrary(g) {
+                            Some(bool::arbitrary(g))
+                        } else {
+                            None
+                        },
                         ram_cache_eligible: Some(true), // explicitly true to test override
                         evaluate_conditions_from_cache: None,
                     };
@@ -620,11 +674,8 @@ fn prop_zero_ttl_forces_ram_cache_ineligible(input: ArbitraryZeroTtlInput) -> Te
         let json = serde_json::to_string_pretty(&input.bucket_settings).unwrap();
         std::fs::write(&settings_path, &json).unwrap();
 
-        let manager = BucketSettingsManager::new(
-            cache_dir,
-            input.global.clone(),
-            Duration::from_secs(3600),
-        );
+        let manager =
+            BucketSettingsManager::new(cache_dir, input.global.clone(), Duration::from_secs(3600));
 
         let resolved = manager.resolve(bucket, &input.path).await;
 
@@ -633,8 +684,7 @@ fn prop_zero_ttl_forces_ram_cache_ineligible(input: ArbitraryZeroTtlInput) -> Te
             return TestResult::error(format!(
                 "Expected resolved get_ttl to be zero but got {:?}.\n\
                  zero_level={}, path={:?}, bucket_settings={:?}, global={:?}",
-                resolved.get_ttl, input.zero_level, input.path,
-                input.bucket_settings, input.global
+                resolved.get_ttl, input.zero_level, input.path, input.bucket_settings, input.global
             ));
         }
 
@@ -652,12 +702,9 @@ fn prop_zero_ttl_forces_ram_cache_ineligible(input: ArbitraryZeroTtlInput) -> Te
 
 #[test]
 fn test_property_zero_ttl_forces_ram_cache_ineligibility() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(
-            prop_zero_ttl_forces_ram_cache_ineligible
-                as fn(ArbitraryZeroTtlInput) -> TestResult,
-        );
+    QuickCheck::new().tests(100).quickcheck(
+        prop_zero_ttl_forces_ram_cache_ineligible as fn(ArbitraryZeroTtlInput) -> TestResult,
+    );
 }
 
 // ============================================================================
@@ -737,8 +784,16 @@ impl Arbitrary for ArbitraryReadCacheDisabledInput {
                         head_ttl: arbitrary_optional_duration(g),
                         put_ttl: arbitrary_optional_duration(g),
                         read_cache_enabled: Some(false),
-                        write_cache_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
-                        compression_enabled: if bool::arbitrary(g) { Some(bool::arbitrary(g)) } else { None },
+                        write_cache_enabled: if bool::arbitrary(g) {
+                            Some(bool::arbitrary(g))
+                        } else {
+                            None
+                        },
+                        compression_enabled: if bool::arbitrary(g) {
+                            Some(bool::arbitrary(g))
+                        } else {
+                            None
+                        },
                         ram_cache_eligible: Some(true), // explicitly true to test override
                         evaluate_conditions_from_cache: None,
                     };
@@ -854,12 +909,10 @@ fn prop_read_cache_disabled_forces_ram_cache_ineligible(
 
 #[test]
 fn test_property_read_cache_disabled_forces_ram_cache_ineligibility() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(
-            prop_read_cache_disabled_forces_ram_cache_ineligible
-                as fn(ArbitraryReadCacheDisabledInput) -> TestResult,
-        );
+    QuickCheck::new().tests(100).quickcheck(
+        prop_read_cache_disabled_forces_ram_cache_ineligible
+            as fn(ArbitraryReadCacheDisabledInput) -> TestResult,
+    );
 }
 
 // ============================================================================
@@ -1026,9 +1079,7 @@ fn prop_longest_prefix_match(input: ArbitraryLongestPrefixInput) -> TestResult {
 fn test_property_longest_prefix_match() {
     QuickCheck::new()
         .tests(100)
-        .quickcheck(
-            prop_longest_prefix_match as fn(ArbitraryLongestPrefixInput) -> TestResult,
-        );
+        .quickcheck(prop_longest_prefix_match as fn(ArbitraryLongestPrefixInput) -> TestResult);
 }
 
 // ============================================================================
@@ -1060,9 +1111,9 @@ impl Arbitrary for ArbitraryErrorRecoveryInput {
         let mut bucket_settings = ArbitraryBucketSettings::arbitrary(g).0;
 
         // Ensure the bucket settings have valid prefixes so they pass validation
-        bucket_settings.prefix_overrides.retain(|po| {
-            !po.prefix.is_empty() && po.prefix.starts_with('/')
-        });
+        bucket_settings
+            .prefix_overrides
+            .retain(|po| !po.prefix.is_empty() && po.prefix.starts_with('/'));
 
         ArbitraryErrorRecoveryInput {
             global,
@@ -1167,12 +1218,9 @@ fn prop_error_recovery_on_invalid_settings(input: ArbitraryErrorRecoveryInput) -
 
 #[test]
 fn test_property_error_recovery_on_invalid_settings() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(
-            prop_error_recovery_on_invalid_settings
-                as fn(ArbitraryErrorRecoveryInput) -> TestResult,
-        );
+    QuickCheck::new().tests(100).quickcheck(
+        prop_error_recovery_on_invalid_settings as fn(ArbitraryErrorRecoveryInput) -> TestResult,
+    );
 }
 
 // ============================================================================
@@ -1203,12 +1251,12 @@ impl Arbitrary for ArbitraryStalenessReloadInput {
         let mut updated = ArbitraryBucketSettings::arbitrary(g).0;
 
         // Ensure both have valid prefixes
-        original.prefix_overrides.retain(|po| {
-            !po.prefix.is_empty() && po.prefix.starts_with('/')
-        });
-        updated.prefix_overrides.retain(|po| {
-            !po.prefix.is_empty() && po.prefix.starts_with('/')
-        });
+        original
+            .prefix_overrides
+            .retain(|po| !po.prefix.is_empty() && po.prefix.starts_with('/'));
+        updated
+            .prefix_overrides
+            .retain(|po| !po.prefix.is_empty() && po.prefix.starts_with('/'));
 
         // Ensure both have explicit get_ttl values that differ, so we can
         // distinguish original from updated after reload.
@@ -1299,10 +1347,7 @@ fn prop_staleness_threshold_triggers_reload(input: ArbitraryStalenessReloadInput
 
 #[test]
 fn test_property_staleness_threshold_triggers_reload() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(
-            prop_staleness_threshold_triggers_reload
-                as fn(ArbitraryStalenessReloadInput) -> TestResult,
-        );
+    QuickCheck::new().tests(100).quickcheck(
+        prop_staleness_threshold_triggers_reload as fn(ArbitraryStalenessReloadInput) -> TestResult,
+    );
 }

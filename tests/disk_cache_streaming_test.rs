@@ -9,7 +9,8 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn test_stream_range_data_8mib_uncompressed() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/large-object.bin";
@@ -46,12 +47,18 @@ async fn test_stream_range_data_8mib_uncompressed() {
             range_size as u64 - 1,
             &test_data,
             metadata,
-            std::time::Duration::from_secs(3600), true)
+            std::time::Duration::from_secs(3600),
+            true,
+        )
         .await
         .unwrap();
 
     // Get metadata to find the RangeSpec
-    let cached_metadata = cache_manager.get_metadata(cache_key).await.unwrap().unwrap();
+    let cached_metadata = cache_manager
+        .get_metadata(cache_key)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cached_metadata.ranges.len(), 1);
     let range_spec = &cached_metadata.ranges[0];
     assert_eq!(range_spec.start, 0);
@@ -96,7 +103,7 @@ async fn test_stream_range_data_8mib_uncompressed() {
     );
 
     // Verify chunk count: 8 MiB / 512 KiB = 16 chunks
-    let expected_chunks = (range_size + chunk_size - 1) / chunk_size;
+    let expected_chunks = range_size.div_ceil(chunk_size);
     assert_eq!(
         chunk_count, expected_chunks,
         "Expected {} chunks, got {}",
@@ -108,7 +115,8 @@ async fn test_stream_range_data_8mib_uncompressed() {
 #[tokio::test]
 async fn test_stream_range_data_compressed() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, true, 1_048_576); // compression enabled
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, true, 1_048_576); // compression enabled
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/compressed-object.txt";
@@ -146,12 +154,18 @@ async fn test_stream_range_data_compressed() {
             range_size as u64 - 1,
             &test_data,
             metadata,
-            std::time::Duration::from_secs(3600), true)
+            std::time::Duration::from_secs(3600),
+            true,
+        )
         .await
         .unwrap();
 
     // Get metadata to find the RangeSpec
-    let cached_metadata = cache_manager.get_metadata(cache_key).await.unwrap().unwrap();
+    let cached_metadata = cache_manager
+        .get_metadata(cache_key)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cached_metadata.ranges.len(), 1);
     let range_spec = &cached_metadata.ranges[0];
 
@@ -187,7 +201,8 @@ async fn test_stream_range_data_compressed() {
 #[tokio::test]
 async fn test_stream_range_data_missing_file() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     // Create a fake RangeSpec pointing to a non-existent file

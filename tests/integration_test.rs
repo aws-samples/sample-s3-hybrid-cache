@@ -28,7 +28,10 @@ fn test_basic_module_instantiation() {
 
     // TCP Proxy
     let tcp_addr = SocketAddr::from(([127, 0, 0, 1], 8443));
-    let _tcp_proxy = TcpProxy::new(tcp_addr, s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()));
+    let _tcp_proxy = TcpProxy::new(
+        tcp_addr,
+        s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+    );
 
     // Cache Manager
     let cache_dir = PathBuf::from("/tmp/test_cache");
@@ -53,12 +56,7 @@ fn test_cache_key_generation() {
     assert_eq!(key2, "my-bucket/my-object");
 
     // Test cache key generation with part number and range
-    let key3 = CacheManager::generate_cache_key_with_params(
-        "/bucket/object",
-        None,
-        None,
-        None,
-    );
+    let key3 = CacheManager::generate_cache_key_with_params("/bucket/object", None, None, None);
     assert_eq!(key3, "bucket/object");
 
     let key4 = CacheManager::generate_cache_key_with_params(
@@ -89,10 +87,16 @@ fn test_compression_threshold() {
 fn test_tcp_proxy_creation() {
     // Test that TCP proxy can be created with different addresses
     let tcp_addr1 = SocketAddr::from(([127, 0, 0, 1], 443));
-    let _tcp_proxy1 = TcpProxy::new(tcp_addr1, s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()));
+    let _tcp_proxy1 = TcpProxy::new(
+        tcp_addr1,
+        s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+    );
 
     let tcp_addr2 = SocketAddr::from(([0, 0, 0, 0], 8443));
-    let _tcp_proxy2 = TcpProxy::new(tcp_addr2, s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()));
+    let _tcp_proxy2 = TcpProxy::new(
+        tcp_addr2,
+        s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+    );
 
     // Verify that the proxy can be created without errors
     // The actual functionality will be tested in integration tests

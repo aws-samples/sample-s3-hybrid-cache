@@ -223,13 +223,13 @@ pub async fn forward_signed_request(
             false
         } else {
             // Check if referer is in SignedHeaders
-            let auth_value = headers.get("authorization")
-                .and_then(|v| v.to_str().ok());
+            let auth_value = headers.get("authorization").and_then(|v| v.to_str().ok());
             if let Some(auth) = auth_value {
                 if is_sigv4_algorithm(auth) {
                     if let Some(pos) = auth.find("SignedHeaders=") {
                         let after_param = &auth[pos + 14..];
-                        let end = after_param.find(',')
+                        let end = after_param
+                            .find(',')
                             .or_else(|| after_param.find(' '))
                             .unwrap_or(after_param.len());
                         let signed_headers = &after_param[..end];
@@ -268,7 +268,10 @@ pub async fn forward_signed_request(
     // Inject Referer header if conditions are met
     if should_inject_referer {
         if let Some(referer_value) = proxy_referer {
-            debug!("Adding proxy identification Referer header to signed request: {}", referer_value);
+            debug!(
+                "Adding proxy identification Referer header to signed request: {}",
+                referer_value
+            );
             raw_request.extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
         }
     }
@@ -328,6 +331,7 @@ pub async fn forward_signed_request(
 /// # Returns
 ///
 /// Returns the S3 response on success
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_signed_request_with_body(
     method: hyper::Method,
     uri: hyper::Uri,
@@ -350,13 +354,13 @@ pub async fn forward_signed_request_with_body(
         if has_referer {
             false
         } else {
-            let auth_value = headers.get("authorization")
-                .and_then(|v| v.to_str().ok());
+            let auth_value = headers.get("authorization").and_then(|v| v.to_str().ok());
             if let Some(auth) = auth_value {
                 if is_sigv4_algorithm(auth) {
                     if let Some(pos) = auth.find("SignedHeaders=") {
                         let after_param = &auth[pos + 14..];
-                        let end = after_param.find(',')
+                        let end = after_param
+                            .find(',')
                             .or_else(|| after_param.find(' '))
                             .unwrap_or(after_param.len());
                         let signed_headers = &after_param[..end];
@@ -395,7 +399,10 @@ pub async fn forward_signed_request_with_body(
     // Inject Referer header if conditions are met
     if should_inject_referer {
         if let Some(referer_value) = proxy_referer {
-            debug!("Adding proxy identification Referer header to signed request: {}", referer_value);
+            debug!(
+                "Adding proxy identification Referer header to signed request: {}",
+                referer_value
+            );
             raw_request.extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
         }
     }
@@ -435,8 +442,6 @@ pub async fn forward_signed_request_with_body(
     // Parse response
     parse_http_response(&response_bytes, &method, path_and_query)
 }
-
-
 
 /// Read request body from incoming request
 async fn read_request_body(req: Request<hyper::body::Incoming>) -> Result<Bytes> {
@@ -1490,12 +1495,10 @@ mod property_tests {
         headers.insert("authorization".to_string(), random_auth_value);
 
         // Should not panic and should return false for malformed headers
-        let result = is_range_signed(&headers);
+        let _result = is_range_signed(&headers);
 
-        // For random strings, we expect false unless they happen to be valid SigV4
-        // with "range" in SignedHeaders (extremely unlikely)
         // The key property is that it doesn't panic
-        TestResult::from_bool(!result || true) // Always passes if no panic
+        TestResult::from_bool(true) // Passes as long as is_range_signed doesn't panic
     }
 
     /// **Feature: signed-range-requests, Property 3: Exact header matching**

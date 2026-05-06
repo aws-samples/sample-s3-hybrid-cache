@@ -21,7 +21,8 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Helper function to create a test cache manager
 async fn create_test_cache_manager() -> (DiskCacheManager, TempDir) {
     let temp_dir = TempDir::new().unwrap();
-    let manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     manager.initialize().await.unwrap();
     (manager, temp_dir)
 }

@@ -145,7 +145,10 @@ impl DiskCacheManager {
 
     /// Set journal consolidator for direct size tracking
     /// When set, size is updated directly when storing new ranges
-    pub fn set_journal_consolidator(&mut self, consolidator: Arc<crate::journal_consolidator::JournalConsolidator>) {
+    pub fn set_journal_consolidator(
+        &mut self,
+        consolidator: Arc<crate::journal_consolidator::JournalConsolidator>,
+    ) {
         info!("JournalConsolidator enabled for DiskCacheManager - direct size tracking active");
         self.journal_consolidator = Some(consolidator);
     }
@@ -803,7 +806,7 @@ impl DiskCacheManager {
 
     /// Extract file extension from path
     fn extract_file_extension(&self, path: &str) -> String {
-        if let Some(last_segment) = path.split('/').last() {
+        if let Some(last_segment) = path.split('/').next_back() {
             if let Some(dot_pos) = last_segment.rfind('.') {
                 return last_segment[dot_pos + 1..].to_lowercase();
             }
@@ -947,6 +950,7 @@ impl DiskCacheManager {
     /// 3. Updates metadata file atomically
     /// 4. Ensures both operations succeed or both fail (atomic guarantee)
     /// 5. Handles partial write failures with cleanup
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_range(
         &mut self,
         cache_key: &str,
@@ -1020,10 +1024,18 @@ impl DiskCacheManager {
             let compression_result = self
                 .compression_handler
                 .compress_content_aware_with_metadata(data, &path);
-            (compression_result.data, compression_result.algorithm, compression_result.compressed_size)
+            (
+                compression_result.data,
+                compression_result.algorithm,
+                compression_result.compressed_size,
+            )
         } else {
             // Compression disabled for this bucket — store uncompressed
-            (data.to_vec(), crate::compression::CompressionAlgorithm::None, data.len() as u64)
+            (
+                data.to_vec(),
+                crate::compression::CompressionAlgorithm::None,
+                data.len() as u64,
+            )
         };
         let compression_duration = compression_start.elapsed();
 
@@ -1187,10 +1199,17 @@ impl DiskCacheManager {
             // This prevents cross-instance over-counting on shared storage
             if let Some(consolidator) = &self.journal_consolidator {
                 if !range_already_existed {
-                    consolidator.size_accumulator().add_range(cache_key, start, end, compressed_size);
+                    consolidator.size_accumulator().add_range(
+                        cache_key,
+                        start,
+                        end,
+                        compressed_size,
+                    );
                     // Track write cache if applicable (completed PutObject or CompleteMPU)
                     if object_metadata.is_write_cached {
-                        consolidator.size_accumulator().add_write_cache(compressed_size);
+                        consolidator
+                            .size_accumulator()
+                            .add_write_cache(compressed_size);
                     }
                 } else {
                     debug!(
@@ -1296,11 +1315,11 @@ impl DiskCacheManager {
                                     "ETag mismatch detected: key={}, existing_etag={}, new_etag={} - invalidating existing ranges",
                                     cache_key, metadata.object_metadata.etag, object_metadata.etag
                                 );
-                                
+
                                 // Requirement 14.1, 14.2, 14.3: Invalidate existing cached ranges
                                 // and allow new data to be cached
                                 let invalidated_count = metadata.ranges.len();
-                                
+
                                 // Delete existing range files
                                 let ranges_dir = self.cache_dir.join("ranges");
                                 for range in &metadata.ranges {
@@ -1314,29 +1333,39 @@ impl DiskCacheManager {
                                         }
                                     }
                                 }
-                                
+
                                 // Record metrics for ETag mismatch invalidation
                                 if let Some(metrics_manager) = &self.metrics_manager {
-                                    metrics_manager.read().await.record_etag_mismatch(
-                                        cache_key,
-                                        &metadata.object_metadata.etag,
-                                        &object_metadata.etag,
-                                    ).await;
-                                    let range_names: Vec<String> = metadata.ranges.iter()
+                                    metrics_manager
+                                        .read()
+                                        .await
+                                        .record_etag_mismatch(
+                                            cache_key,
+                                            &metadata.object_metadata.etag,
+                                            &object_metadata.etag,
+                                        )
+                                        .await;
+                                    let range_names: Vec<String> = metadata
+                                        .ranges
+                                        .iter()
                                         .map(|r| format!("{}-{}", r.start, r.end))
                                         .collect();
-                                    metrics_manager.read().await.record_range_invalidation(
-                                        cache_key,
-                                        &range_names,
-                                        "etag_mismatch",
-                                    ).await;
+                                    metrics_manager
+                                        .read()
+                                        .await
+                                        .record_range_invalidation(
+                                            cache_key,
+                                            &range_names,
+                                            "etag_mismatch",
+                                        )
+                                        .await;
                                 }
-                                
+
                                 info!(
                                     "Invalidated {} existing ranges due to ETag mismatch: key={}, old_etag={}, new_etag={}",
                                     invalidated_count, cache_key, metadata.object_metadata.etag, object_metadata.etag
                                 );
-                                
+
                                 // Create fresh metadata with new object_metadata
                                 let now = SystemTime::now();
                                 NewCacheMetadata {
@@ -1345,7 +1374,8 @@ impl DiskCacheManager {
                                     ranges: Vec::new(),
                                     created_at: now,
                                     expires_at: now + ttl,
-                                    compression_info: crate::cache_types::CompressionInfo::default(),
+                                    compression_info: crate::cache_types::CompressionInfo::default(
+                                    ),
                                     ..Default::default()
                                 }
                             } else {
@@ -1627,10 +1657,7 @@ impl DiskCacheManager {
     /// `writer.bytes_written` always tracks the logical uncompressed total and is
     /// updated on every chunk. `writer.compressed_bytes_written` is updated when
     /// a batch is flushed (or per-chunk in the raw passthrough path).
-    pub fn write_range_chunk(
-        writer: &mut IncrementalRangeWriter,
-        chunk: &[u8],
-    ) -> Result<()> {
+    pub fn write_range_chunk(writer: &mut IncrementalRangeWriter, chunk: &[u8]) -> Result<()> {
         use std::io::Write;
 
         if chunk.is_empty() {
@@ -1642,10 +1669,7 @@ impl DiskCacheManager {
         if !writer.compression_enabled {
             // No compression — write raw bytes (unchanged passthrough path)
             writer.file.write_all(chunk).map_err(|e| {
-                ProxyError::CacheError(format!(
-                    "Failed to write chunk to tmp file: {}",
-                    e
-                ))
+                ProxyError::CacheError(format!("Failed to write chunk to tmp file: {}", e))
             })?;
             writer.compressed_bytes_written += chunk.len() as u64;
             return Ok(());
@@ -1790,9 +1814,7 @@ impl DiskCacheManager {
         let range_file_relative_path = writer
             .final_path
             .strip_prefix(&ranges_dir)
-            .map_err(|e| {
-                ProxyError::CacheError(format!("Failed to compute relative path: {}", e))
-            })?
+            .map_err(|e| ProxyError::CacheError(format!("Failed to compute relative path: {}", e)))?
             .to_string_lossy()
             .to_string();
 
@@ -3316,9 +3338,9 @@ impl DiskCacheManager {
         let compression_algorithm = range_spec.compression_algorithm.clone();
 
         // Async file open — does not block tokio worker thread (Requirement 3.1)
-        let file = tokio::fs::File::open(&range_file_path).await.map_err(|e| {
-            ProxyError::CacheError(format!("Failed to open range file: {}", e))
-        })?;
+        let file = tokio::fs::File::open(&range_file_path)
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("Failed to open range file: {}", e)))?;
 
         // Convert to std::fs::File for FrameDecoder (sync Read trait)
         let std_file = file.into_std().await;
@@ -3347,11 +3369,12 @@ impl DiskCacheManager {
                         {
                             use std::io::BufRead;
                             match buf_reader.fill_buf() {
-                                Ok(b) if b.is_empty() => break, // True EOF
+                                Ok([]) => break, // True EOF
                                 Err(e) => {
-                                    let _ = tx.blocking_send(Err(ProxyError::CacheError(
-                                        format!("Decompression error mid-stream: {}", e),
-                                    )));
+                                    let _ = tx.blocking_send(Err(ProxyError::CacheError(format!(
+                                        "Decompression error mid-stream: {}",
+                                        e
+                                    ))));
                                     break;
                                 }
                                 _ => {}
@@ -3370,9 +3393,10 @@ impl DiskCacheManager {
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = tx.blocking_send(Err(ProxyError::CacheError(
-                                        format!("Decompression error mid-stream: {}", e),
-                                    )));
+                                    let _ = tx.blocking_send(Err(ProxyError::CacheError(format!(
+                                        "Decompression error mid-stream: {}",
+                                        e
+                                    ))));
                                     break 'outer;
                                 }
                             }
@@ -3392,9 +3416,10 @@ impl DiskCacheManager {
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.blocking_send(Err(ProxyError::CacheError(
-                                    format!("Decompression error mid-stream: {}", e),
-                                )));
+                                let _ = tx.blocking_send(Err(ProxyError::CacheError(format!(
+                                    "Decompression error mid-stream: {}",
+                                    e
+                                ))));
                                 break;
                             }
                         }
@@ -3475,8 +3500,16 @@ impl DiskCacheManager {
         );
 
         // Use the existing store_range method - no special casing needed!
-        self.store_range(cache_key, start, end, data, object_metadata, ttl, compression_enabled)
-            .await
+        self.store_range(
+            cache_key,
+            start,
+            end,
+            data,
+            object_metadata,
+            ttl,
+            compression_enabled,
+        )
+        .await
     }
 
     /// Retrieve full object by loading it as a range
@@ -4008,42 +4041,42 @@ impl DiskCacheManager {
 
         match std::fs::read_dir(&shard_dir) {
             Ok(entries) => {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let file_name = entry.file_name();
-                        let file_name_str = file_name.to_string_lossy();
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let file_name_str = file_name.to_string_lossy();
 
-                        // Check if this file belongs to our cache key
-                        // Files should start with sanitized key and end with .bin or .tmp
-                        let is_orphaned_bin = file_name_str.starts_with(&sanitized_key)
-                            && file_name_str.contains("_")
-                            && file_name_str.ends_with(".bin");
-                        let is_orphaned_tmp = file_name_str.starts_with(&sanitized_key)
-                            && file_name_str.ends_with(".tmp");
+                    // Check if this file belongs to our cache key
+                    // Files should start with sanitized key and end with .bin or .tmp
+                    let is_orphaned_bin = file_name_str.starts_with(&sanitized_key)
+                        && file_name_str.contains("_")
+                        && file_name_str.ends_with(".bin");
+                    let is_orphaned_tmp = file_name_str.starts_with(&sanitized_key)
+                        && file_name_str.ends_with(".tmp");
 
-                        if is_orphaned_bin || is_orphaned_tmp {
-                            debug!(
-                                "Found potential orphaned file: key={}, file={:?}",
-                                cache_key,
-                                entry.path()
-                            );
+                    if is_orphaned_bin || is_orphaned_tmp {
+                        debug!(
+                            "Found potential orphaned file: key={}, file={:?}",
+                            cache_key,
+                            entry.path()
+                        );
 
-                            match std::fs::remove_file(entry.path()) {
-                                Ok(_) => {
-                                    cleaned_count += 1;
-                                    debug!(
-                                        "Cleaned up orphaned file: key={}, file={:?}",
-                                        cache_key,
-                                        entry.path()
-                                    );
-                                }
-                                Err(e) => {
-                                    failed_count += 1;
-                                    warn!(
-                                        "Failed to clean up orphaned file: key={}, file={:?}, error={}",
-                                        cache_key, entry.path(), e
-                                    );
-                                }
+                        match std::fs::remove_file(entry.path()) {
+                            Ok(_) => {
+                                cleaned_count += 1;
+                                debug!(
+                                    "Cleaned up orphaned file: key={}, file={:?}",
+                                    cache_key,
+                                    entry.path()
+                                );
+                            }
+                            Err(e) => {
+                                failed_count += 1;
+                                warn!(
+                                    "Failed to clean up orphaned file: key={}, file={:?}, error={}",
+                                    cache_key,
+                                    entry.path(),
+                                    e
+                                );
                             }
                         }
                     }
@@ -4175,26 +4208,24 @@ impl DiskCacheManager {
             );
 
             if let Ok(entries) = std::fs::read_dir(&ranges_shard_dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let file_name = entry.file_name();
-                        let file_name_str = file_name.to_string_lossy();
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let file_name_str = file_name.to_string_lossy();
 
-                        // Check if this is a temp file for our cache key
-                        if file_name_str.starts_with(&sanitized_key)
-                            && file_name_str.ends_with(".bin.tmp")
-                        {
-                            match std::fs::remove_file(entry.path()) {
-                                Ok(_) => {
-                                    cleaned_count += 1;
-                                    debug!("Cleaned up range temp file: {:?}", entry.path());
-                                }
-                                Err(e) => warn!(
-                                    "Failed to clean up range temp file {:?}: {}",
-                                    entry.path(),
-                                    e
-                                ),
+                    // Check if this is a temp file for our cache key
+                    if file_name_str.starts_with(&sanitized_key)
+                        && file_name_str.ends_with(".bin.tmp")
+                    {
+                        match std::fs::remove_file(entry.path()) {
+                            Ok(_) => {
+                                cleaned_count += 1;
+                                debug!("Cleaned up range temp file: {:?}", entry.path());
                             }
+                            Err(e) => warn!(
+                                "Failed to clean up range temp file {:?}: {}",
+                                entry.path(),
+                                e
+                            ),
                         }
                     }
                 }
@@ -4367,6 +4398,7 @@ impl DiskCacheManager {
     /// 2. Cleans up temporary files (.tmp)
     /// 3. Verifies and fixes inconsistent metadata
     /// 4. Returns statistics about cleanup operations
+    ///
     /// Requirement 8.5: Traverse bucket/XX/YYY structure for cleanup
     ///
     /// This method performs comprehensive cache cleanup by:
@@ -4444,47 +4476,40 @@ impl DiskCacheManager {
     ) {
         // Traverse bucket directories
         if let Ok(bucket_entries) = std::fs::read_dir(ranges_base_dir) {
-            for bucket_entry in bucket_entries {
-                if let Ok(bucket_entry) = bucket_entry {
-                    let bucket_path = bucket_entry.path();
-                    if !bucket_path.is_dir() {
-                        continue;
-                    }
+            for bucket_entry in bucket_entries.flatten() {
+                let bucket_path = bucket_entry.path();
+                if !bucket_path.is_dir() {
+                    continue;
+                }
 
-                    // Traverse level1 (XX) directories
-                    if let Ok(level1_entries) = std::fs::read_dir(&bucket_path) {
-                        for level1_entry in level1_entries {
-                            if let Ok(level1_entry) = level1_entry {
-                                let level1_path = level1_entry.path();
-                                if !level1_path.is_dir() {
+                // Traverse level1 (XX) directories
+                if let Ok(level1_entries) = std::fs::read_dir(&bucket_path) {
+                    for level1_entry in level1_entries.flatten() {
+                        let level1_path = level1_entry.path();
+                        if !level1_path.is_dir() {
+                            continue;
+                        }
+
+                        // Traverse level2 (YYY) directories
+                        if let Ok(level2_entries) = std::fs::read_dir(&level1_path) {
+                            for level2_entry in level2_entries.flatten() {
+                                let level2_path = level2_entry.path();
+                                if !level2_path.is_dir() {
                                     continue;
                                 }
 
-                                // Traverse level2 (YYY) directories
-                                if let Ok(level2_entries) = std::fs::read_dir(&level1_path) {
-                                    for level2_entry in level2_entries {
-                                        if let Ok(level2_entry) = level2_entry {
-                                            let level2_path = level2_entry.path();
-                                            if !level2_path.is_dir() {
-                                                continue;
-                                            }
+                                // Now we're in the leaf directory - scan for files
+                                self.cleanup_range_files_in_shard(&level2_path, stats).await;
 
-                                            // Now we're in the leaf directory - scan for files
-                                            self.cleanup_range_files_in_shard(&level2_path, stats)
-                                                .await;
-
-                                            // Try to clean up empty directory
-                                            self.cleanup_empty_directory(&level2_path);
-                                        }
-                                    }
-                                    // Try to clean up empty level1 directory
-                                    self.cleanup_empty_directory(&level1_path);
-                                }
+                                // Try to clean up empty directory
+                                self.cleanup_empty_directory(&level2_path);
                             }
+                            // Try to clean up empty level1 directory
+                            self.cleanup_empty_directory(&level1_path);
                         }
-                        // Try to clean up empty bucket directory
-                        self.cleanup_empty_directory(&bucket_path);
                     }
+                    // Try to clean up empty bucket directory
+                    self.cleanup_empty_directory(&bucket_path);
                 }
             }
         }
@@ -4497,66 +4522,62 @@ impl DiskCacheManager {
         stats: &mut CacheCleanupStats,
     ) {
         if let Ok(entries) = std::fs::read_dir(shard_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    let file_name = entry.file_name();
-                    let file_name_str = file_name.to_string_lossy();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
 
-                    // Check for .tmp files
-                    if file_name_str.ends_with(".bin.tmp") {
-                        match std::fs::remove_file(&path) {
-                            Ok(_) => {
-                                stats.temp_files_cleaned += 1;
-                                debug!("Cleaned up range temp file: {:?}", path);
-                            }
-                            Err(e) => {
-                                warn!("Failed to clean up range temp file {:?}: {}", path, e);
-                            }
+                // Check for .tmp files
+                if file_name_str.ends_with(".bin.tmp") {
+                    match std::fs::remove_file(&path) {
+                        Ok(_) => {
+                            stats.temp_files_cleaned += 1;
+                            debug!("Cleaned up range temp file: {:?}", path);
+                        }
+                        Err(e) => {
+                            warn!("Failed to clean up range temp file {:?}: {}", path, e);
                         }
                     }
-                    // Check for orphaned .bin files
-                    else if file_name_str.ends_with(".bin") {
-                        // Extract sanitized key from filename
-                        // Format: {sanitized_key}_{start}-{end}.bin
-                        if let Some(underscore_pos) = file_name_str.rfind('_') {
-                            let sanitized_key = &file_name_str[..underscore_pos];
+                }
+                // Check for orphaned .bin files
+                else if file_name_str.ends_with(".bin") {
+                    // Extract sanitized key from filename
+                    // Format: {sanitized_key}_{start}-{end}.bin
+                    if let Some(underscore_pos) = file_name_str.rfind('_') {
+                        let sanitized_key = &file_name_str[..underscore_pos];
 
-                            // To check if this is orphaned, we need to find the metadata file
-                            // The metadata file should be in metadata/bucket/XX/YYY/{sanitized_key}.meta
-                            // Extract path components from shard_dir
-                            // shard_dir format: ranges/bucket/XX/YYY
-                            if let Some(level2_dir) = shard_dir.parent() {
-                                // ranges/bucket/XX
-                                if let Some(level1_dir) = level2_dir.parent() {
-                                    // ranges/bucket
-                                    if let Some(bucket_name) = level1_dir.file_name() {
-                                        // bucket
-                                        // Get level1 and level2 from path
-                                        let level1 =
-                                            level2_dir.file_name().unwrap().to_string_lossy(); // XX
-                                        let level2 =
-                                            shard_dir.file_name().unwrap().to_string_lossy(); // YYY
+                        // To check if this is orphaned, we need to find the metadata file
+                        // The metadata file should be in metadata/bucket/XX/YYY/{sanitized_key}.meta
+                        // Extract path components from shard_dir
+                        // shard_dir format: ranges/bucket/XX/YYY
+                        if let Some(level2_dir) = shard_dir.parent() {
+                            // ranges/bucket/XX
+                            if let Some(level1_dir) = level2_dir.parent() {
+                                // ranges/bucket
+                                if let Some(bucket_name) = level1_dir.file_name() {
+                                    // bucket
+                                    // Get level1 and level2 from path
+                                    let level1 = level2_dir.file_name().unwrap().to_string_lossy(); // XX
+                                    let level2 = shard_dir.file_name().unwrap().to_string_lossy(); // YYY
 
-                                        // Construct metadata path
-                                        let metadata_path = self
-                                            .cache_dir
-                                            .join("metadata")
-                                            .join(bucket_name)
-                                            .join(level1.as_ref())
-                                            .join(level2.as_ref())
-                                            .join(format!("{}.meta", sanitized_key));
+                                    // Construct metadata path
+                                    let metadata_path = self
+                                        .cache_dir
+                                        .join("metadata")
+                                        .join(bucket_name)
+                                        .join(level1.as_ref())
+                                        .join(level2.as_ref())
+                                        .join(format!("{}.meta", sanitized_key));
 
-                                        if !metadata_path.exists() {
-                                            // Orphaned range file - no metadata
-                                            match std::fs::remove_file(&path) {
-                                                Ok(_) => {
-                                                    stats.orphaned_files_cleaned += 1;
-                                                    debug!("Cleaned up orphaned range file (no metadata found): {:?}, expected_metadata={:?}", path, metadata_path);
-                                                }
-                                                Err(e) => {
-                                                    warn!("Failed to clean up orphaned range file {:?}: {}", path, e);
-                                                }
+                                    if !metadata_path.exists() {
+                                        // Orphaned range file - no metadata
+                                        match std::fs::remove_file(&path) {
+                                            Ok(_) => {
+                                                stats.orphaned_files_cleaned += 1;
+                                                debug!("Cleaned up orphaned range file (no metadata found): {:?}, expected_metadata={:?}", path, metadata_path);
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to clean up orphaned range file {:?}: {}", path, e);
                                             }
                                         }
                                     }
@@ -4578,49 +4599,40 @@ impl DiskCacheManager {
     ) {
         // Traverse bucket directories
         if let Ok(bucket_entries) = std::fs::read_dir(metadata_base_dir) {
-            for bucket_entry in bucket_entries {
-                if let Ok(bucket_entry) = bucket_entry {
-                    let bucket_path = bucket_entry.path();
-                    if !bucket_path.is_dir() {
-                        continue;
-                    }
+            for bucket_entry in bucket_entries.flatten() {
+                let bucket_path = bucket_entry.path();
+                if !bucket_path.is_dir() {
+                    continue;
+                }
 
-                    // Traverse level1 (XX) directories
-                    if let Ok(level1_entries) = std::fs::read_dir(&bucket_path) {
-                        for level1_entry in level1_entries {
-                            if let Ok(level1_entry) = level1_entry {
-                                let level1_path = level1_entry.path();
-                                if !level1_path.is_dir() {
+                // Traverse level1 (XX) directories
+                if let Ok(level1_entries) = std::fs::read_dir(&bucket_path) {
+                    for level1_entry in level1_entries.flatten() {
+                        let level1_path = level1_entry.path();
+                        if !level1_path.is_dir() {
+                            continue;
+                        }
+
+                        // Traverse level2 (YYY) directories
+                        if let Ok(level2_entries) = std::fs::read_dir(&level1_path) {
+                            for level2_entry in level2_entries.flatten() {
+                                let level2_path = level2_entry.path();
+                                if !level2_path.is_dir() {
                                     continue;
                                 }
 
-                                // Traverse level2 (YYY) directories
-                                if let Ok(level2_entries) = std::fs::read_dir(&level1_path) {
-                                    for level2_entry in level2_entries {
-                                        if let Ok(level2_entry) = level2_entry {
-                                            let level2_path = level2_entry.path();
-                                            if !level2_path.is_dir() {
-                                                continue;
-                                            }
+                                // Now we're in the leaf directory - scan for temp files
+                                self.cleanup_metadata_files_in_shard(&level2_path, stats);
 
-                                            // Now we're in the leaf directory - scan for temp files
-                                            self.cleanup_metadata_files_in_shard(
-                                                &level2_path,
-                                                stats,
-                                            );
-
-                                            // Try to clean up empty directory
-                                            self.cleanup_empty_directory(&level2_path);
-                                        }
-                                    }
-                                    // Try to clean up empty level1 directory
-                                    self.cleanup_empty_directory(&level1_path);
-                                }
+                                // Try to clean up empty directory
+                                self.cleanup_empty_directory(&level2_path);
                             }
+                            // Try to clean up empty level1 directory
+                            self.cleanup_empty_directory(&level1_path);
                         }
-                        // Try to clean up empty bucket directory
-                        self.cleanup_empty_directory(&bucket_path);
                     }
+                    // Try to clean up empty bucket directory
+                    self.cleanup_empty_directory(&bucket_path);
                 }
             }
         }
@@ -4629,23 +4641,20 @@ impl DiskCacheManager {
     /// Clean up metadata files in a specific shard directory
     fn cleanup_metadata_files_in_shard(&self, shard_dir: &PathBuf, stats: &mut CacheCleanupStats) {
         if let Ok(entries) = std::fs::read_dir(shard_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    let file_name = entry.file_name();
-                    let file_name_str = file_name.to_string_lossy();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
 
-                    // Match both old .meta.tmp and new instance-specific .meta.tmp.{instance} patterns
-                    if file_name_str.ends_with(".meta.tmp") || file_name_str.contains(".meta.tmp.")
-                    {
-                        match std::fs::remove_file(&path) {
-                            Ok(_) => {
-                                stats.temp_files_cleaned += 1;
-                                debug!("Cleaned up metadata temp file: {:?}", path);
-                            }
-                            Err(e) => {
-                                warn!("Failed to clean up metadata temp file {:?}: {}", path, e);
-                            }
+                // Match both old .meta.tmp and new instance-specific .meta.tmp.{instance} patterns
+                if file_name_str.ends_with(".meta.tmp") || file_name_str.contains(".meta.tmp.") {
+                    match std::fs::remove_file(&path) {
+                        Ok(_) => {
+                            stats.temp_files_cleaned += 1;
+                            debug!("Cleaned up metadata temp file: {:?}", path);
+                        }
+                        Err(e) => {
+                            warn!("Failed to clean up metadata temp file {:?}: {}", path, e);
                         }
                     }
                 }
@@ -5038,9 +5047,7 @@ impl DiskCacheManager {
                 cache_key,
                 new_ttl.as_secs_f64()
             );
-            return buffer
-                .record_ttl_refresh(cache_key, new_ttl)
-                .await;
+            return buffer.record_ttl_refresh(cache_key, new_ttl).await;
         }
 
         // Single instance mode: direct metadata write
@@ -5056,7 +5063,8 @@ impl DiskCacheManager {
         let operation_start = std::time::Instant::now();
         info!(
             "Starting object TTL refresh: key={}, new_ttl={:.2}s, operation=refresh_object_ttl",
-            cache_key, new_ttl.as_secs_f64()
+            cache_key,
+            new_ttl.as_secs_f64()
         );
 
         let metadata_path = self.get_new_metadata_file_path(cache_key);
@@ -5183,7 +5191,9 @@ impl DiskCacheManager {
         let total_duration = operation_start.elapsed();
         info!(
             "Object TTL refresh completed: key={}, new_expires_at={:?}, total_duration={:.2}ms",
-            cache_key, metadata.expires_at, total_duration.as_secs_f64() * 1000.0
+            cache_key,
+            metadata.expires_at,
+            total_duration.as_secs_f64() * 1000.0
         );
 
         Ok(())
@@ -5730,27 +5740,37 @@ impl DiskCacheManager {
                     "Metadata file not found during expiration check: cache_key={}, path={:?}",
                     cache_key, metadata_path
                 );
-                return Ok(ObjectExpirationResult::Expired { last_modified: None, etag: None });
+                return Ok(ObjectExpirationResult::Expired {
+                    last_modified: None,
+                    etag: None,
+                });
             }
             Err(e) => {
                 warn!(
                     "Failed to read metadata during expiration check: cache_key={}, error={}",
                     cache_key, e
                 );
-                return Ok(ObjectExpirationResult::Expired { last_modified: None, etag: None });
+                return Ok(ObjectExpirationResult::Expired {
+                    last_modified: None,
+                    etag: None,
+                });
             }
         };
 
-        let metadata: crate::cache_types::NewCacheMetadata = match serde_json::from_str(&metadata_content) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "Failed to parse metadata during expiration check: cache_key={}, error={}",
-                    cache_key, e
-                );
-                return Ok(ObjectExpirationResult::Expired { last_modified: None, etag: None });
-            }
-        };
+        let metadata: crate::cache_types::NewCacheMetadata =
+            match serde_json::from_str(&metadata_content) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "Failed to parse metadata during expiration check: cache_key={}, error={}",
+                        cache_key, e
+                    );
+                    return Ok(ObjectExpirationResult::Expired {
+                        last_modified: None,
+                        etag: None,
+                    });
+                }
+            };
 
         if metadata.is_object_expired() {
             debug!(
@@ -7327,10 +7347,7 @@ mod tests {
         // Validates: Requirements 2.1, 5.3
         let result = parse_cache_key("../etc/passwd");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains(".."));
+        assert!(result.unwrap_err().to_string().contains(".."));
     }
 
     #[test]
@@ -7357,8 +7374,7 @@ mod tests {
     #[test]
     fn test_parse_cache_key_accepts_s3_valid_names() {
         // Validates: Requirements 2.6
-        let (bucket, object_key) =
-            parse_cache_key("my-bucket.v2/path/to/key").unwrap();
+        let (bucket, object_key) = parse_cache_key("my-bucket.v2/path/to/key").unwrap();
         assert_eq!(bucket, "my-bucket.v2");
         assert_eq!(object_key, "path/to/key");
     }
@@ -7567,7 +7583,8 @@ mod tests {
     #[tokio::test]
     async fn test_cache_key_sanitization() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let unsafe_key = "bucket/path:with*special?chars<>|";
         let safe_key = cache_manager.sanitize_cache_key(unsafe_key);
@@ -7583,7 +7600,8 @@ mod tests {
     #[tokio::test]
     async fn test_cache_type_determination() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test basic cache types
         assert_eq!(
@@ -7622,7 +7640,8 @@ mod tests {
     #[tokio::test]
     async fn test_new_metadata_file_path_generation() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let path = cache_manager.get_new_metadata_file_path(cache_key);
@@ -7659,7 +7678,8 @@ mod tests {
     #[tokio::test]
     async fn test_new_range_file_path_generation() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let start = 0u64;
@@ -7700,7 +7720,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_basic() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let key = "bucket:object";
         let sanitized = cache_manager.sanitize_cache_key_new(key);
@@ -7713,7 +7734,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_special_characters() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test all special characters that need sanitization
         let key = "bucket:path/with?query&param=value";
@@ -7735,7 +7757,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_filesystem_unsafe_chars() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test filesystem-unsafe characters
         let key = r#"bucket\path*with<special>chars|and"quotes"#;
@@ -7761,7 +7784,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_url_special_chars() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test URL-related special characters
         let key = "bucket#fragment%20space{brace}[bracket]$dollar!exclaim";
@@ -7788,7 +7812,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_whitespace() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test whitespace characters
         let key = "bucket with spaces\tand\ttabs\nand\nnewlines\rand\rreturns";
@@ -7810,7 +7835,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_empty_string() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let key = "";
         let sanitized = cache_manager.sanitize_cache_key_new(key);
@@ -7820,7 +7846,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_already_safe() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test key that's already safe
         let key = "bucket-object-name_with_underscores.and.dots";
@@ -7831,7 +7858,8 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_deterministic() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object?query=value";
         let start = 1024u64;
@@ -7858,7 +7886,8 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_different_ranges() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
 
@@ -7879,7 +7908,8 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_different_keys() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let start = 0u64;
         let end = 1023u64;
@@ -7897,7 +7927,8 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_large_ranges() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/large-object";
 
@@ -7915,7 +7946,8 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_full_object_as_range() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let content_length = 10485760u64; // 10MB
@@ -7929,7 +7961,8 @@ mod tests {
     #[tokio::test]
     async fn test_path_generation_complex_s3_key() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Complex S3 key with multiple path segments and special characters
         let cache_key = "my-bucket/path/to/deeply/nested/object-with-dashes_and_underscores.tar.gz?versionId=abc123&partNumber=5";
@@ -7966,7 +7999,8 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_cache_key_new_unicode() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         // Test with unicode characters
         let key = "bucket:文件/объект/αρχείο";
@@ -8030,7 +8064,9 @@ mod tests {
                 end,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -8088,7 +8124,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -8143,7 +8181,9 @@ mod tests {
                 end,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -8179,9 +8219,14 @@ mod tests {
                 2047,
                 &data,
                 different_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await;
-        assert!(result.is_ok(), "Should succeed after invalidating old ranges");
+        assert!(
+            result.is_ok(),
+            "Should succeed after invalidating old ranges"
+        );
 
         // Verify the old range file was deleted
         assert!(
@@ -8198,9 +8243,19 @@ mod tests {
         let metadata: crate::cache_types::NewCacheMetadata =
             serde_json::from_str(&metadata_content).unwrap();
 
-        assert_eq!(metadata.ranges.len(), 1, "Should have only 1 range (the new one)");
-        assert_eq!(metadata.object_metadata.etag, "different-etag", "ETag should be updated");
-        assert_eq!(metadata.ranges[0].start, 1024, "Range should be the new one");
+        assert_eq!(
+            metadata.ranges.len(),
+            1,
+            "Should have only 1 range (the new one)"
+        );
+        assert_eq!(
+            metadata.object_metadata.etag, "different-etag",
+            "ETag should be updated"
+        );
+        assert_eq!(
+            metadata.ranges[0].start, 1024,
+            "Range should be the new one"
+        );
         assert_eq!(metadata.ranges[0].end, 2047, "Range should be the new one");
     }
 
@@ -8235,7 +8290,9 @@ mod tests {
                 0,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await;
         assert!(result.is_err(), "Should fail when start > end");
 
@@ -8248,7 +8305,9 @@ mod tests {
                 511,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await;
         assert!(
             result.is_err(),
@@ -8290,7 +8349,9 @@ mod tests {
                 end,
                 &data1,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -8302,7 +8363,9 @@ mod tests {
                 end,
                 &data2,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -8351,7 +8414,9 @@ mod tests {
                 content_length - 1,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -8407,7 +8472,9 @@ mod tests {
                 end,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -8481,7 +8548,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata_clone,
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
             });
 
@@ -8529,7 +8598,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_metadata_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/nonexistent-object";
 
@@ -8574,7 +8644,9 @@ mod tests {
                 end,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -8625,7 +8697,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -8653,7 +8727,8 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8698,7 +8773,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_metadata_corrupted_json() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8719,7 +8795,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_metadata_empty_file() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8747,7 +8824,8 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/corrupted-object";
@@ -8758,10 +8836,16 @@ mod tests {
         std::fs::write(&metadata_file_path, "this is not valid json at all!!!").unwrap();
 
         // check_object_expiration should return Expired { last_modified: None }
-        let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
+        let result = cache_manager
+            .check_object_expiration(cache_key)
+            .await
+            .unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None, etag: None },
+            ObjectExpirationResult::Expired {
+                last_modified: None,
+                etag: None
+            },
             "Corrupted metadata should be treated as expired with no last_modified"
         );
     }
@@ -8771,7 +8855,8 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/wrong-schema-object";
@@ -8782,10 +8867,16 @@ mod tests {
         std::fs::write(&metadata_file_path, r#"{"foo": "bar", "baz": 42}"#).unwrap();
 
         // check_object_expiration should return Expired { last_modified: None }
-        let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
+        let result = cache_manager
+            .check_object_expiration(cache_key)
+            .await
+            .unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None, etag: None },
+            ObjectExpirationResult::Expired {
+                last_modified: None,
+                etag: None
+            },
             "Invalid JSON schema should be treated as expired with no last_modified"
         );
     }
@@ -8795,16 +8886,23 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/nonexistent-object";
 
         // No metadata file exists
-        let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
+        let result = cache_manager
+            .check_object_expiration(cache_key)
+            .await
+            .unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None, etag: None },
+            ObjectExpirationResult::Expired {
+                last_modified: None,
+                etag: None
+            },
             "Missing metadata should be treated as expired with no last_modified"
         );
     }
@@ -8814,7 +8912,8 @@ mod tests {
         use crate::cache_types::ObjectExpirationResult;
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/empty-metadata-object";
@@ -8825,10 +8924,16 @@ mod tests {
         std::fs::write(&metadata_file_path, "").unwrap();
 
         // check_object_expiration should return Expired { last_modified: None }
-        let result = cache_manager.check_object_expiration(cache_key).await.unwrap();
+        let result = cache_manager
+            .check_object_expiration(cache_key)
+            .await
+            .unwrap();
         assert_eq!(
             result,
-            ObjectExpirationResult::Expired { last_modified: None, etag: None },
+            ObjectExpirationResult::Expired {
+                last_modified: None,
+                etag: None
+            },
             "Empty metadata file should be treated as expired with no last_modified"
         );
     }
@@ -8838,7 +8943,8 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8895,7 +9001,8 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -8960,7 +9067,8 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9006,7 +9114,8 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         // Don't initialize - test that update_metadata creates directories
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
         let cache_key = "test-bucket/test-object";
         let now = SystemTime::now();
@@ -9046,7 +9155,8 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -9138,7 +9248,8 @@ mod tests {
         use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
 
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         // Cache key with special characters
@@ -9179,7 +9290,8 @@ mod tests {
     #[tokio::test]
     async fn test_find_cached_ranges_no_metadata() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/nonexistent-object";
@@ -9226,7 +9338,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9270,7 +9384,9 @@ mod tests {
                 4095,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9319,7 +9435,9 @@ mod tests {
                 1023,
                 &data1,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -9329,7 +9447,9 @@ mod tests {
                 5119,
                 &data2,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9371,7 +9491,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9415,7 +9537,9 @@ mod tests {
                 2047,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9462,7 +9586,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -9514,7 +9640,9 @@ mod tests {
                 1023,
                 &data1,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -9524,7 +9652,9 @@ mod tests {
                 2047,
                 &data2,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9570,7 +9700,9 @@ mod tests {
                 2047,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9634,7 +9766,9 @@ mod tests {
                 content_length - 1,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9660,13 +9794,16 @@ mod tests {
     #[tokio::test]
     async fn test_find_cached_ranges_invalid_range() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
 
         // Request invalid range (start > end)
-        let result = cache_manager.find_cached_ranges(cache_key, 1024, 0, None).await;
+        let result = cache_manager
+            .find_cached_ranges(cache_key, 1024, 0, None)
+            .await;
         assert!(result.is_err(), "Should fail with invalid range");
     }
 
@@ -9703,7 +9840,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -9756,7 +9895,9 @@ mod tests {
                 5119,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -9766,7 +9907,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -9776,7 +9919,9 @@ mod tests {
                 3071,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9831,7 +9976,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -9879,7 +10026,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -9948,7 +10097,9 @@ mod tests {
                 2999,
                 &data_a,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -9958,7 +10109,9 @@ mod tests {
                 7999,
                 &data_b,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -9968,7 +10121,9 @@ mod tests {
                 11999,
                 &data_c,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10037,7 +10192,9 @@ mod tests {
                 999,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -10047,7 +10204,9 @@ mod tests {
                 3999,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -10057,7 +10216,9 @@ mod tests {
                 6999,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10117,7 +10278,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10174,7 +10337,9 @@ mod tests {
                 end,
                 &original_data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10231,7 +10396,9 @@ mod tests {
                 end,
                 &original_data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10293,7 +10460,9 @@ mod tests {
                 end,
                 &original_data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10382,7 +10551,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -10436,7 +10607,9 @@ mod tests {
                 end,
                 &original_data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10488,7 +10661,9 @@ mod tests {
                 content_length - 1,
                 &original_data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10548,7 +10723,9 @@ mod tests {
                     2047,
                     &original_data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
 
@@ -10606,7 +10783,9 @@ mod tests {
                 end,
                 &original_data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10662,7 +10841,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -10716,7 +10897,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -10830,7 +11013,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -10899,7 +11084,9 @@ mod tests {
                 cache_key,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10954,7 +11141,9 @@ mod tests {
                 cache_key,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11004,7 +11193,9 @@ mod tests {
                 cache_key,
                 &original_data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11073,7 +11264,9 @@ mod tests {
                 cache_key,
                 &original_data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11120,7 +11313,9 @@ mod tests {
                 cache_key,
                 &original_data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11192,7 +11387,9 @@ mod tests {
                 cache_key,
                 &full_object_data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11206,7 +11403,9 @@ mod tests {
                 1023,
                 &partial_data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11302,7 +11501,9 @@ mod tests {
                 1023,
                 &data1,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -11312,7 +11513,9 @@ mod tests {
                 2047,
                 &data2,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -11322,7 +11525,9 @@ mod tests {
                 3071,
                 &data3,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -11332,7 +11537,9 @@ mod tests {
                 4095,
                 &data4,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         cache_manager
@@ -11342,7 +11549,9 @@ mod tests {
                 5119,
                 &data5,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11403,7 +11612,9 @@ mod tests {
                 1023,
                 &data1,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         // Skip range 1024-2047 (gap)
@@ -11414,7 +11625,9 @@ mod tests {
                 3071,
                 &data3,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
         // Skip ranges 3072-5119
@@ -11459,7 +11672,9 @@ mod tests {
                 cache_key,
                 &data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await;
         assert!(
             result.is_err(),
@@ -11504,7 +11719,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -11555,7 +11772,8 @@ mod tests {
     #[tokio::test]
     async fn test_delete_cache_entry_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/nonexistent-object";
@@ -11601,7 +11819,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -11657,7 +11877,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -11738,7 +11960,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -11795,7 +12019,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -11893,7 +12119,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -11954,7 +12182,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -12001,7 +12231,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -12063,7 +12295,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -12146,7 +12380,9 @@ mod tests {
                     end,
                     &data,
                     object_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -12181,7 +12417,8 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_orphaned_files() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
         cache_manager.initialize().await.unwrap();
 
         let cache_key = "test-bucket/test-object";
@@ -12248,7 +12485,9 @@ mod tests {
                 1023,
                 &data,
                 object_metadata,
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -12537,11 +12776,7 @@ mod tests {
         );
 
         // Verify 3 paths were deleted
-        assert_eq!(
-            deleted_paths.len(),
-            3,
-            "Should have 3 deleted file paths"
-        );
+        assert_eq!(deleted_paths.len(), 3, "Should have 3 deleted file paths");
 
         // Verify the .bin files for deleted ranges no longer exist
         for (start, end) in &ranges_to_delete {
@@ -12599,8 +12834,7 @@ mod tests {
         let now = SystemTime::now();
 
         // Create 4 ranges in metadata, but only create .bin files for 2 of them
-        let all_ranges: Vec<(u64, u64)> =
-            vec![(0, 999), (1000, 1999), (2000, 2999), (3000, 3999)];
+        let all_ranges: Vec<(u64, u64)> = vec![(0, 999), (1000, 1999), (2000, 2999), (3000, 3999)];
         let file_size: usize = 500;
 
         let mut range_specs = Vec::new();
@@ -12726,7 +12960,9 @@ mod tests {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
         let corrupt_data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
-        tokio::fs::write(&range_file_path, &corrupt_data).await.unwrap();
+        tokio::fs::write(&range_file_path, &corrupt_data)
+            .await
+            .unwrap();
 
         // Create a RangeSpec pointing to the corrupt file with Lz4 compression
         let range_spec = crate::cache_types::RangeSpec::new(
@@ -12761,7 +12997,10 @@ mod tests {
             }
         }
 
-        assert!(got_error, "Stream should have yielded a decompression error for corrupt LZ4 data");
+        assert!(
+            got_error,
+            "Stream should have yielded a decompression error for corrupt LZ4 data"
+        );
     }
 
     /// Test that streaming a 0-byte range produces no data items and no errors.
@@ -12789,7 +13028,9 @@ mod tests {
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
-        tokio::fs::write(&range_file_path, compressed_data).await.unwrap();
+        tokio::fs::write(&range_file_path, compressed_data)
+            .await
+            .unwrap();
 
         // Create a RangeSpec with uncompressed_size=0
         let range_spec = crate::cache_types::RangeSpec::new(
@@ -12853,7 +13094,10 @@ mod tests {
 
         // stream_range_data should return an error (not a stream that yields errors)
         let stream_result = cache_manager.stream_range_data(&range_spec, 4096).await;
-        assert!(stream_result.is_err(), "Should fail when range file is missing");
+        assert!(
+            stream_result.is_err(),
+            "Should fail when range file is missing"
+        );
 
         let stream_error_msg = match stream_result {
             Err(e) => format!("{}", e),
@@ -12862,7 +13106,10 @@ mod tests {
 
         // load_range_data should also return an error for the same missing file
         let load_result = cache_manager.load_range_data(&range_spec).await;
-        assert!(load_result.is_err(), "load_range_data should also fail for missing file");
+        assert!(
+            load_result.is_err(),
+            "load_range_data should also fail for missing file"
+        );
 
         let load_error_msg = format!("{}", load_result.unwrap_err());
 
@@ -12922,7 +13169,10 @@ mod tests {
         DiskCacheManager::write_range_chunk(&mut writer, &chunk2).unwrap();
 
         // Verify the .tmp file exists before abort
-        assert!(writer.tmp_path.exists(), ".tmp file should exist before abort");
+        assert!(
+            writer.tmp_path.exists(),
+            ".tmp file should exist before abort"
+        );
 
         // Abort the write
         DiskCacheManager::abort_incremental_range(writer);
@@ -12935,7 +13185,7 @@ mod tests {
                     let path = entry.path();
                     if path.is_dir() {
                         results.extend(find_tmp_files(&path));
-                    } else if path.extension().map_or(false, |ext| ext == "tmp") {
+                    } else if path.extension().is_some_and(|ext| ext == "tmp") {
                         results.push(path);
                     }
                 }
@@ -12992,7 +13242,10 @@ mod tests {
         let result = cache_manager
             .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
             .await;
-        assert!(result.is_err(), "Commit should fail when bytes_written != expected size");
+        assert!(
+            result.is_err(),
+            "Commit should fail when bytes_written != expected size"
+        );
 
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -13091,7 +13344,10 @@ mod tests {
 
         // Read back and verify
         let loaded_data = cache_manager.load_range_data(&range_spec).await.unwrap();
-        assert_eq!(loaded_data, single_byte, "Single byte should round-trip correctly");
+        assert_eq!(
+            loaded_data, single_byte,
+            "Single byte should round-trip correctly"
+        );
         assert_eq!(loaded_data.len(), 1);
     }
 
@@ -13141,7 +13397,7 @@ mod tests {
                     let path = entry.path();
                     if path.is_dir() {
                         results.extend(find_tmp_files_in(&path));
-                    } else if path.extension().map_or(false, |ext| ext == "tmp") {
+                    } else if path.extension().is_some_and(|ext| ext == "tmp") {
                         results.push(path);
                     }
                 }
@@ -13192,7 +13448,10 @@ mod tests {
         DiskCacheManager::write_range_chunk(&mut writer, &chunk2).unwrap();
 
         // Logical uncompressed bytes must include everything we pushed
-        assert_eq!(writer.bytes_written, 4000, "bytes_written tracks logical total");
+        assert_eq!(
+            writer.bytes_written, 4000,
+            "bytes_written tracks logical total"
+        );
         // Nothing has been flushed yet, so no compressed bytes accounted for
         assert_eq!(
             writer.compressed_bytes_written, 0,

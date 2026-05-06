@@ -49,7 +49,10 @@ async fn test_full_get_caches_when_size_unknown() {
 
     // Step 1: Verify no cached metadata exists (simulating size unknown scenario)
     println!("[TEST] Step 1: Verifying no cached metadata exists (size unknown)");
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
     assert!(result.is_none(), "Should have no cached metadata initially");
 
     // Step 2: Simulate receiving a full object GET response from S3
@@ -134,7 +137,10 @@ async fn test_full_get_caches_when_size_unknown() {
     // Step 4: Verify has_cached_ranges now returns the size
     println!("[TEST] Step 4: Verifying has_cached_ranges returns size after caching");
 
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
     assert!(result.is_some(), "Should have cached metadata after GET");
 
     let (_has_ranges, stored_length) = result.unwrap();
@@ -168,7 +174,10 @@ async fn test_size_unknown_to_known_flow() {
 
     // Initial state: no metadata (size unknown)
     println!("[TEST] Initial state: no metadata exists");
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
     assert!(result.is_none(), "Initially, size should be unknown");
 
     // Simulate S3 response with 1KB of data
@@ -207,7 +216,10 @@ async fn test_size_unknown_to_known_flow() {
 
     // Final state: metadata exists (size now known)
     println!("[TEST] Final state: checking if size is now known");
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
     assert!(result.is_some(), "After caching, size should be known");
 
     let (_has_ranges, stored_length) = result.unwrap();
@@ -285,7 +297,10 @@ async fn test_content_length_extraction_various_sizes() {
             .unwrap();
 
         // Verify content_length was stored correctly
-        let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+        let result = cache_manager
+            .has_cached_ranges(&cache_key, None)
+            .await
+            .unwrap();
         assert!(result.is_some(), "Should have metadata for {}", description);
 
         let (_has_ranges, stored_length) = result.unwrap();
@@ -333,7 +348,10 @@ async fn test_content_length_extraction_various_sizes() {
         .unwrap();
 
     // Empty files return None from has_cached_ranges (intentional - no range optimization needed)
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
     assert!(
         result.is_none(),
         "Empty files should return None (no range optimization needed)"

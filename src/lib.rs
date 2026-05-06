@@ -46,6 +46,12 @@ pub mod signed_request_proxy;
 pub mod tcp_proxy;
 pub mod tee_stream;
 pub mod tls_proxy_listener;
+pub mod tls_trust_store;
 pub mod write_cache_manager;
 
 pub use error::{ProxyError, Result};
+
+// Re-export the S3 client trait seam so tests (and downstream crates) can
+// reach it without depending on internal module paths. The concrete `S3Client`
+// type stays reachable via the `s3_client` module for callers that need it.
+pub use s3_client::{S3ClientApi, S3RequestContext, S3Response, S3ResponseBody};

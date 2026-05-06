@@ -214,16 +214,10 @@ fn prop_concurrent_commit_size_accounting() {
                         expected_sum += compressed_bytes;
                     }
                     Ok(Err(e)) => {
-                        return TestResult::error(format!(
-                            "task {} commit failed: {}",
-                            i, e
-                        ));
+                        return TestResult::error(format!("task {} commit failed: {}", i, e));
                     }
                     Err(join_err) => {
-                        return TestResult::error(format!(
-                            "task {} panicked: {}",
-                            i, join_err
-                        ));
+                        return TestResult::error(format!("task {} panicked: {}", i, join_err));
                     }
                 }
             }
@@ -304,16 +298,10 @@ fn prop_concurrent_commit_dedup_same_range() {
                         }
                     }
                     Ok(Err(e)) => {
-                        return TestResult::error(format!(
-                            "task {} commit failed: {}",
-                            i, e
-                        ));
+                        return TestResult::error(format!("task {} commit failed: {}", i, e));
                     }
                     Err(join_err) => {
-                        return TestResult::error(format!(
-                            "task {} panicked: {}",
-                            i, join_err
-                        ));
+                        return TestResult::error(format!("task {} panicked: {}", i, join_err));
                     }
                 }
             }

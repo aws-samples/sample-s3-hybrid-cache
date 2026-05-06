@@ -31,12 +31,12 @@ async fn test_cleanup_incomplete_uploads_basic() -> Result<()> {
         false, // write_cache_enabled: false - this test doesn't use write cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/test-object";
@@ -103,12 +103,12 @@ async fn test_cleanup_incomplete_uploads_preserves_recent() -> Result<()> {
         false, // write_cache_enabled: false - this test doesn't use write cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/recent-upload";
@@ -159,12 +159,12 @@ async fn test_cleanup_incomplete_uploads_with_parts() -> Result<()> {
         false, // write_cache_enabled: false - this test doesn't use write cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/upload-with-parts";
@@ -240,12 +240,12 @@ async fn test_cleanup_incomplete_uploads_preserves_completed() -> Result<()> {
         true, // write_cache_enabled: true - this test uses store_write_cache_entry
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/completed-upload";
@@ -315,12 +315,12 @@ async fn test_cleanup_incomplete_uploads_multiple() -> Result<()> {
         false, // write_cache_enabled: false - this test doesn't use write cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     // Create multiple incomplete uploads
@@ -391,12 +391,12 @@ async fn test_cleanup_incomplete_uploads_integrated_with_maintenance() -> Result
         false, // write_cache_enabled: false - this test doesn't use write cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/maintenance-test";
@@ -465,12 +465,12 @@ async fn test_cleanup_incomplete_uploads_bypassed_state() -> Result<()> {
         false, // write_cache_enabled: false - this test doesn't use write cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let path = "/test-bucket/bypassed-upload";

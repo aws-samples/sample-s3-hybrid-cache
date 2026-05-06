@@ -146,25 +146,24 @@ impl CacheWriter {
 
         // Compress data through LZ4 frame format (Requirement 7.2)
         // All data goes through frame encoder for integrity checksums
-        let (data_to_write, compressed_size) =
-            match self
-                .compression_handler
-                .compress_with_algorithm(data, self.compression_algorithm.clone())
-            {
-                Ok(result) => {
-                    debug!(
-                        "Compressed chunk: {} bytes -> {} bytes (ratio: {:.2})",
-                        data.len(),
-                        result.compressed_size,
-                        result.compressed_size as f32 / data.len() as f32
-                    );
-                    (Some(result.data), result.compressed_size as u64)
-                }
-                Err(e) => {
-                    warn!("Compression failed for chunk, storing raw: {}", e);
-                    (None, data.len() as u64)
-                }
-            };
+        let (data_to_write, compressed_size) = match self
+            .compression_handler
+            .compress_with_algorithm(data, self.compression_algorithm.clone())
+        {
+            Ok(result) => {
+                debug!(
+                    "Compressed chunk: {} bytes -> {} bytes (ratio: {:.2})",
+                    data.len(),
+                    result.compressed_size,
+                    result.compressed_size as f32 / data.len() as f32
+                );
+                (Some(result.data), result.compressed_size)
+            }
+            Err(e) => {
+                warn!("Compression failed for chunk, storing raw: {}", e);
+                (None, data.len() as u64)
+            }
+        };
 
         // Check capacity limit before writing (based on compressed size)
         // Note: We check against compressed size since that's what actually gets stored on disk
@@ -625,7 +624,7 @@ mod tests {
         // Verify file exists and has content
         assert!(final_path.exists());
         let content = tokio::fs::read(&final_path).await.unwrap();
-        assert!(content.len() > 0);
+        assert!(!content.is_empty());
     }
 
     #[tokio::test]

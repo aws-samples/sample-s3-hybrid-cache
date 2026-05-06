@@ -39,10 +39,10 @@ async fn create_test_cache_manager() -> (Arc<CacheManager>, TempDir) {
         MetadataCacheConfig::default(),
         95,
         80,
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     ));
 
     (cache_manager, temp_dir)
@@ -52,7 +52,10 @@ async fn create_test_cache_manager() -> (Arc<CacheManager>, TempDir) {
 async fn store_test_cache_entry(cache_manager: &CacheManager, cache_key: &str) -> Result<()> {
     let data = vec![b'X'; 2048];
     let headers = HashMap::from([
-        ("content-type".to_string(), "application/octet-stream".to_string()),
+        (
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        ),
         ("etag".to_string(), "\"test-etag-123\"".to_string()),
         (
             "last-modified".to_string(),
@@ -100,7 +103,10 @@ async fn test_signed_delete_success_invalidates_cache() -> Result<()> {
     // Simulate successful signed DELETE: call invalidate_cache_unified_for_operation
     // This is the exact call made in handle_other_request when response.status().is_success()
     let result = cache_manager
-        .invalidate_cache_unified_for_operation(&CacheManager::generate_cache_key(cache_key, None), "DELETE")
+        .invalidate_cache_unified_for_operation(
+            &CacheManager::generate_cache_key(cache_key, None),
+            "DELETE",
+        )
         .await;
     assert!(result.is_ok(), "Cache invalidation should succeed");
 

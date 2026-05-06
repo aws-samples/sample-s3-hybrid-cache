@@ -86,7 +86,7 @@ async fn test_cache_key_sanitization_round_trip() {
     let cache_manager = create_test_cache_manager(temp_dir.path().to_path_buf()).await;
 
     // Test various special characters that need sanitization
-    let test_keys = vec![
+    let test_keys = [
         "bucket/path:with:colons",
         "bucket/path?with?questions",
         "bucket/path with spaces",
@@ -107,7 +107,7 @@ async fn test_cache_key_sanitization_round_trip() {
             .get_cached_response(key)
             .await
             .unwrap()
-            .expect(&format!("Key '{}' should be cached", key));
+            .unwrap_or_else(|| panic!("Key '{}' should be cached", key));
         assert_eq!(entry.body.as_ref().unwrap(), &data);
         assert_eq!(entry.metadata.etag, format!("etag{}", i));
     }

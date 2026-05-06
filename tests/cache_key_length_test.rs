@@ -21,7 +21,7 @@ async fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheMa
 #[tokio::test]
 async fn test_cache_key_length_reduction() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = create_test_cache_manager(temp_dir.path().to_path_buf()).await;
+    let _cache_manager = create_test_cache_manager(temp_dir.path().to_path_buf()).await;
 
     // Test various cache key formats with new format (no hostname)
     let test_cases = vec![

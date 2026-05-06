@@ -99,10 +99,10 @@ async fn test_connection_pool_config_validation() {
 async fn test_keepalive_enabled_flag() {
     // Test that keepalive_enabled flag is respected
     let config_enabled = create_keepalive_config();
-    assert_eq!(config_enabled.keepalive_enabled, true);
+    assert!(config_enabled.keepalive_enabled);
 
     let config_disabled = create_no_keepalive_config();
-    assert_eq!(config_disabled.keepalive_enabled, false);
+    assert!(!config_disabled.keepalive_enabled);
 }
 
 #[tokio::test]

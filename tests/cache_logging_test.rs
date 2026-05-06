@@ -164,7 +164,8 @@ async fn test_cached_range_hit_logging() {
             &test_data,
             object_metadata,
             std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+            true,
+        )
         .await
         .unwrap();
     drop(disk_cache);
@@ -274,7 +275,8 @@ async fn test_complete_cache_hit_metrics() {
             &test_data1,
             object_metadata.clone(),
             std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+            true,
+        )
         .await
         .unwrap();
 
@@ -286,7 +288,8 @@ async fn test_complete_cache_hit_metrics() {
             &test_data2,
             object_metadata,
             std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+            true,
+        )
         .await
         .unwrap();
     drop(disk_cache);

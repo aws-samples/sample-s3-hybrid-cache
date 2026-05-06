@@ -47,20 +47,19 @@ fn create_shared_storage_cache_manager(cache_dir: std::path::PathBuf) -> CacheMa
         false,                      // write_cache_enabled
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     )
 }
 
 /// Lightweight setup for lock tests: creates the locks directory without
 /// requiring full cache initialization (which needs JournalConsolidator).
 fn setup_locks_dir(cache_dir: &std::path::Path) {
-    std::fs::create_dir_all(cache_dir.join("locks"))
-        .expect("Failed to create locks directory");
+    std::fs::create_dir_all(cache_dir.join("locks")).expect("Failed to create locks directory");
 }
 
 // ============================================================================
@@ -540,7 +539,7 @@ async fn test_corrupted_lock_file_logs_and_handles() {
 
     for (description, content) in corrupted_contents {
         std::fs::write(&lock_file_path, content)
-            .expect(&format!("Failed to write {} lock file", description));
+            .unwrap_or_else(|_| panic!("Failed to write {} lock file", description));
 
         // Should handle gracefully and log error
         let result = cache_manager.try_acquire_global_eviction_lock().await;

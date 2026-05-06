@@ -6,15 +6,9 @@
 //! traffic while maintaining full caching capability.
 
 use crate::{
-    cache::CacheManager,
-    config::Config,
-    http_proxy::HttpProxy,
-    inflight_tracker::InFlightTracker,
-    logging::LoggerManager,
-    range_handler::RangeHandler,
-    s3_client::S3Client,
-    shutdown::ShutdownSignal,
-    ProxyError, Result,
+    cache::CacheManager, config::Config, http_proxy::HttpProxy, inflight_tracker::InFlightTracker,
+    logging::LoggerManager, range_handler::RangeHandler, s3_client::S3ClientApi,
+    shutdown::ShutdownSignal, ProxyError, Result,
 };
 use bytes::Bytes;
 use http_body_util::Full;
@@ -23,8 +17,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -44,7 +38,7 @@ pub struct TlsProxyListener {
     tls_acceptor: TlsAcceptor,
     config: Arc<Config>,
     cache_manager: Arc<CacheManager>,
-    s3_client: Arc<S3Client>,
+    s3_client: Arc<dyn S3ClientApi + Send + Sync>,
     range_handler: Arc<RangeHandler>,
     request_semaphore: Arc<Semaphore>,
     active_connections: Arc<AtomicUsize>,
@@ -59,13 +53,14 @@ impl TlsProxyListener {
     ///
     /// Loads the TLS certificate and private key from the given PEM file paths,
     /// builds a `TlsAcceptor`, and stores shared references for request handling.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         listen_addr: SocketAddr,
         cert_path: &str,
         key_path: &str,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         range_handler: Arc<RangeHandler>,
         request_semaphore: Arc<Semaphore>,
         active_connections: Arc<AtomicUsize>,
@@ -261,7 +256,11 @@ async fn handle_connect(
     use http_body_util::BodyExt;
 
     // Extract target host:port from the CONNECT URI (e.g., "s3.us-west-2.amazonaws.com:443")
-    let target = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
+    let target = req
+        .uri()
+        .authority()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
 
     if target.is_empty() {
         warn!("CONNECT request from {} with empty target", client_addr);
@@ -302,10 +301,15 @@ async fn handle_connect(
                 let target_addr = format!("{}:{}", host, port);
                 match TcpStream::connect(&target_addr).await {
                     Ok(mut server_stream) => {
-                        debug!("CONNECT tunnel established: {} <-> {}", client_addr, target_addr);
+                        debug!(
+                            "CONNECT tunnel established: {} <-> {}",
+                            client_addr, target_addr
+                        );
 
                         // Bidirectional copy
-                        match tokio::io::copy_bidirectional(&mut client_io, &mut server_stream).await {
+                        match tokio::io::copy_bidirectional(&mut client_io, &mut server_stream)
+                            .await
+                        {
                             Ok((tx, rx)) => {
                                 debug!(
                                     "CONNECT tunnel closed: {} <-> {} | tx={} rx={}",
@@ -313,15 +317,15 @@ async fn handle_connect(
                                 );
                             }
                             Err(e) => {
-                                debug!("CONNECT tunnel error: {} <-> {} | {}", client_addr, target_addr, e);
+                                debug!(
+                                    "CONNECT tunnel error: {} <-> {} | {}",
+                                    client_addr, target_addr, e
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "CONNECT tunnel failed to connect to {}: {}",
-                            target_addr, e
-                        );
+                        warn!("CONNECT tunnel failed to connect to {}: {}", target_addr, e);
                         // Try to send an error back to the client
                         let _ = AsyncWriteExt::shutdown(&mut client_io).await;
                     }
@@ -352,35 +356,27 @@ async fn handle_connect(
 /// I/O or parsing failure, enabling operators to diagnose misconfiguration at
 /// startup rather than at runtime.
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig> {
-    let cert_file = std::fs::File::open(cert_path).map_err(|e| {
-        ProxyError::TlsError(format!("Cannot read cert file '{}': {}", cert_path, e))
-    })?;
-    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| ProxyError::TlsError(format!("Cannot read cert file '{}': {}", cert_path, e)))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| {
-            ProxyError::TlsError(format!(
-                "Invalid certificate in '{}': {}",
-                cert_path, e
-            ))
+            ProxyError::TlsError(format!("Invalid certificate in '{}': {}", cert_path, e))
         })?;
 
-    let key_file = std::fs::File::open(key_path).map_err(|e| {
-        ProxyError::TlsError(format!("Cannot read key file '{}': {}", key_path, e))
-    })?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|e| {
-            ProxyError::TlsError(format!(
-                "Invalid private key in '{}': {}",
-                key_path, e
-            ))
-        })?
-        .ok_or_else(|| {
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
+        // from_pem_file returns Error::NoItemsFound when the file contains no
+        // recognised private key block — map that to the same message as before.
+        let msg = format!("{}", e);
+        if msg.contains("NoItemsFound") || msg.contains("no items") {
             ProxyError::TlsError(format!("No private key found in '{}'", key_path))
-        })?;
+        } else {
+            ProxyError::TlsError(format!("Invalid private key in '{}': {}", key_path, e))
+        }
+    })?;
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key.into())
+        .with_single_cert(certs, key)
         .map_err(|e| ProxyError::TlsError(format!("Certificate/key mismatch: {}", e)))?;
 
     Ok(config)
@@ -428,9 +424,7 @@ mod tests {
         }
 
         let cert_path = make_nonexistent_path(seed.clone());
-        let key_path = make_nonexistent_path(
-            seed.iter().map(|b| b.wrapping_add(1)).collect(),
-        );
+        let key_path = make_nonexistent_path(seed.iter().map(|b| b.wrapping_add(1)).collect());
 
         // Both paths are non-existent, so load_tls_config must fail on the cert path first
         let result = load_tls_config(&cert_path, &key_path);

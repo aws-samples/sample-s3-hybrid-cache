@@ -25,10 +25,10 @@ mod pathbuf_serde {
     }
 
     fn expand_tilde(path: &str) -> PathBuf {
-        if path.starts_with("~/") {
+        if let Some(stripped) = path.strip_prefix("~/") {
             if let Some(home) = std::env::var_os("HOME") {
                 let mut result = PathBuf::from(home);
-                result.push(&path[2..]);
+                result.push(stripped);
                 return result;
             }
         }
@@ -136,7 +136,7 @@ impl DashboardConfig {
 
         // Validate refresh intervals (1-300 seconds)
         let cache_stats_secs = self.cache_stats_refresh_interval.as_secs();
-        if cache_stats_secs < 1 || cache_stats_secs > 300 {
+        if !(1..=300).contains(&cache_stats_secs) {
             return Err(format!(
                 "Cache stats refresh interval must be between 1 and 300 seconds, got {}",
                 cache_stats_secs
@@ -144,7 +144,7 @@ impl DashboardConfig {
         }
 
         let logs_secs = self.logs_refresh_interval.as_secs();
-        if logs_secs < 1 || logs_secs > 300 {
+        if !(1..=300).contains(&logs_secs) {
             return Err(format!(
                 "Logs refresh interval must be between 1 and 300 seconds, got {}",
                 logs_secs
@@ -189,18 +189,13 @@ pub struct Config {
 /// Controls which listeners are started at startup.
 /// - `Standard`: HTTP (port 80) + HTTPS (port 443) + optional TLS proxy
 /// - `ProxyOnly`: HTTP forward proxy (port 3128) + optional TLS proxy
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum ServerMode {
     #[serde(rename = "standard")]
+    #[default]
     Standard,
     #[serde(rename = "proxy_only")]
     ProxyOnly,
-}
-
-impl Default for ServerMode {
-    fn default() -> Self {
-        ServerMode::Standard
-    }
 }
 
 /// Server configuration
@@ -331,16 +326,11 @@ impl TlsConfig {
 }
 
 /// HTTPS mode configuration
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum HttpsMode {
     #[serde(rename = "passthrough")]
+    #[default]
     Passthrough, // TCP passthrough (only mode)
-}
-
-impl Default for HttpsMode {
-    fn default() -> Self {
-        HttpsMode::Passthrough
-    }
 }
 
 /// Download coordination configuration for request coalescing
@@ -549,6 +539,7 @@ pub struct SharedStorageConfig {
     /// This is the single knob for self-tuning mode selection:
     /// - Full scan that exceeds this → switch to rolling next cycle
     /// - Rolling scan that extrapolates full time ≤ this → switch back to full
+    ///
     /// Valid range: 10 minutes - 23 hours
     #[serde(
         default = "default_validation_max_duration",
@@ -619,7 +610,7 @@ impl SharedStorageConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         // Validate lock_timeout (10-300 seconds)
         let lock_timeout_secs = self.lock_timeout.as_secs();
-        if lock_timeout_secs < 10 || lock_timeout_secs > 300 {
+        if !(10..=300).contains(&lock_timeout_secs) {
             return Err(format!(
                 "lock_timeout must be between 10 and 300 seconds, got {}",
                 lock_timeout_secs
@@ -628,7 +619,7 @@ impl SharedStorageConfig {
 
         // Validate lock_refresh_interval (5-120 seconds, must be less than lock_timeout)
         let lock_refresh_secs = self.lock_refresh_interval.as_secs();
-        if lock_refresh_secs < 5 || lock_refresh_secs > 120 {
+        if !(5..=120).contains(&lock_refresh_secs) {
             return Err(format!(
                 "lock_refresh_interval must be between 5 and 120 seconds, got {}",
                 lock_refresh_secs
@@ -671,7 +662,7 @@ impl SharedStorageConfig {
 
         // Validate consolidation_interval (1-60 seconds)
         let consolidation_secs = self.consolidation_interval.as_secs();
-        if consolidation_secs < 1 || consolidation_secs > 60 {
+        if !(1..=60).contains(&consolidation_secs) {
             return Err(format!(
                 "consolidation_interval must be between 1 and 60 seconds, got {}",
                 consolidation_secs
@@ -698,7 +689,7 @@ impl SharedStorageConfig {
 
         // Validate validation_frequency (1h-168h)
         let validation_hours = self.validation_frequency.as_secs() / 3600;
-        if validation_hours < 1 || validation_hours > 168 {
+        if !(1..=168).contains(&validation_hours) {
             return Err(format!(
                 "validation_frequency must be between 1 and 168 hours, got {}h",
                 validation_hours
@@ -708,7 +699,7 @@ impl SharedStorageConfig {
         // Validate eviction_lock_timeout (30-3600 seconds)
         // Requirement: 6.4 - THE system SHALL validate that lock timeout is between 30 and 3600 seconds
         let eviction_lock_timeout_secs = self.eviction_lock_timeout.as_secs();
-        if eviction_lock_timeout_secs < 30 || eviction_lock_timeout_secs > 3600 {
+        if !(30..=3600).contains(&eviction_lock_timeout_secs) {
             return Err(format!(
                 "eviction_lock_timeout must be between 30 and 3600 seconds, got {}",
                 eviction_lock_timeout_secs
@@ -868,7 +859,7 @@ impl InitializationConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         // Validate scan timeout (minimum 5 seconds, maximum 300 seconds)
         let scan_timeout_secs = self.scan_timeout.as_secs();
-        if scan_timeout_secs < 5 || scan_timeout_secs > 300 {
+        if !(5..=300).contains(&scan_timeout_secs) {
             return Err(format!(
                 "scan_timeout must be between 5 and 300 seconds, got {}",
                 scan_timeout_secs
@@ -943,7 +934,7 @@ impl MetadataCacheConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         // Validate refresh_interval (1-300 seconds)
         let refresh_secs = self.refresh_interval.as_secs();
-        if refresh_secs < 1 || refresh_secs > 300 {
+        if !(1..=300).contains(&refresh_secs) {
             return Err(format!(
                 "metadata_cache.refresh_interval must be between 1 and 300 seconds, got {}",
                 refresh_secs
@@ -985,7 +976,7 @@ impl ConnectionPoolConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         // Validate idle_timeout (10-300 seconds)
         let idle_timeout_secs = self.idle_timeout.as_secs();
-        if idle_timeout_secs < 10 || idle_timeout_secs > 300 {
+        if !(10..=300).contains(&idle_timeout_secs) {
             return Err(format!(
                 "Idle timeout must be between 10 and 300 seconds, got {}",
                 idle_timeout_secs
@@ -1002,7 +993,7 @@ impl ConnectionPoolConfig {
 
         // Validate max_lifetime (60-3600 seconds)
         let max_lifetime_secs = self.max_lifetime.as_secs();
-        if max_lifetime_secs < 60 || max_lifetime_secs > 3600 {
+        if !(60..=3600).contains(&max_lifetime_secs) {
             return Err(format!(
                 "Max connection lifetime must be between 60 and 3600 seconds, got {}",
                 max_lifetime_secs
@@ -1011,7 +1002,7 @@ impl ConnectionPoolConfig {
 
         // Validate pool_check_interval (1-60 seconds)
         let pool_check_interval_secs = self.pool_check_interval.as_secs();
-        if pool_check_interval_secs < 1 || pool_check_interval_secs > 60 {
+        if !(1..=60).contains(&pool_check_interval_secs) {
             return Err(format!(
                 "Pool check interval must be between 1 and 60 seconds, got {}",
                 pool_check_interval_secs
@@ -1263,9 +1254,7 @@ impl CacheConfig {
         {
             return Err(format!(
                 "cache.compression_batch_size must be between {} and {} bytes, got {}",
-                MIN_COMPRESSION_BATCH_SIZE,
-                MAX_COMPRESSION_BATCH_SIZE,
-                self.compression_batch_size
+                MIN_COMPRESSION_BATCH_SIZE, MAX_COMPRESSION_BATCH_SIZE, self.compression_batch_size
             ));
         }
 
@@ -1274,18 +1263,13 @@ impl CacheConfig {
 }
 
 /// Cache eviction algorithms
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum EvictionAlgorithm {
     #[serde(rename = "lru")]
+    #[default]
     LRU, // Least Recently Used (default)
     #[serde(rename = "tinylfu")]
     TinyLFU, // Simplified frequency-recency hybrid inspired by TinyLFU
-}
-
-impl Default for EvictionAlgorithm {
-    fn default() -> Self {
-        EvictionAlgorithm::LRU
-    }
 }
 
 impl From<EvictionAlgorithm> for crate::cache::CacheEvictionAlgorithm {
@@ -1336,7 +1320,6 @@ fn default_access_log_file_rotation_interval() -> Duration {
     Duration::from_secs(5 * 60)
 }
 
-
 /// Logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1383,18 +1366,13 @@ pub struct LoggingConfig {
 }
 
 /// Access logging mode
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum AccessLogMode {
     #[serde(rename = "all")]
+    #[default]
     All,
     #[serde(rename = "cached_only")]
     CachedOnly,
-}
-
-impl Default for AccessLogMode {
-    fn default() -> Self {
-        AccessLogMode::All
-    }
 }
 
 impl LoggingConfig {
@@ -1417,7 +1395,7 @@ impl LoggingConfig {
 
         // Validate log_cleanup_interval (1h-7d)
         let cleanup_secs = self.log_cleanup_interval.as_secs();
-        if cleanup_secs < 3600 || cleanup_secs > 7 * 24 * 3600 {
+        if !(3600..=7 * 24 * 3600).contains(&cleanup_secs) {
             return Err(format!(
                 "log_cleanup_interval must be between 1 hour and 7 days, got {}s",
                 cleanup_secs
@@ -1426,7 +1404,7 @@ impl LoggingConfig {
 
         // Validate access_log_file_rotation_interval (1m-60m)
         let rotation_secs = self.access_log_file_rotation_interval.as_secs();
-        if rotation_secs < 60 || rotation_secs > 3600 {
+        if !(60..=3600).contains(&rotation_secs) {
             return Err(format!(
                 "access_log_file_rotation_interval must be between 1 and 60 minutes, got {}s",
                 rotation_secs
@@ -1571,7 +1549,6 @@ fn default_ip_failure_threshold() -> u32 {
     3
 }
 
-
 impl Default for ConnectionPoolConfig {
     fn default() -> Self {
         Self {
@@ -1606,23 +1583,18 @@ pub struct CompressionConfig {
 }
 
 /// Compression algorithms
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum CompressionAlgorithm {
     #[serde(rename = "none")]
     None,
     #[serde(rename = "lz4")]
+    #[default]
     Lz4,
     // Future algorithms can be added here
     // #[serde(rename = "zstd")]
     // Zstd,
     // #[serde(rename = "brotli")]
     // Brotli,
-}
-
-impl Default for CompressionAlgorithm {
-    fn default() -> Self {
-        CompressionAlgorithm::Lz4
-    }
 }
 
 impl Default for CompressionConfig {
@@ -1685,18 +1657,13 @@ pub struct OtlpConfig {
 }
 
 /// OTLP compression options
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum OtlpCompression {
     #[serde(rename = "none")]
+    #[default]
     None,
     #[serde(rename = "gzip")]
     Gzip,
-}
-
-impl Default for OtlpCompression {
-    fn default() -> Self {
-        OtlpCompression::None
-    }
 }
 
 impl Default for OtlpConfig {
@@ -2005,10 +1972,7 @@ impl Config {
             }
             ServerMode::ProxyOnly => {
                 info!("Server mode: proxy_only");
-                info!(
-                    "HTTP forward proxy port: {}",
-                    config.server.proxy_port
-                );
+                info!("HTTP forward proxy port: {}", config.server.proxy_port);
                 info!("HTTP/HTTPS direct listeners will not be started");
             }
         }
@@ -2663,7 +2627,7 @@ impl Config {
     fn validate_ram_cache_flush_config(&mut self) {
         // Validate flush_interval (10-600 seconds)
         let flush_interval_secs = self.cache.ram_cache_flush_interval.as_secs();
-        if flush_interval_secs < 10 || flush_interval_secs > 600 {
+        if !(10..=600).contains(&flush_interval_secs) {
             warn!(
                 "Invalid ram_cache_flush_interval: {}s (must be 10-600s), using default 60s",
                 flush_interval_secs
@@ -2683,7 +2647,7 @@ impl Config {
 
         // Validate verification_interval (1-60 seconds)
         let verification_interval_secs = self.cache.ram_cache_verification_interval.as_secs();
-        if verification_interval_secs < 1 || verification_interval_secs > 60 {
+        if !(1..=60).contains(&verification_interval_secs) {
             warn!(
                 "Invalid ram_cache_verification_interval: {}s (must be 1-60s), using default 1s",
                 verification_interval_secs
@@ -2773,7 +2737,11 @@ impl Config {
         // Validate target < trigger
         // Requirement: 3.9
         if self.cache.eviction_target_percent >= self.cache.eviction_trigger_percent {
-            let new_target = self.cache.eviction_trigger_percent.saturating_sub(10).max(50);
+            let new_target = self
+                .cache
+                .eviction_trigger_percent
+                .saturating_sub(10)
+                .max(50);
             warn!(
                 "eviction_target_percent ({}) must be less than eviction_trigger_percent ({}), setting target to {}",
                 self.cache.eviction_target_percent,
@@ -3444,8 +3412,8 @@ metrics:
     fn test_write_cache_enabled_default_true() {
         // Test that the default configuration has write_cache_enabled = true
         let config = Config::default();
-        assert_eq!(
-            config.cache.write_cache_enabled, true,
+        assert!(
+            config.cache.write_cache_enabled,
             "write_cache_enabled should default to true (write caching is complete)"
         );
     }
@@ -3510,8 +3478,8 @@ metrics:
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
-        assert_eq!(
-            config.cache.write_cache_enabled, true,
+        assert!(
+            config.cache.write_cache_enabled,
             "write_cache_enabled should default to true when missing (write caching is complete)"
         );
     }
@@ -3535,8 +3503,8 @@ logging:
         assert_eq!(config.cache.write_cache_percent, 10.0);
         assert_eq!(config.cache.write_cache_max_object_size, 256 * 1024 * 1024);
         assert_eq!(config.cache.max_cache_size, 10 * 1024 * 1024 * 1024);
-        assert_eq!(config.cache.ram_cache_enabled, false);
-        assert_eq!(config.logging.access_log_enabled, true);
+        assert!(!config.cache.ram_cache_enabled);
+        assert!(config.logging.access_log_enabled);
         assert_eq!(config.logging.log_level, "info");
         assert_eq!(config.connection_pool.max_connections_per_ip, 10);
     }
@@ -3602,8 +3570,8 @@ metrics:
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
-        assert_eq!(
-            config.cache.write_cache_enabled, true,
+        assert!(
+            config.cache.write_cache_enabled,
             "write_cache_enabled should be true when explicitly set"
         );
     }
@@ -3669,8 +3637,8 @@ metrics:
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
-        assert_eq!(
-            config.cache.write_cache_enabled, false,
+        assert!(
+            !config.cache.write_cache_enabled,
             "write_cache_enabled should be false when explicitly set"
         );
     }
@@ -3684,8 +3652,8 @@ metrics:
         config.cache.write_cache_enabled = false; // Start with false
         config.apply_env_overrides();
 
-        assert_eq!(
-            config.cache.write_cache_enabled, true,
+        assert!(
+            config.cache.write_cache_enabled,
             "WRITE_CACHE_ENABLED=true should override to true"
         );
 
@@ -3693,8 +3661,8 @@ metrics:
         config.cache.write_cache_enabled = true; // Start with true
         config.apply_env_overrides();
 
-        assert_eq!(
-            config.cache.write_cache_enabled, false,
+        assert!(
+            !config.cache.write_cache_enabled,
             "WRITE_CACHE_ENABLED=false should override to false"
         );
 
@@ -3711,7 +3679,7 @@ metrics:
         assert_eq!(config.dns_refresh_interval, Duration::from_secs(60));
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
         assert_eq!(config.idle_timeout, Duration::from_secs(55));
-        assert_eq!(config.keepalive_enabled, true);
+        assert!(config.keepalive_enabled);
         assert_eq!(config.max_idle_per_host, 100);
         assert_eq!(config.max_lifetime, Duration::from_secs(300));
         assert_eq!(config.pool_check_interval, Duration::from_secs(10));
@@ -3738,7 +3706,7 @@ pool_check_interval: "20s"
         assert_eq!(config.dns_refresh_interval, Duration::from_secs(120));
         assert_eq!(config.connection_timeout, Duration::from_secs(15));
         assert_eq!(config.idle_timeout, Duration::from_secs(45));
-        assert_eq!(config.keepalive_enabled, false);
+        assert!(!config.keepalive_enabled);
         assert_eq!(config.max_idle_per_host, 5);
         assert_eq!(config.max_lifetime, Duration::from_secs(600));
         assert_eq!(config.pool_check_interval, Duration::from_secs(20));
@@ -3789,14 +3757,17 @@ pool_check_interval: "10s"
         let config: ConnectionPoolConfig =
             serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
 
-        assert_eq!(config.max_idle_per_host, 100, "max_idle_per_host should default to 100 when not specified");
+        assert_eq!(
+            config.max_idle_per_host, 100,
+            "max_idle_per_host should default to 100 when not specified"
+        );
     }
 
     #[test]
     fn test_ip_distribution_defaults() {
         // Requirement 5.2, 5.3: ip_distribution_enabled defaults to true, max_idle_per_ip defaults to 10
         let config = ConnectionPoolConfig::default();
-        assert_eq!(config.ip_distribution_enabled, true);
+        assert!(config.ip_distribution_enabled);
         assert_eq!(config.max_idle_per_ip, 10);
     }
 
@@ -3815,7 +3786,7 @@ max_idle_per_ip: 25
         let config: ConnectionPoolConfig =
             serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
 
-        assert_eq!(config.ip_distribution_enabled, true);
+        assert!(config.ip_distribution_enabled);
         assert_eq!(config.max_idle_per_ip, 25);
     }
 
@@ -3832,8 +3803,14 @@ idle_timeout: "30s"
         let config: ConnectionPoolConfig =
             serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
 
-        assert_eq!(config.ip_distribution_enabled, true, "ip_distribution_enabled should default to true");
-        assert_eq!(config.max_idle_per_ip, 10, "max_idle_per_ip should default to 10");
+        assert!(
+            config.ip_distribution_enabled,
+            "ip_distribution_enabled should default to true"
+        );
+        assert_eq!(
+            config.max_idle_per_ip, 10,
+            "max_idle_per_ip should default to 10"
+        );
     }
 
     #[test]
@@ -3844,7 +3821,10 @@ idle_timeout: "30s"
             ..ConnectionPoolConfig::default()
         };
         let result = config.validate();
-        assert!(result.is_err(), "Validation should reject max_idle_per_ip of 0");
+        assert!(
+            result.is_err(),
+            "Validation should reject max_idle_per_ip of 0"
+        );
         assert!(result.unwrap_err().contains("Max idle connections per IP"));
     }
 
@@ -3856,7 +3836,10 @@ idle_timeout: "30s"
             ..ConnectionPoolConfig::default()
         };
         let result = config.validate();
-        assert!(result.is_err(), "Validation should reject max_idle_per_ip > 100");
+        assert!(
+            result.is_err(),
+            "Validation should reject max_idle_per_ip > 100"
+        );
         assert!(result.unwrap_err().contains("Max idle connections per IP"));
     }
 
@@ -3867,22 +3850,28 @@ idle_timeout: "30s"
             max_idle_per_ip: 1,
             ..ConnectionPoolConfig::default()
         };
-        assert!(config_min.validate().is_ok(), "max_idle_per_ip of 1 should be valid");
+        assert!(
+            config_min.validate().is_ok(),
+            "max_idle_per_ip of 1 should be valid"
+        );
 
         let config_max = ConnectionPoolConfig {
             max_idle_per_ip: 100,
             ..ConnectionPoolConfig::default()
         };
-        assert!(config_max.validate().is_ok(), "max_idle_per_ip of 100 should be valid");
+        assert!(
+            config_max.validate().is_ok(),
+            "max_idle_per_ip of 100 should be valid"
+        );
     }
 
     #[test]
     fn test_initialization_config_defaults() {
         let config = InitializationConfig::default();
 
-        assert_eq!(config.parallel_scan, true);
+        assert!(config.parallel_scan);
         assert_eq!(config.scan_timeout, Duration::from_secs(30));
-        assert_eq!(config.progress_logging, true);
+        assert!(config.progress_logging);
     }
 
     #[test]
@@ -3922,7 +3911,10 @@ idle_timeout: "30s"
         assert_eq!(config.lock_refresh_interval, Duration::from_secs(30));
         assert_eq!(config.validation_threshold_warn, 5.0);
         assert_eq!(config.validation_threshold_error, 20.0);
-        assert_eq!(config.validation_max_duration, Duration::from_secs(4 * 3600));
+        assert_eq!(
+            config.validation_max_duration,
+            Duration::from_secs(4 * 3600)
+        );
     }
 
     #[test]
@@ -3980,7 +3972,10 @@ idle_timeout: "30s"
     #[test]
     fn test_validation_max_duration_defaults_to_4_hours() {
         let config = SharedStorageConfig::default();
-        assert_eq!(config.validation_max_duration, Duration::from_secs(4 * 3600));
+        assert_eq!(
+            config.validation_max_duration,
+            Duration::from_secs(4 * 3600)
+        );
     }
 
     #[test]
@@ -4115,12 +4110,12 @@ metrics:
 
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
 
-        assert_eq!(config.cache.initialization.parallel_scan, false);
+        assert!(!config.cache.initialization.parallel_scan);
         assert_eq!(
             config.cache.initialization.scan_timeout,
             Duration::from_secs(60)
         );
-        assert_eq!(config.cache.initialization.progress_logging, false);
+        assert!(!config.cache.initialization.progress_logging);
         assert_eq!(config.cache.shared_storage.validation_threshold_warn, 10.0);
         assert_eq!(config.cache.shared_storage.validation_threshold_error, 30.0);
     }
@@ -4135,12 +4130,12 @@ metrics:
             serde_yaml::from_str(&yaml).expect("Failed to parse config/config.example.yaml");
 
         // Verify initialization config has expected values from the example file
-        assert_eq!(config.cache.initialization.parallel_scan, true);
+        assert!(config.cache.initialization.parallel_scan);
         assert_eq!(
             config.cache.initialization.scan_timeout,
             Duration::from_secs(30)
         );
-        assert_eq!(config.cache.initialization.progress_logging, true);
+        assert!(config.cache.initialization.progress_logging);
         // Validation thresholds are now in shared_storage
         assert_eq!(config.cache.shared_storage.validation_threshold_warn, 5.0);
         assert_eq!(config.cache.shared_storage.validation_threshold_error, 20.0);
@@ -4220,12 +4215,12 @@ metrics:
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
 
         // Should use default values when initialization section is missing
-        assert_eq!(config.cache.initialization.parallel_scan, true);
+        assert!(config.cache.initialization.parallel_scan);
         assert_eq!(
             config.cache.initialization.scan_timeout,
             Duration::from_secs(30)
         );
-        assert_eq!(config.cache.initialization.progress_logging, true);
+        assert!(config.cache.initialization.progress_logging);
         // Validation thresholds are now in shared_storage with defaults
         assert_eq!(config.cache.shared_storage.validation_threshold_warn, 5.0);
         assert_eq!(config.cache.shared_storage.validation_threshold_error, 20.0);
@@ -4309,12 +4304,12 @@ metrics:
             .expect("Should load valid config successfully");
 
         // Verify initialization config was loaded correctly
-        assert_eq!(config.cache.initialization.parallel_scan, true);
+        assert!(config.cache.initialization.parallel_scan);
         assert_eq!(
             config.cache.initialization.scan_timeout,
             Duration::from_secs(30)
         );
-        assert_eq!(config.cache.initialization.progress_logging, true);
+        assert!(config.cache.initialization.progress_logging);
         // Validation thresholds are now in shared_storage
         assert_eq!(config.cache.shared_storage.validation_threshold_warn, 5.0);
         assert_eq!(config.cache.shared_storage.validation_threshold_error, 20.0);
@@ -4406,7 +4401,7 @@ dashboard:
     fn test_dashboard_config_defaults() {
         let config = DashboardConfig::default();
 
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.port, 8081);
         assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.cache_stats_refresh_interval, Duration::from_secs(5));
@@ -4510,7 +4505,7 @@ max_log_entries: 200
         let config: DashboardConfig =
             serde_yaml::from_str(yaml).expect("Failed to parse DashboardConfig");
 
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.port, 9090);
         assert_eq!(config.bind_address, "127.0.0.1");
         assert_eq!(config.cache_stats_refresh_interval, Duration::from_secs(3));
@@ -4523,7 +4518,7 @@ max_log_entries: 200
         let config = Config::default();
 
         // Verify dashboard is included with default values
-        assert_eq!(config.dashboard.enabled, true);
+        assert!(config.dashboard.enabled);
         assert_eq!(config.dashboard.port, 8081);
         assert_eq!(config.dashboard.bind_address, "0.0.0.0");
     }
@@ -4800,7 +4795,7 @@ cache:
     #[test]
     fn test_add_referer_header_default_true() {
         let config = Config::default();
-        assert_eq!(config.server.add_referer_header, true);
+        assert!(config.server.add_referer_header);
     }
 
     #[test]
@@ -4862,7 +4857,7 @@ metrics:
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
-        assert_eq!(config.server.add_referer_header, true);
+        assert!(config.server.add_referer_header);
     }
 
     #[test]
@@ -4925,7 +4920,7 @@ metrics:
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
-        assert_eq!(config.server.add_referer_header, true);
+        assert!(config.server.add_referer_header);
     }
 
     #[test]
@@ -4988,7 +4983,7 @@ metrics:
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
-        assert_eq!(config.server.add_referer_header, false);
+        assert!(!config.server.add_referer_header);
     }
 
     // --- TLS config validation tests ---
@@ -5435,8 +5430,10 @@ metrics:
     #[test]
     fn test_compression_batch_size_below_range_rejected() {
         // Requirement 5.4: values below 64 KiB must be rejected.
-        let mut cfg = CacheConfig::default();
-        cfg.compression_batch_size = 32 * 1024; // 32 KiB, below the 64 KiB minimum
+        let cfg = CacheConfig {
+            compression_batch_size: 32 * 1024, // 32 KiB, below the 64 KiB minimum
+            ..CacheConfig::default()
+        };
         let err = cfg.validate().expect_err("32 KiB must fail validation");
         assert!(
             err.contains("compression_batch_size"),
@@ -5448,8 +5445,10 @@ metrics:
     #[test]
     fn test_compression_batch_size_above_range_rejected() {
         // Requirement 5.4: values above 16 MiB must be rejected.
-        let mut cfg = CacheConfig::default();
-        cfg.compression_batch_size = 32 * 1024 * 1024; // 32 MiB, above the 16 MiB maximum
+        let cfg = CacheConfig {
+            compression_batch_size: 32 * 1024 * 1024, // 32 MiB, above the 16 MiB maximum
+            ..CacheConfig::default()
+        };
         let err = cfg.validate().expect_err("32 MiB must fail validation");
         assert!(
             err.contains("compression_batch_size"),
@@ -5497,12 +5496,9 @@ mod dashboard_property_tests {
         // Determine if the configuration should be valid
         let should_be_valid = port >= 1024
             && !bind_address.is_empty()
-            && cache_stats_secs >= 1
-            && cache_stats_secs <= 300
-            && logs_secs >= 1
-            && logs_secs <= 300
-            && max_entries >= 10
-            && max_entries <= 10000;
+            && (1..=300).contains(&cache_stats_secs)
+            && (1..=300).contains(&logs_secs)
+            && (10..=10000).contains(&max_entries);
 
         if should_be_valid {
             TestResult::from_bool(validation_result.is_ok())
@@ -5523,7 +5519,7 @@ mod dashboard_property_tests {
         let validation_result = default_config.validate();
 
         // Verify specific default values per requirements
-        let defaults_correct = default_config.enabled == true  // Enabled by default per requirements
+        let defaults_correct = default_config.enabled  // Enabled by default per requirements
             && default_config.port == 8081
             && default_config.bind_address == "0.0.0.0"
             && default_config.cache_stats_refresh_interval == Duration::from_secs(5)
@@ -5557,7 +5553,11 @@ mod log_lifecycle_property_tests {
         enabled: bool,
         use_cached_only: bool,
     ) -> TestResult {
-        let access_log_mode = if use_cached_only { "cached_only" } else { "all" };
+        let access_log_mode = if use_cached_only {
+            "cached_only"
+        } else {
+            "all"
+        };
         let log_levels = ["info", "debug", "warn", "error", "trace"];
         let log_level = log_levels[(access_dir_suffix as usize) % log_levels.len()];
 
@@ -5656,11 +5656,13 @@ access_log_file_rotation_interval: "{}s"
         let cleanup_secs = cleanup_secs_raw as u64;
         let rotation_secs = rotation_secs_raw as u64;
 
-        let mut config = LoggingConfig::default();
-        config.access_log_retention_days = access_ret;
-        config.app_log_retention_days = app_ret;
-        config.log_cleanup_interval = Duration::from_secs(cleanup_secs);
-        config.access_log_file_rotation_interval = Duration::from_secs(rotation_secs);
+        let config = LoggingConfig {
+            access_log_retention_days: access_ret,
+            app_log_retention_days: app_ret,
+            log_cleanup_interval: Duration::from_secs(cleanup_secs),
+            access_log_file_rotation_interval: Duration::from_secs(rotation_secs),
+            ..LoggingConfig::default()
+        };
 
         let result = config.validate();
 
@@ -5672,7 +5674,6 @@ access_log_file_rotation_interval: "{}s"
         TestResult::from_bool(result.is_ok() == all_in_range)
     }
 }
-
 
 #[cfg(test)]
 mod tls_config_property_tests {
@@ -5804,6 +5805,7 @@ mod tls_config_property_tests {
     ///
     /// **Validates: Requirements 6.5**
     #[quickcheck]
+    #[allow(clippy::too_many_arguments)]
     fn prop_port_conflict_detection(
         tls_port: u16,
         http_port: u16,
@@ -5817,7 +5819,13 @@ mod tls_config_property_tests {
         // Ensure tls_proxy_port is non-zero (port 0 is rejected by TlsConfig::validate)
         let tls_port = if tls_port == 0 { 1 } else { tls_port };
 
-        let other_ports = [http_port, https_port, health_port, metrics_port, dashboard_port];
+        let other_ports = [
+            http_port,
+            https_port,
+            health_port,
+            metrics_port,
+            dashboard_port,
+        ];
 
         // Determine the actual tls_proxy_port to use
         let tls_proxy_port = if force_conflict {
@@ -5833,7 +5841,7 @@ mod tls_config_property_tests {
             tls_port
         };
 
-        let has_conflict = other_ports.iter().any(|&p| p == tls_proxy_port);
+        let has_conflict = other_ports.contains(&tls_proxy_port);
 
         // Build a Config with these port values and TLS enabled with valid paths
         let mut config = Config::default();
@@ -5874,13 +5882,16 @@ mod rolling_validation_config_property_tests {
     ///
     /// **Validates: Requirements 2.2, 2.3**
     #[quickcheck]
-    fn prop_validation_max_duration_rejects_out_of_range(secs: u64, force_invalid: bool) -> TestResult {
-        const MIN_SECS: u64 = 10 * 60;      // 10 minutes
-        const MAX_SECS: u64 = 23 * 3600;     // 23 hours
+    fn prop_validation_max_duration_rejects_out_of_range(
+        secs: u64,
+        force_invalid: bool,
+    ) -> TestResult {
+        const MIN_SECS: u64 = 10 * 60; // 10 minutes
+        const MAX_SECS: u64 = 23 * 3600; // 23 hours
 
         let duration_secs = if force_invalid {
             // Generate an invalid value: either below min or above max
-            if secs % 2 == 0 {
+            if secs.is_multiple_of(2) {
                 // Below minimum: 0 to MIN_SECS-1
                 secs % MIN_SECS
             } else {
@@ -5898,7 +5909,7 @@ mod rolling_validation_config_property_tests {
         };
 
         let result = config.validate();
-        let is_valid = duration_secs >= MIN_SECS && duration_secs <= MAX_SECS;
+        let is_valid = (MIN_SECS..=MAX_SECS).contains(&duration_secs);
 
         TestResult::from_bool(result.is_ok() == is_valid)
     }

@@ -36,12 +36,12 @@ async fn test_cache_manager_multipart_integration() {
         false,                                 // write_cache_enabled
         std::time::Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     ));
 
     let path = "/test-bucket/test-object";
@@ -114,12 +114,12 @@ async fn test_regular_put_with_conflict_invalidation() {
         false,                                 // write_cache_enabled
         std::time::Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     ));
 
     let path = "/test-bucket/test-object";
@@ -139,7 +139,13 @@ async fn test_regular_put_with_conflict_invalidation() {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, body_data, headers.clone(), metadata.clone(), HashMap::new())
+        .store_write_cache_entry(
+            &cache_key,
+            body_data,
+            headers.clone(),
+            metadata.clone(),
+            HashMap::new(),
+        )
         .await
         .unwrap();
     println!("✓ Initial PUT cached");
@@ -164,7 +170,13 @@ async fn test_regular_put_with_conflict_invalidation() {
     };
 
     cache_manager
-        .store_write_cache_entry(&cache_key, new_body_data, headers, new_metadata, HashMap::new())
+        .store_write_cache_entry(
+            &cache_key,
+            new_body_data,
+            headers,
+            new_metadata,
+            HashMap::new(),
+        )
         .await
         .unwrap();
     println!("✓ New PUT cached");

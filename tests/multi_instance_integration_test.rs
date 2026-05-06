@@ -3,7 +3,6 @@
 //! These tests validate coordination between multiple proxy instances
 //! using shared cache volumes, write lock coordination, and cache consistency.
 
-use futures;
 use s3_proxy::{
     cache::CacheManager,
     cache_types::CacheMetadata,
@@ -20,6 +19,7 @@ use tokio::time::sleep;
 struct MultiInstanceTestConfig {
     shared_cache_dir: PathBuf,
     instance_count: usize,
+    #[allow(dead_code)]
     test_object_size: usize,
     test_data: Vec<u8>,
 }

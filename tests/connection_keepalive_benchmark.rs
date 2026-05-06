@@ -14,7 +14,9 @@ struct BenchmarkConnectionPool {
 }
 
 struct MockConnection {
+    #[allow(dead_code)]
     id: usize,
+    #[allow(dead_code)]
     created_at: Instant,
     last_used: Instant,
     is_active: bool,

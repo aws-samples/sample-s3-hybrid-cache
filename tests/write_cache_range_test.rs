@@ -39,12 +39,12 @@ async fn test_range_request_from_write_cache() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     ));
 
     // Create disk cache manager for range handler
@@ -82,7 +82,13 @@ async fn test_range_request_from_write_cache() {
     // Store as write cache entry (simulating PUT request)
     println!("Storing PUT-cached object...");
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata.clone(),
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -268,12 +274,12 @@ async fn test_full_object_range_from_write_cache() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     ));
 
     // Create disk cache manager
@@ -310,7 +316,13 @@ async fn test_full_object_range_from_write_cache() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata.clone(),
+            HashMap::new(),
+        )
         .await
         .unwrap();
 

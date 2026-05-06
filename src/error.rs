@@ -89,8 +89,8 @@ impl From<serde_yaml::Error> for ProxyError {
     }
 }
 
-impl From<trust_dns_resolver::error::ResolveError> for ProxyError {
-    fn from(err: trust_dns_resolver::error::ResolveError) -> Self {
+impl From<hickory_resolver::net::NetError> for ProxyError {
+    fn from(err: hickory_resolver::net::NetError) -> Self {
         ProxyError::DnsError(err.to_string())
     }
 }

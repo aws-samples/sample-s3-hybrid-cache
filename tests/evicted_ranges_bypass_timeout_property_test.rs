@@ -28,12 +28,12 @@ impl Arbitrary for TestRange {
         let bucket_num = u8::arbitrary(g) % 10;
         let object_num = u16::arbitrary(g) % 1000;
         let cache_key = format!("bucket-{}/object-{}.bin", bucket_num, object_num);
-        
+
         // Generate valid range (start <= end)
         let start = u64::arbitrary(g) % 1_000_000_000;
         let end_offset = u64::arbitrary(g) % 10_000_000;
         let end = start + end_offset;
-        
+
         TestRange {
             cache_key,
             start,
@@ -58,7 +58,7 @@ impl Arbitrary for TestJournalEntry {
         // Generate timestamps within a reasonable range
         let timestamp_secs = u64::arbitrary(g) % 2_000_000_000;
         let range_file_exists = bool::arbitrary(g);
-        
+
         TestJournalEntry {
             range,
             timestamp_secs,
@@ -170,13 +170,16 @@ fn detect_staleness_with_eviction_bypass(
 
 /// Property: Evicted ranges are ALWAYS removed regardless of timestamp
 /// **Validates: Requirements 4.1, 4.3**
-fn prop_evicted_range_always_removed(entry: TestJournalEntry, current_time_secs: u64) -> TestResult {
+fn prop_evicted_range_always_removed(
+    entry: TestJournalEntry,
+    current_time_secs: u64,
+) -> TestResult {
     if current_time_secs == 0 {
         return TestResult::discard();
     }
 
     let mut tracker = EvictedRangesTracker::new();
-    
+
     // Mark this entry's range as evicted
     tracker.mark_ranges_evicted(vec![(
         entry.range.cache_key.clone(),
@@ -222,7 +225,7 @@ fn prop_non_evicted_range_follows_normal_rules(
 
     // Verify normal staleness rules apply
     let entry_age_secs = current_time_secs.saturating_sub(entry.timestamp_secs);
-    
+
     let expected = if entry.range_file_exists {
         StalenessResult::Valid
     } else if entry_age_secs > STALE_ENTRY_TIMEOUT_SECS {
@@ -236,13 +239,16 @@ fn prop_non_evicted_range_follows_normal_rules(
 
 /// Property: Evicted range is only matched once (cleared after first check)
 /// **Validates: Requirements 4.3**
-fn prop_evicted_range_cleared_after_match(entry: TestJournalEntry, current_time_secs: u64) -> TestResult {
+fn prop_evicted_range_cleared_after_match(
+    entry: TestJournalEntry,
+    current_time_secs: u64,
+) -> TestResult {
     if current_time_secs == 0 {
         return TestResult::discard();
     }
 
     let mut tracker = EvictedRangesTracker::new();
-    
+
     // Mark this entry's range as evicted
     tracker.mark_ranges_evicted(vec![(
         entry.range.cache_key.clone(),
@@ -292,7 +298,7 @@ fn prop_eviction_bypass_ignores_timestamp(current_time_secs: u64) -> TestResult 
     };
 
     let mut tracker = EvictedRangesTracker::new();
-    
+
     // Mark as evicted
     tracker.mark_ranges_evicted(vec![(
         entry.range.cache_key.clone(),
@@ -313,7 +319,10 @@ fn prop_eviction_bypass_ignores_timestamp(current_time_secs: u64) -> TestResult 
 
 /// Property: Eviction bypass works regardless of file existence
 /// **Validates: Requirements 4.1, 4.3**
-fn prop_eviction_bypass_ignores_file_existence(entry: TestJournalEntry, current_time_secs: u64) -> TestResult {
+fn prop_eviction_bypass_ignores_file_existence(
+    entry: TestJournalEntry,
+    current_time_secs: u64,
+) -> TestResult {
     if current_time_secs == 0 {
         return TestResult::discard();
     }
@@ -398,7 +407,7 @@ fn prop_different_ranges_tracked_independently(current_time_secs: u64) -> TestRe
     };
 
     let mut tracker = EvictedRangesTracker::new();
-    
+
     // Only mark entry1's range as evicted
     tracker.mark_ranges_evicted(vec![(
         entry1.range.cache_key.clone(),
@@ -447,7 +456,7 @@ fn prop_multiple_evicted_ranges_tracked(current_time_secs: u64) -> TestResult {
         .collect();
 
     let mut tracker = EvictedRangesTracker::new();
-    
+
     // Mark all ranges as evicted
     let evicted: Vec<(String, u64, u64)> = entries
         .iter()
@@ -482,16 +491,16 @@ fn test_property_evicted_range_always_removed() {
 
 #[test]
 fn test_property_non_evicted_range_follows_normal_rules() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(prop_non_evicted_range_follows_normal_rules as fn(TestJournalEntry, u64) -> TestResult);
+    QuickCheck::new().tests(100).quickcheck(
+        prop_non_evicted_range_follows_normal_rules as fn(TestJournalEntry, u64) -> TestResult,
+    );
 }
 
 #[test]
 fn test_property_evicted_range_cleared_after_match() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(prop_evicted_range_cleared_after_match as fn(TestJournalEntry, u64) -> TestResult);
+    QuickCheck::new().tests(100).quickcheck(
+        prop_evicted_range_cleared_after_match as fn(TestJournalEntry, u64) -> TestResult,
+    );
 }
 
 #[test]
@@ -503,9 +512,9 @@ fn test_property_eviction_bypass_ignores_timestamp() {
 
 #[test]
 fn test_property_eviction_bypass_ignores_file_existence() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(prop_eviction_bypass_ignores_file_existence as fn(TestJournalEntry, u64) -> TestResult);
+    QuickCheck::new().tests(100).quickcheck(
+        prop_eviction_bypass_ignores_file_existence as fn(TestJournalEntry, u64) -> TestResult,
+    );
 }
 
 #[test]

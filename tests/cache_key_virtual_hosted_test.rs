@@ -315,11 +315,8 @@ fn test_part_cache_key_all_styles_identical() {
         1,
         Some(&regional_virtual_hosted_host()),
     );
-    let accelerate_key = CacheManager::generate_part_cache_key(
-        &virtual_hosted_path(),
-        1,
-        Some(&accelerate_host()),
-    );
+    let accelerate_key =
+        CacheManager::generate_part_cache_key(&virtual_hosted_path(), 1, Some(&accelerate_host()));
     let legacy_key = CacheManager::generate_part_cache_key(
         &virtual_hosted_path(),
         1,
@@ -435,10 +432,7 @@ use s3_proxy::http_proxy::detect_path_style_alias;
 #[test]
 fn test_preservation_path_style_regional() {
     // Regional path-style: s3.<region>.amazonaws.com
-    let key = CacheManager::generate_cache_key(
-        "/mybucket/key",
-        Some("s3.us-east-1.amazonaws.com"),
-    );
+    let key = CacheManager::generate_cache_key("/mybucket/key", Some("s3.us-east-1.amazonaws.com"));
     assert_eq!(
         key, "mybucket/key",
         "regional path-style Host should produce bucket-prefixed cache key from the URL path"
@@ -448,10 +442,7 @@ fn test_preservation_path_style_regional() {
 #[test]
 fn test_preservation_path_style_legacy_global() {
     // Legacy global path-style: s3.amazonaws.com
-    let key = CacheManager::generate_cache_key(
-        "/mybucket/key",
-        Some("s3.amazonaws.com"),
-    );
+    let key = CacheManager::generate_cache_key("/mybucket/key", Some("s3.amazonaws.com"));
     assert_eq!(
         key, "mybucket/key",
         "legacy global path-style Host should produce bucket-prefixed cache key from the URL path"
@@ -522,11 +513,10 @@ fn test_preservation_path_style_ap_alias_detection_runs_first() {
     let host = "s3-accesspoint.us-east-1.amazonaws.com";
     let path = "/myalias-s3alias/key";
 
-    let alias = detect_path_style_alias(host, path)
-        .expect("path-style AP alias should still be detected");
+    let alias =
+        detect_path_style_alias(host, path).expect("path-style AP alias should still be detected");
     assert_eq!(
-        alias.upstream_host,
-        "myalias-s3alias.s3-accesspoint.us-east-1.amazonaws.com",
+        alias.upstream_host, "myalias-s3alias.s3-accesspoint.us-east-1.amazonaws.com",
         "AP path-style detection should reconstruct upstream host from the alias segment"
     );
     assert_eq!(alias.forwarded_path, "/key");
@@ -714,7 +704,10 @@ impl Arbitrary for ObjPath {
 
 /// Helper: build a regional AP host.
 fn regional_ap_host(name: &str, account: &str, region: &str) -> String {
-    format!("{}-{}.s3-accesspoint.{}.amazonaws.com", name, account, region)
+    format!(
+        "{}-{}.s3-accesspoint.{}.amazonaws.com",
+        name, account, region
+    )
 }
 
 /// Helper: build an MRAP host.
@@ -756,10 +749,7 @@ fn test_preservation_pbt_ap_key_contains_s3alias() {
 }
 
 /// **Property: MRAP hosts always produce keys containing `.mrap/`.**
-fn prop_preservation_mrap_key_contains_mrap(
-    alias: MrapAlias,
-    path: ObjPath,
-) -> TestResult {
+fn prop_preservation_mrap_key_contains_mrap(alias: MrapAlias, path: ObjPath) -> TestResult {
     let host = mrap_host(&alias.0);
     let key = CacheManager::generate_cache_key(&path.0, Some(&host));
     TestResult::from_bool(key.contains(".mrap/"))
@@ -768,8 +758,7 @@ fn prop_preservation_mrap_key_contains_mrap(
 #[test]
 fn test_preservation_pbt_mrap_key_contains_mrap() {
     QuickCheck::new().tests(100).quickcheck(
-        prop_preservation_mrap_key_contains_mrap
-            as fn(MrapAlias, ObjPath) -> TestResult,
+        prop_preservation_mrap_key_contains_mrap as fn(MrapAlias, ObjPath) -> TestResult,
     );
 }
 
@@ -933,7 +922,9 @@ fn supported_virtual_hosted_hosts() -> Vec<String> {
 /// by the time it reaches `handle_get_head_request`) and assert the context's
 /// upstream URI host equals the input Host exactly.
 fn assert_upstream_host_matches(host: &str) {
-    let relative_uri: Uri = format!("/{}", OBJECT_KEY).parse().expect("parse relative URI");
+    let relative_uri: Uri = format!("/{}", OBJECT_KEY)
+        .parse()
+        .expect("parse relative URI");
     let ctx = build_s3_request_context(
         Method::GET,
         relative_uri,
@@ -1060,7 +1051,9 @@ fn test_upstream_forwarding_put_method_also_preserves_host() {
     // Requirement 6.1: PUT requests travel the same path through
     // `build_s3_request_context` — confirm the Host preservation invariant
     // holds for write methods too.
-    let relative_uri: Uri = format!("/{}", OBJECT_KEY).parse().expect("parse relative URI");
+    let relative_uri: Uri = format!("/{}", OBJECT_KEY)
+        .parse()
+        .expect("parse relative URI");
     let host = "mybucket.s3-accelerate.amazonaws.com";
     let ctx = build_s3_request_context(
         Method::PUT,

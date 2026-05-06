@@ -115,11 +115,11 @@ async fn test_cache_eviction_new_format() -> Result<()> {
     }
 
     // Invalidate first entry
-    cache_manager.invalidate_cache(&cache_keys[0]).await?;
+    cache_manager.invalidate_cache(cache_keys[0]).await?;
 
     // Verify first is gone, others remain
     assert!(cache_manager
-        .get_cached_response(&cache_keys[0])
+        .get_cached_response(cache_keys[0])
         .await?
         .is_none());
     for key in &cache_keys[1..] {
@@ -224,7 +224,8 @@ async fn test_cache_size_calculation_new_format() -> Result<()> {
     assert!(
         size_after > initial_size,
         "Cache size should increase after storing entries (initial={}, after={})",
-        initial_size, size_after
+        initial_size,
+        size_after
     );
 
     // Delete one entry
@@ -239,7 +240,8 @@ async fn test_cache_size_calculation_new_format() -> Result<()> {
     assert!(
         size_after_delete < size_after,
         "Cache size should decrease after deletion (after_store={}, after_delete={})",
-        size_after, size_after_delete
+        size_after,
+        size_after_delete
     );
 
     Ok(())

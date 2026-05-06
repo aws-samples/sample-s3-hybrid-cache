@@ -64,7 +64,7 @@ async fn test_range_consolidation_small_gaps() {
     // Cached: 0-1MB, 2-3MB, 4-5MB, 6-7MB, 8-9MB
     // Missing: 1-2MB (1MB gap), 3-4MB (1MB gap), 5-6MB (1MB gap), 7-8MB (1MB gap), 9-10MB (1MB gap)
     let cached_ranges = vec![
-        (0, 1 * mb - 1),      // 0-1MB
+        (0, mb - 1),          // 0-1MB
         (2 * mb, 3 * mb - 1), // 2-3MB
         (4 * mb, 5 * mb - 1), // 4-5MB
         (6 * mb, 7 * mb - 1), // 6-7MB
@@ -104,7 +104,8 @@ async fn test_range_consolidation_small_gaps() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -135,9 +136,9 @@ async fn test_range_consolidation_small_gaps() {
     );
 
     // Verify the missing ranges are correct
-    let expected_missing = vec![
+    let expected_missing = [
         RangeSpec {
-            start: 1 * mb as u64,
+            start: mb as u64,
             end: 2 * mb as u64 - 1,
         }, // 1-2MB
         RangeSpec {
@@ -189,7 +190,7 @@ async fn test_range_consolidation_small_gaps() {
     );
     assert_eq!(
         consolidated_large[0].start,
-        1 * mb as u64,
+        (mb as u64),
         "Consolidated range should start at 1MB"
     );
     assert_eq!(
@@ -225,7 +226,7 @@ async fn test_range_consolidation_large_gaps() {
     // Cached: 0-1MB, 6-7MB, 12-13MB, 18-19MB
     // Missing: 1-6MB (5MB gap), 7-12MB (5MB gap), 13-18MB (5MB gap), 19-20MB (1MB gap)
     let cached_ranges = vec![
-        (0, 1 * mb - 1),        // 0-1MB
+        (0, mb - 1),            // 0-1MB
         (6 * mb, 7 * mb - 1),   // 6-7MB
         (12 * mb, 13 * mb - 1), // 12-13MB
         (18 * mb, 19 * mb - 1), // 18-19MB
@@ -264,7 +265,8 @@ async fn test_range_consolidation_large_gaps() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -307,7 +309,7 @@ async fn test_range_consolidation_large_gaps() {
     );
 
     // Verify each consolidated range is correct
-    assert_eq!(consolidated[0].start, 1 * mb as u64);
+    assert_eq!(consolidated[0].start, (mb as u64));
     assert_eq!(consolidated[0].end, 6 * mb as u64 - 1);
 
     assert_eq!(consolidated[1].start, 7 * mb as u64);
@@ -344,8 +346,8 @@ async fn test_range_consolidation_mixed_gaps() {
     // Cached: 0-1MB, 1.1MB-2MB, 2.1MB-3MB, 5MB-6MB, 6.1MB-7MB, 7.2MB-8MB
     // Gaps: 100KB (small), 100KB (small), 2MB (large), 100KB (small), 100KB (small)
     let cached_ranges = vec![
-        (0, 1 * mb - 1),                 // 0-1MB
-        (1 * mb + 100 * kb, 2 * mb - 1), // 1.1MB-2MB (100KB gap)
+        (0, mb - 1),                     // 0-1MB
+        (mb + 100 * kb, 2 * mb - 1),     // 1.1MB-2MB (100KB gap)
         (2 * mb + 100 * kb, 3 * mb - 1), // 2.1MB-3MB (100KB gap)
         (5 * mb, 6 * mb - 1),            // 5MB-6MB (2MB gap)
         (6 * mb + 100 * kb, 7 * mb - 1), // 6.1MB-7MB (100KB gap)
@@ -385,7 +387,8 @@ async fn test_range_consolidation_mixed_gaps() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -456,9 +459,9 @@ async fn test_range_consolidation_with_fetch_and_merge() {
     // Cached: 0-1MB, 1.5MB-2.5MB, 3MB-4MB
     // Missing: 1-1.5MB (500KB), 2.5-3MB (500KB), 4-5MB (1MB)
     let cached_ranges = vec![
-        (0, 1 * mb - 1),                            // 0-1MB
-        (1 * mb + 500 * kb, 2 * mb + 500 * kb - 1), // 1.5MB-2.5MB
-        (3 * mb, 4 * mb - 1),                       // 3MB-4MB
+        (0, mb - 1),                            // 0-1MB
+        (mb + 500 * kb, 2 * mb + 500 * kb - 1), // 1.5MB-2.5MB
+        (3 * mb, 4 * mb - 1),                   // 3MB-4MB
     ];
 
     let object_metadata = ObjectMetadata {
@@ -494,7 +497,8 @@ async fn test_range_consolidation_with_fetch_and_merge() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }

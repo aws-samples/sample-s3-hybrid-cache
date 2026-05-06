@@ -81,7 +81,12 @@ fn scale_data(data_seed: &[u8]) -> Vec<u8> {
     } else {
         (data_seed.len() * 128).min(2 * 1024 * 1024)
     };
-    data_seed.iter().cycle().take(target_size).copied().collect()
+    data_seed
+        .iter()
+        .cycle()
+        .take(target_size)
+        .copied()
+        .collect()
 }
 
 /// Count files with a given extension recursively under a directory.
@@ -97,7 +102,7 @@ fn count_files_with_ext(dir: &std::path::Path, ext: &str) -> usize {
             e.path()
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map_or(false, |n| n.ends_with(ext))
+                .is_some_and(|n| n.ends_with(ext))
         })
         .count()
 }
@@ -167,18 +172,13 @@ fn prop_store_range_produces_valid_bin_file() {
             };
 
             // Decompress and verify content matches original
-            let compression_handler =
-                s3_proxy::compression::CompressionHandler::new(0, true);
-            let decompressed = match compression_handler.decompress_with_algorithm(
-                &compressed_data,
-                CompressionAlgorithm::Lz4,
-            ) {
+            let compression_handler = s3_proxy::compression::CompressionHandler::new(0, true);
+            let decompressed = match compression_handler
+                .decompress_with_algorithm(&compressed_data, CompressionAlgorithm::Lz4)
+            {
                 Ok(d) => d,
                 Err(e) => {
-                    return TestResult::error(format!(
-                        "Failed to decompress .bin file: {}",
-                        e
-                    ));
+                    return TestResult::error(format!("Failed to decompress .bin file: {}", e));
                 }
             };
 
@@ -369,13 +369,11 @@ fn prop_single_task_incremental_equivalent_to_store_range() {
                 }
             };
 
-            let compression_handler =
-                s3_proxy::compression::CompressionHandler::new(0, true);
+            let compression_handler = s3_proxy::compression::CompressionHandler::new(0, true);
 
-            let incr_decompressed = match compression_handler.decompress_with_algorithm(
-                &incr_compressed,
-                CompressionAlgorithm::Lz4,
-            ) {
+            let incr_decompressed = match compression_handler
+                .decompress_with_algorithm(&incr_compressed, CompressionAlgorithm::Lz4)
+            {
                 Ok(d) => d,
                 Err(e) => {
                     return TestResult::error(format!(
@@ -385,10 +383,9 @@ fn prop_single_task_incremental_equivalent_to_store_range() {
                 }
             };
 
-            let shot_decompressed = match compression_handler.decompress_with_algorithm(
-                &shot_compressed,
-                CompressionAlgorithm::Lz4,
-            ) {
+            let shot_decompressed = match compression_handler
+                .decompress_with_algorithm(&shot_compressed, CompressionAlgorithm::Lz4)
+            {
                 Ok(d) => d,
                 Err(e) => {
                     return TestResult::error(format!(

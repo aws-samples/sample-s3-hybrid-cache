@@ -19,9 +19,9 @@ async fn test_range_stored_with_configured_ttl() {
     let temp_dir = TempDir::new().unwrap();
     let mut disk_cache = DiskCacheManager::new(
         temp_dir.path().to_path_buf(),
-        true,  // compression_enabled
-        1024,  // compression_threshold
-        false, // write_cache_enabled
+        true,      // compression_enabled
+        1024,      // compression_threshold
+        false,     // write_cache_enabled
         1_048_576, // compression_batch_size
     );
 
@@ -59,7 +59,9 @@ async fn test_range_stored_with_configured_ttl() {
             data.len() as u64 - 1,
             data,
             object_metadata,
-            ten_years, true)
+            ten_years,
+            true,
+        )
         .await
         .unwrap();
 
@@ -89,7 +91,10 @@ async fn test_range_stored_with_configured_ttl() {
     );
 
     // Verify the object is not expired
-    assert!(!metadata.is_object_expired(), "Object should not be expired");
+    assert!(
+        !metadata.is_object_expired(),
+        "Object should not be expired"
+    );
 }
 
 #[tokio::test]
@@ -99,9 +104,9 @@ async fn test_range_with_short_ttl_expires() {
     let temp_dir = TempDir::new().unwrap();
     let mut disk_cache = DiskCacheManager::new(
         temp_dir.path().to_path_buf(),
-        true,  // compression_enabled
-        1024,  // compression_threshold
-        false, // write_cache_enabled
+        true,      // compression_enabled
+        1024,      // compression_threshold
+        false,     // write_cache_enabled
         1_048_576, // compression_batch_size
     );
 
@@ -139,7 +144,9 @@ async fn test_range_with_short_ttl_expires() {
             data.len() as u64 - 1,
             data,
             object_metadata,
-            short_ttl, true)
+            short_ttl,
+            true,
+        )
         .await
         .unwrap();
 
@@ -173,9 +180,9 @@ async fn test_object_level_ttl_applies_to_all_ranges() {
     let temp_dir = TempDir::new().unwrap();
     let mut disk_cache = DiskCacheManager::new(
         temp_dir.path().to_path_buf(),
-        true,  // compression_enabled
-        1024,  // compression_threshold
-        false, // write_cache_enabled
+        true,      // compression_enabled
+        1024,      // compression_threshold
+        false,     // write_cache_enabled
         1_048_576, // compression_batch_size
     );
 
@@ -213,7 +220,9 @@ async fn test_object_level_ttl_applies_to_all_ranges() {
             1023,
             &data1,
             object_metadata.clone(),
-            long_ttl, true)
+            long_ttl,
+            true,
+        )
         .await
         .unwrap();
 
@@ -221,7 +230,15 @@ async fn test_object_level_ttl_applies_to_all_ranges() {
     let data2 = vec![2u8; 1024];
     let short_ttl = Duration::from_secs(2); // 2 seconds
     disk_cache
-        .store_range(cache_key, 1024, 2047, &data2, object_metadata, short_ttl, true)
+        .store_range(
+            cache_key,
+            1024,
+            2047,
+            &data2,
+            object_metadata,
+            short_ttl,
+            true,
+        )
         .await
         .unwrap();
 

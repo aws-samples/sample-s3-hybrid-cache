@@ -39,6 +39,7 @@ pub struct JournalEntry {
     /// Whether the metadata was already written to .meta file before this journal entry was created.
     /// - `true`: Range was written to .meta immediately (hybrid mode success) - consolidation should NOT count size
     /// - `false`: Range was NOT written to .meta (journal-only mode) - consolidation SHOULD count size
+    ///
     /// This flag solves the size tracking problem where HybridMetadataWriter writes to .meta immediately,
     /// causing consolidation to see "range already exists" and calculate size_delta = 0.
     #[serde(default)]
@@ -584,7 +585,10 @@ impl JournalManager {
 
         debug!(
             "Appended batch journal entries: cache_key={}, count={}, path={:?}, fresh={}",
-            cache_key, entries.len(), journal_path, !got_lock
+            cache_key,
+            entries.len(),
+            journal_path,
+            !got_lock
         );
 
         Ok(())

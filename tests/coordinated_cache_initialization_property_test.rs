@@ -15,12 +15,10 @@ use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::JournalManager;
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
 use s3_proxy::write_cache_manager::WriteCacheManager;
-use serde_json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
-use tokio;
 
 /// Helper function to create a test CacheSizeTracker with JournalConsolidator
 async fn create_test_size_tracker(
@@ -211,7 +209,7 @@ fn prop_single_directory_scan_coordination(
         }
 
         let config = create_test_cache_config();
-        let coordinator =
+        let _coordinator =
             CacheInitializationCoordinator::new(temp_dir.path().to_path_buf(), true, config);
 
         // Create a validator to perform the scan (since scan_cache_metadata is private)
@@ -227,7 +225,7 @@ fn prop_single_directory_scan_coordination(
         let mut write_cached_objects = 0u64;
         let mut write_cached_size = 0u64;
         let mut read_cached_objects = 0u64;
-        let mut read_cached_size = 0u64;
+        let mut _read_cached_size = 0u64;
 
         for result in &cache_file_results {
             if result.metadata.is_some() {
@@ -239,7 +237,7 @@ fn prop_single_directory_scan_coordination(
                     write_cached_size += result.compressed_size;
                 } else {
                     read_cached_objects += 1;
-                    read_cached_size += result.compressed_size;
+                    _read_cached_size += result.compressed_size;
                 }
             }
         }
@@ -611,7 +609,7 @@ async fn test_property_test_compilation() {
 
     // We can't easily test the property functions directly since they require
     // specific input generation, but we can verify they compile
-    assert!(true);
+    let _ = (); // placeholder
 }
 
 /// Additional property tests for edge cases
@@ -630,7 +628,7 @@ mod edge_case_properties {
                 .unwrap();
 
             let config = create_test_cache_config();
-            let coordinator =
+            let _coordinator =
                 CacheInitializationCoordinator::new(temp_dir.path().to_path_buf(), true, config);
 
             // Use validator to scan empty directory

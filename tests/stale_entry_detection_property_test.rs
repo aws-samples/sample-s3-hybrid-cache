@@ -137,7 +137,10 @@ fn detect_staleness(
 
 /// Property: Entries with existing range files are ALWAYS valid regardless of timestamp
 /// **Validates: Requirements 1.1, 1.3**
-fn prop_existing_file_always_valid(entry_timestamp_secs: u64, current_time_secs: u64) -> TestResult {
+fn prop_existing_file_always_valid(
+    entry_timestamp_secs: u64,
+    current_time_secs: u64,
+) -> TestResult {
     // Ensure current_time is reasonable (not before UNIX_EPOCH)
     if current_time_secs == 0 {
         return TestResult::discard();
@@ -181,11 +184,14 @@ fn prop_old_missing_file_is_stale(entry_timestamp_secs: u64, current_time_secs: 
 
 /// Property: Entries with missing files AND timestamp newer than 5 minutes are PENDING (kept in journal for retry)
 /// **Validates: Requirements 1.1, 1.3, 1.6**
-/// 
+///
 /// BUG FIX (v1.1.10): Changed from Valid to Pending. Previously, these entries were added to
 /// valid_entries and processed for size delta, causing size tracking to count ranges that
 /// don't exist on disk yet. Now they are kept in journal for retry on next consolidation cycle.
-fn prop_recent_missing_file_is_pending(entry_timestamp_secs: u64, current_time_secs: u64) -> TestResult {
+fn prop_recent_missing_file_is_pending(
+    entry_timestamp_secs: u64,
+    current_time_secs: u64,
+) -> TestResult {
     // Ensure current_time is reasonable
     if current_time_secs == 0 {
         return TestResult::discard();
@@ -239,7 +245,7 @@ fn prop_staleness_is_deterministic(
 
 /// Property: Boundary condition - entry exactly at threshold is PENDING (not stale, but not valid either)
 /// **Validates: Requirements 1.1, 1.3**
-/// 
+///
 /// BUG FIX (v1.1.10): Changed from Valid to Pending. Entries with missing files at the
 /// threshold boundary are kept in journal for retry, not processed for size delta.
 fn prop_boundary_at_threshold_is_pending(current_time_secs: u64) -> TestResult {
@@ -287,10 +293,13 @@ fn prop_boundary_past_threshold_is_stale(current_time_secs: u64) -> TestResult {
 /// Property: Future timestamps (entry timestamp > current time) are PENDING (kept for retry)
 /// This handles clock skew scenarios across instances
 /// **Validates: Requirements 1.6**
-/// 
+///
 /// BUG FIX (v1.1.10): Changed from Valid to Pending. Future timestamps with missing files
 /// are kept in journal for retry, not processed for size delta.
-fn prop_future_timestamp_is_pending(entry_timestamp_secs: u64, current_time_secs: u64) -> TestResult {
+fn prop_future_timestamp_is_pending(
+    entry_timestamp_secs: u64,
+    current_time_secs: u64,
+) -> TestResult {
     // Only test cases where entry timestamp is in the future
     if entry_timestamp_secs <= current_time_secs {
         return TestResult::discard();
@@ -309,7 +318,7 @@ fn prop_future_timestamp_is_pending(entry_timestamp_secs: u64, current_time_secs
 
 /// Property: Combined test - all invariants hold for any input
 /// **Validates: Requirements 1.1, 1.3, 1.6**
-/// 
+///
 /// BUG FIX (v1.1.10): Updated Invariant 3 - entries with missing files and age <= threshold
 /// are now Pending (kept for retry), not Valid.
 fn prop_all_staleness_invariants(entry: TestJournalEntry, current_time_secs: u64) -> TestResult {
@@ -343,7 +352,7 @@ fn prop_all_staleness_invariants(entry: TestJournalEntry, current_time_secs: u64
 
 /// Property: Configurable timeout is respected
 /// **Validates: Requirements 1.3** (uses timestamp comparison)
-/// 
+///
 /// BUG FIX (v1.1.10): Updated expected result - entries with missing files and age <= timeout
 /// are now Pending (kept for retry), not Valid.
 fn prop_configurable_timeout_respected(
@@ -620,7 +629,7 @@ mod unit_tests {
     fn test_cross_instance_consistency() {
         // Requirement 1.6: Works correctly across multiple proxy instances
         // since it uses the entry's own timestamp (no cross-instance state required)
-        
+
         let entry_timestamp = 1700000000u64 - 400; // 400 seconds ago
         let current_time = 1700000000u64;
 

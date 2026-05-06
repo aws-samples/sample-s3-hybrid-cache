@@ -6,17 +6,18 @@
 
 use crate::connection_pool::EndpointOverrides;
 use crate::{ProxyError, Result};
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
-use trust_dns_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use trust_dns_resolver::TokioAsyncResolver;
 
 /// TCP Proxy handler for transparent HTTPS passthrough
 pub struct TcpProxy {
     listen_addr: SocketAddr,
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
     /// Parsed endpoint overrides (exact + suffix) for PrivateLink etc.
     overrides: EndpointOverrides,
 }
@@ -24,21 +25,30 @@ pub struct TcpProxy {
 impl TcpProxy {
     /// Create a new TCP proxy instance with external DNS resolver
     pub fn new(listen_addr: SocketAddr, overrides: EndpointOverrides) -> Self {
+        use hickory_resolver::config::{ResolveHosts, CLOUDFLARE, GOOGLE};
         // Use external DNS servers to bypass /etc/hosts (same as connection pool)
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfigGroup::google().into_inner()[0].clone());
-        config.add_name_server(NameServerConfigGroup::google().into_inner()[1].clone());
-        config.add_name_server(NameServerConfigGroup::cloudflare().into_inner()[0].clone());
-        config.add_name_server(NameServerConfigGroup::cloudflare().into_inner()[1].clone());
+        let mut config = ResolverConfig::default();
+        for ns in GOOGLE.udp_and_tcp() {
+            config.add_name_server(ns);
+        }
+        for ns in CLOUDFLARE.udp_and_tcp() {
+            config.add_name_server(ns);
+        }
 
         let mut opts = ResolverOpts::default();
-        opts.use_hosts_file = false; // Critical: bypass /etc/hosts
+        opts.use_hosts_file = ResolveHosts::Never; // Critical: bypass /etc/hosts
 
-        let resolver = TokioAsyncResolver::tokio(config, opts);
+        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .expect("Failed to build DNS resolver");
 
         if !overrides.is_empty() {
-            info!("TCP proxy initialized with {} exact + {} suffix endpoint override(s)",
-                overrides.exact_count(), overrides.suffix_count());
+            info!(
+                "TCP proxy initialized with {} exact + {} suffix endpoint override(s)",
+                overrides.exact_count(),
+                overrides.suffix_count()
+            );
         }
 
         Self {
@@ -106,7 +116,7 @@ impl TcpProxy {
     async fn handle_connection(
         client_stream: TcpStream,
         client_addr: SocketAddr,
-        resolver: TokioAsyncResolver,
+        resolver: TokioResolver,
         overrides: EndpointOverrides,
     ) -> Result<()> {
         // Set up connection cleanup on error
@@ -169,7 +179,15 @@ impl TcpProxy {
         );
 
         // Establish TCP tunnel to the target S3 endpoint with error handling
-        match Self::establish_tcp_tunnel(client_stream, client_addr, &target_host, resolver, overrides).await {
+        match Self::establish_tcp_tunnel(
+            client_stream,
+            client_addr,
+            &target_host,
+            resolver,
+            overrides,
+        )
+        .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 error!(
@@ -317,7 +335,7 @@ impl TcpProxy {
         client_stream: TcpStream,
         client_addr: SocketAddr,
         target_host: &str,
-        resolver: TokioAsyncResolver,
+        resolver: TokioResolver,
         overrides: EndpointOverrides,
     ) -> Result<()> {
         debug!(
@@ -327,10 +345,7 @@ impl TcpProxy {
 
         // Check endpoint overrides first (exact then suffix, for PrivateLink etc.)
         let ip_addresses: Vec<IpAddr> = if let Some(ips) = overrides.resolve(target_host) {
-            info!(
-                "Using endpoint override for {}: {:?}",
-                target_host, ips
-            );
+            info!("Using endpoint override for {}: {:?}", target_host, ips);
             ips.clone()
         } else {
             // Resolve hostname using external DNS to bypass /etc/hosts

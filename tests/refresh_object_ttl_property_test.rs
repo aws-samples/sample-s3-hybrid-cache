@@ -37,7 +37,12 @@ fn arbitrary_last_modified(g: &mut Gen) -> String {
     format!(
         "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
         ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][(u32::arbitrary(g) % 7) as usize],
-        day, month, year, hour, min, sec
+        day,
+        month,
+        year,
+        hour,
+        min,
+        sec
     )
 }
 
@@ -177,9 +182,7 @@ fn prop_ttl_refresh_uses_resolved_ttl(input: ArbitraryTtlRefreshInput) -> TestRe
 
 #[test]
 fn test_property_ttl_refresh_uses_resolved_ttl() {
-    QuickCheck::new()
-        .tests(100)
-        .quickcheck(
-            prop_ttl_refresh_uses_resolved_ttl as fn(ArbitraryTtlRefreshInput) -> TestResult,
-        );
+    QuickCheck::new().tests(100).quickcheck(
+        prop_ttl_refresh_uses_resolved_ttl as fn(ArbitraryTtlRefreshInput) -> TestResult,
+    );
 }

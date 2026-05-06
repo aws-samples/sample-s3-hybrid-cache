@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 // Mock structures for testing
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ConnectionEvent {
     connection_id: String,
     ip: IpAddr,
@@ -17,6 +18,7 @@ struct ConnectionEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum EventType {
     Created,
     Reused,
@@ -35,9 +37,11 @@ struct ConnectionPool {
 
 #[derive(Debug, Clone)]
 struct ConnectionMetadata {
+    #[allow(dead_code)]
     id: String,
     ip: IpAddr,
     endpoint: String,
+    #[allow(dead_code)]
     created_at: SystemTime,
     last_used: SystemTime,
     request_count: u64,
@@ -181,11 +185,7 @@ fn test_property_connection_reuse() {
         }
 
         // After first request, all subsequent requests should reuse
-        let expected_reuse = if request_count > 1 {
-            request_count - 1
-        } else {
-            0
-        };
+        let expected_reuse = request_count.saturating_sub(1);
 
         TestResult::from_bool(
             reuse_count == expected_reuse as usize && pool.total_connection_count() == 1,
@@ -426,8 +426,9 @@ fn test_property_non_blocking_maintenance() {
             }
         }
 
-        // All requests should complete successfully
-        TestResult::from_bool(pool.total_connection_count() >= 0)
+        // All requests should complete successfully (pool is in a valid state)
+        let _ = pool.total_connection_count();
+        TestResult::passed()
     }
 
     quickcheck(prop_non_blocking_maintenance as fn(u8) -> TestResult);

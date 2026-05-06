@@ -180,7 +180,5 @@ fn prop_cache_write_sets_expires_at(input: ArbitraryCacheWriteInput) -> TestResu
 fn test_property_cache_write_sets_expires_at_from_get_ttl() {
     QuickCheck::new()
         .tests(100)
-        .quickcheck(
-            prop_cache_write_sets_expires_at as fn(ArbitraryCacheWriteInput) -> TestResult,
-        );
+        .quickcheck(prop_cache_write_sets_expires_at as fn(ArbitraryCacheWriteInput) -> TestResult);
 }

@@ -63,7 +63,10 @@ impl Arbitrary for ArbitraryObjectExpirationInput {
 }
 
 /// Helper: create a NewCacheMetadata with the given expires_at.
-fn create_metadata(input: &ArbitraryObjectExpirationInput, expires_at: SystemTime) -> NewCacheMetadata {
+fn create_metadata(
+    input: &ArbitraryObjectExpirationInput,
+    expires_at: SystemTime,
+) -> NewCacheMetadata {
     let now = SystemTime::now();
     NewCacheMetadata {
         cache_key: "test-bucket/object-expiration-test".to_string(),

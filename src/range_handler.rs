@@ -280,7 +280,10 @@ impl RangeHandler {
             match self.parse_single_range_spec(range_spec, content_length) {
                 Ok(range) => parsed_ranges.push(range),
                 Err(e) => {
-                    debug!("Range parse error '{}': {}, content_length={:?}", range_spec, e, content_length);
+                    debug!(
+                        "Range parse error '{}': {}, content_length={:?}",
+                        range_spec, e, content_length
+                    );
                     return RangeParseResult::Invalid(format!(
                         "Invalid range specification: {}",
                         e
@@ -465,285 +468,6 @@ impl RangeHandler {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    fn create_test_range_handler() -> RangeHandler {
-        let temp_dir = TempDir::new().unwrap();
-        let cache_dir = temp_dir.path().to_path_buf();
-        let cache_manager = Arc::new(CacheManager::new_with_defaults(cache_dir.clone(), false, 0));
-        let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(DiskCacheManager::new(
-            cache_dir, true, 1024, false, 1_048_576,
-        )));
-        RangeHandler::new(cache_manager, disk_cache_manager)
-    }
-
-    #[test]
-    fn test_parse_valid_range_header() {
-        let handler = create_test_range_handler();
-
-        // Test "bytes=0-499"
-        match handler.parse_range_header("bytes=0-499", Some(1000)) {
-            RangeParseResult::SingleRange(range) => {
-                assert_eq!(range.start, 0);
-                assert_eq!(range.end, 499);
-            }
-            _ => panic!("Expected SingleRange"),
-        }
-
-        // Test "bytes=500-"
-        match handler.parse_range_header("bytes=500-", Some(1000)) {
-            RangeParseResult::SingleRange(range) => {
-                assert_eq!(range.start, 500);
-                assert_eq!(range.end, 999);
-            }
-            _ => panic!("Expected SingleRange"),
-        }
-
-        // Test "bytes=-200"
-        match handler.parse_range_header("bytes=-200", Some(1000)) {
-            RangeParseResult::SingleRange(range) => {
-                assert_eq!(range.start, 800);
-                assert_eq!(range.end, 999);
-            }
-            _ => panic!("Expected SingleRange"),
-        }
-    }
-
-    #[test]
-    fn test_parse_invalid_range_header() {
-        let handler = create_test_range_handler();
-
-        // Test invalid format
-        match handler.parse_range_header("invalid", Some(1000)) {
-            RangeParseResult::Invalid(_) => {}
-            _ => panic!("Expected Invalid"),
-        }
-
-        // Test invalid range
-        match handler.parse_range_header("bytes=500-100", Some(1000)) {
-            RangeParseResult::Invalid(_) => {}
-            _ => panic!("Expected Invalid"),
-        }
-    }
-
-    #[test]
-    fn test_range_validation() {
-        let handler = create_test_range_handler();
-        let range = RangeSpec { start: 0, end: 499 };
-
-        // Valid range
-        assert!(handler.validate_range_request(&range, 1000).is_ok());
-
-        // Invalid range - exceeds content length
-        assert!(handler.validate_range_request(&range, 400).is_err());
-    }
-
-    #[test]
-    fn test_range_overlap_detection() {
-        let handler = create_test_range_handler();
-        let range1 = RangeSpec { start: 0, end: 100 };
-        let range2 = RangeSpec {
-            start: 50,
-            end: 150,
-        };
-        let range3 = RangeSpec {
-            start: 200,
-            end: 300,
-        };
-
-        assert!(handler.ranges_overlap(&range1, &range2));
-        assert!(!handler.ranges_overlap(&range1, &range3));
-    }
-
-    #[test]
-    fn test_range_merging() {
-        let handler = create_test_range_handler();
-        let ranges = vec![
-            RangeSpec { start: 0, end: 100 },
-            RangeSpec {
-                start: 50,
-                end: 150,
-            },
-            RangeSpec {
-                start: 200,
-                end: 300,
-            },
-        ];
-
-        let merged = handler.merge_ranges(&ranges);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0], RangeSpec { start: 0, end: 150 });
-        assert_eq!(
-            merged[1],
-            RangeSpec {
-                start: 200,
-                end: 300
-            }
-        );
-    }
-
-    #[test]
-    fn test_range_spec_len() {
-        let range = RangeSpec { start: 0, end: 99 };
-        assert_eq!(range.len(), 100);
-
-        let range = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        assert_eq!(range.len(), 101);
-
-        let range = RangeSpec { start: 0, end: 0 };
-        assert_eq!(range.len(), 1);
-    }
-
-    #[test]
-    fn test_slice_offset_in() {
-        // Test at start of cached range
-        let requested = RangeSpec { start: 0, end: 100 };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert_eq!(requested.slice_offset_in(&cached), 0);
-
-        // Test in middle of cached range
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert_eq!(requested.slice_offset_in(&cached), 100);
-
-        // Test at end of cached range
-        let requested = RangeSpec {
-            start: 400,
-            end: 500,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert_eq!(requested.slice_offset_in(&cached), 400);
-
-        // Test with non-zero cached start
-        let requested = RangeSpec {
-            start: 8388608,
-            end: 16777215,
-        };
-        let cached = RangeSpec {
-            start: 8388608,
-            end: 16777269,
-        };
-        assert_eq!(requested.slice_offset_in(&cached), 0);
-    }
-
-    #[test]
-    fn test_slice_length() {
-        let range = RangeSpec { start: 0, end: 99 };
-        assert_eq!(range.slice_length(), 100);
-
-        let range = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        assert_eq!(range.slice_length(), 101);
-
-        let range = RangeSpec {
-            start: 0,
-            end: 8388607,
-        };
-        assert_eq!(range.slice_length(), 8388608);
-    }
-
-    #[test]
-    fn test_validate_slice_bounds_valid() {
-        // Test exact match
-        let requested = RangeSpec { start: 0, end: 99 };
-        let cached = RangeSpec { start: 0, end: 99 };
-        assert!(requested.validate_slice_bounds(&cached, 100).is_ok());
-
-        // Test at start of cached range
-        let requested = RangeSpec { start: 0, end: 99 };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
-
-        // Test in middle of cached range
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
-
-        // Test at end of cached range
-        let requested = RangeSpec {
-            start: 400,
-            end: 500,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
-    }
-
-    #[test]
-    fn test_validate_slice_bounds_invalid() {
-        // Test requested range starts before container
-        let requested = RangeSpec { start: 0, end: 100 };
-        let cached = RangeSpec {
-            start: 50,
-            end: 500,
-        };
-        assert!(requested.validate_slice_bounds(&cached, 451).is_err());
-
-        // Test requested range ends after container
-        let requested = RangeSpec {
-            start: 100,
-            end: 600,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 501).is_err());
-
-        // Test slice exceeds container data length
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 150).is_err());
-
-        // Test container data length mismatch
-        let requested = RangeSpec {
-            start: 100,
-            end: 200,
-        };
-        let cached = RangeSpec { start: 0, end: 500 };
-        assert!(requested.validate_slice_bounds(&cached, 400).is_err());
-    }
-
-    #[test]
-    fn test_slice_bounds_multipart_scenario() {
-        // Test the specific bug scenario: requested 0-8388607, cached 0-8388661
-        let requested = RangeSpec {
-            start: 0,
-            end: 8388607,
-        };
-        let cached = RangeSpec {
-            start: 0,
-            end: 8388661,
-        };
-
-        // With correct cached data length (8388662 bytes)
-        assert!(requested.validate_slice_bounds(&cached, 8388662).is_ok());
-        assert_eq!(requested.slice_offset_in(&cached), 0);
-        assert_eq!(requested.slice_length(), 8388608);
-
-        // Verify we can extract the correct slice
-        let offset = requested.slice_offset_in(&cached) as usize;
-        let length = requested.slice_length();
-        assert_eq!(offset, 0);
-        assert_eq!(length, 8388608);
-        assert_eq!(offset + length, 8388608);
-    }
-}
-
 impl RangeHandler {
     /// Find cached ranges that overlap with requested range - Requirements 3.2, 3.3
     ///
@@ -845,10 +569,7 @@ impl RangeHandler {
             for (i, range) in metadata.ranges.iter().enumerate() {
                 debug!(
                     "[CACHE_LOOKUP] Metadata range {}: cache_key={}, start={}, end={}",
-                    i,
-                    cache_key,
-                    range.start,
-                    range.end,
+                    i, cache_key, range.start, range.end,
                 );
             }
 
@@ -858,7 +579,12 @@ impl RangeHandler {
                 cache_key, requested_range.start, requested_range.end
             );
             let overlapping_range_specs = disk_cache
-                .find_cached_ranges(cache_key, requested_range.start, requested_range.end, preloaded_metadata)
+                .find_cached_ranges(
+                    cache_key,
+                    requested_range.start,
+                    requested_range.end,
+                    preloaded_metadata,
+                )
                 .await?;
 
             debug!(
@@ -1125,7 +851,15 @@ impl RangeHandler {
         // Resolve per-bucket compression settings (Requirements 5.1, 5.2, 5.3)
         let resolved = self.cache_manager.resolve_settings(cache_key).await;
         disk_cache
-            .store_range(cache_key, start, end, data, object_metadata, ttl, resolved.compression_enabled)
+            .store_range(
+                cache_key,
+                start,
+                end,
+                data,
+                object_metadata,
+                ttl,
+                resolved.compression_enabled,
+            )
             .await?;
 
         debug!(
@@ -1936,7 +1670,7 @@ impl RangeHandler {
         &self,
         cache_key: &str,
         missing_ranges: &[RangeSpec],
-        s3_client: &Arc<crate::s3_client::S3Client>,
+        s3_client: &Arc<dyn crate::s3_client::S3ClientApi + Send + Sync>,
         host: &str,
         uri: &hyper::Uri,
         headers: &HashMap<String, String>,
@@ -2124,13 +1858,14 @@ impl RangeHandler {
     /// 3. Return the S3 data with appropriate metrics (0% cache efficiency)
     ///
     /// Requirements: 2.5, 8.2 (from design)
+    #[allow(clippy::too_many_arguments)]
     pub async fn merge_ranges_with_fallback(
         &self,
         cache_key: &str,
         requested_range: &RangeSpec,
         cached_ranges: &[Range],
         fetched_ranges: &[(RangeSpec, Vec<u8>, HashMap<String, String>)],
-        s3_client: &Arc<crate::s3_client::S3Client>,
+        s3_client: &Arc<dyn crate::s3_client::S3ClientApi + Send + Sync>,
         host: &str,
         uri: &hyper::Uri,
         headers: &HashMap<String, String>,
@@ -2240,11 +1975,12 @@ impl RangeHandler {
     ///
     /// # Returns
     /// RangeMergeResult with data from S3 and 0% cache efficiency
+    #[allow(clippy::too_many_arguments)]
     async fn fallback_to_complete_s3_fetch(
         &self,
         cache_key: &str,
         requested_range: &RangeSpec,
-        s3_client: &Arc<crate::s3_client::S3Client>,
+        s3_client: &Arc<dyn crate::s3_client::S3ClientApi + Send + Sync>,
         host: &str,
         uri: &hyper::Uri,
         headers: &HashMap<String, String>,
@@ -2333,5 +2069,284 @@ impl RangeHandler {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn create_test_range_handler() -> RangeHandler {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+        let cache_manager = Arc::new(CacheManager::new_with_defaults(cache_dir.clone(), false, 0));
+        let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(DiskCacheManager::new(
+            cache_dir, true, 1024, false, 1_048_576,
+        )));
+        RangeHandler::new(cache_manager, disk_cache_manager)
+    }
+
+    #[test]
+    fn test_parse_valid_range_header() {
+        let handler = create_test_range_handler();
+
+        // Test "bytes=0-499"
+        match handler.parse_range_header("bytes=0-499", Some(1000)) {
+            RangeParseResult::SingleRange(range) => {
+                assert_eq!(range.start, 0);
+                assert_eq!(range.end, 499);
+            }
+            _ => panic!("Expected SingleRange"),
+        }
+
+        // Test "bytes=500-"
+        match handler.parse_range_header("bytes=500-", Some(1000)) {
+            RangeParseResult::SingleRange(range) => {
+                assert_eq!(range.start, 500);
+                assert_eq!(range.end, 999);
+            }
+            _ => panic!("Expected SingleRange"),
+        }
+
+        // Test "bytes=-200"
+        match handler.parse_range_header("bytes=-200", Some(1000)) {
+            RangeParseResult::SingleRange(range) => {
+                assert_eq!(range.start, 800);
+                assert_eq!(range.end, 999);
+            }
+            _ => panic!("Expected SingleRange"),
+        }
+    }
+
+    #[test]
+    fn test_parse_invalid_range_header() {
+        let handler = create_test_range_handler();
+
+        // Test invalid format
+        match handler.parse_range_header("invalid", Some(1000)) {
+            RangeParseResult::Invalid(_) => {}
+            _ => panic!("Expected Invalid"),
+        }
+
+        // Test invalid range
+        match handler.parse_range_header("bytes=500-100", Some(1000)) {
+            RangeParseResult::Invalid(_) => {}
+            _ => panic!("Expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn test_range_validation() {
+        let handler = create_test_range_handler();
+        let range = RangeSpec { start: 0, end: 499 };
+
+        // Valid range
+        assert!(handler.validate_range_request(&range, 1000).is_ok());
+
+        // Invalid range - exceeds content length
+        assert!(handler.validate_range_request(&range, 400).is_err());
+    }
+
+    #[test]
+    fn test_range_overlap_detection() {
+        let handler = create_test_range_handler();
+        let range1 = RangeSpec { start: 0, end: 100 };
+        let range2 = RangeSpec {
+            start: 50,
+            end: 150,
+        };
+        let range3 = RangeSpec {
+            start: 200,
+            end: 300,
+        };
+
+        assert!(handler.ranges_overlap(&range1, &range2));
+        assert!(!handler.ranges_overlap(&range1, &range3));
+    }
+
+    #[test]
+    fn test_range_merging() {
+        let handler = create_test_range_handler();
+        let ranges = vec![
+            RangeSpec { start: 0, end: 100 },
+            RangeSpec {
+                start: 50,
+                end: 150,
+            },
+            RangeSpec {
+                start: 200,
+                end: 300,
+            },
+        ];
+
+        let merged = handler.merge_ranges(&ranges);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], RangeSpec { start: 0, end: 150 });
+        assert_eq!(
+            merged[1],
+            RangeSpec {
+                start: 200,
+                end: 300
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_spec_len() {
+        let range = RangeSpec { start: 0, end: 99 };
+        assert_eq!(range.len(), 100);
+
+        let range = RangeSpec {
+            start: 100,
+            end: 200,
+        };
+        assert_eq!(range.len(), 101);
+
+        let range = RangeSpec { start: 0, end: 0 };
+        assert_eq!(range.len(), 1);
+    }
+
+    #[test]
+    fn test_slice_offset_in() {
+        // Test at start of cached range
+        let requested = RangeSpec { start: 0, end: 100 };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert_eq!(requested.slice_offset_in(&cached), 0);
+
+        // Test in middle of cached range
+        let requested = RangeSpec {
+            start: 100,
+            end: 200,
+        };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert_eq!(requested.slice_offset_in(&cached), 100);
+
+        // Test at end of cached range
+        let requested = RangeSpec {
+            start: 400,
+            end: 500,
+        };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert_eq!(requested.slice_offset_in(&cached), 400);
+
+        // Test with non-zero cached start
+        let requested = RangeSpec {
+            start: 8388608,
+            end: 16777215,
+        };
+        let cached = RangeSpec {
+            start: 8388608,
+            end: 16777269,
+        };
+        assert_eq!(requested.slice_offset_in(&cached), 0);
+    }
+
+    #[test]
+    fn test_slice_length() {
+        let range = RangeSpec { start: 0, end: 99 };
+        assert_eq!(range.slice_length(), 100);
+
+        let range = RangeSpec {
+            start: 100,
+            end: 200,
+        };
+        assert_eq!(range.slice_length(), 101);
+
+        let range = RangeSpec {
+            start: 0,
+            end: 8388607,
+        };
+        assert_eq!(range.slice_length(), 8388608);
+    }
+
+    #[test]
+    fn test_validate_slice_bounds_valid() {
+        // Test exact match
+        let requested = RangeSpec { start: 0, end: 99 };
+        let cached = RangeSpec { start: 0, end: 99 };
+        assert!(requested.validate_slice_bounds(&cached, 100).is_ok());
+
+        // Test at start of cached range
+        let requested = RangeSpec { start: 0, end: 99 };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
+
+        // Test in middle of cached range
+        let requested = RangeSpec {
+            start: 100,
+            end: 200,
+        };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
+
+        // Test at end of cached range
+        let requested = RangeSpec {
+            start: 400,
+            end: 500,
+        };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert!(requested.validate_slice_bounds(&cached, 501).is_ok());
+    }
+
+    #[test]
+    fn test_validate_slice_bounds_invalid() {
+        // Test requested range starts before container
+        let requested = RangeSpec { start: 0, end: 100 };
+        let cached = RangeSpec {
+            start: 50,
+            end: 500,
+        };
+        assert!(requested.validate_slice_bounds(&cached, 451).is_err());
+
+        // Test requested range ends after container
+        let requested = RangeSpec {
+            start: 100,
+            end: 600,
+        };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert!(requested.validate_slice_bounds(&cached, 501).is_err());
+
+        // Test slice exceeds container data length
+        let requested = RangeSpec {
+            start: 100,
+            end: 200,
+        };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert!(requested.validate_slice_bounds(&cached, 150).is_err());
+
+        // Test container data length mismatch
+        let requested = RangeSpec {
+            start: 100,
+            end: 200,
+        };
+        let cached = RangeSpec { start: 0, end: 500 };
+        assert!(requested.validate_slice_bounds(&cached, 400).is_err());
+    }
+
+    #[test]
+    fn test_slice_bounds_multipart_scenario() {
+        // Test the specific bug scenario: requested 0-8388607, cached 0-8388661
+        let requested = RangeSpec {
+            start: 0,
+            end: 8388607,
+        };
+        let cached = RangeSpec {
+            start: 0,
+            end: 8388661,
+        };
+
+        // With correct cached data length (8388662 bytes)
+        assert!(requested.validate_slice_bounds(&cached, 8388662).is_ok());
+        assert_eq!(requested.slice_offset_in(&cached), 0);
+        assert_eq!(requested.slice_length(), 8388608);
+
+        // Verify we can extract the correct slice
+        let offset = requested.slice_offset_in(&cached) as usize;
+        let length = requested.slice_length();
+        assert_eq!(offset, 0);
+        assert_eq!(length, 8388608);
+        assert_eq!(offset + length, 8388608);
     }
 }

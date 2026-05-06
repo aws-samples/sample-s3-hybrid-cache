@@ -27,8 +27,10 @@ use s3_proxy::write_cache_manager::WriteCacheManager;
 
 /// Represents a simulated proxy instance for multi-instance testing
 struct TestProxyInstance {
+    #[allow(dead_code)]
     instance_id: String,
     cache_dir: std::path::PathBuf,
+    #[allow(dead_code)]
     lock_manager: Arc<MetadataLockManager>,
     journal_manager: Arc<JournalManager>,
     hybrid_writer: HybridMetadataWriter,
@@ -120,7 +122,13 @@ impl TestProxyInstance {
 
         // Write metadata
         self.hybrid_writer
-            .write_range_metadata(cache_key, range_spec, write_mode, None, std::time::Duration::from_secs(3600))
+            .write_range_metadata(
+                cache_key,
+                range_spec,
+                write_mode,
+                None,
+                std::time::Duration::from_secs(3600),
+            )
             .await?;
 
         Ok(())

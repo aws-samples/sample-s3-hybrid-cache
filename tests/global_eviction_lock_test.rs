@@ -140,11 +140,7 @@ fn test_global_eviction_lock_serialization() {
         .acquired_at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
-    let diff = if original_duration > deserialized_duration {
-        original_duration - deserialized_duration
-    } else {
-        deserialized_duration - original_duration
-    };
+    let diff = original_duration.abs_diff(deserialized_duration);
     assert!(
         diff.as_secs() <= 1,
         "Timestamps differ by more than 1 second"
@@ -193,7 +189,7 @@ mod helper_methods_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_dir = temp_dir.path().to_path_buf();
 
-        let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
+        let _ = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
 
         // Verify the expected lock file path structure
         let locks_dir = cache_dir.join("locks");
@@ -210,7 +206,7 @@ mod helper_methods_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_dir = temp_dir.path().to_path_buf();
 
-        let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
+        let _ = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
 
         // We can't directly test the private method, but we can verify the format
         // by checking that hostname and PID are available
@@ -251,21 +247,13 @@ mod helper_methods_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_dir = temp_dir.path().to_path_buf();
 
-        let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
+        let _ = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
 
         // The default timeout should be 300 seconds (5 minutes)
         // We can't directly test the private method, but we verify the constant
         const EXPECTED_DEFAULT_TIMEOUT: u64 = 300;
 
-        // Verify the expected default is reasonable
-        assert!(
-            EXPECTED_DEFAULT_TIMEOUT >= 60,
-            "Default timeout should be at least 60 seconds"
-        );
-        assert!(
-            EXPECTED_DEFAULT_TIMEOUT <= 3600,
-            "Default timeout should be at most 3600 seconds"
-        );
+        // Verify the expected default is exactly 300 seconds (5 minutes)
         assert_eq!(
             EXPECTED_DEFAULT_TIMEOUT, 300,
             "Default timeout should be 300 seconds (5 minutes)"
@@ -317,7 +305,7 @@ mod helper_methods_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_dir = temp_dir.path().to_path_buf();
 
-        let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
+        let _ = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
 
         // Get current process ID
         let current_pid = std::process::id();
@@ -434,7 +422,8 @@ mod lock_acquisition_tests {
 
         // Create a stale lock file manually
         let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
-        std::fs::create_dir_all(lock_file_path.parent().unwrap()).expect("Failed to create locks dir");
+        std::fs::create_dir_all(lock_file_path.parent().unwrap())
+            .expect("Failed to create locks dir");
         let stale_time = SystemTime::now() - Duration::from_secs(400); // 400 seconds ago (stale)
 
         let stale_lock = s3_proxy::cache::GlobalEvictionLock {
@@ -483,7 +472,8 @@ mod lock_acquisition_tests {
 
         // Create a corrupted lock file manually
         let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
-        std::fs::create_dir_all(lock_file_path.parent().unwrap()).expect("Failed to create locks dir");
+        std::fs::create_dir_all(lock_file_path.parent().unwrap())
+            .expect("Failed to create locks dir");
         std::fs::write(&lock_file_path, b"invalid json {{{")
             .expect("Failed to write corrupted lock file");
 
@@ -649,9 +639,15 @@ mod lock_release_tests {
             .expect("Failed to release lock");
 
         // Verify lock was released by confirming it can be re-acquired
-        let reacquired = cache_manager.try_acquire_global_eviction_lock().await.expect("Should be able to attempt lock acquisition");
+        let reacquired = cache_manager
+            .try_acquire_global_eviction_lock()
+            .await
+            .expect("Should be able to attempt lock acquisition");
         assert!(reacquired, "Lock should be re-acquirable after release");
-        cache_manager.release_global_eviction_lock().await.expect("Should release lock");
+        cache_manager
+            .release_global_eviction_lock()
+            .await
+            .expect("Should release lock");
     }
 
     #[tokio::test]
@@ -677,7 +673,8 @@ mod lock_release_tests {
 
         // Manually create a lock file with a different instance ID
         let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
-        std::fs::create_dir_all(lock_file_path.parent().unwrap()).expect("Failed to create locks dir");
+        std::fs::create_dir_all(lock_file_path.parent().unwrap())
+            .expect("Failed to create locks dir");
         let fake_lock = s3_proxy::cache::GlobalEvictionLock {
             instance_id: "different-host:99999".to_string(),
             process_id: 99999,
@@ -715,7 +712,8 @@ mod lock_release_tests {
 
         // Create a corrupted lock file
         let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
-        std::fs::create_dir_all(lock_file_path.parent().unwrap()).expect("Failed to create locks dir");
+        std::fs::create_dir_all(lock_file_path.parent().unwrap())
+            .expect("Failed to create locks dir");
         std::fs::write(&lock_file_path, b"invalid json {{{")
             .expect("Failed to write corrupted lock file");
 
@@ -726,9 +724,15 @@ mod lock_release_tests {
             .expect("Should handle corrupted lock file during release");
 
         // Verify lock was released by confirming it can be re-acquired
-        let reacquired = cache_manager.try_acquire_global_eviction_lock().await.expect("Should be able to attempt lock acquisition");
+        let reacquired = cache_manager
+            .try_acquire_global_eviction_lock()
+            .await
+            .expect("Should be able to attempt lock acquisition");
         assert!(reacquired, "Lock should be re-acquirable after release");
-        cache_manager.release_global_eviction_lock().await.expect("Should release lock");
+        cache_manager
+            .release_global_eviction_lock()
+            .await
+            .expect("Should release lock");
     }
 
     #[tokio::test]
@@ -823,7 +827,7 @@ mod lock_release_tests {
 
 #[cfg(test)]
 mod eviction_integration_tests {
-    
+
     use s3_proxy::cache::CacheManager;
     use tempfile::TempDir;
 
@@ -856,9 +860,15 @@ mod eviction_integration_tests {
             .expect("Failed to release lock");
 
         // Verify lock was released by confirming it can be re-acquired
-        let reacquired = cache_manager.try_acquire_global_eviction_lock().await.expect("Should be able to attempt lock acquisition");
+        let reacquired = cache_manager
+            .try_acquire_global_eviction_lock()
+            .await
+            .expect("Should be able to attempt lock acquisition");
         assert!(reacquired, "Lock should be re-acquirable after release");
-        cache_manager.release_global_eviction_lock().await.expect("Should release lock");
+        cache_manager
+            .release_global_eviction_lock()
+            .await
+            .expect("Should release lock");
     }
 
     #[tokio::test]
@@ -903,9 +913,15 @@ mod eviction_integration_tests {
             .expect("Failed to release lock");
 
         // Verify lock was released by confirming it can be re-acquired
-        let reacquired = cache_manager1.try_acquire_global_eviction_lock().await.expect("Should be able to attempt lock acquisition");
+        let reacquired = cache_manager1
+            .try_acquire_global_eviction_lock()
+            .await
+            .expect("Should be able to attempt lock acquisition");
         assert!(reacquired, "Lock should be re-acquirable after release");
-        cache_manager1.release_global_eviction_lock().await.expect("Should release lock");
+        cache_manager1
+            .release_global_eviction_lock()
+            .await
+            .expect("Should release lock");
 
         // Now second instance can acquire lock
         let acquired3 = cache_manager2

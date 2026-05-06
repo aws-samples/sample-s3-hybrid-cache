@@ -133,10 +133,9 @@ async fn test_collect_cache_entries_for_eviction_with_new_architecture() {
     let cache_dir = temp_dir.path().to_path_buf();
 
     // Create cache manager
-    let cache_manager = create_test_cache_manager_with_eviction(
-        cache_dir.clone(),
-        CacheEvictionAlgorithm::LRU,
-    ).await;
+    let cache_manager =
+        create_test_cache_manager_with_eviction(cache_dir.clone(), CacheEvictionAlgorithm::LRU)
+            .await;
 
     // Create a new metadata file with multiple ranges (>3 for granular eviction)
     let object_metadata = ObjectMetadata::new(
@@ -228,10 +227,9 @@ async fn test_collect_cache_entries_for_eviction_full_object() {
     let cache_dir = temp_dir.path().to_path_buf();
 
     // Create cache manager
-    let cache_manager = create_test_cache_manager_with_eviction(
-        cache_dir.clone(),
-        CacheEvictionAlgorithm::LRU,
-    ).await;
+    let cache_manager =
+        create_test_cache_manager_with_eviction(cache_dir.clone(), CacheEvictionAlgorithm::LRU)
+            .await;
 
     // Create a new metadata file with few ranges (≤3 for full object eviction)
     let object_metadata = ObjectMetadata::new(

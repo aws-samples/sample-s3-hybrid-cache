@@ -127,7 +127,10 @@ impl CustomHttpsConnector {
 /// Apply TCP socket options (keepalive + receive buffer) via socket2.
 /// Converts TcpStream → socket2::Socket → apply options → convert back.
 /// Errors are logged as warnings and do not fail the connection.
-fn apply_socket_options(tcp: TcpStream, config: &ConnectionPoolConfig) -> std::result::Result<TcpStream, ProxyError> {
+fn apply_socket_options(
+    tcp: TcpStream,
+    config: &ConnectionPoolConfig,
+) -> std::result::Result<TcpStream, ProxyError> {
     let std_stream = tcp.into_std().map_err(|e| {
         ProxyError::ConnectionError(format!("Failed to convert TcpStream to std: {}", e))
     })?;
@@ -152,7 +155,10 @@ fn apply_socket_options(tcp: TcpStream, config: &ConnectionPoolConfig) -> std::r
 
     let std_stream: std::net::TcpStream = socket.into();
     let tcp = TcpStream::from_std(std_stream).map_err(|e| {
-        ProxyError::ConnectionError(format!("Failed to convert std TcpStream back to tokio: {}", e))
+        ProxyError::ConnectionError(format!(
+            "Failed to convert std TcpStream back to tokio: {}",
+            e
+        ))
     })?;
 
     tcp.set_nodelay(true).ok();
@@ -220,10 +226,7 @@ impl Service<Uri> for CustomHttpsConnector {
                     pm.resolve_endpoint(uri_host).await?
                 };
                 let ip = *ips.first().ok_or_else(|| {
-                    ProxyError::ConnectionError(format!(
-                        "No addresses found for {}",
-                        uri_host
-                    ))
+                    ProxyError::ConnectionError(format!("No addresses found for {}", uri_host))
                 })?;
                 (ip, uri_host.to_string())
             };
@@ -278,13 +281,9 @@ impl Service<Uri> for CustomHttpsConnector {
             };
 
             // TLS handshake
-            let server_name =
-                ServerName::try_from(tls_hostname.clone()).map_err(|e| {
-                    ProxyError::TlsError(format!(
-                        "Invalid server name '{}': {}",
-                        tls_hostname, e
-                    ))
-                })?;
+            let server_name = ServerName::try_from(tls_hostname.clone()).map_err(|e| {
+                ProxyError::TlsError(format!("Invalid server name '{}': {}", tls_hostname, e))
+            })?;
 
             let tls = tls_connector.connect(server_name, tcp).await.map_err(|e| {
                 warn!(

@@ -10,7 +10,7 @@ use crate::metrics::SystemMetrics;
 use crate::{ProxyError, Result};
 use opentelemetry::metrics::{Gauge, MeterProvider as _};
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use tracing::{debug, info};
@@ -69,6 +69,10 @@ struct Instruments {
     coalesce_timeouts: Gauge<u64>,
     coalesce_s3_fetches_saved: Gauge<u64>,
     coalesce_avg_wait_ms: Gauge<f64>,
+    coalesce_waiter_conditional_304: Gauge<u64>,
+    coalesce_waiter_conditional_200: Gauge<u64>,
+    coalesce_waiter_conditional_4xx: Gauge<u64>,
+    coalesce_waiter_conditional_error: Gauge<u64>,
     // -- request_metrics --
     req_total: Gauge<u64>,
     req_successful: Gauge<u64>,
@@ -83,7 +87,11 @@ struct Instruments {
 
 impl OtlpExporter {
     pub fn new(config: OtlpConfig) -> Self {
-        Self { config, provider: None, instruments: None }
+        Self {
+            config,
+            provider: None,
+            instruments: None,
+        }
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
@@ -92,19 +100,21 @@ impl OtlpExporter {
             return Ok(());
         }
         if self.config.endpoint.is_empty() {
-            return Err(ProxyError::ConfigError("OTLP endpoint cannot be empty".into()));
+            return Err(ProxyError::ConfigError(
+                "OTLP endpoint cannot be empty".into(),
+            ));
         }
-        info!("Initializing OTLP exporter: endpoint={}, interval={:?}",
-            self.config.endpoint, self.config.export_interval);
+        info!(
+            "Initializing OTLP exporter: endpoint={}, interval={:?}",
+            self.config.endpoint, self.config.export_interval
+        );
 
-        let exporter = opentelemetry_otlp::new_exporter()
-            .http()
+        let exporter = MetricExporter::builder()
+            .with_http()
             .with_endpoint(&self.config.endpoint)
             .with_timeout(self.config.timeout)
-            .build_metrics_exporter(
-                Box::new(opentelemetry_sdk::metrics::reader::DefaultAggregationSelector::new()),
-                Box::new(opentelemetry_sdk::metrics::reader::DefaultTemporalitySelector::new()),
-            ).map_err(|e| ProxyError::SystemError(format!("OTLP build failed: {}", e)))?;
+            .build()
+            .map_err(|e| ProxyError::SystemError(format!("OTLP build failed: {}", e)))?;
 
         let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
             .with_interval(self.config.export_interval)
@@ -114,72 +124,95 @@ impl OtlpExporter {
         let provider = SdkMeterProvider::builder()
             .with_reader(reader)
             .with_resource(Resource::new(vec![
-                KeyValue::new(opentelemetry_semantic_conventions::resource::SERVICE_NAME, "s3-proxy"),
-                KeyValue::new(opentelemetry_semantic_conventions::resource::SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-                KeyValue::new(opentelemetry_semantic_conventions::resource::HOST_NAME, hostname),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                    "s3-proxy",
+                ),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                    env!("CARGO_PKG_VERSION"),
+                ),
+                KeyValue::new(
+                    // "host.name" — not in the stable attribute set for 0.27;
+                    // use the raw string which is what the constant expands to.
+                    "host.name",
+                    hostname,
+                ),
             ]))
             .build();
 
         let m = provider.meter("s3-proxy");
 
-        macro_rules! g_u64 { ($name:expr) => { m.u64_gauge($name).init() } }
-        macro_rules! g_f64 { ($name:expr) => { m.f64_gauge($name).init() } }
+        macro_rules! g_u64 {
+            ($name:expr) => {
+                m.u64_gauge($name).build()
+            };
+        }
+        macro_rules! g_f64 {
+            ($name:expr) => {
+                m.f64_gauge($name).build()
+            };
+        }
 
         let instruments = Instruments {
             // cache: sizes
-            cache_total_cache_size:  g_u64!("cache.total_cache_size"),
-            cache_read_cache_size:   g_u64!("cache.read_cache_size"),
-            cache_write_cache_size:  g_u64!("cache.write_cache_size"),
-            cache_ram_cache_size:    g_u64!("cache.ram_cache_size"),
+            cache_total_cache_size: g_u64!("cache.total_cache_size"),
+            cache_read_cache_size: g_u64!("cache.read_cache_size"),
+            cache_write_cache_size: g_u64!("cache.write_cache_size"),
+            cache_ram_cache_size: g_u64!("cache.ram_cache_size"),
             // cache: hits/misses/evictions
-            cache_hits:              g_u64!("cache.cache_hits"),
-            cache_misses:            g_u64!("cache.cache_misses"),
-            cache_evictions:         g_u64!("cache.evictions"),
-            cache_write_hits:        g_u64!("cache.write_cache_hits"),
+            cache_hits: g_u64!("cache.cache_hits"),
+            cache_misses: g_u64!("cache.cache_misses"),
+            cache_evictions: g_u64!("cache.evictions"),
+            cache_write_hits: g_u64!("cache.write_cache_hits"),
             cache_s3_requests_saved: g_u64!("cache.s3_requests_saved"),
             // cache: bytes saved
             bytes_served_from_cache: g_u64!("cache.bytes_served_from_cache"),
             // cache per-tier: RAM
-            ram_cache_hits:          g_u64!("cache.ram_cache_hits"),
-            ram_cache_misses:        g_u64!("cache.ram_cache_misses"),
-            ram_cache_evictions:     g_u64!("cache.ram_cache_evictions"),
+            ram_cache_hits: g_u64!("cache.ram_cache_hits"),
+            ram_cache_misses: g_u64!("cache.ram_cache_misses"),
+            ram_cache_evictions: g_u64!("cache.ram_cache_evictions"),
             // cache per-tier: metadata
-            metadata_cache_hits:            g_u64!("cache.metadata_cache_hits"),
-            metadata_cache_misses:          g_u64!("cache.metadata_cache_misses"),
-            metadata_cache_entries:         g_u64!("cache.metadata_cache_entries"),
-            metadata_cache_evictions:       g_u64!("cache.metadata_cache_evictions"),
+            metadata_cache_hits: g_u64!("cache.metadata_cache_hits"),
+            metadata_cache_misses: g_u64!("cache.metadata_cache_misses"),
+            metadata_cache_entries: g_u64!("cache.metadata_cache_entries"),
+            metadata_cache_evictions: g_u64!("cache.metadata_cache_evictions"),
             metadata_cache_stale_refreshes: g_u64!("cache.metadata_cache_stale_refreshes"),
             // cache: error/health signals
-            cache_corruption_metadata_total:       g_u64!("cache.corruption_metadata_total"),
-            cache_corruption_missing_range_total:  g_u64!("cache.corruption_missing_range_total"),
-            cache_disk_full_events_total:          g_u64!("cache.disk_full_events_total"),
-            cache_lock_timeout_total:              g_u64!("cache.lock_timeout_total"),
-            cache_write_failures_total:            g_u64!("cache.write_failures_total"),
-            cache_etag_mismatches_total:           g_u64!("cache.etag_mismatches_total"),
-            cache_range_invalidations_total:       g_u64!("cache.range_invalidations_total"),
-            cache_incomplete_uploads_evicted:      g_u64!("cache.incomplete_uploads_evicted"),
+            cache_corruption_metadata_total: g_u64!("cache.corruption_metadata_total"),
+            cache_corruption_missing_range_total: g_u64!("cache.corruption_missing_range_total"),
+            cache_disk_full_events_total: g_u64!("cache.disk_full_events_total"),
+            cache_lock_timeout_total: g_u64!("cache.lock_timeout_total"),
+            cache_write_failures_total: g_u64!("cache.write_failures_total"),
+            cache_etag_mismatches_total: g_u64!("cache.etag_mismatches_total"),
+            cache_range_invalidations_total: g_u64!("cache.range_invalidations_total"),
+            cache_incomplete_uploads_evicted: g_u64!("cache.incomplete_uploads_evicted"),
             // compression
-            compression_ratio:       g_f64!("compression.average_compression_ratio"),
-            compression_failures:    g_u64!("compression.failures_total"),
+            compression_ratio: g_f64!("compression.average_compression_ratio"),
+            compression_failures: g_u64!("compression.failures_total"),
             // connection pool
-            conn_failed:             g_u64!("connection_pool.failed_connections"),
-            conn_latency_ms:         g_u64!("connection_pool.average_latency_ms"),
-            conn_success_rate:       g_f64!("connection_pool.success_rate_percent"),
+            conn_failed: g_u64!("connection_pool.failed_connections"),
+            conn_latency_ms: g_u64!("connection_pool.average_latency_ms"),
+            conn_success_rate: g_f64!("connection_pool.success_rate_percent"),
             // coalescing
-            coalesce_waits:                 g_u64!("coalescing.waits_total"),
+            coalesce_waits: g_u64!("coalescing.waits_total"),
             coalesce_cache_hits_after_wait: g_u64!("coalescing.cache_hits_after_wait_total"),
-            coalesce_timeouts:              g_u64!("coalescing.timeouts_total"),
-            coalesce_s3_fetches_saved:      g_u64!("coalescing.s3_fetches_saved_total"),
-            coalesce_avg_wait_ms:           g_f64!("coalescing.average_wait_duration_ms"),
+            coalesce_timeouts: g_u64!("coalescing.timeouts_total"),
+            coalesce_s3_fetches_saved: g_u64!("coalescing.s3_fetches_saved_total"),
+            coalesce_avg_wait_ms: g_f64!("coalescing.average_wait_duration_ms"),
+            coalesce_waiter_conditional_304: g_u64!("coalescing.waiter_conditional_304"),
+            coalesce_waiter_conditional_200: g_u64!("coalescing.waiter_conditional_200"),
+            coalesce_waiter_conditional_4xx: g_u64!("coalescing.waiter_conditional_4xx"),
+            coalesce_waiter_conditional_error: g_u64!("coalescing.waiter_conditional_error"),
             // request metrics
-            req_total:          g_u64!("request_metrics.total_requests"),
-            req_successful:     g_u64!("request_metrics.successful_requests"),
-            req_failed:         g_u64!("request_metrics.failed_requests"),
+            req_total: g_u64!("request_metrics.total_requests"),
+            req_successful: g_u64!("request_metrics.successful_requests"),
+            req_failed: g_u64!("request_metrics.failed_requests"),
             req_avg_latency_ms: g_u64!("request_metrics.average_response_time_ms"),
-            req_active:         g_u64!("request_metrics.active_requests"),
+            req_active: g_u64!("request_metrics.active_requests"),
             // top-level
-            uptime_seconds:      g_u64!("uptime_seconds"),
-            memory_usage_bytes:  g_u64!("process.memory_usage_bytes"),
+            uptime_seconds: g_u64!("uptime_seconds"),
+            memory_usage_bytes: g_u64!("process.memory_usage_bytes"),
         };
 
         self.provider = Some(provider);
@@ -190,8 +223,11 @@ impl OtlpExporter {
 
     /// Record SystemMetrics into OTLP instruments — same data as /metrics JSON.
     pub async fn export_metrics(&self, metrics: &SystemMetrics) -> Result<()> {
-        let i = match &self.instruments { Some(i) => i, None => return Ok(()) };
-        let a = &[];  // no extra attributes — host/service come from Resource
+        let i = match &self.instruments {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let a = &[]; // no extra attributes — host/service come from Resource
 
         if let Some(c) = &metrics.cache {
             // sizes
@@ -204,8 +240,10 @@ impl OtlpExporter {
             i.cache_misses.record(c.cache_misses, a);
             i.cache_evictions.record(c.evictions, a);
             i.cache_write_hits.record(c.write_cache_hits, a);
-            i.cache_s3_requests_saved.record(c.cache_hits + c.metadata_cache_hits, a);
-            i.bytes_served_from_cache.record(c.bytes_served_from_cache, a);
+            i.cache_s3_requests_saved
+                .record(c.cache_hits + c.metadata_cache_hits, a);
+            i.bytes_served_from_cache
+                .record(c.bytes_served_from_cache, a);
             // RAM tier
             i.ram_cache_hits.record(c.ram_cache_hits, a);
             i.ram_cache_misses.record(c.ram_cache_misses, a);
@@ -214,36 +252,59 @@ impl OtlpExporter {
             i.metadata_cache_hits.record(c.metadata_cache_hits, a);
             i.metadata_cache_misses.record(c.metadata_cache_misses, a);
             i.metadata_cache_entries.record(c.metadata_cache_entries, a);
-            i.metadata_cache_evictions.record(c.metadata_cache_evictions, a);
-            i.metadata_cache_stale_refreshes.record(c.metadata_cache_stale_refreshes, a);
+            i.metadata_cache_evictions
+                .record(c.metadata_cache_evictions, a);
+            i.metadata_cache_stale_refreshes
+                .record(c.metadata_cache_stale_refreshes, a);
             // error/health signals
-            i.cache_corruption_metadata_total.record(c.corruption_metadata_total, a);
-            i.cache_corruption_missing_range_total.record(c.corruption_missing_range_total, a);
-            i.cache_disk_full_events_total.record(c.disk_full_events_total, a);
+            i.cache_corruption_metadata_total
+                .record(c.corruption_metadata_total, a);
+            i.cache_corruption_missing_range_total
+                .record(c.corruption_missing_range_total, a);
+            i.cache_disk_full_events_total
+                .record(c.disk_full_events_total, a);
             i.cache_lock_timeout_total.record(c.lock_timeout_total, a);
-            i.cache_write_failures_total.record(c.cache_write_failures_total, a);
-            i.cache_etag_mismatches_total.record(c.cache_etag_mismatches_total, a);
-            i.cache_range_invalidations_total.record(c.cache_range_invalidations_total, a);
-            i.cache_incomplete_uploads_evicted.record(c.incomplete_uploads_evicted, a);
+            i.cache_write_failures_total
+                .record(c.cache_write_failures_total, a);
+            i.cache_etag_mismatches_total
+                .record(c.cache_etag_mismatches_total, a);
+            i.cache_range_invalidations_total
+                .record(c.cache_range_invalidations_total, a);
+            i.cache_incomplete_uploads_evicted
+                .record(c.incomplete_uploads_evicted, a);
         }
 
         if let Some(comp) = &metrics.compression {
-            i.compression_ratio.record(comp.average_compression_ratio as f64, a);
-            i.compression_failures.record(comp.compression_failures + comp.decompression_failures, a);
+            i.compression_ratio
+                .record(comp.average_compression_ratio as f64, a);
+            i.compression_failures
+                .record(comp.compression_failures + comp.decompression_failures, a);
         }
 
         if let Some(conn) = &metrics.connection_pool {
             i.conn_failed.record(conn.failed_connections, a);
             i.conn_latency_ms.record(conn.average_latency_ms, a);
-            i.conn_success_rate.record(conn.success_rate_percent as f64, a);
+            i.conn_success_rate
+                .record(conn.success_rate_percent as f64, a);
         }
 
         if let Some(coal) = &metrics.coalescing {
             i.coalesce_waits.record(coal.waits_total, a);
-            i.coalesce_cache_hits_after_wait.record(coal.cache_hits_after_wait_total, a);
+            i.coalesce_cache_hits_after_wait
+                .record(coal.cache_hits_after_wait_total, a);
             i.coalesce_timeouts.record(coal.timeouts_total, a);
-            i.coalesce_s3_fetches_saved.record(coal.s3_fetches_saved_total, a);
-            i.coalesce_avg_wait_ms.record(coal.average_wait_duration_ms, a);
+            i.coalesce_s3_fetches_saved
+                .record(coal.s3_fetches_saved_total, a);
+            i.coalesce_avg_wait_ms
+                .record(coal.average_wait_duration_ms, a);
+            i.coalesce_waiter_conditional_304
+                .record(coal.waiter_conditional_304, a);
+            i.coalesce_waiter_conditional_200
+                .record(coal.waiter_conditional_200, a);
+            i.coalesce_waiter_conditional_4xx
+                .record(coal.waiter_conditional_4xx, a);
+            i.coalesce_waiter_conditional_error
+                .record(coal.waiter_conditional_error, a);
         }
 
         let rm = &metrics.request_metrics;
@@ -276,7 +337,9 @@ impl OtlpExporter {
                 if line.starts_with("VmRSS:") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 {
-                        return parts[1].parse::<u64>().map(|kb| kb * 1024)
+                        return parts[1]
+                            .parse::<u64>()
+                            .map(|kb| kb * 1024)
                             .map_err(|e| ProxyError::SystemError(format!("parse VmRSS: {}", e)));
                     }
                 }
@@ -284,13 +347,17 @@ impl OtlpExporter {
             Err(ProxyError::SystemError("VmRSS not found".into()))
         }
         #[cfg(not(target_os = "linux"))]
-        { Ok(0) }
+        {
+            Ok(0)
+        }
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
         if let Some(provider) = self.provider.take() {
             info!("Shutting down OTLP exporter");
-            provider.shutdown().map_err(|e| ProxyError::SystemError(format!("OTLP shutdown: {}", e)))?;
+            provider
+                .shutdown()
+                .map_err(|e| ProxyError::SystemError(format!("OTLP shutdown: {}", e)))?;
             self.instruments = None;
         }
         Ok(())

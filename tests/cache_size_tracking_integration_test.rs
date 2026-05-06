@@ -76,8 +76,10 @@ async fn test_multi_instance_validation_coordination() {
     consolidator.initialize().await.unwrap();
 
     // Create two size trackers sharing the same directory
-    let mut config1 = s3_proxy::cache_size_tracker::CacheSizeConfig::default();
-    config1.validation_enabled = true; // Enable validation for this test to test locking
+    let config1 = s3_proxy::cache_size_tracker::CacheSizeConfig {
+        validation_enabled: true, // Enable validation for this test to test locking
+        ..s3_proxy::cache_size_tracker::CacheSizeConfig::default()
+    };
 
     let tracker1 = Arc::new(
         s3_proxy::cache_size_tracker::CacheSizeTracker::new(
@@ -90,8 +92,10 @@ async fn test_multi_instance_validation_coordination() {
         .unwrap(),
     );
 
-    let mut config2 = s3_proxy::cache_size_tracker::CacheSizeConfig::default();
-    config2.validation_enabled = true; // Enable validation for this test to test locking
+    let config2 = s3_proxy::cache_size_tracker::CacheSizeConfig {
+        validation_enabled: true, // Enable validation for this test to test locking
+        ..s3_proxy::cache_size_tracker::CacheSizeConfig::default()
+    };
 
     let tracker2 = Arc::new(
         s3_proxy::cache_size_tracker::CacheSizeTracker::new(
@@ -162,8 +166,10 @@ async fn test_validation_metadata_persistence() {
     ));
     consolidator.initialize().await.unwrap();
 
-    let mut config = s3_proxy::cache_size_tracker::CacheSizeConfig::default();
-    config.validation_enabled = false; // Disable validation for tests
+    let config = s3_proxy::cache_size_tracker::CacheSizeConfig {
+        validation_enabled: false, // Disable validation for tests
+        ..s3_proxy::cache_size_tracker::CacheSizeConfig::default()
+    };
 
     let tracker = Arc::new(
         s3_proxy::cache_size_tracker::CacheSizeTracker::new(
@@ -231,7 +237,7 @@ async fn test_actively_remove_cached_data_flag_behavior() {
         cache_manager.set_cache_manager_in_tracker().await;
 
         let tracker = cache_manager.get_size_tracker().await.unwrap();
-        assert_eq!(tracker.is_active_expiration_enabled(), false);
+        assert!(!tracker.is_active_expiration_enabled());
 
         // coordinate_cleanup should return 0 immediately
         let cleaned = cache_manager.coordinate_cleanup().await.unwrap();
@@ -262,7 +268,7 @@ async fn test_actively_remove_cached_data_flag_behavior() {
         cache_manager.set_cache_manager_in_tracker().await;
 
         let tracker = cache_manager.get_size_tracker().await.unwrap();
-        assert_eq!(tracker.is_active_expiration_enabled(), true);
+        assert!(tracker.is_active_expiration_enabled());
     }
 }
 

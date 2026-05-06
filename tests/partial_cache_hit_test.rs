@@ -103,7 +103,8 @@ async fn test_partial_cache_hit_scenario() {
                 &range_data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }
@@ -140,7 +141,7 @@ async fn test_partial_cache_hit_scenario() {
     );
 
     // Verify the missing ranges are correct (8-16MB and 24-32MB)
-    let expected_missing = vec![
+    let expected_missing = [
         RangeSpec {
             start: 8 * mb as u64,
             end: 16 * mb as u64 - 1,
@@ -263,7 +264,8 @@ async fn test_partial_cache_hit_scenario() {
                 data,
                 object_metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
     }

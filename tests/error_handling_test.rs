@@ -18,7 +18,8 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn test_corrupted_metadata_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -48,7 +49,8 @@ async fn test_corrupted_metadata_handling() {
 #[tokio::test]
 async fn test_empty_metadata_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -73,7 +75,8 @@ async fn test_empty_metadata_handling() {
 #[tokio::test]
 async fn test_missing_range_file_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -131,7 +134,8 @@ async fn test_missing_range_file_handling() {
 #[tokio::test]
 async fn test_disk_space_exhaustion_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -158,13 +162,18 @@ async fn test_disk_space_exhaustion_handling() {
             1023,
             &data,
             object_metadata,
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await;
 
     // Restore permissions for cleanup
-    let mut perms = std::fs::metadata(&ranges_dir).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(&ranges_dir, perms).unwrap();
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        let mut perms = std::fs::metadata(&ranges_dir).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&ranges_dir, perms).unwrap();
+    }
 
     assert!(result.is_err(), "Should return error when disk write fails");
 }
@@ -177,7 +186,8 @@ async fn test_disk_space_exhaustion_handling() {
 #[tokio::test]
 async fn test_inconsistent_metadata_handling() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -200,7 +210,9 @@ async fn test_inconsistent_metadata_handling() {
             1023,
             &data1,
             object_metadata.clone(),
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await
         .unwrap();
     cache_manager
@@ -210,7 +222,9 @@ async fn test_inconsistent_metadata_handling() {
             2047,
             &data2,
             object_metadata.clone(),
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await
         .unwrap();
 
@@ -255,7 +269,8 @@ async fn test_inconsistent_metadata_handling() {
 #[tokio::test]
 async fn test_all_ranges_missing() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -276,7 +291,9 @@ async fn test_all_ranges_missing() {
             1023,
             &data,
             object_metadata,
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await
         .unwrap();
 
@@ -306,7 +323,8 @@ async fn test_all_ranges_missing() {
 #[tokio::test]
 async fn test_cleanup_temp_files() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -351,7 +369,8 @@ async fn test_cleanup_temp_files() {
 #[tokio::test]
 async fn test_comprehensive_cache_cleanup() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -372,7 +391,9 @@ async fn test_comprehensive_cache_cleanup() {
             1023,
             &data,
             object_metadata,
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await
         .unwrap();
 
@@ -424,7 +445,8 @@ async fn test_comprehensive_cache_cleanup() {
 #[tokio::test]
 async fn test_cleanup_preserves_valid_entries() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -445,12 +467,14 @@ async fn test_cleanup_preserves_valid_entries() {
             1023,
             &data,
             object_metadata,
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await
         .unwrap();
 
     // Perform cleanup
-    let stats = cache_manager.perform_cache_cleanup().await.unwrap();
+    let _stats = cache_manager.perform_cache_cleanup().await.unwrap();
 
     // Verify valid entry still exists
     let metadata = cache_manager.get_metadata(cache_key).await.unwrap();
@@ -476,7 +500,8 @@ async fn test_cleanup_preserves_valid_entries() {
 #[tokio::test]
 async fn test_error_recovery_no_crash() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     // Create multiple corrupted metadata files
@@ -509,7 +534,8 @@ async fn test_error_recovery_no_crash() {
 #[tokio::test]
 async fn test_partial_write_cleanup() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
     cache_manager.initialize().await.unwrap();
 
     let cache_key = "test-bucket/test-object";
@@ -530,12 +556,18 @@ async fn test_partial_write_cleanup() {
             1023,
             &data,
             object_metadata.clone(),
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await
         .unwrap();
 
     // Verify first range exists
-    let metadata = cache_manager.get_metadata(cache_key).await.unwrap().unwrap();
+    let metadata = cache_manager
+        .get_metadata(cache_key)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(metadata.ranges.len(), 1, "Should have 1 range");
     assert_eq!(metadata.object_metadata.etag, "test-etag");
 
@@ -555,15 +587,30 @@ async fn test_partial_write_cleanup() {
             2047,
             &data2,
             different_metadata,
-            std::time::Duration::from_secs(315360000), true)
+            std::time::Duration::from_secs(315360000),
+            true,
+        )
         .await;
-    assert!(result.is_ok(), "ETag mismatch should invalidate old ranges and store new data");
+    assert!(
+        result.is_ok(),
+        "ETag mismatch should invalidate old ranges and store new data"
+    );
 
     // Verify old range was invalidated and new range stored
-    let metadata = cache_manager.get_metadata(cache_key).await.unwrap().unwrap();
-    assert_eq!(metadata.object_metadata.etag, "different-etag", "ETag should be updated");
+    let metadata = cache_manager
+        .get_metadata(cache_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        metadata.object_metadata.etag, "different-etag",
+        "ETag should be updated"
+    );
     assert_eq!(metadata.ranges.len(), 1, "Should have only the new range");
-    assert_eq!(metadata.ranges[0].start, 1024, "New range should start at 1024");
+    assert_eq!(
+        metadata.ranges[0].start, 1024,
+        "New range should start at 1024"
+    );
     assert_eq!(metadata.ranges[0].end, 2047, "New range should end at 2047");
 
     // Verify old range file was cleaned up

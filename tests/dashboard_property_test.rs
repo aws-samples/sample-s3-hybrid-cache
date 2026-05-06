@@ -36,7 +36,7 @@ use tokio::fs;
 
 fn prop_dashboard_accessibility_without_authentication(port_offset: u8) -> TestResult {
     let port = 8080 + (port_offset % 100) as u16;
-    if port < 8080 || port > 8180 {
+    if !(8080..=8180).contains(&port) {
         return TestResult::discard();
     }
 
@@ -105,7 +105,10 @@ fn prop_comprehensive_cache_statistics(_seed: u8) -> TestResult {
             PathBuf::from("/tmp/logs"),
             "test-host".to_string(),
         ));
-        let api_handler = Arc::new(ApiHandler::new(log_reader, Arc::new(DashboardConfig::default())));
+        let api_handler = Arc::new(ApiHandler::new(
+            log_reader,
+            Arc::new(DashboardConfig::default()),
+        ));
         let response = api_handler.get_cache_stats().await;
 
         match response {
@@ -426,7 +429,7 @@ fn prop_system_information_display(uptime_hours: u16, hostname_suffix: u8) -> Te
 
         let has_hostname = !system_info.hostname.is_empty();
         let has_version = !system_info.version.is_empty();
-        let hostname_valid = system_info.hostname.len() > 0 && system_info.hostname.len() < 256;
+        let hostname_valid = !system_info.hostname.is_empty() && system_info.hostname.len() < 256;
         let version_valid = system_info.version.contains('.') && !system_info.version.is_empty();
         let status_valid = matches!(
             system_info.status.as_str(),

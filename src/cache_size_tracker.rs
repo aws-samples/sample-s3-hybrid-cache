@@ -145,7 +145,7 @@ pub struct ValidationMetadata {
 /// Defaults to cursor 0 with no scan rate when the file is missing or corrupted.
 ///
 /// See: Requirement 5 (Rolling Cursor Persistence)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RollingState {
     /// Next L1 directory index to process (0–255, wraps cyclically).
     pub cursor: u8,
@@ -161,18 +161,6 @@ pub struct RollingState {
     /// Duration of the last full scan in seconds, used by [`determine_scan_mode`]
     /// to decide whether to switch from full to rolling mode.
     pub last_full_scan_duration_secs: Option<f64>,
-}
-
-impl Default for RollingState {
-    fn default() -> Self {
-        Self {
-            cursor: 0,
-            scan_rate: None,
-            full_rotation_count: 0,
-            rotation_start_time: None,
-            last_full_scan_duration_secs: None,
-        }
-    }
 }
 
 /// Per-cycle statistics for a rolling scan, written alongside [`RollingState`]
@@ -353,14 +341,12 @@ pub fn determine_scan_mode(
 
     match prev_validation_type {
         None => (ScanMode::Full, ScanModeReason::NoHistory),
-        Some("full") => {
-            match last_full_scan_duration_secs {
-                Some(dur) if dur > budget_secs => {
-                    (ScanMode::Rolling, ScanModeReason::FullExceededBudget)
-                }
-                _ => (ScanMode::Full, ScanModeReason::FullWithinBudget),
+        Some("full") => match last_full_scan_duration_secs {
+            Some(dur) if dur > budget_secs => {
+                (ScanMode::Rolling, ScanModeReason::FullExceededBudget)
             }
-        }
+            _ => (ScanMode::Full, ScanModeReason::FullWithinBudget),
+        },
         Some("rolling") => {
             // Extrapolate: (elapsed / dirs_scanned) * 256
             match (rolling_cycle_duration_secs, rolling_dirs_scanned) {
@@ -482,7 +468,12 @@ impl CacheSizeTracker {
 
     /// Forward scan results to the consolidator to reconcile size_state.json.
     /// Called on cold startup after a real metadata scan completes.
-    pub async fn update_size_from_scan(&self, total_size: u64, write_cache_size: u64, cached_objects: u64) {
+    pub async fn update_size_from_scan(
+        &self,
+        total_size: u64,
+        write_cache_size: u64,
+        cached_objects: u64,
+    ) {
         self.consolidator
             .update_size_from_validation(total_size, Some(write_cache_size), Some(cached_objects))
             .await;
@@ -587,6 +578,7 @@ impl CacheSizeTracker {
     }
 
     /// Write validation metadata
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_validation_metadata(
         &self,
         scanned_size: u64,
@@ -616,6 +608,7 @@ impl CacheSizeTracker {
 
     /// Write validation metadata with write cache information
     /// Requirement 6.3: Track write cache size separately
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_validation_metadata_with_write_cache(
         &self,
         scanned_size: u64,
@@ -698,9 +691,7 @@ impl CacheSizeTracker {
             .map(|v| v.min(255) as u8)
             .unwrap_or(0);
 
-        let scan_rate = json
-            .get("rolling_scan_rate")
-            .and_then(|v| v.as_f64());
+        let scan_rate = json.get("rolling_scan_rate").and_then(|v| v.as_f64());
 
         let full_rotation_count = json
             .get("rolling_full_rotation_count")
@@ -832,7 +823,7 @@ impl CacheSizeTracker {
             // Skip internal directories (e.g., _journals)
             if bucket_path
                 .file_name()
-                .map_or(false, |n| n.to_str().map_or(false, |s| s.starts_with('_')))
+                .is_some_and(|n| n.to_str().is_some_and(|s| s.starts_with('_')))
             {
                 continue;
             }
@@ -1025,7 +1016,7 @@ impl CacheSizeTracker {
 
         // If target time has already passed today, schedule for tomorrow
         if next_time <= now {
-            next_time = next_time + ChronoDuration::days(1);
+            next_time += ChronoDuration::days(1);
         }
 
         // Check if validation already ran in the last 23 hours (leave 1 hour buffer for jitter)
@@ -1240,9 +1231,16 @@ impl CacheSizeTracker {
         };
 
         PreviousScanState {
-            validation_type: json.get("validation_type").and_then(|v| v.as_str()).map(String::from),
-            last_full_scan_duration_secs: json.get("last_full_scan_duration_secs").and_then(|v| v.as_f64()),
-            rolling_cycle_duration_secs: json.get("rolling_cycle_duration_secs").and_then(|v| v.as_f64()),
+            validation_type: json
+                .get("validation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            last_full_scan_duration_secs: json
+                .get("last_full_scan_duration_secs")
+                .and_then(|v| v.as_f64()),
+            rolling_cycle_duration_secs: json
+                .get("rolling_cycle_duration_secs")
+                .and_then(|v| v.as_f64()),
             rolling_dirs_scanned: json.get("rolling_dirs_scanned").and_then(|v| v.as_u64()),
         }
     }
@@ -1307,7 +1305,8 @@ impl CacheSizeTracker {
         .await?;
 
         // Persist last_full_scan_duration_secs for mode selection on next cycle
-        self.persist_full_scan_duration(duration.as_secs_f64()).await?;
+        self.persist_full_scan_duration(duration.as_secs_f64())
+            .await?;
 
         // 8.2: Warn if full scan exceeded the time budget
         let max_duration = self.config.validation_max_duration;
@@ -1330,10 +1329,14 @@ impl CacheSizeTracker {
             Err(_) => "{}".to_string(),
         };
 
-        let mut json: serde_json::Value = serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
 
         if let Some(obj) = json.as_object_mut() {
-            obj.insert("last_full_scan_duration_secs".to_string(), serde_json::json!(duration_secs));
+            obj.insert(
+                "last_full_scan_duration_secs".to_string(),
+                serde_json::json!(duration_secs),
+            );
             obj.insert("validation_type".to_string(), serde_json::json!("full"));
         }
 
@@ -1346,9 +1349,11 @@ impl CacheSizeTracker {
         tokio::fs::write(&temp_path, &updated).await.map_err(|e| {
             ProxyError::CacheError(format!("Failed to write validation temp file: {}", e))
         })?;
-        tokio::fs::rename(&temp_path, &self.validation_path).await.map_err(|e| {
-            ProxyError::CacheError(format!("Failed to rename validation temp file: {}", e))
-        })?;
+        tokio::fs::rename(&temp_path, &self.validation_path)
+            .await
+            .map_err(|e| {
+                ProxyError::CacheError(format!("Failed to rename validation temp file: {}", e))
+            })?;
 
         Ok(())
     }
@@ -1451,7 +1456,7 @@ impl CacheSizeTracker {
                     };
                     for file_entry in file_entries.flatten() {
                         let path = file_entry.path();
-                        if !path.extension().map_or(false, |ext| ext == "meta") {
+                        if path.extension().is_none_or(|ext| ext != "meta") {
                             continue;
                         }
                         let result = self.scan_metadata_file(&path, now_systime);
@@ -1589,7 +1594,10 @@ impl CacheSizeTracker {
             scan_rate,
             new_cursor,
             if let Some(ext) = extrapolated_full_secs {
-                format!(", extrapolated_full_scan={}", format_duration_human(Duration::from_secs_f64(ext)))
+                format!(
+                    ", extrapolated_full_scan={}",
+                    format_duration_human(Duration::from_secs_f64(ext))
+                )
             } else {
                 String::new()
             }
@@ -1613,6 +1621,7 @@ impl CacheSizeTracker {
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&self.validation_lock_path)
             .map_err(|e| {
                 ProxyError::CacheError(format!("Failed to open validation lock file: {}", e))
@@ -1659,11 +1668,14 @@ impl CacheSizeTracker {
         if let Ok(bucket_entries) = std::fs::read_dir(&metadata_dir) {
             for bucket_entry in bucket_entries.flatten() {
                 let bucket_path = bucket_entry.path();
-                if !bucket_path.is_dir() { continue; }
+                if !bucket_path.is_dir() {
+                    continue;
+                }
                 // Skip _journals and other internal directories
-                if bucket_path.file_name().map_or(false, |n| {
-                    n.to_str().map_or(false, |s| s.starts_with('_'))
-                }) {
+                if bucket_path
+                    .file_name()
+                    .is_some_and(|n| n.to_str().is_some_and(|s| s.starts_with('_')))
+                {
                     continue;
                 }
                 if let Ok(l1_entries) = std::fs::read_dir(&bucket_path) {
@@ -1691,14 +1703,16 @@ impl CacheSizeTracker {
             };
             for l2_entry in l2_entries.flatten() {
                 let l2_path = l2_entry.path();
-                if !l2_path.is_dir() { continue; }
+                if !l2_path.is_dir() {
+                    continue;
+                }
                 let file_entries = match std::fs::read_dir(&l2_path) {
                     Ok(entries) => entries,
                     Err(_) => continue,
                 };
                 for file_entry in file_entries.flatten() {
                     let path = file_entry.path();
-                    if !path.extension().map_or(false, |ext| ext == "meta") {
+                    if path.extension().is_none_or(|ext| ext != "meta") {
                         continue;
                     }
                     let result = self.scan_metadata_file(&path, now);
@@ -1713,7 +1727,7 @@ impl CacheSizeTracker {
                         cache_errors.fetch_add(1, Ordering::Relaxed);
                     }
                     let count = files_processed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100_000 == 0 {
+                    if count.is_multiple_of(100_000) {
                         info!("Cache validation progress: {} files processed", count);
                     }
                 }
@@ -2123,7 +2137,7 @@ mod tests {
         assert_eq!(metadata.cache_entries_expired, 5);
         assert_eq!(metadata.cache_entries_skipped, 1);
         assert_eq!(metadata.cache_expiration_errors, 0);
-        assert_eq!(metadata.active_expiration_enabled, false);
+        assert!(!metadata.active_expiration_enabled);
     }
 
     #[tokio::test]
@@ -2178,13 +2192,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(tracker_disabled.actively_remove_cached_data, false);
+        assert!(!tracker_disabled.actively_remove_cached_data);
 
         // Create tracker with flag enabled
         let tracker_enabled = CacheSizeTracker::new(cache_dir, config, true, consolidator)
             .await
             .unwrap();
-        assert_eq!(tracker_enabled.actively_remove_cached_data, true);
+        assert!(tracker_enabled.actively_remove_cached_data);
     }
 
     #[tokio::test]
@@ -2492,13 +2506,8 @@ mod tests {
     #[test]
     fn test_mode_selection_no_history() {
         // No previous scan history → Full
-        let (mode, _reason) = determine_scan_mode(
-            None,
-            None,
-            None,
-            None,
-            Duration::from_secs(4 * 3600),
-        );
+        let (mode, _reason) =
+            determine_scan_mode(None, None, None, None, Duration::from_secs(4 * 3600));
         assert_eq!(mode, ScanMode::Full);
     }
 
@@ -2631,10 +2640,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let actual = rt.block_on(async {
             let (tracker, _consolidator, _temp_dir) = create_test_tracker().await;
-            tracker.estimate_batch_size(
-                Some(scan_rate),
-                Duration::from_secs(budget_secs_raw as u64),
-            )
+            tracker
+                .estimate_batch_size(Some(scan_rate), Duration::from_secs(budget_secs_raw as u64))
         });
 
         TestResult::from_bool(actual == expected)
@@ -2727,7 +2734,10 @@ mod tests {
 
         // Exactly at boundary: cursor=253, count=3 → 253,254,255 → no wrap
         let (_dirs, wraps) = tracker.select_l1_directories(&metadata_dir, 253, 3);
-        assert!(!wraps, "cursor=253, count=3 should not wrap (253+3=256, not >256)");
+        assert!(
+            !wraps,
+            "cursor=253, count=3 should not wrap (253+3=256, not >256)"
+        );
 
         // One past boundary: cursor=254, count=3 → 254,255,0 → wraps
         let (_dirs, wraps) = tracker.select_l1_directories(&metadata_dir, 254, 3);
@@ -2762,7 +2772,10 @@ mod tests {
     ///
     /// **Validates: Requirements 3.1**
     #[quickcheck]
-    fn prop_sequential_directory_selection_cyclic_wrapping(cursor: u8, count_raw: u16) -> TestResult {
+    fn prop_sequential_directory_selection_cyclic_wrapping(
+        cursor: u8,
+        count_raw: u16,
+    ) -> TestResult {
         // count must be in [1, 256]
         let count = (count_raw % 256) as usize + 1; // maps to [1, 256]
 
@@ -2847,13 +2860,7 @@ mod tests {
                 (m, r)
             }
             Some("full") => {
-                let (m, r) = determine_scan_mode(
-                    Some("full"),
-                    Some(dur),
-                    None,
-                    None,
-                    budget,
-                );
+                let (m, r) = determine_scan_mode(Some("full"), Some(dur), None, None, budget);
                 // Full exceeded budget → Rolling; within budget → Full
                 let expected = if dur > budget_f64 {
                     ScanMode::Rolling
@@ -2866,13 +2873,8 @@ mod tests {
                 (m, r)
             }
             Some("rolling") => {
-                let (m, r) = determine_scan_mode(
-                    Some("rolling"),
-                    None,
-                    Some(dur),
-                    Some(dirs),
-                    budget,
-                );
+                let (m, r) =
+                    determine_scan_mode(Some("rolling"), None, Some(dur), Some(dirs), budget);
                 // Extrapolated = (dur / dirs) * 256
                 let extrapolated = (dur / dirs as f64) * 256.0;
                 let expected = if extrapolated > budget_f64 {
@@ -2905,7 +2907,10 @@ mod tests {
         let (corrected_size, corrected_objects) =
             tracker.apply_proportional_correction(6400, 640, 64, 25600, 2560);
         assert_eq!(corrected_size, 25600, "No-drift: size should be unchanged");
-        assert_eq!(corrected_objects, 2560, "No-drift: objects should be unchanged");
+        assert_eq!(
+            corrected_objects, 2560,
+            "No-drift: objects should be unchanged"
+        );
     }
 
     #[tokio::test]
@@ -2916,8 +2921,14 @@ mod tests {
         // scanned=7400 → discrepancy=+1000 → corrected=26600
         let (corrected_size, corrected_objects) =
             tracker.apply_proportional_correction(7400, 740, 64, 25600, 2560);
-        assert_eq!(corrected_size, 26600, "Positive drift should increase total");
-        assert!(corrected_objects > 2560, "Positive drift should increase objects");
+        assert_eq!(
+            corrected_size, 26600,
+            "Positive drift should increase total"
+        );
+        assert!(
+            corrected_objects > 2560,
+            "Positive drift should increase objects"
+        );
     }
 
     #[tokio::test]
@@ -2928,8 +2939,14 @@ mod tests {
         // scanned=5400 → discrepancy=-1000 → corrected=24600
         let (corrected_size, corrected_objects) =
             tracker.apply_proportional_correction(5400, 540, 64, 25600, 2560);
-        assert_eq!(corrected_size, 24600, "Negative drift should decrease total");
-        assert!(corrected_objects < 2560, "Negative drift should decrease objects");
+        assert_eq!(
+            corrected_size, 24600,
+            "Negative drift should decrease total"
+        );
+        assert!(
+            corrected_objects < 2560,
+            "Negative drift should decrease objects"
+        );
     }
 
     #[tokio::test]
@@ -2955,9 +2972,11 @@ mod tests {
         // To truly go negative: tracked=50, dirs_scanned=256 → expected=50
         // scanned=0 → discrepancy=-50 → corrected=0
         // tracked=50, dirs_scanned=256, scanned=0 → corrected = 50 + (0 - 50) = 0
-        let (corrected_size, _) =
-            tracker.apply_proportional_correction(0, 0, 256, 50, 5);
-        assert_eq!(corrected_size, 0, "Should clamp to 0 when scanned is 0 for full range");
+        let (corrected_size, _) = tracker.apply_proportional_correction(0, 0, 256, 50, 5);
+        assert_eq!(
+            corrected_size, 0,
+            "Should clamp to 0 when scanned is 0 for full range"
+        );
 
         // Case where discrepancy would make it negative:
         // tracked=100, dirs_scanned=256 → expected=100
@@ -2967,8 +2986,7 @@ mod tests {
         // To go truly negative: need scanned << expected by more than tracked
         // tracked=10, dirs_scanned=256 → expected=10
         // scanned=0 → corrected = max(0, 10-10) = 0
-        let (corrected_size, _) =
-            tracker.apply_proportional_correction(0, 0, 256, 10, 1);
+        let (corrected_size, _) = tracker.apply_proportional_correction(0, 0, 256, 10, 1);
         assert_eq!(corrected_size, 0, "Should clamp to 0");
     }
 
@@ -3002,13 +3020,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async {
             let (tracker, _consolidator, _temp_dir) = create_test_tracker().await;
-            let (corrected_size, _) = tracker.apply_proportional_correction(
-                scanned_size,
-                0,
-                dirs_scanned,
-                tracked,
-                0,
-            );
+            let (corrected_size, _) =
+                tracker.apply_proportional_correction(scanned_size, 0, dirs_scanned, tracked, 0);
             corrected_size
         });
 
@@ -3040,13 +3053,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let actual = rt.block_on(async {
             let (tracker, _consolidator, _temp_dir) = create_test_tracker().await;
-            let (corrected_size, _) = tracker.apply_proportional_correction(
-                scanned,
-                0,
-                dirs_scanned,
-                tracked,
-                0,
-            );
+            let (corrected_size, _) =
+                tracker.apply_proportional_correction(scanned, 0, dirs_scanned, tracked, 0);
             corrected_size
         });
 
@@ -3101,14 +3109,18 @@ mod tests {
         let (tracker, _consolidator, _temp_dir) = create_test_tracker().await;
 
         let duration_secs = 3600.5;
-        tracker.persist_full_scan_duration(duration_secs).await.unwrap();
+        tracker
+            .persist_full_scan_duration(duration_secs)
+            .await
+            .unwrap();
 
         // Read validation.json and verify the field
         let content = std::fs::read_to_string(&tracker.validation_path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
 
         assert_eq!(
-            json.get("last_full_scan_duration_secs").and_then(|v| v.as_f64()),
+            json.get("last_full_scan_duration_secs")
+                .and_then(|v| v.as_f64()),
             Some(3600.5),
             "last_full_scan_duration_secs should be persisted"
         );
@@ -3126,7 +3138,10 @@ mod tests {
         let (tracker, _consolidator, _temp_dir) = create_test_tracker().await;
 
         let duration_secs = 14520.3;
-        tracker.persist_full_scan_duration(duration_secs).await.unwrap();
+        tracker
+            .persist_full_scan_duration(duration_secs)
+            .await
+            .unwrap();
 
         let state = tracker.read_rolling_state().unwrap();
         assert_eq!(
@@ -3146,8 +3161,7 @@ mod tests {
             validation_max_duration: short_budget,
             ..CacheSizeConfig::default()
         };
-        let (tracker, _consolidator, _temp_dir) =
-            create_test_tracker_with_config(config).await;
+        let (tracker, _consolidator, _temp_dir) = create_test_tracker_with_config(config).await;
 
         // Simulate: a full scan took 10 seconds (well above 1ms budget)
         let simulated_duration = Duration::from_secs(10);
@@ -3170,8 +3184,7 @@ mod tests {
             validation_max_duration: Duration::from_secs(4 * 3600), // 4 hours
             ..CacheSizeConfig::default()
         };
-        let (tracker, _consolidator, _temp_dir) =
-            create_test_tracker_with_config(config).await;
+        let (tracker, _consolidator, _temp_dir) = create_test_tracker_with_config(config).await;
 
         let simulated_duration = Duration::from_secs(3600); // 1 hour
         let max_duration = tracker.config.validation_max_duration;
@@ -3189,11 +3202,7 @@ mod tests {
 
         // Write initial validation metadata
         tracker
-            .write_validation_metadata(
-                500000, 500000, 0,
-                Duration::from_secs(60),
-                1000, 0, 0, 0,
-            )
+            .write_validation_metadata(500000, 500000, 0, Duration::from_secs(60), 1000, 0, 0, 0)
             .await
             .unwrap();
 
@@ -3205,7 +3214,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
 
         assert_eq!(
-            json.get("last_full_scan_duration_secs").and_then(|v| v.as_f64()),
+            json.get("last_full_scan_duration_secs")
+                .and_then(|v| v.as_f64()),
             Some(7200.0),
         );
         assert_eq!(

@@ -5,8 +5,8 @@
 
 use crate::{ProxyError, Result};
 use lz4_flex::frame::{BlockMode, FrameDecoder, FrameEncoder, FrameInfo};
-use std::io::{Read, Write};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use tracing::{debug, error, warn};
 
 /// Compression statistics for monitoring
@@ -38,20 +38,15 @@ impl Default for CompressionStats {
 }
 
 /// Compression algorithm identifier
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum CompressionAlgorithm {
-    Lz4,  // LZ4 compression (frame format with content checksum)
+    #[default]
+    Lz4, // LZ4 compression (frame format with content checksum)
     None, // No compression (data stored as-is, used when per-bucket compression is disabled)
           // Future algorithms can be added here:
           // Zstd,     // Zstandard compression
           // Brotli,   // Brotli compression
           // Lz4Hc,    // LZ4 High Compression
-}
-
-impl Default for CompressionAlgorithm {
-    fn default() -> Self {
-        CompressionAlgorithm::Lz4
-    }
 }
 
 /// Compression result with metadata
@@ -133,12 +128,12 @@ impl CompressionHandler {
         frame_info.block_mode = BlockMode::Independent;
         let mut output = Vec::new();
         let mut encoder = FrameEncoder::with_frame_info(frame_info, &mut output);
-        encoder.write_all(data).map_err(|e| {
-            ProxyError::CompressionError(format!("LZ4 frame encode failed: {}", e))
-        })?;
-        encoder.finish().map_err(|e| {
-            ProxyError::CompressionError(format!("LZ4 frame finish failed: {}", e))
-        })?;
+        encoder
+            .write_all(data)
+            .map_err(|e| ProxyError::CompressionError(format!("LZ4 frame encode failed: {}", e)))?;
+        encoder
+            .finish()
+            .map_err(|e| ProxyError::CompressionError(format!("LZ4 frame finish failed: {}", e)))?;
         Ok(output)
     }
 
@@ -161,7 +156,7 @@ impl CompressionHandler {
 
     /// Extract file extension from a path or S3 key
     fn extract_file_extension(path: &str) -> String {
-        if let Some(last_segment) = path.split('/').last() {
+        if let Some(last_segment) = path.split('/').next_back() {
             if let Some(dot_pos) = last_segment.rfind('.') {
                 return last_segment[dot_pos + 1..].to_lowercase();
             }
@@ -232,7 +227,10 @@ impl CompressionHandler {
         let mut output = Vec::new();
         let mut encoder = FrameEncoder::with_frame_info(frame_info, &mut output);
         encoder.write_all(data).map_err(|e| {
-            ProxyError::CompressionError(format!("Failed to write data to LZ4 frame encoder: {}", e))
+            ProxyError::CompressionError(format!(
+                "Failed to write data to LZ4 frame encoder: {}",
+                e
+            ))
         })?;
         encoder.finish().map_err(|e| {
             ProxyError::CompressionError(format!("Failed to finish LZ4 frame encoding: {}", e))
@@ -260,7 +258,10 @@ impl CompressionHandler {
         let mut output = Vec::new();
         let mut encoder = FrameEncoder::with_frame_info(frame_info, &mut output);
         encoder.write_all(data).map_err(|e| {
-            ProxyError::CompressionError(format!("Failed to write data to LZ4 frame encoder: {}", e))
+            ProxyError::CompressionError(format!(
+                "Failed to write data to LZ4 frame encoder: {}",
+                e
+            ))
         })?;
         encoder.finish().map_err(|e| {
             ProxyError::CompressionError(format!("Failed to finish LZ4 frame encoding: {}", e))
@@ -351,10 +352,7 @@ impl CompressionHandler {
                 (compressed_data, true)
             }
             Err(e) => {
-                warn!(
-                    "Compression failed for {}, wrapping in frame: {}",
-                    path, e
-                );
+                warn!("Compression failed for {}, wrapping in frame: {}", path, e);
                 self.stats.compression_failures += 1;
                 self.stats.total_objects_uncompressed += 1;
                 // Wrap in frame even on failure for integrity
@@ -381,10 +379,7 @@ impl CompressionHandler {
         match self.compress_with_algorithm(data, algorithm) {
             Ok(result) => result,
             Err(e) => {
-                warn!(
-                    "Compression failed for {}, wrapping in frame: {}",
-                    path, e
-                );
+                warn!("Compression failed for {}, wrapping in frame: {}", path, e);
                 self.stats.compression_failures += 1;
 
                 // Even on failure, wrap in frame format for integrity
@@ -535,8 +530,7 @@ impl CompressionHandler {
                     compressed_size: original_size,
                     was_compressed: false,
                 });
-            }
-            // Future algorithms would be handled here
+            } // Future algorithms would be handled here
         };
 
         let compressed_size = compressed_data.len() as u64;
@@ -633,7 +627,7 @@ mod tests {
         assert!(!handler.should_compress(small_data.len()));
 
         // Large data should be compressed
-        let large_data = vec![b'x'; 200];
+        let large_data = [b'x'; 200];
         assert!(handler.should_compress(large_data.len()));
     }
 
@@ -642,7 +636,7 @@ mod tests {
         let handler = CompressionHandler::new(10, false);
 
         // Even large data should not be compressed when disabled
-        let large_data = vec![b'x'; 200];
+        let large_data = [b'x'; 200];
         assert!(!handler.should_compress(large_data.len()));
     }
 
@@ -786,7 +780,7 @@ mod tests {
     #[test]
     fn test_content_aware_compression() {
         let handler = CompressionHandler::new(10, true);
-        let test_data = vec![b'A'; 100]; // Repeating data that compresses well
+        let test_data = [b'A'; 100]; // Repeating data that compresses well
 
         // Text file should be compressed
         assert!(handler.should_compress_content("file.txt", test_data.len()));
@@ -803,7 +797,7 @@ mod tests {
     #[test]
     fn test_content_aware_compression_with_paths() {
         let handler = CompressionHandler::new(10, true);
-        let test_data = vec![b'A'; 100];
+        let test_data = [b'A'; 100];
 
         // Test with S3-style paths
         assert!(handler.should_compress_content("bucket/folder/data.txt", test_data.len()));
@@ -818,7 +812,7 @@ mod tests {
     #[test]
     fn test_content_aware_compression_disabled() {
         let handler = CompressionHandler::new_with_content_aware(10, true, false);
-        let test_data = vec![b'A'; 100];
+        let test_data = [b'A'; 100];
 
         // When content-aware is disabled, should compress based on size only
         assert!(handler.should_compress_content("image.jpg", test_data.len()));
@@ -842,7 +836,7 @@ mod tests {
             handler.compress_data_content_aware_with_fallback(test_data, "image.jpg");
         assert!(was_compressed_jpg); // always true: data is in LZ4 frame format
         assert_ne!(compressed_jpg, test_data); // frame-wrapped, not raw
-        // Round-trip: decompress should recover original data
+                                               // Round-trip: decompress should recover original data
         let decompressed = handler.decompress_data(&compressed_jpg).unwrap();
         assert_eq!(decompressed, test_data);
     }
@@ -940,7 +934,11 @@ mod tests {
         assert!(result.is_err());
         match result {
             Err(ProxyError::CompressionError(msg)) => {
-                assert!(msg.contains("Failed to decompress"), "Unexpected error message: {}", msg);
+                assert!(
+                    msg.contains("Failed to decompress"),
+                    "Unexpected error message: {}",
+                    msg
+                );
             }
             other => panic!("Expected ProxyError::CompressionError, got: {:?}", other),
         }
@@ -964,7 +962,10 @@ mod tests {
         }
 
         let result = handler.decompress_data(&compressed);
-        assert!(result.is_err(), "Decompression of corrupted frame data should fail");
+        assert!(
+            result.is_err(),
+            "Decompression of corrupted frame data should fail"
+        );
     }
 
     #[test]

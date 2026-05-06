@@ -82,7 +82,7 @@ pub struct AccessLogBuffer {
 }
 
 /// Result of flushing the access log buffer to disk
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AccessLogFlushResult {
     /// Number of entries that were flushed
     pub entries_flushed: usize,
@@ -90,16 +90,6 @@ pub struct AccessLogFlushResult {
     pub skipped: bool,
     /// Whether the flush was skipped because another flush is in progress
     pub already_in_progress: bool,
-}
-
-impl Default for AccessLogFlushResult {
-    fn default() -> Self {
-        Self {
-            entries_flushed: 0,
-            skipped: false,
-            already_in_progress: false,
-        }
-    }
 }
 
 /// Result of a log cleanup cycle
@@ -392,7 +382,11 @@ impl AccessLogBuffer {
                 created_at: now,
             });
 
-            debug!("Created new log file {:?} with {} entries", log_file_path, entries.len());
+            debug!(
+                "Created new log file {:?} with {} entries",
+                log_file_path,
+                entries.len()
+            );
         }
 
         Ok(())
@@ -608,8 +602,9 @@ impl LoggerManager {
 
         // Try to set global subscriber, but don't fail if already set (for tests)
         // Use config log_level, but allow RUST_LOG env var to override
-        let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&format!("{},trust_dns_proto=error", self.config.log_level)));
+        let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(format!("{},hickory_proto=error", self.config.log_level))
+        });
 
         let result = tracing_subscriber::registry()
             .with(env_filter)
@@ -635,7 +630,11 @@ impl LoggerManager {
     }
 
     /// Perform log rotation and cleanup
-    pub fn rotate_logs(&self, access_log_retention_days: u32, app_log_retention_days: u32) -> Result<LogCleanupResult> {
+    pub fn rotate_logs(
+        &self,
+        access_log_retention_days: u32,
+        app_log_retention_days: u32,
+    ) -> Result<LogCleanupResult> {
         let mut result = LogCleanupResult::default();
         let host_log_dir = self.config.app_log_dir.join(&self.config.hostname);
 
@@ -695,12 +694,18 @@ impl LoggerManager {
         let mut errors = 0u32;
 
         // Walk through the date-partitioned directory structure
-        self.cleanup_directory_recursive(&self.config.access_log_dir, cutoff_time, &mut deleted, &mut errors)?;
+        self.cleanup_directory_recursive(
+            &self.config.access_log_dir,
+            cutoff_time,
+            &mut deleted,
+            &mut errors,
+        )?;
 
         Ok((deleted, errors))
     }
 
     /// Recursively clean up directories and files older than cutoff time
+    #[allow(clippy::only_used_in_recursion)]
     fn cleanup_directory_recursive(
         &self,
         dir: &PathBuf,
@@ -777,6 +782,7 @@ impl LoggerManager {
     }
 
     /// Create an access log entry from HTTP request/response data
+    #[allow(clippy::too_many_arguments)]
     pub fn create_access_log_entry(
         &self,
         method: &str,
@@ -1335,7 +1341,10 @@ mod tests {
 
         // current_file should now be set
         let current = buffer.current_file.read().await;
-        assert!(current.is_some(), "current_file should be set after first flush");
+        assert!(
+            current.is_some(),
+            "current_file should be set after first flush"
+        );
         let cf = current.as_ref().unwrap();
         assert!(cf.path.exists(), "created file should exist on disk");
         assert_eq!(cf.date_key, Utc::now().format("%Y/%m/%d").to_string());
@@ -1369,15 +1378,32 @@ mod tests {
         buffer.log(entry1).await.unwrap();
         buffer.force_flush().await.unwrap();
 
-        let first_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+        let first_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
 
         // Second flush — should append to the same file (within rotation window)
         let entry2 = create_test_entry("test-bucket", "key-2");
         buffer.log(entry2).await.unwrap();
         buffer.force_flush().await.unwrap();
 
-        let second_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
-        assert_eq!(first_path, second_path, "Should reuse the same file within rotation window");
+        let second_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert_eq!(
+            first_path, second_path,
+            "Should reuse the same file within rotation window"
+        );
 
         // Only one file should exist
         let date_path = Utc::now().format("%Y/%m/%d").to_string();
@@ -1386,7 +1412,11 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_file())
             .collect();
-        assert_eq!(files.len(), 1, "Should have exactly 1 file (appended, not rotated)");
+        assert_eq!(
+            files.len(),
+            1,
+            "Should have exactly 1 file (appended, not rotated)"
+        );
 
         // File should contain both entries (2 lines)
         let content = std::fs::read_to_string(&first_path).unwrap();
@@ -1413,7 +1443,14 @@ mod tests {
         buffer.log(entry1).await.unwrap();
         buffer.force_flush().await.unwrap();
 
-        let first_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+        let first_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
 
         // Sleep past the rotation interval AND past the 1-second timestamp boundary
         // so the new file gets a distinct name (filenames use second-level precision)
@@ -1424,8 +1461,18 @@ mod tests {
         buffer.log(entry2).await.unwrap();
         buffer.force_flush().await.unwrap();
 
-        let second_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
-        assert_ne!(first_path, second_path, "Should create a new file after rotation window expires");
+        let second_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert_ne!(
+            first_path, second_path,
+            "Should create a new file after rotation window expires"
+        );
 
         // Two files should exist
         let date_path = Utc::now().format("%Y/%m/%d").to_string();
@@ -1439,7 +1486,11 @@ mod tests {
         // Each file should have exactly 1 entry
         for file in &files {
             let content = std::fs::read_to_string(file.path()).unwrap();
-            assert_eq!(content.lines().count(), 1, "Each rotated file should have 1 entry");
+            assert_eq!(
+                content.lines().count(),
+                1,
+                "Each rotated file should have 1 entry"
+            );
         }
     }
 
@@ -1465,11 +1516,22 @@ mod tests {
         buffer.log(entry1).await.unwrap();
         buffer.force_flush().await.unwrap();
 
-        let first_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+        let first_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
 
         // Verify the file has 1 entry
         let content_before = std::fs::read_to_string(&first_path).unwrap();
-        assert_eq!(content_before.lines().count(), 1, "First file should have 1 entry");
+        assert_eq!(
+            content_before.lines().count(),
+            1,
+            "First file should have 1 entry"
+        );
 
         // Manually override current_file's date_key to simulate a date partition mismatch.
         // This mimics what happens at midnight when the date rolls over: the current_file
@@ -1487,7 +1549,14 @@ mod tests {
         buffer.log(entry2).await.unwrap();
         buffer.force_flush().await.unwrap();
 
-        let second_path = buffer.current_file.read().await.as_ref().unwrap().path.clone();
+        let second_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
 
         // current_file should now point to today's date
         let current = buffer.current_file.read().await;
@@ -1503,14 +1572,16 @@ mod tests {
         // have exactly 1 entry (it was not appended to).
         let content_after = std::fs::read_to_string(&first_path).unwrap();
         assert_eq!(
-            content_after.lines().count(), 1,
+            content_after.lines().count(),
+            1,
             "Original file should still have 1 entry (not appended to after date change)"
         );
 
         // The new file should have exactly 1 entry
         let new_content = std::fs::read_to_string(&second_path).unwrap();
         assert_eq!(
-            new_content.lines().count(), 1,
+            new_content.lines().count(),
+            1,
             "New file created after date partition change should have 1 entry"
         );
     }
@@ -1529,7 +1600,7 @@ mod tests {
     // interval has elapsed since the current file's creation should create a new file.
     #[tokio::test]
     async fn prop_file_rotation_window_consolidation() {
-        use quickcheck::{Gen, Arbitrary};
+        use quickcheck::{Arbitrary, Gen};
 
         // Run multiple random iterations to get property-based coverage.
         // Each iteration sleeps ~1.2s between batches, so we limit iterations
@@ -1586,7 +1657,10 @@ mod tests {
                         total_entries += 1;
                     }
                     let result = buffer.force_flush().await.unwrap();
-                    assert!(!result.skipped, "Flush should not be skipped when entries exist");
+                    assert!(
+                        !result.skipped,
+                        "Flush should not be skipped when entries exist"
+                    );
                 }
             }
 
@@ -1688,10 +1762,7 @@ mod log_lifecycle_property_tests {
             let path = host_app_dir.join(format!("s3-proxy.log.{}", i));
             std::fs::write(&path, format!("app log content {}", i)).unwrap();
 
-            let mtime_secs = now
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
+            let mtime_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
                 - (age_days as i64 * 86400);
             set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
 
@@ -1709,10 +1780,7 @@ mod log_lifecycle_property_tests {
             let path = other_host_dir.join(format!("s3-proxy.log.{}", i));
             std::fs::write(&path, format!("other host log {}", i)).unwrap();
 
-            let mtime_secs = now
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
+            let mtime_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
                 - (age_days as i64 * 86400);
             set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
         }
@@ -1725,10 +1793,7 @@ mod log_lifecycle_property_tests {
             let path = access_date_dir.join(format!("2024-01-15-00-00-00-access-{}", i));
             std::fs::write(&path, format!("access log content {}", i)).unwrap();
 
-            let mtime_secs = now
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
+            let mtime_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
                 - (age_days as i64 * 86400);
             set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
 
@@ -1865,17 +1930,16 @@ mod log_lifecycle_property_tests {
         std::fs::create_dir_all(&host_app_dir).unwrap();
 
         let now = std::time::SystemTime::now();
-        let now_secs = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
         // Track which (year, month, day) partitions should survive
         // A partition survives if it has at least one non-expired file
-        let mut surviving_day_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut surviving_day_dirs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Deduplicate partitions by (month, day) to avoid conflicts
-        let mut seen_partitions: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+        let mut seen_partitions: std::collections::HashSet<(u8, u8)> =
+            std::collections::HashSet::new();
 
         let year = "2024";
         for &(month_raw, day_raw, file_count_raw, all_expired) in &partitions_raw {
@@ -1893,7 +1957,8 @@ mod log_lifecycle_property_tests {
             std::fs::create_dir_all(&date_dir).unwrap();
 
             for i in 0..file_count {
-                let path = date_dir.join(format!("2024-{:02}-{:02}-00-00-00-file-{}", month, day, i));
+                let path =
+                    date_dir.join(format!("2024-{:02}-{:02}-00-00-00-file-{}", month, day, i));
                 std::fs::write(&path, format!("access log content {}", i)).unwrap();
 
                 let mtime_secs = if all_expired {
@@ -2029,10 +2094,7 @@ mod log_lifecycle_property_tests {
         std::fs::create_dir_all(&host_app_dir).unwrap();
 
         let now = std::time::SystemTime::now();
-        let now_secs = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
         // All files are expired (well beyond any retention period)
         let expired_mtime_secs = now_secs - (400 * 86400); // 400 days ago
@@ -2099,7 +2161,12 @@ mod log_lifecycle_property_tests {
         // Assert: all deletable expired files were removed
         let remaining_writable: Vec<_> = std::fs::read_dir(&writable_dir)
             .ok()
-            .map(|entries| entries.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).collect())
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_file())
+                    .collect()
+            })
             .unwrap_or_default();
 
         if !remaining_writable.is_empty() {
@@ -2152,6 +2219,4 @@ mod log_lifecycle_property_tests {
 
         TestResult::passed()
     }
-
-
 }

@@ -21,9 +21,9 @@ async fn test_cache_lookup_diagnostic_basic() {
     let temp_dir = TempDir::new().unwrap();
     let mut cache_manager = DiskCacheManager::new(
         temp_dir.path().to_path_buf(),
-        true,  // compression enabled
-        1024,  // compression threshold
-        false, // write cache disabled
+        true,      // compression enabled
+        1024,      // compression threshold
+        false,     // write cache disabled
         1_048_576, // compression_batch_size
     );
 
@@ -57,7 +57,8 @@ async fn test_cache_lookup_diagnostic_basic() {
             test_data,
             object_metadata.clone(),
             Duration::from_secs(3600), // 1 hour TTL
-            true)
+            true,
+        )
         .await
         .unwrap();
 
@@ -181,7 +182,8 @@ async fn test_cache_lookup_diagnostic_key_formats() {
         .try_init();
 
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     cache_manager.initialize().await.unwrap();
 
@@ -227,7 +229,9 @@ async fn test_cache_lookup_diagnostic_key_formats() {
                 range_end,
                 test_data,
                 object_metadata.clone(),
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -286,7 +290,8 @@ async fn test_cache_lookup_diagnostic_multiple_ranges() {
         .try_init();
 
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     cache_manager.initialize().await.unwrap();
 
@@ -322,7 +327,9 @@ async fn test_cache_lookup_diagnostic_multiple_ranges() {
                 *end,
                 data,
                 object_metadata,
-                Duration::from_secs(3600), true)
+                Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
     }
@@ -384,7 +391,8 @@ async fn test_cache_lookup_diagnostic_partial_overlap() {
         .try_init();
 
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     cache_manager.initialize().await.unwrap();
 
@@ -407,7 +415,9 @@ async fn test_cache_lookup_diagnostic_partial_overlap() {
             999,
             &cached_data,
             object_metadata.clone(),
-            Duration::from_secs(3600), true)
+            Duration::from_secs(3600),
+            true,
+        )
         .await
         .unwrap();
 
@@ -468,7 +478,8 @@ async fn test_cache_lookup_diagnostic_expired_ranges() {
         .try_init();
 
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     cache_manager.initialize().await.unwrap();
 
@@ -492,7 +503,8 @@ async fn test_cache_lookup_diagnostic_expired_ranges() {
             test_data,
             object_metadata,
             Duration::from_millis(1), // Very short TTL
-            true)
+            true,
+        )
         .await
         .unwrap();
 

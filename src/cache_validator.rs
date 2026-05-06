@@ -505,7 +505,7 @@ impl CacheValidator {
                     Ok(entry) => {
                         let path = entry.path();
                         // Only include .meta files
-                        if path.extension().map_or(false, |ext| ext == "meta") {
+                        if path.extension().is_some_and(|ext| ext == "meta") {
                             Some(path.to_path_buf())
                         } else {
                             None
@@ -973,7 +973,7 @@ impl CacheValidator {
             return Vec::new();
         }
 
-        let bucket_size = (max_size + bucket_count as u64 - 1) / bucket_count as u64; // Ceiling division
+        let bucket_size = max_size.div_ceil(bucket_count as u64); // Ceiling division
         let mut buckets = vec![
             SizeBucket {
                 min_size: 0,

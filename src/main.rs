@@ -226,8 +226,14 @@ async fn main() -> Result<()> {
             let proxy_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.proxy_port));
             let http_proxy = HttpProxy::new(proxy_addr, config_arc.clone())?;
 
-            info!("Proxy-only mode: HTTP direct listener (port {}) not started", config.server.http_port);
-            info!("Proxy-only mode: HTTPS passthrough listener (port {}) not started", config.server.https_port);
+            info!(
+                "Proxy-only mode: HTTP direct listener (port {}) not started",
+                config.server.http_port
+            );
+            info!(
+                "Proxy-only mode: HTTPS passthrough listener (port {}) not started",
+                config.server.https_port
+            );
 
             (http_proxy, None)
         }
@@ -444,8 +450,10 @@ async fn main() -> Result<()> {
         {
             let logger = cleanup_logger.lock().await;
             match logger.rotate_logs(access_retention, app_retention) {
-                Ok(result) => info!("Startup log cleanup: {} access files, {} app files deleted",
-                    result.access_files_deleted, result.app_files_deleted),
+                Ok(result) => info!(
+                    "Startup log cleanup: {} access files, {} app files deleted",
+                    result.access_files_deleted, result.app_files_deleted
+                ),
                 Err(e) => warn!("Startup log cleanup failed: {}", e),
             }
         }
@@ -530,7 +538,9 @@ async fn main() -> Result<()> {
         let health_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
 
         Some(tokio::spawn(async move {
-            if let Err(e) = start_health_server(health_addr, health_manager_clone, health_shutdown).await {
+            if let Err(e) =
+                start_health_server(health_addr, health_manager_clone, health_shutdown).await
+            {
                 error!("Health check server failed: {}", e);
             }
         }))
@@ -546,7 +556,9 @@ async fn main() -> Result<()> {
         let metrics_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
 
         Some(tokio::spawn(async move {
-            if let Err(e) = start_metrics_server(metrics_addr, metrics_manager_clone, metrics_shutdown).await {
+            if let Err(e) =
+                start_metrics_server(metrics_addr, metrics_manager_clone, metrics_shutdown).await
+            {
                 error!("Metrics server failed: {}", e);
             }
         }))
@@ -591,7 +603,10 @@ async fn main() -> Result<()> {
                     }))
                 }
                 Err(e) => {
-                    error!("Failed to start TLS proxy listener: {}. HTTP/HTTPS proxies will continue.", e);
+                    error!(
+                        "Failed to start TLS proxy listener: {}. HTTP/HTTPS proxies will continue.",
+                        e
+                    );
                     None
                 }
             }
@@ -623,7 +638,10 @@ async fn main() -> Result<()> {
             .await;
         dashboard_server.set_logger_manager(logger_manager.clone());
         dashboard_server
-            .set_active_connections(http_proxy.get_active_connections(), config.server.max_concurrent_requests)
+            .set_active_connections(
+                http_proxy.get_active_connections(),
+                config.server.max_concurrent_requests,
+            )
             .await;
 
         // Get shutdown signal for dashboard
@@ -656,7 +674,9 @@ async fn main() -> Result<()> {
 
     // Start HTTPS proxy only in standard mode
     let _https_task = if let Some(https_proxy) = https_proxy {
-        let https_shutdown = ShutdownSignal::new(https_shutdown_rx.expect("HTTPS shutdown receiver must exist in standard mode"));
+        let https_shutdown = ShutdownSignal::new(
+            https_shutdown_rx.expect("HTTPS shutdown receiver must exist in standard mode"),
+        );
         Some(tokio::spawn(async move {
             if let Err(e) = https_proxy.start(https_shutdown).await {
                 error!("HTTPS proxy failed: {}", e);

@@ -33,12 +33,12 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         false,
         Duration::from_secs(86400),
         MetadataCacheConfig::default(),
-        95,  // eviction_trigger_percent
-        80,  // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     )
 }
 
@@ -125,10 +125,10 @@ async fn test_unified_head_get_share_meta_file() {
     let meta_files: Vec<_> = walkdir::WalkDir::new(&metadata_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "meta"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "meta"))
         .collect();
     assert!(
-        meta_files.len() >= 1,
+        !meta_files.is_empty(),
         "Should have at least one .meta file for unified storage"
     );
 }
@@ -159,12 +159,12 @@ async fn test_independent_head_get_ttls() {
             enabled: false, // Disable RAM cache to test disk behavior directly
             ..Default::default()
         },
-        95,  // eviction_trigger_percent
-        80,  // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = "test-bucket/ttl-test-object.txt";
@@ -212,10 +212,10 @@ async fn test_independent_head_get_ttls() {
     let meta_files: Vec<_> = walkdir::WalkDir::new(&metadata_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "meta"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "meta"))
         .collect();
     assert!(
-        meta_files.len() >= 1,
+        !meta_files.is_empty(),
         ".meta file should not be deleted when HEAD expires"
     );
 }
@@ -266,7 +266,7 @@ async fn test_head_invalidation_preserves_ranges() {
     let _meta_files: Vec<_> = walkdir::WalkDir::new(&metadata_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "meta"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "meta"))
         .collect();
     // The .meta file may or may not exist depending on implementation
     // The key test is that HEAD invalidation doesn't cause errors
@@ -299,12 +299,12 @@ async fn test_metadata_cache_integration() {
             max_entries: 100,
             stale_handle_max_retries: 3,
         },
-        95,  // eviction_trigger_percent
-        80,  // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = "test-bucket/metadata-cache-test.txt";

@@ -1258,7 +1258,7 @@ impl CacheInitializationCoordinator {
             debug!(
                 "Cache initialization: Processed batch {}/{} ({} files) in {} - total: {}/{} ({:.1}%)",
                 batch_index + 1,
-                (total_files + BATCH_SIZE - 1) / BATCH_SIZE,
+                total_files.div_ceil(BATCH_SIZE),
                 batch_processed,
                 format_duration_human(batch_duration),
                 total_processed,
@@ -1340,7 +1340,7 @@ impl CacheInitializationCoordinator {
             processed_entries += 1;
 
             // Log progress for very large directories
-            if processed_entries % PROGRESS_INTERVAL == 0 {
+            if processed_entries.is_multiple_of(PROGRESS_INTERVAL) {
                 debug!(
                     "Cache initialization: Scanned {} directory entries, found {} metadata files",
                     processed_entries,
@@ -1351,12 +1351,12 @@ impl CacheInitializationCoordinator {
             let path = entry.path();
 
             // Filter for metadata files
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "meta") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "meta") {
                 metadata_files.push(path.to_path_buf());
             }
 
             // Yield control periodically to prevent blocking the async runtime
-            if processed_entries % 1000 == 0 {
+            if processed_entries.is_multiple_of(1000) {
                 tokio::task::yield_now().await;
             }
         }
@@ -1757,6 +1757,7 @@ impl CacheInitializationCoordinator {
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(lock_path)
             .map_err(|e| {
                 ProxyError::CacheError(format!("Failed to open initialization lock file: {}", e))
@@ -2054,9 +2055,9 @@ impl CacheInitializationCoordinator {
                         consistency_info.subsystem_consistency_message =
                             Some(validation_results.summary_string());
 
-                        if validation_results.has_serious_discrepancy() {
-                            consistency_info.warnings += 1;
-                        } else if validation_results.has_minor_discrepancy() {
+                        if validation_results.has_serious_discrepancy()
+                            || validation_results.has_minor_discrepancy()
+                        {
                             consistency_info.warnings += 1;
                         }
                     }
@@ -2469,6 +2470,12 @@ fn get_current_memory_usage() -> u64 {
 
     // Fallback: return 0 if we can't determine memory usage
     0
+}
+
+impl Default for PerformanceMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PerformanceMetrics {
@@ -3028,7 +3035,7 @@ impl ValidationResults {
 
         let manager_size = self.write_cache_manager_size.unwrap_or(0);
         let tracker_size = self.size_tracker_write_cache_size.unwrap_or(0);
-        let absolute_diff = (manager_size as i64 - tracker_size as i64).abs() as u64;
+        let absolute_diff = (manager_size as i64 - tracker_size as i64).unsigned_abs();
 
         let mut report = String::new();
         report.push_str("=== Cross-Validation Detailed Report ===\n");
@@ -3206,6 +3213,12 @@ pub struct CacheConsistencyInfo {
     pub warnings: u32,
 }
 
+impl Default for CacheConsistencyInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CacheConsistencyInfo {
     /// Create new cache consistency info
     pub fn new() -> Self {
@@ -3290,7 +3303,11 @@ impl ConsistencyValidationInfo {
                 self.head_only_expired_removed
             ));
         }
-        format!("{} in {}", parts.join(", "), format_duration_human(self.validation_duration))
+        format!(
+            "{} in {}",
+            parts.join(", "),
+            format_duration_human(self.validation_duration)
+        )
     }
 }
 

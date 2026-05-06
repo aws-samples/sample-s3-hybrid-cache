@@ -13,12 +13,10 @@ use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::JournalManager;
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
 use s3_proxy::write_cache_manager::WriteCacheManager;
-use serde_json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
-use tokio;
 
 /// Helper function to create a test CacheSizeTracker with JournalConsolidator
 async fn create_test_size_tracker(

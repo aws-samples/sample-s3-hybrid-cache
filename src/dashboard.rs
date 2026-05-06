@@ -81,8 +81,14 @@ impl DashboardServer {
     }
 
     /// Set active connections counter for dashboard display
-    pub async fn set_active_connections(&self, active_connections: Arc<std::sync::atomic::AtomicUsize>, max_concurrent_requests: usize) {
-        self.api_handler.set_active_connections(active_connections, max_concurrent_requests).await;
+    pub async fn set_active_connections(
+        &self,
+        active_connections: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent_requests: usize,
+    ) {
+        self.api_handler
+            .set_active_connections(active_connections, max_concurrent_requests)
+            .await;
     }
 
     /// Set logger manager reference
@@ -247,11 +253,11 @@ impl DashboardServerClone {
 
         // Only allow GET requests
         if method != Method::GET {
-            return Ok(Response::builder()
+            return Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .header("Allow", "GET")
                 .body("Method Not Allowed".to_string())
-                .map_err(|e| ProxyError::HttpError(format!("Failed to build response: {}", e)))?);
+                .map_err(|e| ProxyError::HttpError(format!("Failed to build response: {}", e)));
         }
 
         match path {
@@ -263,7 +269,7 @@ impl DashboardServerClone {
                 let params = parse_log_query_params(uri);
                 // Validate parameters and return 400 for invalid ones
                 if let Some(validation_error) = validate_log_params(&params) {
-                    return Ok(Response::builder()
+                    return Response::builder()
                         .status(StatusCode::BAD_REQUEST)
                         .header("Content-Type", "application/json")
                         .header("Cache-Control", "no-cache")
@@ -274,7 +280,7 @@ impl DashboardServerClone {
                         .map_err(|e| {
                             error!("Failed to build validation error response: {}", e);
                             ProxyError::HttpError(format!("Failed to build error response: {}", e))
-                        })?);
+                        });
                 }
                 self.api_handler.get_logs(params).await
             }
@@ -311,6 +317,12 @@ pub struct StaticFileHandler {
     // Static files are embedded in the binary
 }
 
+impl Default for StaticFileHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StaticFileHandler {
     pub fn new() -> Self {
         Self {}
@@ -322,24 +334,24 @@ impl StaticFileHandler {
             "/style.css" => (self.get_style_css(), "text/css"),
             "/script.js" => (self.get_script_js(), "application/javascript"),
             _ => {
-                return Ok(Response::builder()
+                return Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .header("Content-Type", "text/plain")
                     .body("Static file not found".to_string())
                     .map_err(|e| {
                         ProxyError::HttpError(format!("Failed to build 404 response: {}", e))
-                    })?);
+                    });
             }
         };
 
-        Ok(Response::builder()
+        Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", content_type)
             .header("Cache-Control", "no-cache")
             .body(content)
             .map_err(|e| {
                 ProxyError::HttpError(format!("Failed to build static file response: {}", e))
-            })?)
+            })
     }
 
     pub fn get_index_html(&self) -> String {
@@ -1548,7 +1560,11 @@ impl ApiHandler {
         *mm = Some(metrics_manager);
     }
 
-    pub async fn set_active_connections(&self, active_connections: Arc<std::sync::atomic::AtomicUsize>, max_concurrent_requests: usize) {
+    pub async fn set_active_connections(
+        &self,
+        active_connections: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent_requests: usize,
+    ) {
         *self.active_connections.write().await = Some(active_connections);
         *self.max_concurrent_requests.write().await = max_concurrent_requests;
     }
@@ -1571,7 +1587,7 @@ impl ApiHandler {
                             ))
                         })?;
 
-                        return Ok(Response::builder()
+                        return Response::builder()
                             .status(StatusCode::OK)
                             .header("Content-Type", "application/json")
                             .header("Cache-Control", "no-cache")
@@ -1583,19 +1599,15 @@ impl ApiHandler {
                                     "Failed to build cached response: {}",
                                     e
                                 ))
-                            })?);
+                            });
                     }
                 }
             }
         }
 
         // Generate fresh stats
-        let cache_manager_guard = match self.cache_manager.read().await {
-            guard => guard,
-        };
-        let metrics_manager_guard = match self.metrics_manager.read().await {
-            guard => guard,
-        };
+        let cache_manager_guard = self.cache_manager.read().await;
+        let metrics_manager_guard = self.metrics_manager.read().await;
 
         let stats = if let Some(cache_manager) = cache_manager_guard.as_ref() {
             debug!("Cache manager is available, getting cache statistics");
@@ -1775,7 +1787,9 @@ impl ApiHandler {
                 },
                 overall: OverallStats {
                     total_requests,
-                    head_total: cache_stats.head_hits.saturating_add(cache_stats.head_misses),
+                    head_total: cache_stats
+                        .head_hits
+                        .saturating_add(cache_stats.head_misses),
                     get_total: cache_stats.get_hits.saturating_add(cache_stats.get_misses),
                     head_hits: cache_stats.head_hits,
                     head_misses: cache_stats.head_misses,
@@ -1791,7 +1805,7 @@ impl ApiHandler {
         } else {
             // Return service unavailable if cache manager is not available
             warn!("Dashboard API: cache manager not available, returning service unavailable");
-            return Ok(Response::builder()
+            return Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header("Content-Type", "application/json")
                 .header("Cache-Control", "no-cache")
@@ -1800,22 +1814,19 @@ impl ApiHandler {
                 .map_err(|e| {
                     error!("Failed to build service unavailable response: {}", e);
                     ProxyError::HttpError(format!("Failed to build error response: {}", e))
-                })?);
+                });
         };
 
         // Cache the response with error handling
-        match self.cached_stats.write().await {
-            mut cached => {
-                *cached = Some((SystemTime::now(), stats.clone()));
-            }
-        }
+        let mut cached = self.cached_stats.write().await;
+        *cached = Some((SystemTime::now(), stats.clone()));
 
         let body = serde_json::to_string(&stats).map_err(|e| {
             error!("Failed to serialize cache stats: {}", e);
             ProxyError::SerializationError(format!("Failed to serialize cache stats: {}", e))
         })?;
 
-        Ok(Response::builder()
+        Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("Cache-Control", "no-cache")
@@ -1824,7 +1835,7 @@ impl ApiHandler {
             .map_err(|e| {
                 error!("Failed to build cache stats response: {}", e);
                 ProxyError::HttpError(format!("Failed to build cache stats response: {}", e))
-            })?)
+            })
     }
 
     pub async fn get_system_info(&self) -> Result<Response<String>> {
@@ -1854,7 +1865,10 @@ impl ApiHandler {
             };
 
         // Get active/max concurrent requests directly from atomic counter (real-time)
-        let active_requests_val = self.active_connections.read().await
+        let active_requests_val = self
+            .active_connections
+            .read()
+            .await
             .as_ref()
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64)
             .unwrap_or(0);
@@ -1880,7 +1894,7 @@ impl ApiHandler {
         let elapsed = start_time.elapsed();
         debug!("System info API response generated in {:?}", elapsed);
 
-        Ok(Response::builder()
+        Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("Cache-Control", "no-cache")
@@ -1889,7 +1903,7 @@ impl ApiHandler {
             .map_err(|e| {
                 error!("Failed to build system info response: {}", e);
                 ProxyError::HttpError(format!("Failed to build system info response: {}", e))
-            })?)
+            })
     }
 
     pub async fn get_logs(&self, params: LogQueryParams) -> Result<Response<String>> {
@@ -1907,7 +1921,7 @@ impl ApiHandler {
             Err(e) => {
                 error!("Failed to read log files: {}", e);
                 // Return 500 with error details
-                return Ok(Response::builder()
+                return Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("Content-Type", "application/json")
                     .header("Cache-Control", "no-cache")
@@ -1918,7 +1932,7 @@ impl ApiHandler {
                     .map_err(|e| {
                         error!("Failed to build error response: {}", e);
                         ProxyError::HttpError(format!("Failed to build error response: {}", e))
-                    })?);
+                    });
             }
         };
 
@@ -1936,7 +1950,7 @@ impl ApiHandler {
         let elapsed = start_time.elapsed();
         debug!("Log API response generated in {:?}", elapsed);
 
-        Ok(Response::builder()
+        Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("Cache-Control", "no-cache")
@@ -1945,7 +1959,7 @@ impl ApiHandler {
             .map_err(|e| {
                 error!("Failed to build logs response: {}", e);
                 ProxyError::HttpError(format!("Failed to build logs response: {}", e))
-            })?)
+            })
     }
 
     /// Return per-bucket cache hit/miss stats and resolved settings summary.
@@ -1958,12 +1972,14 @@ impl ApiHandler {
         let cache_manager = match cache_manager_guard.as_ref() {
             Some(cm) => cm,
             None => {
-                return Ok(Response::builder()
+                return Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .header("Content-Type", "application/json")
                     .header("Cache-Control", "no-cache")
                     .body(r#"{"error": "Cache manager not available", "code": 503}"#.to_string())
-                    .map_err(|e| ProxyError::HttpError(format!("Failed to build response: {}", e)))?);
+                    .map_err(|e| {
+                        ProxyError::HttpError(format!("Failed to build response: {}", e))
+                    });
             }
         };
 
@@ -2056,7 +2072,7 @@ impl ApiHandler {
             ProxyError::SerializationError(format!("Failed to serialize bucket stats: {}", e))
         })?;
 
-        Ok(Response::builder()
+        Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("Cache-Control", "no-cache")
@@ -2064,7 +2080,7 @@ impl ApiHandler {
             .map_err(|e| {
                 error!("Failed to build bucket stats response: {}", e);
                 ProxyError::HttpError(format!("Failed to build bucket stats response: {}", e))
-            })?)
+            })
     }
 }
 
@@ -2165,8 +2181,8 @@ impl LogReader {
                     // Check if it's a file and has the right extension/name
                     if let Ok(metadata) = path.metadata() {
                         if metadata.is_file() {
-                            let is_log_file = path.extension().map_or(false, |ext| ext == "log")
-                                || path.file_name().map_or(false, |name| {
+                            let is_log_file = path.extension().is_some_and(|ext| ext == "log")
+                                || path.file_name().is_some_and(|name| {
                                     name.to_string_lossy().contains("s3-proxy.log")
                                 });
 
@@ -2225,11 +2241,7 @@ impl LogReader {
             ProxyError::IoError(format!("Failed to open log file {:?}: {}", file_path, e))
         })?;
 
-        let start_pos = if file_size > read_size {
-            file_size - read_size
-        } else {
-            0
-        };
+        let start_pos = file_size.saturating_sub(read_size);
 
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         file.seek(std::io::SeekFrom::Start(start_pos as u64))
@@ -2345,7 +2357,7 @@ impl LogReader {
                 && before_colon
                     .chars()
                     .last()
-                    .map_or(false, |c| c.is_ascii_digit())
+                    .is_some_and(|c| c.is_ascii_digit())
             {
                 location_and_message[location_end + 2..].to_string()
             } else {
@@ -2615,7 +2627,7 @@ pub fn parse_log_query_params(uri: &Uri) -> LogQueryParams {
                         match decoded_value.parse::<usize>() {
                             Ok(l) => {
                                 // Validate limit bounds (1 to 10000)
-                                if l >= 1 && l <= 10000 {
+                                if (1..=10000).contains(&l) {
                                     limit = Some(l);
                                 } else {
                                     warn!("Invalid limit parameter: {} (must be 1-10000)", l);

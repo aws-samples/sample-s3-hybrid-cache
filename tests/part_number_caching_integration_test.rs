@@ -14,6 +14,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 /// Helper function to create test cache manager
+#[allow(dead_code)]
 fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
     CacheManager::new_with_shared_storage(
         temp_dir.path().to_path_buf(),
@@ -32,16 +33,17 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         false,                      // write_cache_enabled: false - not testing write cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                    // eviction_trigger_percent
-        80,                                    // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     )
 }
 
 /// Helper function to create S3 response headers for a part
+#[allow(dead_code)]
 fn create_part_response_headers(
     _part_number: u32,
     start: u64,

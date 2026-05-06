@@ -418,11 +418,8 @@ fn prop_no_temp_file_leaks(config: AtomicLockTestConfig) -> TestResult {
 
         let total_attempts = config.num_instances * config.attempts_per_instance;
         for _ in 0..total_attempts {
-            match cache_manager.try_acquire_global_eviction_lock().await {
-                Ok(true) => {
-                    cache_manager.release_global_eviction_lock().await.ok();
-                }
-                _ => {}
+            if let Ok(true) = cache_manager.try_acquire_global_eviction_lock().await {
+                cache_manager.release_global_eviction_lock().await.ok();
             }
         }
 

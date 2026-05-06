@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "1.15.0"
+version = "1.15.3"
 edition = "2021"
 # MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
 # Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
@@ -25,18 +25,18 @@ quickcheck_macros = "1.0"
 # TLS support
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ring = "0.17"
-rustls-pemfile = "2.0"
-rustls-native-certs = "0.7"
+# rustls-native-certs: OS trust store loader (0.8 drops rustls-pemfile dep, resolves RUSTSEC-2025-0134)
+rustls-native-certs = "0.8"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.13"
 time = { version = "0.3", features = ["macros"] }
 webpki-roots = "0.26"
 
-# Service abstraction for connection pooling
-tower = "0.4"
+# Service abstraction for connection pooling (used by CustomHttpsConnector in https_connector.rs)
+tower = "0.5"
 
 # Compression
-lz4_flex = "0.11"
+lz4_flex = "0.11.6"
 
 # Hashing
 blake3 = "1.5"
@@ -52,8 +52,8 @@ tracing-appender = "0.2"
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
-# Networking and DNS
-trust-dns-resolver = "0.23"
+# Networking and DNS (hickory is the maintained successor to trust-dns)
+hickory-resolver = "0.26"
 socket2 = { version = "0.5", features = ["all"] }
 
 # Configuration
@@ -62,6 +62,9 @@ clap = { version = "4.0", features = ["derive"] }
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
+
+# Async trait support (for dyn-compatible async traits)
+async-trait = "0.1"
 
 # RAII guard for cleanup
 scopeguard = "1.2"
@@ -90,11 +93,11 @@ walkdir = "2.4"
 # Concurrent data structures
 dashmap = "6.0"
 
-# OpenTelemetry for OTLP metrics export
-opentelemetry = { version = "0.24", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.24", features = ["metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.17", features = ["http-proto", "reqwest-client"] }
-opentelemetry-semantic-conventions = "0.16"
+# OpenTelemetry for OTLP metrics export (0.27 drops rand 0.8, resolves RUSTSEC-2026-0097 path 2)
+opentelemetry = { version = "0.27", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = "0.27"
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]

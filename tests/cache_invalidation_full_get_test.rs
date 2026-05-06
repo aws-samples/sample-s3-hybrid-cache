@@ -90,7 +90,13 @@ async fn test_put_then_full_get_uses_cache() {
 
     println!("[TEST] Step 1: Storing PUT data in write cache");
     cache_manager
-        .store_write_cache_entry(&cache_key, test_data, headers.clone(), metadata.clone(), HashMap::new())
+        .store_write_cache_entry(
+            &cache_key,
+            test_data,
+            headers.clone(),
+            metadata.clone(),
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -391,7 +397,10 @@ async fn test_has_cached_ranges_optimization() {
 
     // Step 2: Call has_cached_ranges to check if optimization works
     println!("[TEST] Step 2: Checking has_cached_ranges");
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
 
     // Verify the result
     assert!(result.is_some(), "Should find cached metadata");
@@ -456,7 +465,10 @@ async fn test_has_cached_ranges_no_metadata() {
     let cache_key = CacheManager::generate_cache_key("/test-bucket/non-existent-object", None);
 
     println!("[TEST] Checking has_cached_ranges for non-existent object");
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
 
     assert!(
         result.is_none(),
@@ -604,7 +616,10 @@ async fn test_get_response_stores_content_length_in_metadata() {
 
     // Step 2: Verify that object metadata was created with content_length
     println!("[TEST] Step 2: Checking if object metadata was created");
-    let result = cache_manager.has_cached_ranges(&cache_key, None).await.unwrap();
+    let result = cache_manager
+        .has_cached_ranges(&cache_key, None)
+        .await
+        .unwrap();
 
     assert!(
         result.is_some(),

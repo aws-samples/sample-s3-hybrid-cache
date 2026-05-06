@@ -91,17 +91,12 @@ impl Default for CompressionInfo {
 // ============================================================================
 
 /// Upload state for multipart tracking
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum UploadState {
-    Complete,   // Regular PUT or completed multipart
+    #[default]
+    Complete, // Regular PUT or completed multipart
     InProgress, // Multipart upload in progress
     Bypassed,   // Upload too large, not caching
-}
-
-impl Default for UploadState {
-    fn default() -> Self {
-        UploadState::Complete
-    }
 }
 
 /// Part information stored temporarily during upload
@@ -150,11 +145,7 @@ impl CachedPartInfo {
     }
 
     /// Create a new CachedPartInfo with default compression (Lz4)
-    pub fn new_uncompressed(
-        part_number: u32,
-        size: u64,
-        etag: String,
-    ) -> Self {
+    pub fn new_uncompressed(part_number: u32, size: u64, etag: String) -> Self {
         Self {
             part_number,
             size,
@@ -972,7 +963,10 @@ mod tests {
         } else {
             expected.duration_since(meta.expires_at).unwrap()
         };
-        assert!(diff < Duration::from_secs(2), "expires_at not within tolerance");
+        assert!(
+            diff < Duration::from_secs(2),
+            "expires_at not within tolerance"
+        );
         assert!(!meta.is_object_expired());
     }
 
@@ -1349,7 +1343,7 @@ mod tests {
                     metadata.etag == etag
                         && metadata.last_modified == last_modified
                         && metadata.content_length == content_length
-                        && metadata.is_write_cached == false
+                        && !metadata.is_write_cached
                         && metadata.write_cache_expires_at.is_none()
                         && metadata.write_cache_created_at.is_none()
                         && metadata.write_cache_last_accessed.is_none(),
@@ -1401,22 +1395,14 @@ mod tests {
         );
 
         // Add part 1
-        let part1 = CachedPartInfo::new_uncompressed(
-            1,
-            5242880,
-            "\"etag1\"".to_string(),
-        );
+        let part1 = CachedPartInfo::new_uncompressed(1, 5242880, "\"etag1\"".to_string());
         tracker.add_part(part1);
 
         assert_eq!(tracker.parts.len(), 1);
         assert_eq!(tracker.total_size, 5242880);
 
         // Add part 2
-        let part2 = CachedPartInfo::new_uncompressed(
-            2,
-            5242880,
-            "\"etag2\"".to_string(),
-        );
+        let part2 = CachedPartInfo::new_uncompressed(2, 5242880, "\"etag2\"".to_string());
         tracker.add_part(part2);
 
         assert_eq!(tracker.parts.len(), 2);
@@ -1431,22 +1417,14 @@ mod tests {
         );
 
         // Add part 1
-        let part1 = CachedPartInfo::new_uncompressed(
-            1,
-            5242880,
-            "\"etag1\"".to_string(),
-        );
+        let part1 = CachedPartInfo::new_uncompressed(1, 5242880, "\"etag1\"".to_string());
         tracker.add_part(part1);
 
         assert_eq!(tracker.parts.len(), 1);
         assert_eq!(tracker.total_size, 5242880);
 
         // Re-upload part 1 with different size
-        let part1_new = CachedPartInfo::new_uncompressed(
-            1,
-            6000000,
-            "\"etag1_new\"".to_string(),
-        );
+        let part1_new = CachedPartInfo::new_uncompressed(1, 6000000, "\"etag1_new\"".to_string());
         tracker.add_part(part1_new);
 
         // Should still have 1 part, but with updated size
@@ -1735,7 +1713,7 @@ mod tests {
             // Cache multiple parts
             let mut expected_parts = Vec::new();
             for part_num in 1..=part_count {
-                let data: Vec<u8> = (0..data_size).map(|i| (i + part_num as u8) as u8).collect();
+                let data: Vec<u8> = (0..data_size).map(|i| i + part_num).collect();
                 let etag = format!("\"part-etag-{}\"", part_num);
 
                 let result = handler
@@ -1824,7 +1802,7 @@ mod tests {
             let upload_id = "test-upload-eviction";
             let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
 
-            if let Err(_) = tokio::fs::create_dir_all(&multipart_dir).await {
+            if tokio::fs::create_dir_all(&multipart_dir).await.is_err() {
                 return TestResult::failed();
             }
 
@@ -1842,15 +1820,12 @@ mod tests {
                 // Create part file in the upload directory
                 let part_file = multipart_dir.join(format!("part{}.bin", part_num));
 
-                if let Err(_) = tokio::fs::write(&part_file, &data).await {
+                if tokio::fs::write(&part_file, &data).await.is_err() {
                     return TestResult::failed();
                 }
 
-                let part_info = CachedPartInfo::new_uncompressed(
-                    part_num as u32,
-                    data.len() as u64,
-                    etag,
-                );
+                let part_info =
+                    CachedPartInfo::new_uncompressed(part_num as u32, data.len() as u64, etag);
 
                 tracker.add_part(part_info);
             }
@@ -1862,7 +1837,10 @@ mod tests {
                 Err(_) => return TestResult::failed(),
             };
 
-            if let Err(_) = tokio::fs::write(&upload_meta_file, tracker_json).await {
+            if tokio::fs::write(&upload_meta_file, tracker_json)
+                .await
+                .is_err()
+            {
                 return TestResult::failed();
             }
 
@@ -1877,7 +1855,7 @@ mod tests {
             // Set file mtime to be older than TTL (instead of sleeping)
             let old_time = std::time::SystemTime::now() - ttl - Duration::from_secs(10);
             let old_filetime = filetime::FileTime::from_system_time(old_time);
-            if let Err(_) = filetime::set_file_mtime(&upload_meta_file, old_filetime) {
+            if filetime::set_file_mtime(&upload_meta_file, old_filetime).is_err() {
                 return TestResult::failed();
             }
 

@@ -215,14 +215,14 @@ fn test_property_non_expired_head_returns_false() {
 
 #[test]
 fn test_property_none_head_expires_at_is_expired() {
-    QuickCheck::new().tests(100).quickcheck(
-        prop_none_head_expires_at_is_expired as fn() -> TestResult,
-    );
+    QuickCheck::new()
+        .tests(100)
+        .quickcheck(prop_none_head_expires_at_is_expired as fn() -> TestResult);
 }
 
 #[test]
 fn test_property_zero_head_ttl_is_immediately_expired() {
-    QuickCheck::new().tests(100).quickcheck(
-        prop_zero_head_ttl_is_immediately_expired as fn() -> TestResult,
-    );
+    QuickCheck::new()
+        .tests(100)
+        .quickcheck(prop_zero_head_ttl_is_immediately_expired as fn() -> TestResult);
 }

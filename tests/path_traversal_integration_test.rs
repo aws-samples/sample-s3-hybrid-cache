@@ -18,7 +18,7 @@ use tempfile::TempDir;
 const TRAVERSAL_KEYS: &[&str] = &[
     "../etc/passwd",
     "../../secret",
-    "/../etc/passwd",   // form produced by a raw `GET /../etc/passwd` request line
+    "/../etc/passwd", // form produced by a raw `GET /../etc/passwd` request line
     "./bucket/key",
     "/./etc/passwd",
     "..//etc/passwd",

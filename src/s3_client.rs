@@ -7,7 +7,9 @@ use crate::cache_types::CacheMetadata;
 use crate::config::ConnectionPoolConfig;
 use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
 use crate::https_connector::CustomHttpsConnector;
+use crate::tls_trust_store;
 use crate::{ProxyError, Result};
+use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -110,6 +112,102 @@ impl Default for RetryConfig {
     }
 }
 
+/// Trait abstraction over [`S3Client`] for dependency injection in tests.
+///
+/// This trait captures the subset of [`S3Client`] behaviour exercised by the HTTP
+/// proxy (`forward_request`, metadata extraction, connection pool access, DNS
+/// refresh, and metrics wiring). Production code constructs the concrete
+/// [`S3Client`] and stores it as `Arc<dyn S3ClientApi + Send + Sync>`; tests can
+/// implement a stub that records calls and returns canned responses without
+/// opening real TLS connections to S3.
+///
+/// The trait is dyn-compatible via [`async_trait`] so it can live behind an
+/// `Arc<dyn S3ClientApi>` trait object.
+#[async_trait]
+pub trait S3ClientApi: Send + Sync {
+    /// Forward a request to S3 with connection pooling and retries.
+    async fn forward_request(&self, context: S3RequestContext) -> Result<S3Response>;
+
+    /// Extract a compact [`CacheMetadata`] record from an S3 response's headers.
+    fn extract_metadata_from_response(&self, headers: &HashMap<String, String>) -> CacheMetadata;
+
+    /// Extract a full [`crate::cache_types::ObjectMetadata`] record from an S3
+    /// response's headers, preserving all cacheable response headers.
+    fn extract_object_metadata_from_response(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> crate::cache_types::ObjectMetadata;
+
+    /// Access the shared connection pool manager. Used by signed PUT /
+    /// multipart handlers that need to resolve a distributed IP for a host.
+    fn get_connection_pool(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>>;
+
+    /// True when the client was built with endpoint overrides (PrivateLink
+    /// destinations). Consumers use this to decide whether to lock outbound
+    /// TLS to 1.2.
+    fn has_endpoint_overrides(&self) -> bool;
+
+    /// Install the metrics manager reference used for connection keepalive and
+    /// error-closure tracking.
+    async fn set_metrics_manager(
+        &self,
+        metrics_manager: Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>,
+    );
+
+    /// Register an endpoint with the connection pool for DNS-based IP
+    /// distribution and perform an immediate resolve.
+    async fn register_endpoint(&self, endpoint: &str);
+
+    /// Refresh DNS for all registered endpoints and reset per-IP failure
+    /// tracking so restored IPs aren't immediately re-excluded.
+    async fn refresh_dns(&self) -> Result<()>;
+}
+
+#[async_trait]
+impl S3ClientApi for S3Client {
+    async fn forward_request(&self, context: S3RequestContext) -> Result<S3Response> {
+        S3Client::forward_request(self, context).await
+    }
+
+    fn extract_metadata_from_response(&self, headers: &HashMap<String, String>) -> CacheMetadata {
+        S3Client::extract_metadata_from_response(self, headers)
+    }
+
+    fn extract_object_metadata_from_response(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> crate::cache_types::ObjectMetadata {
+        S3Client::extract_object_metadata_from_response(self, headers)
+    }
+
+    fn get_connection_pool(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>> {
+        S3Client::get_connection_pool(self)
+    }
+
+    fn has_endpoint_overrides(&self) -> bool {
+        S3Client::has_endpoint_overrides(self)
+    }
+
+    async fn set_metrics_manager(
+        &self,
+        metrics_manager: Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>,
+    ) {
+        S3Client::set_metrics_manager(self, metrics_manager).await
+    }
+
+    async fn register_endpoint(&self, endpoint: &str) {
+        S3Client::register_endpoint(self, endpoint).await
+    }
+
+    async fn refresh_dns(&self) -> Result<()> {
+        S3Client::refresh_dns(self).await
+    }
+}
+
 impl S3Client {
     /// Create a new S3 client with Hyper connection pooling
     pub fn new(
@@ -123,16 +221,9 @@ impl S3Client {
         let health_tracker = Arc::new(IpHealthTracker::new(config.ip_failure_threshold));
 
         // Create TLS connector for HTTPS connections to S3 with system root certificates
-        let mut root_store = rustls::RootCertStore::empty();
-
         // Load system root certificates
-        for cert in rustls_native_certs::load_native_certs()
-            .map_err(|e| ProxyError::TlsError(format!("Failed to load native certs: {}", e)))?
-        {
-            root_store
-                .add(cert)
-                .map_err(|e| ProxyError::TlsError(format!("Failed to add cert: {}", e)))?;
-        }
+        let root_store = tls_trust_store::load_root_cert_store()
+            .map_err(|e| ProxyError::TlsError(format!("Failed to load native certs: {}", e)))?;
 
         // Build TLS connectors. Default uses TLS 1.2+1.3. When endpoint
         // overrides are configured, also build a TLS 1.2-only connector
@@ -149,11 +240,10 @@ impl S3Client {
             info!(
                 "Endpoint overrides configured — building TLS 1.2 connector for PrivateLink destinations"
             );
-            let cfg = rustls::ClientConfig::builder_with_protocol_versions(
-                &[&rustls::version::TLS12],
-            )
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+            let cfg =
+                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
             Some(TlsConnector::from(Arc::new(cfg)))
         } else {
             None
@@ -373,7 +463,9 @@ impl S3Client {
         };
 
         // Build HTTP request
-        let mut request_builder = Request::builder().method(&context.method).uri(&effective_uri);
+        let mut request_builder = Request::builder()
+            .method(&context.method)
+            .uri(&effective_uri);
 
         // Add headers (including any conditional headers)
         // Skip Content-Length header for requests with bodies - Hyper will set it automatically
@@ -947,7 +1039,7 @@ mod tests {
 
         let client = result.unwrap();
         assert_eq!(client.request_timeout, Duration::from_secs(30));
-        assert_eq!(client.keepalive_enabled, true);
+        assert!(client.keepalive_enabled);
     }
 
     #[test]
@@ -1156,10 +1248,9 @@ mod tests {
     #[test]
     fn test_rewrite_uri_authority_preserves_path_and_query() {
         // Validates: Requirement 2.3 - all other request components preserved
-        let uri: Uri =
-            "https://s3.amazonaws.com/bucket/key?partNumber=1&uploadId=abc"
-                .parse()
-                .unwrap();
+        let uri: Uri = "https://s3.amazonaws.com/bucket/key?partNumber=1&uploadId=abc"
+            .parse()
+            .unwrap();
         let ip: IpAddr = "52.92.17.224".parse().unwrap();
 
         let result = rewrite_uri_authority(&uri, &ip).unwrap();
@@ -1171,9 +1262,7 @@ mod tests {
     #[test]
     fn test_rewrite_uri_authority_non_default_port() {
         // Validates: Requirement 1.1 - non-default ports preserved
-        let uri: Uri = "https://s3.amazonaws.com:8443/bucket/key"
-            .parse()
-            .unwrap();
+        let uri: Uri = "https://s3.amazonaws.com:8443/bucket/key".parse().unwrap();
         let ip: IpAddr = "52.92.17.224".parse().unwrap();
 
         let result = rewrite_uri_authority(&uri, &ip).unwrap();
@@ -1186,9 +1275,7 @@ mod tests {
     #[test]
     fn test_rewrite_uri_authority_default_https_port_omitted() {
         // Default port 443 for https should not appear in the rewritten URI
-        let uri: Uri = "https://s3.amazonaws.com:443/bucket/key"
-            .parse()
-            .unwrap();
+        let uri: Uri = "https://s3.amazonaws.com:443/bucket/key".parse().unwrap();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         let result = rewrite_uri_authority(&uri, &ip).unwrap();

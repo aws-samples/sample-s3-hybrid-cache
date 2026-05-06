@@ -9,11 +9,11 @@ use crate::{
     cache_types::{CacheMetadata, ObjectExpirationResult},
     config::Config,
     disk_cache::{DiskCacheManager, IncrementalRangeWriter},
-    inflight_tracker::{FetchRole, InFlightTracker},
+    inflight_tracker::{FetchGuard, FetchRole, InFlightTracker},
     logging::LoggerManager,
     range_handler::{RangeHandler, RangeParseResult, RangeSpec},
     s3_client::{
-        build_s3_request_context, build_s3_request_context_with_operation, S3Client,
+        build_s3_request_context, build_s3_request_context_with_operation, S3Client, S3ClientApi,
         S3RequestContext, S3ResponseBody,
     },
     tee_stream::TeeStream,
@@ -278,7 +278,10 @@ pub fn maybe_add_referer(
         }
     }
 
-    debug!("Adding proxy identification Referer header: {}", referer_value);
+    debug!(
+        "Adding proxy identification Referer header: {}",
+        referer_value
+    );
     headers.insert("Referer".to_string(), referer_value.clone());
 }
 
@@ -380,15 +383,12 @@ pub fn detect_path_style_alias(host: &str, path: &str) -> Option<PathStyleAlias>
     None
 }
 
-
-
-
 /// HTTP Proxy server for S3 requests with caching
 pub struct HttpProxy {
     listen_addr: SocketAddr,
     config: Arc<Config>,
     cache_manager: Arc<CacheManager>,
-    s3_client: Arc<S3Client>,
+    s3_client: Arc<dyn S3ClientApi + Send + Sync>,
     range_handler: Arc<RangeHandler>,
     request_semaphore: Arc<Semaphore>,
     active_connections: Arc<AtomicUsize>,
@@ -417,7 +417,7 @@ impl HttpProxy {
             config.cache.max_ram_cache_size,
             config.cache.max_cache_size,
             eviction_algorithm,
-            1024, // 1KB compression threshold
+            1024,                       // 1KB compression threshold
             config.compression.enabled, // compression enabled (from config.compression.enabled)
             config.cache.get_ttl,
             config.cache.head_ttl,
@@ -437,7 +437,8 @@ impl HttpProxy {
         ));
 
         // Create S3 client (metrics will be set later via set_metrics_manager)
-        let s3_client = Arc::new(S3Client::new(&config.connection_pool, None)?);
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> =
+            Arc::new(S3Client::new(&config.connection_pool, None)?);
 
         // Create disk cache manager for new range storage architecture with atomic metadata writes support
         let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
@@ -454,8 +455,15 @@ impl HttpProxy {
         // Build proxy identification Referer header value at startup
         let proxy_referer = if config.server.add_referer_header {
             let hostname = gethostname::gethostname().to_string_lossy().to_string();
-            let referer = format!("s3-hybrid-cache/{} ({})", env!("CARGO_PKG_VERSION"), hostname);
-            info!("Proxy identification enabled: Referer header will be set to \"{}\"", referer);
+            let referer = format!(
+                "s3-hybrid-cache/{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                hostname
+            );
+            info!(
+                "Proxy identification enabled: Referer header will be set to \"{}\"",
+                referer
+            );
             Some(referer)
         } else {
             info!("Proxy identification headers are disabled (add_referer_header = false)");
@@ -503,7 +511,7 @@ impl HttpProxy {
     }
 
     /// Get reference to S3 client for DNS refresh and IP distribution management
-    pub fn get_s3_client(&self) -> Arc<S3Client> {
+    pub fn get_s3_client(&self) -> Arc<dyn S3ClientApi + Send + Sync> {
         Arc::clone(&self.s3_client)
     }
 
@@ -540,7 +548,9 @@ impl HttpProxy {
     }
 
     /// Get reference to metrics manager for TLS proxy listener
-    pub fn get_metrics_manager(&self) -> Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>> {
+    pub fn get_metrics_manager(
+        &self,
+    ) -> Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>> {
         self.metrics_manager.clone()
     }
 
@@ -649,7 +659,10 @@ impl HttpProxy {
         let drain_start = std::time::Instant::now();
         let active = self.active_connections.load(Ordering::Relaxed);
         if active > 0 {
-            info!("HTTP proxy draining {} active connections (timeout: {:?})", active, drain_timeout);
+            info!(
+                "HTTP proxy draining {} active connections (timeout: {:?})",
+                active, drain_timeout
+            );
             while self.active_connections.load(Ordering::Relaxed) > 0
                 && drain_start.elapsed() < drain_timeout
             {
@@ -657,7 +670,10 @@ impl HttpProxy {
             }
             let remaining = self.active_connections.load(Ordering::Relaxed);
             if remaining > 0 {
-                warn!("HTTP proxy shutdown with {} connections still active", remaining);
+                warn!(
+                    "HTTP proxy shutdown with {} connections still active",
+                    remaining
+                );
             } else {
                 info!("HTTP proxy all connections drained");
             }
@@ -668,12 +684,13 @@ impl HttpProxy {
     }
 
     /// Serve a single HTTP connection
+    #[allow(clippy::too_many_arguments)]
     async fn serve_connection(
         stream: TcpStream,
         addr: SocketAddr,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         range_handler: Arc<RangeHandler>,
         request_semaphore: Arc<Semaphore>,
         active_connections: Arc<AtomicUsize>,
@@ -739,12 +756,13 @@ impl HttpProxy {
     }
 
     /// Handle a single HTTP request
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_request(
         mut req: Request<hyper::body::Incoming>,
         client_addr: SocketAddr,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         range_handler: Arc<RangeHandler>,
         request_semaphore: Arc<Semaphore>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
@@ -760,9 +778,12 @@ impl HttpProxy {
             Err(_) => {
                 // Return 503 Service Unavailable (S3-compatible SlowDown) when limit exceeded
                 // AWS SDKs have built-in retry with exponential backoff for 503
-                static LAST_503_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                static REJECTED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let _rejected = REJECTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                static LAST_503_LOG: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                static REJECTED_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let _rejected =
+                    REJECTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -770,7 +791,8 @@ impl HttpProxy {
                 let last = LAST_503_LOG.load(std::sync::atomic::Ordering::Relaxed);
                 if now_secs >= last + 60 {
                     LAST_503_LOG.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                    let total_rejected = REJECTED_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let total_rejected =
+                        REJECTED_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
                     warn!(
                         "Request limit exceeded (max_concurrent_requests={}, rejected={} in last period)",
                         config.server.max_concurrent_requests, total_rejected
@@ -788,21 +810,24 @@ impl HttpProxy {
 
         // Detect forward proxy request (absolute URI) or fall through to direct mode
         // Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 5.1, 5.2, 11.1, 14.1, 14.2, 14.3, 14.4
-        let (host, effective_uri) = if let Some((proxy_host, relative_uri)) = Self::detect_forward_proxy(&req) {
-            debug!(
-                "Forward proxy request detected: method={}, host={}, path={}",
-                req.method(), proxy_host, relative_uri.path()
-            );
-            (proxy_host, relative_uri)
-        } else {
-            // Existing direct-mode path: extract host from Host header
-            let host = match Self::validate_host_header(&req) {
-                Ok(host) => host,
-                Err(response) => return Ok(response),
+        let (host, effective_uri) =
+            if let Some((proxy_host, relative_uri)) = Self::detect_forward_proxy(&req) {
+                debug!(
+                    "Forward proxy request detected: method={}, host={}, path={}",
+                    req.method(),
+                    proxy_host,
+                    relative_uri.path()
+                );
+                (proxy_host, relative_uri)
+            } else {
+                // Existing direct-mode path: extract host from Host header
+                let host = match Self::validate_host_header(&req) {
+                    Ok(host) => host,
+                    Err(response) => return Ok(response),
+                };
+                let effective_uri = req.uri().clone();
+                (host, effective_uri)
             };
-            let effective_uri = req.uri().clone();
-            (host, effective_uri)
-        };
 
         // Rewrite the request URI to the effective (relative) URI so all downstream
         // handlers (handle_get_head_request, handle_put_request, handle_other_request)
@@ -818,7 +843,8 @@ impl HttpProxy {
         if let Some(alias) = detect_path_style_alias(&host, effective_uri.path()) {
             debug!(
                 "Path-style AP/MRAP alias detected (forwarding as-is): alias={}, path={}",
-                alias.cache_key_prefix, effective_uri.path()
+                alias.cache_key_prefix,
+                effective_uri.path()
             );
         }
 
@@ -994,9 +1020,7 @@ impl HttpProxy {
     fn detect_forward_proxy_uri(uri: &Uri) -> Option<(String, Uri)> {
         if uri.scheme().is_some() {
             let host = uri.authority()?.host().to_string();
-            let path_and_query = uri.path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/");
+            let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
             let relative_uri: Uri = path_and_query.parse().ok()?;
             Some((host, relative_uri))
         } else {
@@ -1071,6 +1095,7 @@ impl HttpProxy {
     ///
     /// Uses `parse_host_header` to correctly handle bracketed IPv6 literals
     /// (e.g., `[::1]:8081` → `::1`) per RFC 3986 §3.2.2.
+    #[allow(clippy::result_large_err)]
     fn validate_host_header(
         req: &Request<hyper::body::Incoming>,
     ) -> std::result::Result<String, Response<BoxBody<Bytes, hyper::Error>>> {
@@ -1395,12 +1420,13 @@ impl HttpProxy {
     }
 
     /// Handle GET and HEAD requests with caching and range support
+    #[allow(clippy::too_many_arguments)]
     async fn handle_get_head_request(
         req: Request<hyper::body::Incoming>,
         host: String,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         range_handler: Arc<RangeHandler>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         inflight_tracker: Arc<InFlightTracker>,
@@ -1572,7 +1598,11 @@ impl HttpProxy {
                 "Conditional request: method={} path={} mode={} conditional_headers=[{}]",
                 method,
                 path,
-                if mode_b { "evaluate-from-cache" } else { "forward-to-s3" },
+                if mode_b {
+                    "evaluate-from-cache"
+                } else {
+                    "forward-to-s3"
+                },
                 conditional_headers.join(", ")
             );
 
@@ -1594,7 +1624,11 @@ impl HttpProxy {
             let mut mode_b_fresh = false;
             if mode_b {
                 // Load metadata (RAM-cached fast path).
-                let cached_metadata = cache_manager.get_metadata_cached(&cache_key).await.ok().flatten();
+                let cached_metadata = cache_manager
+                    .get_metadata_cached(&cache_key)
+                    .await
+                    .ok()
+                    .flatten();
                 if let Some(meta) = cached_metadata.as_ref() {
                     // Check freshness: only evaluate from cache if object is unexpired.
                     // For HEAD requests use head expiration; for GET use object expiration.
@@ -1638,13 +1672,16 @@ impl HttpProxy {
                                     "Mode B: not modified locally, returning 304: cache_key={}",
                                     cache_key
                                 );
-                                let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+                                let mut builder =
+                                    Response::builder().status(StatusCode::NOT_MODIFIED);
                                 if !meta.object_metadata.etag.is_empty() {
                                     builder = builder.header("etag", &meta.object_metadata.etag);
                                 }
                                 if !meta.object_metadata.last_modified.is_empty() {
-                                    builder = builder
-                                        .header("last-modified", &meta.object_metadata.last_modified);
+                                    builder = builder.header(
+                                        "last-modified",
+                                        &meta.object_metadata.last_modified,
+                                    );
                                 }
                                 let response = builder
                                     .body(
@@ -2076,7 +2113,9 @@ impl HttpProxy {
 
                     // Record per-bucket cache hit for HEAD
                     cache_manager.update_statistics(true, 0, true);
-                    cache_manager.record_bucket_cache_access(&cache_key, true, true).await;
+                    cache_manager
+                        .record_bucket_cache_access(&cache_key, true, true)
+                        .await;
 
                     // Build response from HEAD cache
                     let mut response_builder = Response::builder().status(StatusCode::OK);
@@ -2101,7 +2140,9 @@ impl HttpProxy {
 
                     // Record per-bucket cache miss for HEAD
                     cache_manager.update_statistics(false, 0, true);
-                    cache_manager.record_bucket_cache_access(&cache_key, false, true).await;
+                    cache_manager
+                        .record_bucket_cache_access(&cache_key, false, true)
+                        .await;
 
                     // Forward request to S3 and cache response
                     Self::forward_get_head_to_s3_and_cache(
@@ -2156,7 +2197,10 @@ impl HttpProxy {
             };
 
             // Check if we have any cached ranges for this object
-            match cache_manager.has_cached_ranges(&cache_key, preloaded_metadata.as_ref()).await {
+            match cache_manager
+                .has_cached_ranges(&cache_key, preloaded_metadata.as_ref())
+                .await
+            {
                 Ok(Some((true, total_size))) => {
                     debug!(
                         "Found cached ranges for key: {}, total_size: {} bytes",
@@ -2171,7 +2215,12 @@ impl HttpProxy {
 
                     // Check if we can serve the full object from cache
                     match range_handler
-                        .find_cached_ranges(&cache_key, &full_range, None, preloaded_metadata.as_ref())
+                        .find_cached_ranges(
+                            &cache_key,
+                            &full_range,
+                            None,
+                            preloaded_metadata.as_ref(),
+                        )
                         .await
                     {
                         Ok(overlap) if overlap.can_serve_from_cache => {
@@ -2182,120 +2231,266 @@ impl HttpProxy {
 
                                 // Check object-level expiration
                                 let cached_range = &overlap.cached_ranges[0];
-                                match disk_cache_guard
-                                    .check_object_expiration(&cache_key)
-                                    .await
-                                {
-                                    Ok(ObjectExpirationResult::Expired { last_modified, etag }) => {
-                                    debug!(
+                                match disk_cache_guard.check_object_expiration(&cache_key).await {
+                                    Ok(ObjectExpirationResult::Expired {
+                                        last_modified,
+                                        etag,
+                                    }) => {
+                                        debug!(
                                         "Full object expired, performing conditional validation: cache_key={}",
                                         cache_key
                                     );
 
-                                    // Drop the lock before making S3 request
-                                    drop(disk_cache_guard);
+                                        // Drop the lock before making S3 request
+                                        drop(disk_cache_guard);
 
-                                    // Build validation headers
-                                    let mut validation_headers = header_map.clone();
-                                    if let Some(ref lm) = last_modified {
-                                        validation_headers
-                                            .insert("if-modified-since".to_string(), lm.clone());
-                                    }
-                                    if let Some(ref et) = etag {
-                                        validation_headers
-                                            .insert("if-none-match".to_string(), et.clone());
-                                    }
+                                        // Download-coordination wrapping: coalesce concurrent
+                                        // expired-revalidations for the same object so only one
+                                        // authoritative revalidation hits S3, and every waiter
+                                        // issues its own signed conditional (Task 6 of the
+                                        // `download-coordination-ttl-correctness` bugfix).
+                                        let mut fetcher_guard: Option<FetchGuard> = None;
+                                        if config.cache.download_coordination.enabled {
+                                            let flight_key =
+                                                InFlightTracker::make_full_key(&cache_key);
+                                            match inflight_tracker.try_register(&flight_key) {
+                                                FetchRole::Fetcher(g) => {
+                                                    fetcher_guard = Some(g);
+                                                }
+                                                FetchRole::Waiter(mut rx) => {
+                                                    if let Some(ref mm) = metrics_manager {
+                                                        mm.read()
+                                                            .await
+                                                            .record_coalesce_wait()
+                                                            .await;
+                                                    }
+                                                    let wait_start = std::time::Instant::now();
+                                                    let wait_timeout = config
+                                                        .cache
+                                                        .download_coordination
+                                                        .wait_timeout();
+                                                    let wait_result = tokio::time::timeout(
+                                                        wait_timeout,
+                                                        rx.recv(),
+                                                    )
+                                                    .await;
+                                                    if let Some(ref mm) = metrics_manager {
+                                                        mm.read()
+                                                            .await
+                                                            .record_coalesce_wait_duration(
+                                                                wait_start.elapsed(),
+                                                            )
+                                                            .await;
+                                                    }
+                                                    if let Ok(Ok(Ok(()))) = wait_result {
+                                                        let waiter_headers = header_map.clone();
+                                                        return Self::serve_from_cache_validated(
+                                                            method,
+                                                            uri,
+                                                            host,
+                                                            waiter_headers,
+                                                            cache_key,
+                                                            cache_manager,
+                                                            range_handler,
+                                                            s3_client,
+                                                            config,
+                                                            metrics_manager.clone(),
+                                                            proxy_referer,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    // Waiter fallback (channel closed /
+                                                    // fetcher error / timeout): fall through
+                                                    // to the non-coordinated inline
+                                                    // revalidation path below. No guard is
+                                                    // held; waiter acts as its own fetcher.
+                                                }
+                                            }
+                                        }
 
-                                    // Build S3 request context for conditional validation
-                                    let validation_context = crate::s3_client::build_s3_request_context(
-                                        method.clone(),
-                                        uri.clone(),
-                                        validation_headers,
-                                        None, // No body
-                                        host.clone(),
-                                    );
+                                        // Build validation headers
+                                        let mut validation_headers = header_map.clone();
+                                        if let Some(ref lm) = last_modified {
+                                            validation_headers.insert(
+                                                "if-modified-since".to_string(),
+                                                lm.clone(),
+                                            );
+                                        }
+                                        if let Some(ref et) = etag {
+                                            validation_headers
+                                                .insert("if-none-match".to_string(), et.clone());
+                                        }
 
-                                    // Make conditional request to S3
-                                    match s3_client.forward_request(validation_context).await {
-                                        Ok(response) => {
-                                            if response.status == StatusCode::NOT_MODIFIED {
-                                                // 304 Not Modified - refresh TTL and serve from cache (Requirement 2.3)
-                                                debug!(
+                                        // Build S3 request context for conditional validation
+                                        let validation_context =
+                                            crate::s3_client::build_s3_request_context(
+                                                method.clone(),
+                                                uri.clone(),
+                                                validation_headers,
+                                                None, // No body
+                                                host.clone(),
+                                            );
+
+                                        // Make conditional request to S3
+                                        match s3_client.forward_request(validation_context).await {
+                                            Ok(response) => {
+                                                if response.status == StatusCode::NOT_MODIFIED {
+                                                    // 304 Not Modified - refresh TTL and serve from cache (Requirement 2.3)
+                                                    debug!(
                                                     "Full object conditional validation returned 304 Not Modified, refreshing TTL: cache_key={}",
                                                     cache_key
                                                 );
 
-                                                let mut disk_cache_guard = disk_cache.write().await;
-                                                if let Err(e) = disk_cache_guard
-                                                    .refresh_object_ttl(
-                                                        &cache_key,
-                                                        resolved_settings.get_ttl,
-                                                    )
-                                                    .await
-                                                {
-                                                    warn!("Failed to refresh full object TTL: {}", e);
-                                                }
-                                                drop(disk_cache_guard);
+                                                    let mut disk_cache_guard =
+                                                        disk_cache.write().await;
+                                                    if let Err(e) = disk_cache_guard
+                                                        .refresh_object_ttl(
+                                                            &cache_key,
+                                                            resolved_settings.get_ttl,
+                                                        )
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            "Failed to refresh full object TTL: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                    drop(disk_cache_guard);
 
-                                                // Serve from cache
-                                                let header_map: HeaderMap = header_map
-                                                    .iter()
-                                                    .filter_map(|(k, v)| {
-                                                        HeaderName::from_str(k)
-                                                            .ok()
-                                                            .zip(HeaderValue::from_str(v).ok())
-                                                    })
-                                                    .collect();
-                                                return Self::serve_full_object_from_cache(
-                                                    method,
-                                                    &full_range,
-                                                    &overlap,
-                                                    &cache_key,
-                                                    cache_manager,
-                                                    range_handler,
-                                                    s3_client,
-                                                    &host,
-                                                    uri.path(),
-                                                    &header_map,
-                                                    config,
-                                                )
-                                                .await;
-                                            } else if response.status == StatusCode::OK {
-                                                // 200 OK - data changed, remove stale range and forward to S3 (Requirement 2.4)
-                                                debug!(
+                                                    // Notify any waiters on the flight key.
+                                                    if let Some(g) = fetcher_guard.take() {
+                                                        g.complete_success();
+                                                        if let Some(ref mm) = metrics_manager {
+                                                            mm.read()
+                                                                .await
+                                                                .record_coalesce_fetcher_success()
+                                                                .await;
+                                                        }
+                                                    }
+
+                                                    // Serve from cache
+                                                    let header_map: HeaderMap = header_map
+                                                        .iter()
+                                                        .filter_map(|(k, v)| {
+                                                            HeaderName::from_str(k)
+                                                                .ok()
+                                                                .zip(HeaderValue::from_str(v).ok())
+                                                        })
+                                                        .collect();
+                                                    return Self::serve_full_object_from_cache(
+                                                        method,
+                                                        &full_range,
+                                                        &overlap,
+                                                        &cache_key,
+                                                        cache_manager,
+                                                        range_handler,
+                                                        s3_client,
+                                                        &host,
+                                                        uri.path(),
+                                                        &header_map,
+                                                        config,
+                                                    )
+                                                    .await;
+                                                } else if response.status == StatusCode::OK {
+                                                    // 200 OK - data changed, remove stale range and forward to S3 (Requirement 2.4)
+                                                    debug!(
                                                     "Full object conditional validation returned 200 OK, data changed: cache_key={}, range={}-{}",
                                                     cache_key, cached_range.start, cached_range.end
                                                 );
 
-                                                let mut disk_cache_guard = disk_cache.write().await;
-                                                if let Err(e) = disk_cache_guard
-                                                    .remove_invalidated_range(
-                                                        &cache_key,
-                                                        cached_range.start,
-                                                        cached_range.end,
-                                                    )
-                                                    .await
-                                                {
-                                                    warn!("Failed to remove invalidated full object range: {}", e);
-                                                }
-                                                drop(disk_cache_guard);
+                                                    let mut disk_cache_guard =
+                                                        disk_cache.write().await;
+                                                    if let Err(e) = disk_cache_guard
+                                                        .remove_invalidated_range(
+                                                            &cache_key,
+                                                            cached_range.start,
+                                                            cached_range.end,
+                                                        )
+                                                        .await
+                                                    {
+                                                        warn!("Failed to remove invalidated full object range: {}", e);
+                                                    }
+                                                    drop(disk_cache_guard);
 
-                                                // Fall through to forward_get_head_with_coordination
-                                            } else if response.status == StatusCode::FORBIDDEN || response.status == StatusCode::UNAUTHORIZED {
-                                                // 403/401 - credentials issue, not a data change
-                                                // Return error to client, do NOT invalidate cache
-                                                debug!(
+                                                    if let Some(g) = fetcher_guard.take() {
+                                                        g.complete_success();
+                                                        if let Some(ref mm) = metrics_manager {
+                                                            mm.read()
+                                                                .await
+                                                                .record_coalesce_fetcher_success()
+                                                                .await;
+                                                        }
+                                                    }
+
+                                                    // Fall through to forward_get_head_with_coordination
+                                                } else if response.status == StatusCode::FORBIDDEN
+                                                    || response.status == StatusCode::UNAUTHORIZED
+                                                {
+                                                    // 403/401 - credentials issue, not a data change
+                                                    // Return error to client, do NOT invalidate cache
+                                                    debug!(
                                                     "Full object conditional validation returned {} (auth error), returning to client without cache invalidation: cache_key={}",
                                                     response.status, cache_key
                                                 );
-                                                return Self::convert_s3_response_to_http(response);
-                                            } else {
-                                                // Validation returned unexpected status - forward original request to S3 (Requirement 2.5)
-                                                warn!(
+                                                    if let Some(g) = fetcher_guard.take() {
+                                                        g.complete_error(format!(
+                                                            "S3 returned status {}",
+                                                            response.status
+                                                        ));
+                                                        if let Some(ref mm) = metrics_manager {
+                                                            mm.read()
+                                                                .await
+                                                                .record_coalesce_fetcher_error()
+                                                                .await;
+                                                        }
+                                                    }
+                                                    return Self::convert_s3_response_to_http(
+                                                        response,
+                                                    );
+                                                } else {
+                                                    // Validation returned unexpected status - forward original request to S3 (Requirement 2.5)
+                                                    warn!(
                                                     "Full object conditional validation returned unexpected status ({}), forwarding to S3: cache_key={}, range={}-{}",
                                                     response.status, cache_key, cached_range.start, cached_range.end
                                                 );
 
+                                                    let mut disk_cache_guard =
+                                                        disk_cache.write().await;
+                                                    if let Err(e) = disk_cache_guard
+                                                        .remove_invalidated_range(
+                                                            &cache_key,
+                                                            cached_range.start,
+                                                            cached_range.end,
+                                                        )
+                                                        .await
+                                                    {
+                                                        warn!("Failed to remove invalidated full object range: {}", e);
+                                                    }
+                                                    drop(disk_cache_guard);
+
+                                                    if let Some(g) = fetcher_guard.take() {
+                                                        g.complete_error(format!(
+                                                            "S3 returned status {}",
+                                                            response.status
+                                                        ));
+                                                        if let Some(ref mm) = metrics_manager {
+                                                            mm.read()
+                                                                .await
+                                                                .record_coalesce_fetcher_error()
+                                                                .await;
+                                                        }
+                                                    }
+
+                                                    // Fall through to forward_get_head_with_coordination
+                                                }
+                                            }
+                                            Err(e) => {
+                                                // Validation request failed - forward original request to S3
+                                                warn!(
+                                                "Full object conditional validation request failed ({}), forwarding to S3: cache_key={}, range={}-{}",
+                                                e, cache_key, cached_range.start, cached_range.end
+                                            );
+
                                                 let mut disk_cache_guard = disk_cache.write().await;
                                                 if let Err(e) = disk_cache_guard
                                                     .remove_invalidated_range(
@@ -2309,70 +2504,60 @@ impl HttpProxy {
                                                 }
                                                 drop(disk_cache_guard);
 
+                                                if let Some(g) = fetcher_guard.take() {
+                                                    g.complete_error(format!(
+                                                        "S3 transport error: {}",
+                                                        e
+                                                    ));
+                                                    if let Some(ref mm) = metrics_manager {
+                                                        mm.read()
+                                                            .await
+                                                            .record_coalesce_fetcher_error()
+                                                            .await;
+                                                    }
+                                                }
+
                                                 // Fall through to forward_get_head_with_coordination
                                             }
                                         }
-                                        Err(e) => {
-                                            // Validation request failed - forward original request to S3
-                                            warn!(
-                                                "Full object conditional validation request failed ({}), forwarding to S3: cache_key={}, range={}-{}",
-                                                e, cache_key, cached_range.start, cached_range.end
-                                            );
-
-                                            let mut disk_cache_guard = disk_cache.write().await;
-                                            if let Err(e) = disk_cache_guard
-                                                .remove_invalidated_range(
-                                                    &cache_key,
-                                                    cached_range.start,
-                                                    cached_range.end,
-                                                )
-                                                .await
-                                            {
-                                                warn!("Failed to remove invalidated full object range: {}", e);
-                                            }
-                                            drop(disk_cache_guard);
-
-                                            // Fall through to forward_get_head_with_coordination
-                                        }
-                                    }
                                     }
                                     Ok(ObjectExpirationResult::Fresh) => {
-                                    // Not expired - serve from cache as before
-                                    drop(disk_cache_guard);
+                                        // Not expired - serve from cache as before
+                                        drop(disk_cache_guard);
 
-                                    // Cache HIT - we can serve the full object from cache
-                                    debug!(
-                                        operation = "GET",
-                                        cache_result = "HIT",
-                                        cache_type = "full_object_from_ranges",
-                                        path = uri.path(),
-                                        size_bytes = total_size,
-                                        "Cache operation completed"
-                                    );
+                                        // Cache HIT - we can serve the full object from cache
+                                        debug!(
+                                            operation = "GET",
+                                            cache_result = "HIT",
+                                            cache_type = "full_object_from_ranges",
+                                            path = uri.path(),
+                                            size_bytes = total_size,
+                                            "Cache operation completed"
+                                        );
 
-                                    let header_map: HeaderMap = header_map
-                                        .iter()
-                                        .filter_map(|(k, v)| {
-                                            HeaderName::from_str(k)
-                                                .ok()
-                                                .zip(HeaderValue::from_str(v).ok())
-                                        })
-                                        .collect();
+                                        let header_map: HeaderMap = header_map
+                                            .iter()
+                                            .filter_map(|(k, v)| {
+                                                HeaderName::from_str(k)
+                                                    .ok()
+                                                    .zip(HeaderValue::from_str(v).ok())
+                                            })
+                                            .collect();
 
-                                    return Self::serve_full_object_from_cache(
-                                        method,
-                                        &full_range,
-                                        &overlap,
-                                        &cache_key,
-                                        cache_manager,
-                                        range_handler,
-                                        s3_client,
-                                        &host,
-                                        uri.path(),
-                                        &header_map,
-                                        config,
-                                    )
-                                    .await;
+                                        return Self::serve_full_object_from_cache(
+                                            method,
+                                            &full_range,
+                                            &overlap,
+                                            &cache_key,
+                                            cache_manager,
+                                            range_handler,
+                                            s3_client,
+                                            &host,
+                                            uri.path(),
+                                            &header_map,
+                                            config,
+                                        )
+                                        .await;
                                     }
                                     Err(e) => {
                                         // Unexpected error - log and fall through to S3
@@ -2444,8 +2629,7 @@ impl HttpProxy {
                             let range_is_signed =
                                 crate::signed_request_proxy::is_range_signed(&header_map);
 
-                            let fraction_ok = cached_bytes
-                                * PARTIAL_MERGE_MIN_FRACTION_DENOMINATOR
+                            let fraction_ok = cached_bytes * PARTIAL_MERGE_MIN_FRACTION_DENOMINATOR
                                 >= total_size * PARTIAL_MERGE_MIN_FRACTION_NUMERATOR;
                             let size_ok = total_size <= PARTIAL_MERGE_MAX_SIZE_BYTES;
 
@@ -2591,7 +2775,7 @@ impl HttpProxy {
         host: String,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
@@ -2626,7 +2810,8 @@ impl HttpProxy {
                 });
             }
             let host_for_cache = host.clone();
-            let response = Self::forward_signed_request(req, host, s3_client, proxy_referer).await?;
+            let response =
+                Self::forward_signed_request(req, host, s3_client, proxy_referer).await?;
             if response.status().is_success() {
                 let cache_key = CacheManager::generate_cache_key(path, Some(&host_for_cache));
                 if let Err(e) = cache_manager
@@ -2656,7 +2841,8 @@ impl HttpProxy {
 
                 // Forward request to S3 and invalidate cache on success
                 let host_for_cache = host.clone();
-                let response = Self::forward_signed_request(req, host, s3_client, proxy_referer).await?;
+                let response =
+                    Self::forward_signed_request(req, host, s3_client, proxy_referer).await?;
 
                 // If PUT was successful, invalidate cache
                 if response.status().is_success() {
@@ -2696,19 +2882,9 @@ impl HttpProxy {
 
             match target_ip_opt {
                 Some(target_ip) => {
-
                     // Create TLS connector
-                    let mut root_store = rustls::RootCertStore::empty();
-
-                    // Load system root certificates
-                    match rustls_native_certs::load_native_certs() {
-                        Ok(certs) => {
-                            for cert in certs {
-                                if let Err(e) = root_store.add(cert) {
-                                    warn!("Failed to add cert: {}", e);
-                                }
-                            }
-                        }
+                    let root_store = match crate::tls_trust_store::load_root_cert_store() {
+                        Ok(rs) => rs,
                         Err(e) => {
                             error!("Failed to load native certs: {}", e);
                             return Ok(Self::build_error_response(
@@ -2718,7 +2894,7 @@ impl HttpProxy {
                                 None,
                             ));
                         }
-                    }
+                    };
 
                     let tls_config = if config.connection_pool.endpoint_overrides.is_empty() {
                         rustls::ClientConfig::builder()
@@ -2730,9 +2906,9 @@ impl HttpProxy {
                         let pm = pool.read().await;
                         if pm.resolve_override(&host).is_some() {
                             drop(pm);
-                            rustls::ClientConfig::builder_with_protocol_versions(
-                                &[&rustls::version::TLS12],
-                            )
+                            rustls::ClientConfig::builder_with_protocol_versions(&[
+                                &rustls::version::TLS12,
+                            ])
                             .with_root_certificates(root_store)
                             .with_no_client_auth()
                         } else {
@@ -2823,7 +2999,7 @@ impl HttpProxy {
         query: &str,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Extract headers for multipart detection
         let headers: HashMap<String, String> = req
@@ -2992,7 +3168,13 @@ impl HttpProxy {
                     }
 
                     if let Err(e) = cache_manager
-                        .store_write_cache_entry(&cache_key, &body_bytes, headers, metadata, response_headers)
+                        .store_write_cache_entry(
+                            &cache_key,
+                            &body_bytes,
+                            headers,
+                            metadata,
+                            response_headers,
+                        )
                         .await
                     {
                         warn!("Failed to store PUT request in write cache: {}", e);
@@ -3043,7 +3225,7 @@ impl HttpProxy {
         host: String,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
@@ -3194,7 +3376,11 @@ impl HttpProxy {
 
     /// Rate-limited error log for S3 forwarding failures (once per minute with count).
     /// Stores the most recent request details so the emitted log always shows a fresh example.
-    fn log_s3_forward_error(uri: &impl std::fmt::Display, method: &impl std::fmt::Display, error: &impl std::fmt::Display) {
+    fn log_s3_forward_error(
+        uri: &impl std::fmt::Display,
+        method: &impl std::fmt::Display,
+        error: &impl std::fmt::Display,
+    ) {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Mutex;
 
@@ -3280,17 +3466,12 @@ impl HttpProxy {
     ///   so we return a terminal 4xx rather than falling through to S3.
     /// - All other variants → HTTP 500 `InternalError` as a safe default.
     #[allow(dead_code)]
-    fn proxy_error_to_response(
-        err: &crate::ProxyError,
-    ) -> Response<BoxBody<Bytes, hyper::Error>> {
+    fn proxy_error_to_response(err: &crate::ProxyError) -> Response<BoxBody<Bytes, hyper::Error>> {
         use crate::ProxyError;
         match err {
-            ProxyError::CacheError(msg) => Self::build_error_response(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                msg,
-                None,
-            ),
+            ProxyError::CacheError(msg) => {
+                Self::build_error_response(StatusCode::BAD_REQUEST, "InvalidArgument", msg, None)
+            }
             other => Self::build_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -3315,7 +3496,7 @@ impl HttpProxy {
     async fn forward_put_to_s3_without_caching(
         req: Request<hyper::body::Incoming>,
         host: String,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!("Forwarding PUT request to S3 without caching");
 
@@ -3343,7 +3524,8 @@ impl HttpProxy {
         };
 
         // Build S3 request context
-        let context = build_s3_request_context(method.clone(), uri.clone(), headers, body_bytes, host);
+        let context =
+            build_s3_request_context(method.clone(), uri.clone(), headers, body_bytes, host);
 
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
@@ -3369,7 +3551,7 @@ impl HttpProxy {
         host: String,
         path: &str,
         headers: HashMap<String, String>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!(
             "Forwarding PUT request with body to S3 (size: {} bytes)",
@@ -3463,7 +3645,7 @@ impl HttpProxy {
         cache_key: String,
         range_spec: RangeSpec,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         _config: Arc<Config>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let mut response_builder = Response::builder().status(s3_response.status);
@@ -3636,6 +3818,7 @@ impl HttpProxy {
     }
 
     /// Handle range requests with caching and conditional headers - Requirements 3.1, 3.2, 3.3, 3.4, 3.6, 3.7, 3.8
+    #[allow(clippy::too_many_arguments)]
     async fn handle_range_request(
         method: Method,
         cache_key: String,
@@ -3643,7 +3826,7 @@ impl HttpProxy {
         client_headers: HashMap<String, String>,
         cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         host: String,
         uri: hyper::Uri,
         config: Arc<Config>,
@@ -3660,7 +3843,10 @@ impl HttpProxy {
 
         // Get content_length from cached metadata if available (for open-ended ranges like "bytes=100-")
         // Also capture the full metadata for pass-through to avoid redundant NFS reads (Requirement 1.1)
-        let (content_length, preloaded_metadata) = match cache_manager.get_metadata_cached(&cache_key).await {
+        let (content_length, preloaded_metadata) = match cache_manager
+            .get_metadata_cached(&cache_key)
+            .await
+        {
             Ok(Some(metadata)) => {
                 let len = metadata.object_metadata.content_length;
                 debug!(
@@ -3704,7 +3890,9 @@ impl HttpProxy {
                 // Requirement 2.3: When content_length is unknown (metadata is None), proceed with full-object check as before.
                 let skip_full_object_check = preloaded_metadata
                     .as_ref()
-                    .map(|m| m.object_metadata.content_length > config.cache.full_object_check_threshold)
+                    .map(|m| {
+                        m.object_metadata.content_length > config.cache.full_object_check_threshold
+                    })
                     .unwrap_or(false);
 
                 if skip_full_object_check {
@@ -3718,115 +3906,123 @@ impl HttpProxy {
 
                 // Requirement 1.3: First check if we have a full object cached that can serve this range
                 if !skip_full_object_check {
-                debug!("Range request: checking for full object cache first: cache_key={}, requested_range={}-{}", cache_key, range_spec.start, range_spec.end);
-                match cache_manager.has_cached_ranges(&cache_key, preloaded_metadata.as_ref()).await {
-                    Ok(Some((true, total_size))) => {
-                        // We have cached ranges - check if they represent a full object that can serve this range
-                        if range_spec.start < total_size && range_spec.end < total_size {
-                            debug!("Full object available for range request: cache_key={}, total_size={}, requested_range={}-{}", cache_key, total_size, range_spec.start, range_spec.end);
+                    debug!("Range request: checking for full object cache first: cache_key={}, requested_range={}-{}", cache_key, range_spec.start, range_spec.end);
+                    match cache_manager
+                        .has_cached_ranges(&cache_key, preloaded_metadata.as_ref())
+                        .await
+                    {
+                        Ok(Some((true, total_size))) => {
+                            // We have cached ranges - check if they represent a full object that can serve this range
+                            if range_spec.start < total_size && range_spec.end < total_size {
+                                debug!("Full object available for range request: cache_key={}, total_size={}, requested_range={}-{}", cache_key, total_size, range_spec.start, range_spec.end);
 
-                            // Create a full object range spec to check if it's completely cached
-                            let full_range = crate::range_handler::RangeSpec {
-                                start: 0,
-                                end: total_size - 1,
-                            };
+                                // Create a full object range spec to check if it's completely cached
+                                let full_range = crate::range_handler::RangeSpec {
+                                    start: 0,
+                                    end: total_size - 1,
+                                };
 
-                            // Check if the full object is cached with ETag validation
-                            match range_handler
-                                .find_cached_ranges(
-                                    &cache_key,
-                                    &full_range,
-                                    current_etag.as_deref(),
-                                    preloaded_metadata.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok(full_overlap) if full_overlap.can_serve_from_cache => {
-                                    debug!(
+                                // Check if the full object is cached with ETag validation
+                                match range_handler
+                                    .find_cached_ranges(
+                                        &cache_key,
+                                        &full_range,
+                                        current_etag.as_deref(),
+                                        preloaded_metadata.as_ref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(full_overlap) if full_overlap.can_serve_from_cache => {
+                                        debug!(
                                         "Range request served from full object cache: cache_key={}, requested_range={}-{}, full_object_size={} bytes",
                                         cache_key, range_spec.start, range_spec.end, total_size
                                     );
 
-                                    // Filter cached ranges to only include those that overlap with the requested range
-                                    let mut filtered_cached_ranges = Vec::new();
-                                    for cached_range in &full_overlap.cached_ranges {
-                                        // Check if this cached range overlaps with the requested range
-                                        if cached_range.start <= range_spec.end
-                                            && cached_range.end >= range_spec.start
-                                        {
-                                            filtered_cached_ranges.push(cached_range.clone());
+                                        // Filter cached ranges to only include those that overlap with the requested range
+                                        let mut filtered_cached_ranges = Vec::new();
+                                        for cached_range in &full_overlap.cached_ranges {
+                                            // Check if this cached range overlaps with the requested range
+                                            if cached_range.start <= range_spec.end
+                                                && cached_range.end >= range_spec.start
+                                            {
+                                                filtered_cached_ranges.push(cached_range.clone());
+                                            }
                                         }
+
+                                        // Create filtered overlap with only relevant ranges
+                                        let filtered_overlap = crate::range_handler::RangeOverlap {
+                                            cached_ranges: filtered_cached_ranges,
+                                            missing_ranges: Vec::new(), // No missing ranges since we can serve from cache
+                                            can_serve_from_cache: true,
+                                        };
+
+                                        // Serve the requested range from the filtered cache ranges
+                                        let header_map: HeaderMap = client_headers
+                                            .iter()
+                                            .filter_map(|(k, v)| {
+                                                k.parse::<hyper::header::HeaderName>()
+                                                    .ok()
+                                                    .and_then(|name| {
+                                                        v.parse::<hyper::header::HeaderValue>()
+                                                            .ok()
+                                                            .map(|val| (name, val))
+                                                    })
+                                            })
+                                            .collect();
+                                        return Self::serve_range_from_cache(
+                                            method,
+                                            &range_spec,
+                                            &filtered_overlap,
+                                            &cache_key,
+                                            cache_manager,
+                                            range_handler,
+                                            s3_client.clone(),
+                                            &host,
+                                            &uri.to_string(),
+                                            &header_map,
+                                            config.clone(),
+                                            preloaded_metadata.as_ref(),
+                                        )
+                                        .await;
                                     }
-
-                                    // Create filtered overlap with only relevant ranges
-                                    let filtered_overlap = crate::range_handler::RangeOverlap {
-                                        cached_ranges: filtered_cached_ranges,
-                                        missing_ranges: Vec::new(), // No missing ranges since we can serve from cache
-                                        can_serve_from_cache: true,
-                                    };
-
-                                    // Serve the requested range from the filtered cache ranges
-                                    let header_map: HeaderMap = client_headers
-                                        .iter()
-                                        .filter_map(|(k, v)| {
-                                            k.parse::<hyper::header::HeaderName>().ok().and_then(
-                                                |name| {
-                                                    v.parse::<hyper::header::HeaderValue>()
-                                                        .ok()
-                                                        .map(|val| (name, val))
-                                                },
-                                            )
-                                        })
-                                        .collect();
-                                    return Self::serve_range_from_cache(
-                                        method,
-                                        &range_spec,
-                                        &filtered_overlap,
-                                        &cache_key,
-                                        cache_manager,
-                                        range_handler,
-                                        s3_client.clone(),
-                                        &host,
-                                        &uri.to_string(),
-                                        &header_map,
-                                        config.clone(),
-                                        preloaded_metadata.as_ref(),
-                                    )
-                                    .await;
+                                    Ok(_) => {
+                                        debug!("Full object not completely cached, falling back to range-specific lookup: cache_key={}", cache_key);
+                                    }
+                                    Err(e) => {
+                                        debug!("Error checking full object cache, falling back to range-specific lookup: cache_key={}, error={}", cache_key, e);
+                                    }
                                 }
-                                Ok(_) => {
-                                    debug!("Full object not completely cached, falling back to range-specific lookup: cache_key={}", cache_key);
-                                }
-                                Err(e) => {
-                                    debug!("Error checking full object cache, falling back to range-specific lookup: cache_key={}, error={}", cache_key, e);
-                                }
+                            } else {
+                                debug!("Requested range exceeds cached object size: cache_key={}, total_size={}, requested_range={}-{}", cache_key, total_size, range_spec.start, range_spec.end);
                             }
-                        } else {
-                            debug!("Requested range exceeds cached object size: cache_key={}, total_size={}, requested_range={}-{}", cache_key, total_size, range_spec.start, range_spec.end);
+                        }
+                        Ok(Some((false, _))) => {
+                            debug!(
+                                "No cached ranges found for range request: cache_key={}",
+                                cache_key
+                            );
+                        }
+                        Ok(None) => {
+                            debug!(
+                                "No metadata found for range request: cache_key={}",
+                                cache_key
+                            );
+                        }
+                        Err(e) => {
+                            debug!("Error checking cached ranges for range request: cache_key={}, error={}", cache_key, e);
                         }
                     }
-                    Ok(Some((false, _))) => {
-                        debug!(
-                            "No cached ranges found for range request: cache_key={}",
-                            cache_key
-                        );
-                    }
-                    Ok(None) => {
-                        debug!(
-                            "No metadata found for range request: cache_key={}",
-                            cache_key
-                        );
-                    }
-                    Err(e) => {
-                        debug!("Error checking cached ranges for range request: cache_key={}, error={}", cache_key, e);
-                    }
-                }
                 } // end if !skip_full_object_check
 
                 // Fall back to range-specific cache lookup with ETag validation (Requirement 3.3)
                 debug!("[DIAGNOSTIC] Calling find_cached_ranges for cache_key: {}, range: {}-{}, etag: {:?}", cache_key, range_spec.start, range_spec.end, current_etag);
                 match range_handler
-                    .find_cached_ranges(&cache_key, &range_spec, current_etag.as_deref(), preloaded_metadata.as_ref())
+                    .find_cached_ranges(
+                        &cache_key,
+                        &range_spec,
+                        current_etag.as_deref(),
+                        preloaded_metadata.as_ref(),
+                    )
                     .await
                 {
                     Ok(overlap) => {
@@ -3866,148 +4062,307 @@ impl HttpProxy {
 
                             // Check object-level expiration
                             let cached_range = &overlap.cached_ranges[0];
-                            match disk_cache_guard
-                                .check_object_expiration(&cache_key)
-                                .await
-                            {
-                                Ok(ObjectExpirationResult::Expired { last_modified, etag }) => {
-                                debug!(
+                            match disk_cache_guard.check_object_expiration(&cache_key).await {
+                                Ok(ObjectExpirationResult::Expired {
+                                    last_modified,
+                                    etag,
+                                }) => {
+                                    debug!(
                                     "Range expired, performing conditional validation: cache_key={}",
                                     cache_key
                                 );
 
-                                // Drop the lock before making S3 request
-                                drop(disk_cache_guard);
+                                    // Drop the lock before making S3 request
+                                    drop(disk_cache_guard);
 
-                                // Build validation headers
-                                let mut validation_headers = client_headers.clone();
-                                if let Some(ref lm) = last_modified {
-                                    validation_headers
-                                        .insert("if-modified-since".to_string(), lm.clone());
-                                }
-                                if let Some(ref et) = etag {
-                                    validation_headers
-                                        .insert("if-none-match".to_string(), et.clone());
-                                }
-                                validation_headers.insert(
-                                    "range".to_string(),
-                                    format!("bytes={}-{}", range_spec.start, range_spec.end),
-                                );
+                                    // Download-coordination wrapping for expired-range
+                                    // revalidation (Task 7 of the
+                                    // `download-coordination-ttl-correctness` bugfix). Mirrors
+                                    // the full-object wrapping in Task 6: exactly one
+                                    // authoritative revalidation per flight, and every waiter
+                                    // issues its own signed conditional.
+                                    let mut fetcher_guard: Option<FetchGuard> = None;
+                                    if config.cache.download_coordination.enabled {
+                                        let flight_key = InFlightTracker::make_range_key(
+                                            &cache_key,
+                                            range_spec.start,
+                                            range_spec.end,
+                                        );
+                                        match inflight_tracker.try_register(&flight_key) {
+                                            FetchRole::Fetcher(g) => {
+                                                fetcher_guard = Some(g);
+                                            }
+                                            FetchRole::Waiter(mut rx) => {
+                                                if let Some(ref mm) = metrics_manager {
+                                                    mm.read().await.record_coalesce_wait().await;
+                                                }
+                                                let wait_start = std::time::Instant::now();
+                                                let wait_timeout = config
+                                                    .cache
+                                                    .download_coordination
+                                                    .wait_timeout();
+                                                let wait_result =
+                                                    tokio::time::timeout(wait_timeout, rx.recv())
+                                                        .await;
+                                                if let Some(ref mm) = metrics_manager {
+                                                    mm.read()
+                                                        .await
+                                                        .record_coalesce_wait_duration(
+                                                            wait_start.elapsed(),
+                                                        )
+                                                        .await;
+                                                }
+                                                if let Ok(Ok(Ok(()))) = wait_result {
+                                                    let is_signed =
+                                                    crate::signed_request_proxy::is_range_signed(
+                                                        &client_headers,
+                                                    );
+                                                    return Self::serve_range_from_cache_validated(
+                                                        method,
+                                                        uri,
+                                                        host,
+                                                        client_headers,
+                                                        cache_key,
+                                                        range_spec,
+                                                        cache_manager,
+                                                        range_handler,
+                                                        s3_client,
+                                                        config,
+                                                        is_signed,
+                                                        metrics_manager.clone(),
+                                                        proxy_referer,
+                                                    )
+                                                    .await;
+                                                }
+                                                // Waiter fallback: fall through to the
+                                                // non-coordinated inline revalidation path.
+                                            }
+                                        }
+                                    }
 
-                                // Build S3 request context for conditional validation
-                                let validation_context = crate::s3_client::build_s3_request_context(
-                                    method.clone(),
-                                    uri.clone(),
-                                    validation_headers,
-                                    None, // No body
-                                    host.clone(),
-                                );
+                                    // Build validation headers
+                                    let mut validation_headers = client_headers.clone();
+                                    if let Some(ref lm) = last_modified {
+                                        validation_headers
+                                            .insert("if-modified-since".to_string(), lm.clone());
+                                    }
+                                    if let Some(ref et) = etag {
+                                        validation_headers
+                                            .insert("if-none-match".to_string(), et.clone());
+                                    }
+                                    validation_headers.insert(
+                                        "range".to_string(),
+                                        format!("bytes={}-{}", range_spec.start, range_spec.end),
+                                    );
 
-                                // Make conditional request to S3
-                                match s3_client.forward_request(validation_context).await {
-                                    Ok(response) => {
-                                        if response.status == StatusCode::NOT_MODIFIED {
-                                            // 304 Not Modified - refresh TTL and serve from cache (Requirement 1.5, 6.4)
-                                            debug!(
+                                    // Build S3 request context for conditional validation
+                                    let validation_context =
+                                        crate::s3_client::build_s3_request_context(
+                                            method.clone(),
+                                            uri.clone(),
+                                            validation_headers,
+                                            None, // No body
+                                            host.clone(),
+                                        );
+
+                                    // Make conditional request to S3
+                                    match s3_client.forward_request(validation_context).await {
+                                        Ok(response) => {
+                                            if response.status == StatusCode::NOT_MODIFIED {
+                                                // 304 Not Modified - refresh TTL and serve from cache (Requirement 1.5, 6.4)
+                                                debug!(
                                                 "Conditional validation returned 304 Not Modified, refreshing TTL: cache_key={}",
                                                 cache_key
                                             );
 
-                                            let mut disk_cache_guard = disk_cache.write().await;
-                                            if let Err(e) = disk_cache_guard
-                                                .refresh_object_ttl(
-                                                    &cache_key,
-                                                    resolved_get_ttl,
-                                                )
-                                                .await
-                                            {
-                                                warn!("Failed to refresh object TTL: {}", e);
-                                            }
-                                            drop(disk_cache_guard);
+                                                let mut disk_cache_guard = disk_cache.write().await;
+                                                if let Err(e) = disk_cache_guard
+                                                    .refresh_object_ttl(
+                                                        &cache_key,
+                                                        resolved_get_ttl,
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!("Failed to refresh object TTL: {}", e);
+                                                }
+                                                drop(disk_cache_guard);
 
-                                            // Serve from cache
-                                            let header_map: HeaderMap = client_headers
-                                                .iter()
-                                                .filter_map(|(k, v)| {
-                                                    k.parse::<hyper::header::HeaderName>()
+                                                if let Some(g) = fetcher_guard.take() {
+                                                    g.complete_success();
+                                                    if let Some(ref mm) = metrics_manager {
+                                                        mm.read()
+                                                            .await
+                                                            .record_coalesce_fetcher_success()
+                                                            .await;
+                                                    }
+                                                }
+
+                                                // Serve from cache
+                                                let header_map: HeaderMap = client_headers
+                                                    .iter()
+                                                    .filter_map(|(k, v)| {
+                                                        k.parse::<hyper::header::HeaderName>()
                                                         .ok()
                                                         .and_then(|name| {
                                                             v.parse::<hyper::header::HeaderValue>()
                                                                 .ok()
                                                                 .map(|val| (name, val))
                                                         })
-                                                })
-                                                .collect();
-                                            return Self::serve_range_from_cache(
-                                                method,
-                                                &range_spec,
-                                                &overlap,
-                                                &cache_key,
-                                                cache_manager,
-                                                range_handler,
-                                                s3_client.clone(),
-                                                &host,
-                                                &uri.to_string(),
-                                                &header_map,
-                                                config.clone(),
-                                                preloaded_metadata.as_ref(),
-                                            )
-                                            .await;
-                                        } else if response.status == StatusCode::OK {
-                                            // 200 OK - data changed, remove invalidated range and cache new data (Requirement 1.6)
-                                            debug!(
+                                                    })
+                                                    .collect();
+                                                return Self::serve_range_from_cache(
+                                                    method,
+                                                    &range_spec,
+                                                    &overlap,
+                                                    &cache_key,
+                                                    cache_manager,
+                                                    range_handler,
+                                                    s3_client.clone(),
+                                                    &host,
+                                                    &uri.to_string(),
+                                                    &header_map,
+                                                    config.clone(),
+                                                    preloaded_metadata.as_ref(),
+                                                )
+                                                .await;
+                                            } else if response.status == StatusCode::OK {
+                                                // 200 OK - data changed, remove invalidated range and cache new data (Requirement 1.6)
+                                                debug!(
                                                 "Conditional validation returned 200 OK, data changed: cache_key={}, range={}-{}",
                                                 cache_key, cached_range.start, cached_range.end
                                             );
 
-                                            let mut disk_cache_guard = disk_cache.write().await;
-                                            if let Err(e) = disk_cache_guard
-                                                .remove_invalidated_range(
-                                                    &cache_key,
-                                                    cached_range.start,
-                                                    cached_range.end,
-                                                )
-                                                .await
-                                            {
-                                                warn!("Failed to remove invalidated range: {}", e);
-                                            }
-                                            drop(disk_cache_guard);
+                                                let mut disk_cache_guard = disk_cache.write().await;
+                                                if let Err(e) = disk_cache_guard
+                                                    .remove_invalidated_range(
+                                                        &cache_key,
+                                                        cached_range.start,
+                                                        cached_range.end,
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        "Failed to remove invalidated range: {}",
+                                                        e
+                                                    );
+                                                }
+                                                drop(disk_cache_guard);
 
-                                            // Forward request to S3 to get and cache new data
-                                            return Self::forward_range_request_to_s3(
-                                                method,
-                                                uri.clone(),
-                                                host.clone(),
-                                                client_headers.clone(),
-                                                cache_key.clone(),
-                                                range_spec.clone(),
-                                                overlap,
-                                                cache_manager,
-                                                range_handler.clone(),
-                                                s3_client,
-                                                config.clone(),
-                                                preloaded_metadata.as_ref(),
-                                                proxy_referer,
-                                            )
-                                            .await;
-                                        } else if response.status == StatusCode::FORBIDDEN || response.status == StatusCode::UNAUTHORIZED {
-                                            // 403/401 - credentials issue, not a data change
-                                            // Return error to client, do NOT invalidate cache
-                                            debug!(
+                                                if let Some(g) = fetcher_guard.take() {
+                                                    g.complete_success();
+                                                    if let Some(ref mm) = metrics_manager {
+                                                        mm.read()
+                                                            .await
+                                                            .record_coalesce_fetcher_success()
+                                                            .await;
+                                                    }
+                                                }
+
+                                                // Forward request to S3 to get and cache new data
+                                                return Self::forward_range_request_to_s3(
+                                                    method,
+                                                    uri.clone(),
+                                                    host.clone(),
+                                                    client_headers.clone(),
+                                                    cache_key.clone(),
+                                                    range_spec.clone(),
+                                                    overlap,
+                                                    cache_manager,
+                                                    range_handler.clone(),
+                                                    s3_client,
+                                                    config.clone(),
+                                                    preloaded_metadata.as_ref(),
+                                                    proxy_referer,
+                                                )
+                                                .await;
+                                            } else if response.status == StatusCode::FORBIDDEN
+                                                || response.status == StatusCode::UNAUTHORIZED
+                                            {
+                                                // 403/401 - credentials issue, not a data change
+                                                // Return error to client, do NOT invalidate cache
+                                                debug!(
                                                 "Conditional validation returned {} (auth error), returning to client without cache invalidation: cache_key={}",
                                                 response.status, cache_key
                                             );
-                                            return Self::convert_s3_response_to_http(response);
-                                        } else {
-                                            // Validation returned unexpected status - forward original request to S3
-                                            warn!(
+                                                if let Some(g) = fetcher_guard.take() {
+                                                    g.complete_error(format!(
+                                                        "S3 returned status {}",
+                                                        response.status
+                                                    ));
+                                                    if let Some(ref mm) = metrics_manager {
+                                                        mm.read()
+                                                            .await
+                                                            .record_coalesce_fetcher_error()
+                                                            .await;
+                                                    }
+                                                }
+                                                return Self::convert_s3_response_to_http(response);
+                                            } else {
+                                                // Validation returned unexpected status - forward original request to S3
+                                                warn!(
                                                 "Conditional validation returned unexpected status ({}), forwarding original request to S3: cache_key={}, range={}-{}",
                                                 response.status, cache_key, cached_range.start, cached_range.end
                                             );
 
+                                                // Remove the expired range since we couldn't validate it
+                                                let mut disk_cache_guard = disk_cache.write().await;
+                                                if let Err(e) = disk_cache_guard
+                                                    .remove_invalidated_range(
+                                                        &cache_key,
+                                                        cached_range.start,
+                                                        cached_range.end,
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        "Failed to remove invalidated range: {}",
+                                                        e
+                                                    );
+                                                }
+                                                drop(disk_cache_guard);
+
+                                                if let Some(g) = fetcher_guard.take() {
+                                                    g.complete_error(format!(
+                                                        "S3 returned status {}",
+                                                        response.status
+                                                    ));
+                                                    if let Some(ref mm) = metrics_manager {
+                                                        mm.read()
+                                                            .await
+                                                            .record_coalesce_fetcher_error()
+                                                            .await;
+                                                    }
+                                                }
+
+                                                // Forward original request to S3 and cache response if successful
+                                                return Self::forward_range_request_to_s3(
+                                                    method,
+                                                    uri.clone(),
+                                                    host.clone(),
+                                                    client_headers.clone(),
+                                                    cache_key.clone(),
+                                                    range_spec.clone(),
+                                                    overlap,
+                                                    cache_manager,
+                                                    range_handler.clone(),
+                                                    s3_client,
+                                                    config.clone(),
+                                                    preloaded_metadata.as_ref(),
+                                                    proxy_referer,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Validation request failed - forward original request to S3
+                                            warn!(
+                                            "Conditional validation request failed ({}), forwarding original request to S3: cache_key={}, range={}-{}",
+                                            e, cache_key, cached_range.start, cached_range.end
+                                        );
+
                                             // Remove the expired range since we couldn't validate it
                                             let mut disk_cache_guard = disk_cache.write().await;
-                                            if let Err(e) = disk_cache_guard
+                                            if let Err(err) = disk_cache_guard
                                                 .remove_invalidated_range(
                                                     &cache_key,
                                                     cached_range.start,
@@ -4015,9 +4370,25 @@ impl HttpProxy {
                                                 )
                                                 .await
                                             {
-                                                warn!("Failed to remove invalidated range: {}", e);
+                                                warn!(
+                                                    "Failed to remove invalidated range: {}",
+                                                    err
+                                                );
                                             }
                                             drop(disk_cache_guard);
+
+                                            if let Some(g) = fetcher_guard.take() {
+                                                g.complete_error(format!(
+                                                    "S3 transport error: {}",
+                                                    e
+                                                ));
+                                                if let Some(ref mm) = metrics_manager {
+                                                    mm.read()
+                                                        .await
+                                                        .record_coalesce_fetcher_error()
+                                                        .await;
+                                                }
+                                            }
 
                                             // Forward original request to S3 and cache response if successful
                                             return Self::forward_range_request_to_s3(
@@ -4038,46 +4409,6 @@ impl HttpProxy {
                                             .await;
                                         }
                                     }
-                                    Err(e) => {
-                                        // Validation request failed - forward original request to S3
-                                        warn!(
-                                            "Conditional validation request failed ({}), forwarding original request to S3: cache_key={}, range={}-{}",
-                                            e, cache_key, cached_range.start, cached_range.end
-                                        );
-
-                                        // Remove the expired range since we couldn't validate it
-                                        let mut disk_cache_guard = disk_cache.write().await;
-                                        if let Err(e) = disk_cache_guard
-                                            .remove_invalidated_range(
-                                                &cache_key,
-                                                cached_range.start,
-                                                cached_range.end,
-                                            )
-                                            .await
-                                        {
-                                            warn!("Failed to remove invalidated range: {}", e);
-                                        }
-                                        drop(disk_cache_guard);
-
-                                        // Forward original request to S3 and cache response if successful
-                                        return Self::forward_range_request_to_s3(
-                                            method,
-                                            uri.clone(),
-                                            host.clone(),
-                                            client_headers.clone(),
-                                            cache_key.clone(),
-                                            range_spec.clone(),
-                                            overlap,
-                                            cache_manager,
-                                            range_handler.clone(),
-                                            s3_client,
-                                            config.clone(),
-                                            preloaded_metadata.as_ref(),
-                                            proxy_referer,
-                                        )
-                                        .await;
-                                    }
-                                }
                                 }
                                 Ok(ObjectExpirationResult::Fresh) => {
                                     // Not expired - fall through to serve from cache
@@ -4150,7 +4481,9 @@ impl HttpProxy {
                             // Record cache miss for disk cache statistics (GET request)
                             // This is a partial or complete miss since we need to fetch from S3
                             cache_manager.update_statistics(false, 0, false);
-                            cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
+                            cache_manager
+                                .record_bucket_cache_access(&cache_key, false, false)
+                                .await;
 
                             // Check if this is a signed range request (Requirement 1.2, 1.3)
                             // Only check signature when there are cache gaps to avoid overhead
@@ -4300,6 +4633,7 @@ impl HttpProxy {
     }
 
     /// Serve full object from cache (no Range header in original request)
+    #[allow(clippy::too_many_arguments)]
     async fn serve_full_object_from_cache(
         method: Method,
         range_spec: &RangeSpec,
@@ -4307,7 +4641,7 @@ impl HttpProxy {
         cache_key: &str,
         cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         host: &str,
         uri: &str,
         headers: &HeaderMap,
@@ -4476,6 +4810,7 @@ impl HttpProxy {
     }
 
     /// Serve range request entirely from cache (Range header was present in original request)
+    #[allow(clippy::too_many_arguments)]
     async fn serve_range_from_cache(
         method: Method,
         range_spec: &RangeSpec,
@@ -4483,7 +4818,7 @@ impl HttpProxy {
         cache_key: &str,
         cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         host: &str,
         uri: &str,
         headers: &HeaderMap,
@@ -4502,11 +4837,9 @@ impl HttpProxy {
         // Check RAM cache before the streaming/buffered decision (Requirements 3.1, 3.2, 3.3, 4.1, 4.2)
         let perf_start = Instant::now();
         let ram_lookup_start = Instant::now();
-        if let Some(ram_data) = cache_manager.get_range_from_ram_cache(
-            cache_key,
-            range_spec.start,
-            range_spec.end,
-        ) {
+        if let Some(ram_data) =
+            cache_manager.get_range_from_ram_cache(cache_key, range_spec.start, range_spec.end)
+        {
             let ram_lookup_ms = ram_lookup_start.elapsed().as_millis();
             debug!(
                 "RAM cache hit for range {}-{}, serving buffered response",
@@ -4529,12 +4862,8 @@ impl HttpProxy {
             });
 
             // Resolve metadata for response headers
-            let cached_metadata = Self::resolve_cached_metadata(
-                preloaded_metadata,
-                &cache_manager,
-                cache_key,
-            )
-            .await;
+            let cached_metadata =
+                Self::resolve_cached_metadata(preloaded_metadata, &cache_manager, cache_key).await;
 
             let total_object_size = cached_metadata.content_length;
 
@@ -4586,7 +4915,9 @@ impl HttpProxy {
 
             // Record cache hit statistics
             cache_manager.update_statistics(true, range_size, method == Method::HEAD);
-            cache_manager.record_bucket_cache_access(&cache_key, true, method == Method::HEAD).await;
+            cache_manager
+                .record_bucket_cache_access(cache_key, true, method == Method::HEAD)
+                .await;
 
             return Ok(response);
         }
@@ -4622,12 +4953,8 @@ impl HttpProxy {
 
             // Resolve metadata for headers (Requirement 5.6)
             let metadata_start = Instant::now();
-            let cached_metadata = Self::resolve_cached_metadata(
-                preloaded_metadata,
-                &cache_manager,
-                cache_key,
-            )
-            .await;
+            let cached_metadata =
+                Self::resolve_cached_metadata(preloaded_metadata, &cache_manager, cache_key).await;
             let metadata_ms = metadata_start.elapsed().as_millis();
 
             let total_object_size = cached_metadata.content_length;
@@ -4683,10 +5010,9 @@ impl HttpProxy {
                         .await
                     {
                         Ok(journal_ranges) => {
-                            match journal_ranges
-                                .into_iter()
-                                .find(|r| r.start == cached_range.start && r.end == cached_range.end)
-                            {
+                            match journal_ranges.into_iter().find(|r| {
+                                r.start == cached_range.start && r.end == cached_range.end
+                            }) {
                                 Some(spec) => spec,
                                 None => {
                                     debug!(
@@ -4771,8 +5097,7 @@ impl HttpProxy {
                     // handle slicing. For streaming, only support exact match or full cached range.
                     // If slicing is needed, the stream handles the full cached range data.
                     // For sub-range requests, fall back to buffered path.
-                    if range_spec.start != cached_range.start
-                        || range_spec.end != cached_range.end
+                    if range_spec.start != cached_range.start || range_spec.end != cached_range.end
                     {
                         debug!(
                             "Requested range {}-{} differs from cached range {}-{}, falling back to buffered for slicing",
@@ -4798,7 +5123,9 @@ impl HttpProxy {
                     // Bridge the disk stream to a channel-based stream that is Send + Sync.
                     // Spawn a task to read chunks and send Frame<Bytes> through the channel.
                     // Mid-stream errors cause the sender to drop, terminating the connection (Requirement 5.7).
-                    let (frame_tx, frame_rx) = mpsc::channel::<std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>>(4);
+                    let (frame_tx, frame_rx) = mpsc::channel::<
+                        std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>,
+                    >(4);
 
                     // Prepare RAM cache promotion context (Requirements 2.2, 5.1, 5.2)
                     let max_ram_cache_size = config.cache.max_ram_cache_size;
@@ -4813,11 +5140,12 @@ impl HttpProxy {
                         let mut stream = std::pin::pin!(data_stream);
 
                         // Collect chunks for RAM cache promotion if range fits
-                        let mut promotion_buffer: Option<Vec<u8>> = if range_size <= max_ram_cache_size {
-                            Some(Vec::with_capacity(range_size as usize))
-                        } else {
-                            None
-                        };
+                        let mut promotion_buffer: Option<Vec<u8>> =
+                            if range_size <= max_ram_cache_size {
+                                Some(Vec::with_capacity(range_size as usize))
+                            } else {
+                                None
+                            };
                         let mut stream_completed = true;
 
                         while let Some(result) = stream.next().await {
@@ -4839,7 +5167,10 @@ impl HttpProxy {
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Mid-stream disk read error, terminating connection: {}", e);
+                                    error!(
+                                        "Mid-stream disk read error, terminating connection: {}",
+                                        e
+                                    );
                                     stream_completed = false;
                                     break; // Drop sender, which ends the stream (Requirement 5.7)
                                 }
@@ -4850,7 +5181,9 @@ impl HttpProxy {
                         if stream_completed {
                             if let Some(buffer) = promotion_buffer {
                                 // Check bucket-level RAM cache eligibility before promoting
-                                let resolved = promotion_cache_manager.resolve_settings(&promotion_cache_key).await;
+                                let resolved = promotion_cache_manager
+                                    .resolve_settings(&promotion_cache_key)
+                                    .await;
                                 if !resolved.ram_cache_eligible {
                                     debug!(
                                         "Skipping RAM cache promotion for {}: ram_cache_eligible=false (source={:?})",
@@ -4893,7 +5226,9 @@ impl HttpProxy {
 
                     // Record cache hit statistics for streaming path
                     cache_manager.update_statistics(true, range_size, false);
-                    cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
+                    cache_manager
+                        .record_bucket_cache_access(cache_key, true, false)
+                        .await;
 
                     return Ok(response);
                 }
@@ -4963,10 +5298,8 @@ impl HttpProxy {
                 }
                 _ => {
                     if attempt < 4 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            20 * (attempt + 1),
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(20 * (attempt + 1)))
+                            .await;
                     }
                 }
             }
@@ -5081,6 +5414,7 @@ impl HttpProxy {
 
     /// Serve range from cache using buffered (non-streaming) path.
     /// Used for RAM cache hits, small ranges, multi-range merges, or as fallback.
+    #[allow(clippy::too_many_arguments)]
     async fn serve_range_from_cache_buffered(
         method: Method,
         range_spec: &RangeSpec,
@@ -5088,7 +5422,7 @@ impl HttpProxy {
         cache_key: &str,
         cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         host: &str,
         uri: &str,
         headers: &HeaderMap,
@@ -5134,12 +5468,8 @@ impl HttpProxy {
         });
 
         // Resolve metadata for response headers
-        let cached_metadata = Self::resolve_cached_metadata(
-            preloaded_metadata,
-            &cache_manager,
-            cache_key,
-        )
-        .await;
+        let cached_metadata =
+            Self::resolve_cached_metadata(preloaded_metadata, &cache_manager, cache_key).await;
 
         // Get total object size from cached metadata for correct Content-Range header
         let total_object_size = cached_metadata.content_length;
@@ -5183,7 +5513,9 @@ impl HttpProxy {
         // Record cache hit statistics (buffered path — RAM and streaming paths record separately)
         let range_size = range_spec.end - range_spec.start + 1;
         cache_manager.update_statistics(true, range_size, method == Method::HEAD);
-        cache_manager.record_bucket_cache_access(cache_key, true, method == Method::HEAD).await;
+        cache_manager
+            .record_bucket_cache_access(cache_key, true, method == Method::HEAD)
+            .await;
 
         // Log cache hit at INFO level for observability
         let cache_tier = if is_ram_hit { "RAM" } else { "Disk" };
@@ -5211,13 +5543,14 @@ impl HttpProxy {
     }
 
     /// Common logic to get cached range data
+    #[allow(clippy::too_many_arguments)]
     async fn get_cached_range_data(
         range_spec: &RangeSpec,
         overlap: &crate::range_handler::RangeOverlap,
         cache_key: &str,
         cache_manager: &Arc<CacheManager>,
         range_handler: &Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         host: &str,
         uri: &str,
         headers: &HeaderMap,
@@ -5517,6 +5850,7 @@ impl HttpProxy {
 
     /// Forward conditional request to S3 with proper cache management based on response
     /// Requirements: 1.2, 1.3, 2.2, 2.3, 3.2, 3.3, 3.4, 4.2, 4.3, 4.4, 6.1, 6.2, 6.3
+    #[allow(clippy::too_many_arguments)]
     async fn forward_conditional_request_to_s3(
         method: Method,
         uri: hyper::Uri,
@@ -5524,15 +5858,16 @@ impl HttpProxy {
         mut headers: HashMap<String, String>,
         cache_key: String,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!("Forwarding conditional {} request to S3: {}", method, uri);
 
         // Inject proxy identification Referer header if conditions are met
-        let auth_header_owned: Option<String> = headers.get("authorization")
-            .or_else(|| headers.get("Authorization")).cloned()
-            ;
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
         maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
 
         // Build S3 request context
@@ -5689,7 +6024,7 @@ impl HttpProxy {
         uri: hyper::Uri,
         host: String,
         mut headers: HashMap<String, String>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         operation_type: Option<&str>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
@@ -5706,9 +6041,10 @@ impl HttpProxy {
         }
 
         // Inject proxy identification Referer header if conditions are met
-        let auth_header_owned: Option<String> = headers.get("authorization")
-            .or_else(|| headers.get("Authorization")).cloned()
-            ;
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
         maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
 
         // Build S3 request context with operation type
@@ -5826,14 +6162,15 @@ impl HttpProxy {
     /// - After completion, waiters serve from cache or fall back to their own S3 fetch
     ///
     /// Requirements: 15.1, 15.2, 15.4, 17.1, 17.2, 17.3, 17.4, 18.4
-    async fn forward_get_head_with_coordination(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_get_head_with_coordination(
         method: Method,
         uri: hyper::Uri,
         host: String,
         headers: HashMap<String, String>,
         cache_key: String,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         inflight_tracker: Arc<InFlightTracker>,
         range_handler: Arc<RangeHandler>,
         config: Arc<Config>,
@@ -5846,7 +6183,9 @@ impl HttpProxy {
         // Requirement 18.4
         if !coordination_enabled {
             cache_manager.update_statistics(false, 0, false);
-            cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
+            cache_manager
+                .record_bucket_cache_access(&cache_key, false, false)
+                .await;
             return Self::forward_get_head_to_s3_and_cache(
                 method,
                 uri,
@@ -5876,7 +6215,9 @@ impl HttpProxy {
 
                 // Fetcher always goes to S3 — record cache miss
                 cache_manager.update_statistics(false, 0, false);
-                cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
+                cache_manager
+                    .record_bucket_cache_access(&cache_key, false, false)
+                    .await;
 
                 let response = Self::forward_get_head_to_s3_and_cache(
                     method,
@@ -5938,23 +6279,26 @@ impl HttpProxy {
                 // Requirement 17.3: Waiter timeout falls back to own S3 fetch
                 match tokio::time::timeout(wait_timeout, rx.recv()).await {
                     Ok(Ok(Ok(()))) => {
-                        // Record wait duration and cache hit metrics
-                        // Requirements 19.2, 19.5
+                        // Record wait duration.
+                        // Requirement 19.5 (cache-hit metric is recorded
+                        // inside `serve_from_cache_validated` on the 304
+                        // branch for backward compatibility).
                         if let Some(ref mm) = metrics_manager {
-                            let mm_guard = mm.read().await;
-                            mm_guard.record_coalesce_wait_duration(wait_start.elapsed()).await;
-                            mm_guard.record_coalesce_cache_hit().await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
 
-                        // Fetcher completed successfully - try to serve from cache
-                        // Requirement 17.1: Waiter serves from cache after success
+                        // Fetcher completed successfully - issue our own
+                        // signed conditional request before serving from
+                        // cache (validated-serve; fixes IAM bypass).
                         debug!(
-                            "Download coordination: fetcher completed, attempting cache lookup for {}",
+                            "Download coordination: fetcher completed, issuing validated serve for {}",
                             cache_key
                         );
 
-                        // Try cache first — the fetcher should have cached the data
-                        Self::serve_from_cache_or_s3(
+                        Self::serve_from_cache_validated(
                             method,
                             uri,
                             host,
@@ -5964,6 +6308,7 @@ impl HttpProxy {
                             range_handler,
                             s3_client,
                             config,
+                            metrics_manager.clone(),
                             proxy_referer,
                         )
                         .await
@@ -5972,7 +6317,10 @@ impl HttpProxy {
                         // Record wait duration (no cache hit since fetcher failed)
                         // Requirement 19.5
                         if let Some(ref mm) = metrics_manager {
-                            mm.read().await.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
 
                         // Fetcher completed with error - fall back to own S3 fetch
@@ -5998,7 +6346,10 @@ impl HttpProxy {
                         // Record wait duration (no cache hit since channel closed)
                         // Requirement 19.5
                         if let Some(ref mm) = metrics_manager {
-                            mm.read().await.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
 
                         // Channel closed (fetcher dropped without completing) - fall back to S3
@@ -6025,7 +6376,9 @@ impl HttpProxy {
                         // Requirements 19.3, 19.5
                         if let Some(ref mm) = metrics_manager {
                             let mm_guard = mm.read().await;
-                            mm_guard.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm_guard
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                             mm_guard.record_coalesce_timeout().await;
                         }
 
@@ -6057,7 +6410,8 @@ impl HttpProxy {
     /// Uses InFlightTracker with part-specific flight keys to coalesce concurrent
     /// requests for the same part of the same object.
     /// Requirements: 12.4, 15.3, 17.1-17.4
-    async fn forward_part_with_coordination(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_part_with_coordination(
         method: Method,
         uri: hyper::Uri,
         host: String,
@@ -6065,7 +6419,7 @@ impl HttpProxy {
         cache_key: String,
         part_number: u32,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         inflight_tracker: Arc<InFlightTracker>,
         range_handler: Arc<RangeHandler>,
         coordination_enabled: bool,
@@ -6150,72 +6504,89 @@ impl HttpProxy {
                 match tokio::time::timeout(wait_timeout, rx.recv()).await {
                     Ok(Ok(Ok(()))) => {
                         if let Some(ref mm) = metrics_manager {
-                            let mm_guard = mm.read().await;
-                            mm_guard.record_coalesce_wait_duration(wait_start.elapsed()).await;
-                            mm_guard.record_coalesce_cache_hit().await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
 
                         debug!(
-                            "Download coordination: part fetcher completed, re-entering cache lookup for {}:part{}",
+                            "Download coordination: part fetcher completed, issuing validated serve for {}:part{}",
                             cache_key, part_number
                         );
 
-                        // Try cache first — the fetcher should have cached the part
-                        match cache_manager.lookup_part(&cache_key, part_number).await {
-                            Ok(Some(cached_part)) => {
-                                debug!(
-                                    "Coalescing waiter: serving part {} from cache for {}",
-                                    part_number, cache_key
-                                );
-                                cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
-                                cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
-                                Self::serve_cached_part_response(cached_part, method, uri.path()).await
-                            }
-                            _ => {
-                                // Cache miss — fall back to S3
-                                debug!(
-                                    "Coalescing waiter: part {} cache miss for {}, falling back to S3",
-                                    part_number, cache_key
-                                );
-                                cache_manager.update_statistics(false, 0, false);
-                                cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
-                                Self::forward_get_head_to_s3_and_cache(
-                                    method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
-                                )
-                                .await
-                            }
-                        }
+                        // Validated serve: every waiter issues its own
+                        // signed conditional request before serving cached
+                        // bytes (fixes IAM bypass on part coalescing).
+                        Self::serve_cached_part_validated(
+                            method,
+                            uri,
+                            host,
+                            headers,
+                            cache_key,
+                            part_number,
+                            cache_manager,
+                            range_handler,
+                            s3_client,
+                            metrics_manager.clone(),
+                            proxy_referer,
+                        )
+                        .await
                     }
                     Ok(Ok(Err(error))) => {
                         if let Some(ref mm) = metrics_manager {
-                            mm.read().await.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
                         debug!(
                             "Download coordination: part fetcher error ({}), falling back for {}:part{}",
                             error, cache_key, part_number
                         );
                         Self::forward_get_head_to_s3_and_cache(
-                            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler.clone(), proxy_referer,
+                            method,
+                            uri,
+                            host,
+                            headers,
+                            cache_key,
+                            cache_manager,
+                            s3_client,
+                            range_handler.clone(),
+                            proxy_referer,
                         )
                         .await
                     }
                     Ok(Err(_recv_error)) => {
                         if let Some(ref mm) = metrics_manager {
-                            mm.read().await.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
                         debug!(
                             "Download coordination: part channel closed, falling back for {}:part{}",
                             cache_key, part_number
                         );
                         Self::forward_get_head_to_s3_and_cache(
-                            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler.clone(), proxy_referer,
+                            method,
+                            uri,
+                            host,
+                            headers,
+                            cache_key,
+                            cache_manager,
+                            s3_client,
+                            range_handler.clone(),
+                            proxy_referer,
                         )
                         .await
                     }
                     Err(_timeout) => {
                         if let Some(ref mm) = metrics_manager {
                             let mm_guard = mm.read().await;
-                            mm_guard.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm_guard
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                             mm_guard.record_coalesce_timeout().await;
                         }
                         debug!(
@@ -6223,7 +6594,15 @@ impl HttpProxy {
                             cache_key, part_number
                         );
                         Self::forward_get_head_to_s3_and_cache(
-                            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
+                            method,
+                            uri,
+                            host,
+                            headers,
+                            cache_key,
+                            cache_manager,
+                            s3_client,
+                            range_handler,
+                            proxy_referer,
                         )
                         .await
                     }
@@ -6237,7 +6616,7 @@ impl HttpProxy {
     /// requests for the same byte range of the same object.
     /// Requirements: 12.3, 15.3, 17.1-17.4
     #[allow(clippy::too_many_arguments)]
-    async fn forward_range_with_coordination(
+    pub async fn forward_range_with_coordination(
         method: Method,
         uri: hyper::Uri,
         host: String,
@@ -6247,7 +6626,7 @@ impl HttpProxy {
         overlap: crate::range_handler::RangeOverlap,
         cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
         is_signed: bool,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
@@ -6259,14 +6638,35 @@ impl HttpProxy {
         if !config.cache.download_coordination.enabled {
             if is_signed {
                 return Self::forward_signed_range_request(
-                    method, uri, host, headers, cache_key, range_spec, overlap,
-                    cache_manager, range_handler, s3_client, config, proxy_referer,
+                    method,
+                    uri,
+                    host,
+                    headers,
+                    cache_key,
+                    range_spec,
+                    overlap,
+                    cache_manager,
+                    range_handler,
+                    s3_client,
+                    config,
+                    proxy_referer,
                 )
                 .await;
             } else {
                 return Self::forward_range_request_to_s3(
-                    method, uri, host, headers, cache_key, range_spec, overlap,
-                    cache_manager, range_handler, s3_client, config, preloaded_metadata, proxy_referer,
+                    method,
+                    uri,
+                    host,
+                    headers,
+                    cache_key,
+                    range_spec,
+                    overlap,
+                    cache_manager,
+                    range_handler,
+                    s3_client,
+                    config,
+                    preloaded_metadata,
+                    proxy_referer,
                 )
                 .await;
             }
@@ -6274,7 +6674,8 @@ impl HttpProxy {
 
         // Create flight key for range request
         // Requirement 15.3: Use exact byte range for independent tracking
-        let flight_key = InFlightTracker::make_range_key(&cache_key, range_spec.start, range_spec.end);
+        let flight_key =
+            InFlightTracker::make_range_key(&cache_key, range_spec.start, range_spec.end);
         let wait_timeout = config.cache.download_coordination.wait_timeout();
 
         match inflight_tracker.try_register(&flight_key) {
@@ -6286,20 +6687,44 @@ impl HttpProxy {
 
                 let response = if is_signed {
                     Self::forward_signed_range_request(
-                        method, uri, host, headers, cache_key, range_spec, overlap,
-                        cache_manager, range_handler, s3_client, config, proxy_referer,
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        cache_key,
+                        range_spec,
+                        overlap,
+                        cache_manager,
+                        range_handler,
+                        s3_client,
+                        config,
+                        proxy_referer,
                     )
                     .await
                 } else {
                     Self::forward_range_request_to_s3(
-                        method, uri, host, headers, cache_key, range_spec, overlap,
-                        cache_manager, range_handler, s3_client, config, preloaded_metadata, proxy_referer,
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        cache_key,
+                        range_spec,
+                        overlap,
+                        cache_manager,
+                        range_handler,
+                        s3_client,
+                        config,
+                        preloaded_metadata,
+                        proxy_referer,
                     )
                     .await
                 };
 
                 match &response {
-                    Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::PARTIAL_CONTENT => {
+                    Ok(resp)
+                        if resp.status().is_success()
+                            || resp.status() == StatusCode::PARTIAL_CONTENT =>
+                    {
                         guard.complete_success();
                         if let Some(ref mm) = metrics_manager {
                             mm.read().await.record_coalesce_fetcher_success().await;
@@ -6335,58 +6760,43 @@ impl HttpProxy {
                 match tokio::time::timeout(wait_timeout, rx.recv()).await {
                     Ok(Ok(Ok(()))) => {
                         if let Some(ref mm) = metrics_manager {
-                            let mm_guard = mm.read().await;
-                            mm_guard.record_coalesce_wait_duration(wait_start.elapsed()).await;
-                            mm_guard.record_coalesce_cache_hit().await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
 
                         debug!(
-                            "Download coordination: range fetcher completed, re-entering for {}:{}-{}",
+                            "Download coordination: range fetcher completed, issuing validated serve for {}:{}-{}",
                             cache_key, range_spec.start, range_spec.end
                         );
 
-                        // Recompute overlap to reflect data the fetcher just cached.
-                        // This prevents the waiter from re-fetching from S3 and double-counting
-                        // size when the stale overlap still shows missing_ranges.
-                        let overlap_to_use = match range_handler
-                            .find_cached_ranges(&cache_key, &range_spec, None, preloaded_metadata)
-                            .await
-                        {
-                            Ok(fresh) => {
-                                debug!(
-                                    "Download coordination: recomputed overlap for {}:{}-{}, can_serve_from_cache={}, cached={}, missing={}",
-                                    cache_key, range_spec.start, range_spec.end,
-                                    fresh.can_serve_from_cache, fresh.cached_ranges.len(), fresh.missing_ranges.len()
-                                );
-                                fresh
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Download coordination: failed to recompute overlap ({}), using original for {}:{}-{}",
-                                    e, cache_key, range_spec.start, range_spec.end
-                                );
-                                overlap.clone()
-                            }
-                        };
-
-                        // Re-enter the forwarding path with fresh overlap
-                        if is_signed {
-                            Self::forward_signed_range_request(
-                                method, uri, host, headers, cache_key, range_spec, overlap_to_use,
-                                cache_manager, range_handler, s3_client, config, proxy_referer,
-                            )
-                            .await
-                        } else {
-                            Self::forward_range_request_to_s3(
-                                method, uri, host, headers, cache_key, range_spec, overlap_to_use,
-                                cache_manager, range_handler, s3_client, config, preloaded_metadata, proxy_referer,
-                            )
-                            .await
-                        }
+                        // Validated serve: every waiter issues its own
+                        // signed conditional GET before serving cached
+                        // bytes (fixes IAM bypass on range coalescing).
+                        Self::serve_range_from_cache_validated(
+                            method,
+                            uri,
+                            host,
+                            headers,
+                            cache_key,
+                            range_spec,
+                            cache_manager,
+                            range_handler,
+                            s3_client,
+                            config,
+                            is_signed,
+                            metrics_manager.clone(),
+                            proxy_referer,
+                        )
+                        .await
                     }
                     Ok(Ok(Err(error))) => {
                         if let Some(ref mm) = metrics_manager {
-                            mm.read().await.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
                         debug!(
                             "Download coordination: range fetcher error ({}), falling back for {}:{}-{}",
@@ -6394,21 +6804,45 @@ impl HttpProxy {
                         );
                         if is_signed {
                             Self::forward_signed_range_request(
-                                method, uri, host, headers, cache_key, range_spec, overlap,
-                                cache_manager, range_handler, s3_client, config, proxy_referer,
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                proxy_referer,
                             )
                             .await
                         } else {
                             Self::forward_range_request_to_s3(
-                                method, uri, host, headers, cache_key, range_spec, overlap,
-                                cache_manager, range_handler, s3_client, config, preloaded_metadata, proxy_referer,
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                preloaded_metadata,
+                                proxy_referer,
                             )
                             .await
                         }
                     }
                     Ok(Err(_recv_error)) => {
                         if let Some(ref mm) = metrics_manager {
-                            mm.read().await.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm.read()
+                                .await
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                         }
                         debug!(
                             "Download coordination: range channel closed, falling back for {}:{}-{}",
@@ -6416,14 +6850,35 @@ impl HttpProxy {
                         );
                         if is_signed {
                             Self::forward_signed_range_request(
-                                method, uri, host, headers, cache_key, range_spec, overlap,
-                                cache_manager, range_handler, s3_client, config, proxy_referer,
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                proxy_referer,
                             )
                             .await
                         } else {
                             Self::forward_range_request_to_s3(
-                                method, uri, host, headers, cache_key, range_spec, overlap,
-                                cache_manager, range_handler, s3_client, config, preloaded_metadata, proxy_referer,
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                preloaded_metadata,
+                                proxy_referer,
                             )
                             .await
                         }
@@ -6431,7 +6886,9 @@ impl HttpProxy {
                     Err(_timeout) => {
                         if let Some(ref mm) = metrics_manager {
                             let mm_guard = mm.read().await;
-                            mm_guard.record_coalesce_wait_duration(wait_start.elapsed()).await;
+                            mm_guard
+                                .record_coalesce_wait_duration(wait_start.elapsed())
+                                .await;
                             mm_guard.record_coalesce_timeout().await;
                         }
                         debug!(
@@ -6440,14 +6897,35 @@ impl HttpProxy {
                         );
                         if is_signed {
                             Self::forward_signed_range_request(
-                                method, uri, host, headers, cache_key, range_spec, overlap,
-                                cache_manager, range_handler, s3_client, config, proxy_referer,
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                proxy_referer,
                             )
                             .await
                         } else {
                             Self::forward_range_request_to_s3(
-                                method, uri, host, headers, cache_key, range_spec, overlap,
-                                cache_manager, range_handler, s3_client, config, preloaded_metadata, proxy_referer,
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                preloaded_metadata,
+                                proxy_referer,
                             )
                             .await
                         }
@@ -6457,10 +6935,30 @@ impl HttpProxy {
         }
     }
 
-    /// Try to serve a full-object GET from cache. If cache miss, forward to S3 and cache.
-    /// Used by coalescing waiters after the fetcher completes — the data should be cached,
-    /// so this avoids a redundant S3 fetch in the common case.
-    async fn serve_from_cache_or_s3(
+    /// Validated-serve for a full-object GET/HEAD waiter.
+    ///
+    /// Implements the `download-coordination-ttl-correctness` fix: when a
+    /// waiter wakes up after the fetcher has committed the object to cache,
+    /// the waiter issues its OWN signed conditional request to S3 using the
+    /// cached ETag / `Last-Modified` as `If-None-Match` /
+    /// `If-Modified-Since`. Dispatch:
+    ///
+    /// - `304 Not Modified`: S3 has validated the waiter's credentials
+    ///   against the current object version. Refresh the cache TTL and
+    ///   serve the cached body (GET) or cached metadata (HEAD).
+    /// - `200 OK`: the object changed between fetcher commit and waiter
+    ///   wakeup. Return S3's fresh body and best-effort update the cache.
+    /// - `4xx` (`401`/`403`/...): return S3's response unchanged. Do NOT
+    ///   invalidate the cache — other principals may still be authorised.
+    /// - `5xx` / transport error: `warn!` and fall back to serving from
+    ///   the existing cache (degraded path).
+    ///
+    /// When metadata is missing (cache evicted between fetcher commit and
+    /// waiter wakeup), the call delegates to `forward_get_head_to_s3_and_cache`
+    /// with the waiter's signed headers — the waiter's own request reaches
+    /// S3 so there is no IAM bypass.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_from_cache_validated(
         method: Method,
         uri: hyper::Uri,
         host: String,
@@ -6468,42 +6966,142 @@ impl HttpProxy {
         cache_key: String,
         cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
+        metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
-        // Try cache first — the fetcher should have cached the data
-        let preloaded_metadata = match cache_manager.get_metadata_cached(&cache_key).await {
-            Ok(m) => m,
-            Err(_) => None,
+        // 1. Look up cached metadata. If missing, fall back to a full
+        //    signed fetch with the waiter's own request — no IAM bypass.
+        let preloaded_metadata = cache_manager
+            .get_metadata_cached(&cache_key)
+            .await
+            .unwrap_or_default();
+
+        let metadata = match preloaded_metadata {
+            Some(m) => m,
+            None => {
+                debug!(
+                    "Coalescing waiter (validated): metadata missing for {}, falling back to signed S3 fetch",
+                    cache_key
+                );
+                return Self::forward_get_head_to_s3_and_cache(
+                    method,
+                    uri,
+                    host,
+                    headers,
+                    cache_key,
+                    cache_manager,
+                    s3_client,
+                    range_handler,
+                    proxy_referer,
+                )
+                .await;
+            }
         };
 
-        if let Some(ref metadata) = preloaded_metadata {
-            let total_size = metadata.object_metadata.content_length;
-            if total_size > 0 {
-                let full_range = crate::range_handler::RangeSpec { start: 0, end: total_size - 1 };
-                if let Ok(overlap) = range_handler
-                    .find_cached_ranges(&cache_key, &full_range, None, preloaded_metadata.as_ref())
+        // 2. Build the conditional request. Clone the waiter's headers
+        //    verbatim (preserving SigV4 signature headers) and add
+        //    If-None-Match + If-Modified-Since.
+        let etag = metadata.object_metadata.etag.clone();
+        let last_modified = metadata.object_metadata.last_modified.clone();
+        let total_size = metadata.object_metadata.content_length;
+
+        let mut conditional_headers = headers.clone();
+        if !etag.is_empty() {
+            conditional_headers.insert("if-none-match".to_string(), etag.clone());
+        }
+        if !last_modified.is_empty() {
+            conditional_headers.insert("if-modified-since".to_string(), last_modified.clone());
+        }
+
+        let context = build_s3_request_context(
+            method.clone(),
+            uri.clone(),
+            conditional_headers,
+            None,
+            host.clone(),
+        );
+
+        match s3_client.forward_request(context).await {
+            Ok(response) if response.status == StatusCode::NOT_MODIFIED => {
+                // 304 — waiter's credentials are valid for this object.
+                debug!(
+                    "Coalescing waiter (validated): 304 Not Modified for {}, serving from cache",
+                    cache_key
+                );
+                if let Some(ref mm) = metrics_manager {
+                    let mm_guard = mm.read().await;
+                    mm_guard.record_coalesce_waiter_conditional_304().await;
+                    // Keep the existing `record_coalesce_cache_hit` firing
+                    // on the 304 branch for dashboard backward-compat.
+                    mm_guard.record_coalesce_cache_hit().await;
+                }
+
+                // Best-effort TTL refresh. `refresh_cache_ttl` updates both
+                // GET and HEAD expires_at using the effective TTLs.
+                if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
+                    debug!(
+                        "Coalescing waiter (validated): TTL refresh failed for {}: {}",
+                        cache_key, e
+                    );
+                }
+
+                cache_manager.update_statistics(true, total_size, method == Method::HEAD);
+                cache_manager
+                    .record_bucket_cache_access(&cache_key, true, method == Method::HEAD)
+                    .await;
+
+                if method == Method::HEAD {
+                    // Return cached metadata headers with empty body.
+                    let mut builder = Response::builder().status(StatusCode::OK);
+                    for (k, v) in &metadata.object_metadata.response_headers {
+                        builder = builder.header(k, v);
+                    }
+                    return Ok(builder
+                        .body(
+                            Full::new(Bytes::new())
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+
+                // GET: serve the cached body via the existing helper.
+                if total_size == 0 {
+                    // Zero-length object — return an empty body with the
+                    // cached headers, same convention as an empty success.
+                    let mut builder = Response::builder().status(StatusCode::OK);
+                    for (k, v) in &metadata.object_metadata.response_headers {
+                        builder = builder.header(k, v);
+                    }
+                    return Ok(builder
+                        .body(
+                            Full::new(Bytes::new())
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap());
+                }
+
+                let full_range = RangeSpec {
+                    start: 0,
+                    end: total_size - 1,
+                };
+                match range_handler
+                    .find_cached_ranges(&cache_key, &full_range, None, Some(&metadata))
                     .await
                 {
-                    if overlap.can_serve_from_cache {
-                        debug!(
-                            "Coalescing waiter: serving full object from cache for {}",
-                            cache_key
-                        );
-                        cache_manager.update_statistics(true, total_size, false);
-                        cache_manager.record_bucket_cache_access(&cache_key, true, method == Method::HEAD).await;
-
-                        let header_map: hyper::header::HeaderMap = headers
+                    Ok(overlap) if overlap.can_serve_from_cache => {
+                        let header_map: HeaderMap = headers
                             .iter()
                             .filter_map(|(k, v)| {
-                                k.parse::<hyper::header::HeaderName>()
+                                k.parse::<HeaderName>()
                                     .ok()
-                                    .zip(v.parse::<hyper::header::HeaderValue>().ok())
+                                    .zip(v.parse::<HeaderValue>().ok())
                             })
                             .collect();
-
-                        return Self::serve_full_object_from_cache(
+                        Self::serve_full_object_from_cache(
                             method,
                             &full_range,
                             &overlap,
@@ -6516,23 +7114,818 @@ impl HttpProxy {
                             &header_map,
                             config,
                         )
-                        .await;
+                        .await
+                    }
+                    _ => {
+                        // The cache was concurrently evicted between
+                        // metadata lookup and range resolution. Fall back.
+                        debug!(
+                            "Coalescing waiter (validated): cached ranges missing after 304 for {}, falling back to signed S3 fetch",
+                            cache_key
+                        );
+                        Self::forward_get_head_to_s3_and_cache(
+                            method,
+                            uri,
+                            host,
+                            headers,
+                            cache_key,
+                            cache_manager,
+                            s3_client,
+                            range_handler,
+                            proxy_referer,
+                        )
+                        .await
                     }
                 }
             }
-        }
+            Ok(response) if response.status == StatusCode::OK => {
+                // 200 — the object changed mid-flight. Record metric,
+                // serve S3's fresh body to the waiter, and best-effort
+                // update the cache. The waiter already has correct bytes
+                // regardless of whether the cache-write succeeds.
+                debug!(
+                    "Coalescing waiter (validated): 200 OK for {}, serving fresh body and updating cache",
+                    cache_key
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_200()
+                        .await;
+                }
 
-        // Cache miss — fall back to S3 (fetcher may not have finished caching yet)
-        debug!(
-            "Coalescing waiter: cache miss for {}, falling back to S3",
-            cache_key
-        );
-        cache_manager.update_statistics(false, 0, false);
-        cache_manager.record_bucket_cache_access(&cache_key, false, method == Method::HEAD).await;
-        Self::forward_get_head_to_s3_and_cache(
-            method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
+                // For HEAD we can emit the response directly — there's no
+                // body to buffer for the cache update. Fire-and-forget
+                // refresh the HEAD cache with the new headers.
+                if method == Method::HEAD {
+                    let new_metadata = s3_client.extract_metadata_from_response(&response.headers);
+                    let response_headers = response.headers.clone();
+                    let cache_key_clone = cache_key.clone();
+                    let cache_manager_clone = Arc::clone(&cache_manager);
+                    tokio::spawn(async move {
+                        if let Err(e) = cache_manager_clone
+                            .store_head_cache_entry_unified(
+                                &cache_key_clone,
+                                response_headers,
+                                new_metadata,
+                            )
+                            .await
+                        {
+                            debug!(
+                                "Coalescing waiter (validated): HEAD cache update failed for {}: {}",
+                                cache_key_clone, e
+                            );
+                        }
+                    });
+                    return Self::convert_s3_response_to_http(response);
+                }
+
+                // GET: buffer the fresh body, serve it, and asynchronously
+                // update the cache. We buffer because the cache helper
+                // takes `&[u8]` — for coalesced-waiter 200-mid-flight
+                // events this is rare, so the buffering cost is acceptable.
+                let status = response.status;
+                let response_headers = response.headers.clone();
+                let new_metadata = s3_client.extract_metadata_from_response(&response.headers);
+                let body_bytes: Bytes = match response.body {
+                    Some(S3ResponseBody::Buffered(b)) => b,
+                    Some(S3ResponseBody::Streaming(incoming)) => match incoming.collect().await {
+                        Ok(collected) => collected.to_bytes(),
+                        Err(e) => {
+                            warn!(
+                                    "Coalescing waiter (validated): failed to collect 200 body for {}: {}",
+                                    cache_key, e
+                                );
+                            Bytes::new()
+                        }
+                    },
+                    None => Bytes::new(),
+                };
+
+                // Fire-and-forget cache update.
+                {
+                    let cache_key_clone = cache_key.clone();
+                    let uri_clone = uri.clone();
+                    let cache_manager_clone = Arc::clone(&cache_manager);
+                    let body_for_cache = body_bytes.clone();
+                    let headers_for_cache = response_headers.clone();
+                    let metadata_for_cache = new_metadata.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::cache_response_appropriately(
+                            &cache_manager_clone,
+                            &cache_key_clone,
+                            &uri_clone,
+                            &body_for_cache,
+                            &headers_for_cache,
+                            &metadata_for_cache,
+                        )
+                        .await
+                        {
+                            debug!(
+                                "Coalescing waiter (validated): cache update failed for {}: {}",
+                                cache_key_clone, e
+                            );
+                        }
+                    });
+                }
+
+                let mut builder = Response::builder().status(status);
+                for (k, v) in &response_headers {
+                    builder = builder.header(k, v);
+                }
+                Ok(builder
+                    .body(
+                        Full::new(body_bytes)
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap())
+            }
+            Ok(response) if response.status.is_client_error() => {
+                // 4xx — credentials / client issue. Return S3's response
+                // unchanged. Do NOT invalidate the cache.
+                debug!(
+                    "Coalescing waiter (validated): 4xx ({}) for {}, returning S3 response unchanged",
+                    response.status, cache_key
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_4xx()
+                        .await;
+                }
+                Self::convert_s3_response_to_http(response)
+            }
+            Ok(response) => {
+                // 5xx / other non-success — degraded fallback to cache.
+                warn!(
+                    "Coalescing waiter (validated): unexpected S3 status {} for {}, falling back to cached serve",
+                    response.status, cache_key
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_error()
+                        .await;
+                }
+                Self::serve_cached_fallback_full(
+                    method,
+                    &cache_key,
+                    &metadata,
+                    &headers,
+                    &host,
+                    &uri,
+                    cache_manager,
+                    range_handler,
+                    s3_client,
+                    config,
+                )
+                .await
+            }
+            Err(e) => {
+                // Transport failure — degraded fallback to cache.
+                warn!(
+                    "Coalescing waiter (validated): S3 transport error for {}: {}, falling back to cached serve",
+                    cache_key, e
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_error()
+                        .await;
+                }
+                Self::serve_cached_fallback_full(
+                    method,
+                    &cache_key,
+                    &metadata,
+                    &headers,
+                    &host,
+                    &uri,
+                    cache_manager,
+                    range_handler,
+                    s3_client,
+                    config,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Degraded cache-serve fallback for the full-object validated-serve
+    /// helper. Only used on waiter `5xx` / transport-error paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_cached_fallback_full(
+        method: Method,
+        cache_key: &str,
+        metadata: &crate::cache_types::NewCacheMetadata,
+        headers: &HashMap<String, String>,
+        host: &str,
+        uri: &hyper::Uri,
+        cache_manager: Arc<CacheManager>,
+        range_handler: Arc<RangeHandler>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
+        config: Arc<Config>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let total_size = metadata.object_metadata.content_length;
+        if total_size == 0 {
+            let mut builder = Response::builder().status(StatusCode::OK);
+            for (k, v) in &metadata.object_metadata.response_headers {
+                builder = builder.header(k, v);
+            }
+            return Ok(builder
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+        if method == Method::HEAD {
+            let mut builder = Response::builder().status(StatusCode::OK);
+            for (k, v) in &metadata.object_metadata.response_headers {
+                builder = builder.header(k, v);
+            }
+            return Ok(builder
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap());
+        }
+        let full_range = RangeSpec {
+            start: 0,
+            end: total_size - 1,
+        };
+        let overlap = match range_handler
+            .find_cached_ranges(cache_key, &full_range, None, Some(metadata))
+            .await
+        {
+            Ok(o) if o.can_serve_from_cache => o,
+            _ => {
+                // Cache evicted — we can't serve. Return 503 so callers see
+                // the failure rather than silently hanging.
+                warn!(
+                    "Coalescing waiter (validated): cache evicted during degraded fallback for {}",
+                    cache_key
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(
+                        Full::new(Bytes::from_static(b"cache unavailable"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap());
+            }
+        };
+        let header_map: HeaderMap = headers
+            .iter()
+            .filter_map(|(k, v)| {
+                k.parse::<HeaderName>()
+                    .ok()
+                    .zip(v.parse::<HeaderValue>().ok())
+            })
+            .collect();
+        Self::serve_full_object_from_cache(
+            method,
+            &full_range,
+            &overlap,
+            cache_key,
+            cache_manager,
+            range_handler,
+            s3_client,
+            host,
+            uri.path(),
+            &header_map,
+            config,
         )
         .await
+    }
+
+    /// Validated-serve for a byte-range waiter.
+    ///
+    /// Mirror of [`serve_from_cache_validated`] for range requests. The
+    /// waiter's `Range: bytes={start}-{end}` header is preserved verbatim
+    /// on the conditional, and `If-None-Match` / `If-Modified-Since` are
+    /// injected from the cached object's metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_range_from_cache_validated(
+        method: Method,
+        uri: hyper::Uri,
+        host: String,
+        headers: HashMap<String, String>,
+        cache_key: String,
+        range_spec: RangeSpec,
+        cache_manager: Arc<CacheManager>,
+        range_handler: Arc<RangeHandler>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
+        config: Arc<Config>,
+        is_signed: bool,
+        metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        proxy_referer: &Option<String>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let preloaded_metadata = cache_manager
+            .get_metadata_cached(&cache_key)
+            .await
+            .unwrap_or_default();
+
+        let metadata = match preloaded_metadata {
+            Some(m) => m,
+            None => {
+                debug!(
+                    "Coalescing range waiter (validated): metadata missing for {}:{}-{}, falling back to signed S3 fetch",
+                    cache_key, range_spec.start, range_spec.end
+                );
+                // Metadata missing — use an empty overlap so the forwarder
+                // treats the request as a complete cache miss.
+                let empty_overlap = crate::range_handler::RangeOverlap {
+                    missing_ranges: vec![range_spec.clone()],
+                    cached_ranges: Vec::new(),
+                    can_serve_from_cache: false,
+                };
+                return if is_signed {
+                    Self::forward_signed_range_request(
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        cache_key,
+                        range_spec,
+                        empty_overlap,
+                        cache_manager,
+                        range_handler,
+                        s3_client,
+                        config,
+                        proxy_referer,
+                    )
+                    .await
+                } else {
+                    Self::forward_range_request_to_s3(
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        cache_key,
+                        range_spec,
+                        empty_overlap,
+                        cache_manager,
+                        range_handler,
+                        s3_client,
+                        config,
+                        None,
+                        proxy_referer,
+                    )
+                    .await
+                };
+            }
+        };
+
+        // Build the conditional request. Keep the waiter's own Range
+        // header (already present in `headers` for range clients) and
+        // inject the validator headers. If for any reason `headers` does
+        // not contain a Range, add one so the conditional lines up with
+        // the flight.
+        let etag = metadata.object_metadata.etag.clone();
+        let last_modified = metadata.object_metadata.last_modified.clone();
+
+        let mut conditional_headers = headers.clone();
+        if !etag.is_empty() {
+            conditional_headers.insert("if-none-match".to_string(), etag.clone());
+        }
+        if !last_modified.is_empty() {
+            conditional_headers.insert("if-modified-since".to_string(), last_modified.clone());
+        }
+        // Ensure the Range header is present (preserve any existing one).
+        if !conditional_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("range"))
+        {
+            conditional_headers.insert(
+                "range".to_string(),
+                format!("bytes={}-{}", range_spec.start, range_spec.end),
+            );
+        }
+
+        let context = build_s3_request_context(
+            method.clone(),
+            uri.clone(),
+            conditional_headers,
+            None,
+            host.clone(),
+        );
+
+        match s3_client.forward_request(context).await {
+            Ok(response) if response.status == StatusCode::NOT_MODIFIED => {
+                debug!(
+                    "Coalescing range waiter (validated): 304 Not Modified for {}:{}-{}",
+                    cache_key, range_spec.start, range_spec.end
+                );
+                if let Some(ref mm) = metrics_manager {
+                    let mm_guard = mm.read().await;
+                    mm_guard.record_coalesce_waiter_conditional_304().await;
+                    mm_guard.record_coalesce_cache_hit().await;
+                }
+                if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
+                    debug!(
+                        "Coalescing range waiter (validated): TTL refresh failed for {}: {}",
+                        cache_key, e
+                    );
+                }
+                // Recompute overlap and serve range from cache.
+                let overlap = match range_handler
+                    .find_cached_ranges(&cache_key, &range_spec, None, Some(&metadata))
+                    .await
+                {
+                    Ok(o) if o.can_serve_from_cache => o,
+                    _ => {
+                        debug!(
+                            "Coalescing range waiter (validated): range missing after 304 for {}:{}-{}, falling back to signed S3 fetch",
+                            cache_key, range_spec.start, range_spec.end
+                        );
+                        let empty_overlap = crate::range_handler::RangeOverlap {
+                            missing_ranges: vec![range_spec.clone()],
+                            cached_ranges: Vec::new(),
+                            can_serve_from_cache: false,
+                        };
+                        return if is_signed {
+                            Self::forward_signed_range_request(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                empty_overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                proxy_referer,
+                            )
+                            .await
+                        } else {
+                            Self::forward_range_request_to_s3(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                empty_overlap,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                Some(&metadata),
+                                proxy_referer,
+                            )
+                            .await
+                        };
+                    }
+                };
+                let header_map: HeaderMap = headers
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        k.parse::<HeaderName>()
+                            .ok()
+                            .zip(v.parse::<HeaderValue>().ok())
+                    })
+                    .collect();
+                Self::serve_range_from_cache(
+                    method,
+                    &range_spec,
+                    &overlap,
+                    &cache_key,
+                    cache_manager,
+                    range_handler,
+                    s3_client,
+                    &host,
+                    &uri.to_string(),
+                    &header_map,
+                    config,
+                    Some(&metadata),
+                )
+                .await
+            }
+            Ok(response)
+                if response.status == StatusCode::OK
+                    || response.status == StatusCode::PARTIAL_CONTENT =>
+            {
+                debug!(
+                    "Coalescing range waiter (validated): {} for {}:{}-{}, serving S3 body",
+                    response.status, cache_key, range_spec.start, range_spec.end
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_200()
+                        .await;
+                }
+                // Trust the range handler's existing cache-write behaviour
+                // on 206. On 200 (full body instead of range), the cache
+                // update happens via the forwarding path. Simplest: return
+                // S3's response directly and let the existing range path
+                // pick up the cache update on the next request.
+                Self::convert_s3_response_to_http(response)
+            }
+            Ok(response) if response.status.is_client_error() => {
+                debug!(
+                    "Coalescing range waiter (validated): 4xx ({}) for {}:{}-{}",
+                    response.status, cache_key, range_spec.start, range_spec.end
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_4xx()
+                        .await;
+                }
+                Self::convert_s3_response_to_http(response)
+            }
+            Ok(response) => {
+                warn!(
+                    "Coalescing range waiter (validated): unexpected status {} for {}:{}-{}, falling back",
+                    response.status, cache_key, range_spec.start, range_spec.end
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_error()
+                        .await;
+                }
+                Self::serve_cached_fallback_range(
+                    method,
+                    &cache_key,
+                    &range_spec,
+                    &metadata,
+                    &headers,
+                    &host,
+                    &uri,
+                    cache_manager,
+                    range_handler,
+                    s3_client,
+                    config,
+                )
+                .await
+            }
+            Err(e) => {
+                warn!(
+                    "Coalescing range waiter (validated): S3 transport error for {}:{}-{}: {}, falling back",
+                    cache_key, range_spec.start, range_spec.end, e
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_error()
+                        .await;
+                }
+                Self::serve_cached_fallback_range(
+                    method,
+                    &cache_key,
+                    &range_spec,
+                    &metadata,
+                    &headers,
+                    &host,
+                    &uri,
+                    cache_manager,
+                    range_handler,
+                    s3_client,
+                    config,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Degraded cache-serve fallback for the range validated-serve helper.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_cached_fallback_range(
+        method: Method,
+        cache_key: &str,
+        range_spec: &RangeSpec,
+        metadata: &crate::cache_types::NewCacheMetadata,
+        headers: &HashMap<String, String>,
+        host: &str,
+        uri: &hyper::Uri,
+        cache_manager: Arc<CacheManager>,
+        range_handler: Arc<RangeHandler>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
+        config: Arc<Config>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let overlap = match range_handler
+            .find_cached_ranges(cache_key, range_spec, None, Some(metadata))
+            .await
+        {
+            Ok(o) if o.can_serve_from_cache => o,
+            _ => {
+                warn!(
+                    "Coalescing range waiter (validated): cache evicted during degraded fallback for {}:{}-{}",
+                    cache_key, range_spec.start, range_spec.end
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(
+                        Full::new(Bytes::from_static(b"cache unavailable"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap());
+            }
+        };
+        let header_map: HeaderMap = headers
+            .iter()
+            .filter_map(|(k, v)| {
+                k.parse::<HeaderName>()
+                    .ok()
+                    .zip(v.parse::<HeaderValue>().ok())
+            })
+            .collect();
+        Self::serve_range_from_cache(
+            method,
+            range_spec,
+            &overlap,
+            cache_key,
+            cache_manager,
+            range_handler,
+            s3_client,
+            host,
+            &uri.to_string(),
+            &header_map,
+            config,
+            Some(metadata),
+        )
+        .await
+    }
+
+    /// Validated-serve for a part-number waiter.
+    ///
+    /// Mirror of [`serve_from_cache_validated`] for `?partNumber=N` clients.
+    /// Preserves whatever variant the caller sent (part-number query or
+    /// part-range header) and injects the validator headers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_cached_part_validated(
+        method: Method,
+        uri: hyper::Uri,
+        host: String,
+        headers: HashMap<String, String>,
+        cache_key: String,
+        part_number: u32,
+        cache_manager: Arc<CacheManager>,
+        range_handler: Arc<RangeHandler>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
+        metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        proxy_referer: &Option<String>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        // Look up the cached part. If part metadata is missing, fall back
+        // to signed S3 fetch with the waiter's own headers.
+        let cached_part = match cache_manager.lookup_part(&cache_key, part_number).await {
+            Ok(Some(p)) => p,
+            _ => {
+                debug!(
+                    "Coalescing part waiter (validated): part {} missing for {}, falling back to signed S3 fetch",
+                    part_number, cache_key
+                );
+                return Self::forward_get_head_to_s3_and_cache(
+                    method,
+                    uri,
+                    host,
+                    headers,
+                    cache_key,
+                    cache_manager,
+                    s3_client,
+                    range_handler,
+                    proxy_referer,
+                )
+                .await;
+            }
+        };
+
+        // Pull ETag / Last-Modified from the part's response headers (same
+        // source `serve_cached_part_response` uses for the outgoing HTTP
+        // headers). Fall back to the full-object metadata when the part's
+        // headers are empty.
+        let part_etag = cached_part
+            .headers
+            .get("etag")
+            .or_else(|| cached_part.headers.get("ETag"))
+            .cloned()
+            .unwrap_or_default();
+        let part_last_modified = cached_part
+            .headers
+            .get("last-modified")
+            .or_else(|| cached_part.headers.get("Last-Modified"))
+            .cloned()
+            .unwrap_or_default();
+
+        let (etag, last_modified) = if part_etag.is_empty() && part_last_modified.is_empty() {
+            match cache_manager.get_metadata_cached(&cache_key).await {
+                Ok(Some(m)) => (
+                    m.object_metadata.etag.clone(),
+                    m.object_metadata.last_modified.clone(),
+                ),
+                _ => (String::new(), String::new()),
+            }
+        } else {
+            (part_etag, part_last_modified)
+        };
+
+        let mut conditional_headers = headers.clone();
+        if !etag.is_empty() {
+            conditional_headers.insert("if-none-match".to_string(), etag.clone());
+        }
+        if !last_modified.is_empty() {
+            conditional_headers.insert("if-modified-since".to_string(), last_modified.clone());
+        }
+
+        let context = build_s3_request_context(
+            method.clone(),
+            uri.clone(),
+            conditional_headers,
+            None,
+            host.clone(),
+        );
+
+        match s3_client.forward_request(context).await {
+            Ok(response) if response.status == StatusCode::NOT_MODIFIED => {
+                debug!(
+                    "Coalescing part waiter (validated): 304 Not Modified for {}:part{}",
+                    cache_key, part_number
+                );
+                if let Some(ref mm) = metrics_manager {
+                    let mm_guard = mm.read().await;
+                    mm_guard.record_coalesce_waiter_conditional_304().await;
+                    mm_guard.record_coalesce_cache_hit().await;
+                }
+                if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
+                    debug!(
+                        "Coalescing part waiter (validated): TTL refresh failed for {}: {}",
+                        cache_key, e
+                    );
+                }
+                cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
+                cache_manager
+                    .record_bucket_cache_access(&cache_key, true, false)
+                    .await;
+                Self::serve_cached_part_response(cached_part, method, uri.path()).await
+            }
+            Ok(response)
+                if response.status == StatusCode::OK
+                    || response.status == StatusCode::PARTIAL_CONTENT =>
+            {
+                debug!(
+                    "Coalescing part waiter (validated): {} for {}:part{}, serving S3 body",
+                    response.status, cache_key, part_number
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_200()
+                        .await;
+                }
+                Self::convert_s3_response_to_http(response)
+            }
+            Ok(response) if response.status.is_client_error() => {
+                debug!(
+                    "Coalescing part waiter (validated): 4xx ({}) for {}:part{}",
+                    response.status, cache_key, part_number
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_4xx()
+                        .await;
+                }
+                Self::convert_s3_response_to_http(response)
+            }
+            Ok(response) => {
+                warn!(
+                    "Coalescing part waiter (validated): unexpected status {} for {}:part{}, serving cached part (degraded)",
+                    response.status, cache_key, part_number
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_error()
+                        .await;
+                }
+                cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
+                Self::serve_cached_part_response(cached_part, method, uri.path()).await
+            }
+            Err(e) => {
+                warn!(
+                    "Coalescing part waiter (validated): S3 transport error for {}:part{}: {}, serving cached part (degraded)",
+                    cache_key, part_number, e
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_coalesce_waiter_conditional_error()
+                        .await;
+                }
+                cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
+                Self::serve_cached_part_response(cached_part, method, uri.path()).await
+            }
+        }
     }
 
     /// Forward GET/HEAD request to S3 and cache the response with streaming support
@@ -6540,6 +7933,7 @@ impl HttpProxy {
     ///
     /// Uses TeeStream to simultaneously stream to client and cache in background.
     /// For buffered responses (non-streaming body), caches synchronously.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_get_head_to_s3_and_cache(
         method: Method,
         uri: hyper::Uri,
@@ -6547,7 +7941,7 @@ impl HttpProxy {
         mut headers: HashMap<String, String>,
         cache_key: String,
         cache_manager: Arc<CacheManager>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         range_handler: Arc<RangeHandler>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
@@ -6562,9 +7956,10 @@ impl HttpProxy {
         debug!("Forwarding {} request to S3: {}", method, uri);
 
         // Inject proxy identification Referer header if conditions are met
-        let auth_header_owned: Option<String> = headers.get("authorization")
-            .or_else(|| headers.get("Authorization")).cloned()
-            ;
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
         maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
 
         // Build S3 request context
@@ -6589,7 +7984,8 @@ impl HttpProxy {
                 if method == Method::GET && s3_response.status.is_success() {
                     debug!(
                         "PERF cache_miss path={} s3_fetch_ms={} source=s3_full_object",
-                        uri.path(), s3_fetch_ms
+                        uri.path(),
+                        s3_fetch_ms
                     );
                 }
 
@@ -6674,17 +8070,30 @@ impl HttpProxy {
                                     .unwrap_or(false);
 
                                 // Use incremental writes for regular GET responses with known content_length
-                                if !is_part_request && content_length.is_some() && content_length.unwrap() > 0 {
+                                #[allow(clippy::unnecessary_unwrap)]
+                                if !is_part_request
+                                    && content_length.is_some()
+                                    && content_length.unwrap() > 0
+                                {
                                     let total_size = content_length.unwrap();
                                     let start = 0u64;
                                     let end = total_size - 1;
 
                                     // Begin incremental write
-                                    let disk_cache = range_handler_clone.get_disk_cache_manager().read().await;
-                                    let resolved = cache_manager_clone.resolve_settings(&cache_key_clone).await;
-                                    let writer = match disk_cache.begin_incremental_range_write(
-                                        &cache_key_clone, start, end, resolved.compression_enabled,
-                                    ).await {
+                                    let disk_cache =
+                                        range_handler_clone.get_disk_cache_manager().read().await;
+                                    let resolved = cache_manager_clone
+                                        .resolve_settings(&cache_key_clone)
+                                        .await;
+                                    let writer = match disk_cache
+                                        .begin_incremental_range_write(
+                                            &cache_key_clone,
+                                            start,
+                                            end,
+                                            resolved.compression_enabled,
+                                        )
+                                        .await
+                                    {
                                         Ok(w) => w,
                                         Err(e) => {
                                             warn!("Failed to begin incremental cache write for GET response: cache_key={}, error={}", cache_key_clone, e);
@@ -6702,12 +8111,10 @@ impl HttpProxy {
                                             let mut writer = writer;
                                             let mut rx = cache_rx;
                                             while let Some(chunk) = rx.blocking_recv() {
-                                                if let Err(e) =
-                                                    DiskCacheManager::write_range_chunk(
-                                                        &mut writer,
-                                                        &chunk,
-                                                    )
-                                                {
+                                                if let Err(e) = DiskCacheManager::write_range_chunk(
+                                                    &mut writer,
+                                                    &chunk,
+                                                ) {
                                                     return (writer, Err(e));
                                                 }
                                             }
@@ -6730,12 +8137,12 @@ impl HttpProxy {
                                     };
 
                                     // Build object metadata for commit
-                                    let mut object_metadata =
-                                        s3_client_clone.extract_object_metadata_from_response(
-                                            &headers_for_cache,
-                                        );
-                                    object_metadata.upload_state = crate::cache_types::UploadState::Complete;
-                                    object_metadata.cumulative_size = object_metadata.content_length;
+                                    let mut object_metadata = s3_client_clone
+                                        .extract_object_metadata_from_response(&headers_for_cache);
+                                    object_metadata.upload_state =
+                                        crate::cache_types::UploadState::Complete;
+                                    object_metadata.cumulative_size =
+                                        object_metadata.content_length;
 
                                     // Commit incremental write
                                     //
@@ -6744,8 +8151,16 @@ impl HttpProxy {
                                     // internal mutation is already serialized by finer-grained
                                     // locks (HybridMetadataWriter mutex, SizeAccumulator atomics).
                                     // Concurrent commits of distinct ranges proceed in parallel.
-                                    let disk_cache = range_handler_clone.get_disk_cache_manager().read().await;
-                                    if let Err(e) = disk_cache.commit_incremental_range(writer, object_metadata, resolved.get_ttl).await {
+                                    let disk_cache =
+                                        range_handler_clone.get_disk_cache_manager().read().await;
+                                    if let Err(e) = disk_cache
+                                        .commit_incremental_range(
+                                            writer,
+                                            object_metadata,
+                                            resolved.get_ttl,
+                                        )
+                                        .await
+                                    {
                                         if e.to_string().contains("size mismatch") {
                                             debug!(
                                                 "Incremental cache write incomplete for GET response: cache_key={}, error={}",
@@ -6928,7 +8343,7 @@ impl HttpProxy {
         overlap: crate::range_handler::RangeOverlap,
         _cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
@@ -6942,9 +8357,15 @@ impl HttpProxy {
         );
 
         // Inject proxy identification Referer header if conditions are met
-        let auth_header_owned: Option<String> = client_headers.get("authorization")
-            .or_else(|| client_headers.get("Authorization")).cloned();
-        maybe_add_referer(&mut client_headers, proxy_referer, auth_header_owned.as_deref());
+        let auth_header_owned: Option<String> = client_headers
+            .get("authorization")
+            .or_else(|| client_headers.get("Authorization"))
+            .cloned();
+        maybe_add_referer(
+            &mut client_headers,
+            proxy_referer,
+            auth_header_owned.as_deref(),
+        );
 
         // Build S3 request context with original headers (Requirement 2.2)
         // All headers are preserved exactly as received to maintain signature validity
@@ -7048,7 +8469,16 @@ impl HttpProxy {
         }
 
         // All retries exhausted
-        Self::log_s3_forward_error(&uri, &method, &format_args!("all {} attempts failed, cache_key={}, last_error={:?}", MAX_RETRIES + 1, cache_key, last_error));
+        Self::log_s3_forward_error(
+            &uri,
+            &method,
+            &format_args!(
+                "all {} attempts failed, cache_key={}, last_error={:?}",
+                MAX_RETRIES + 1,
+                cache_key,
+                last_error
+            ),
+        );
         Ok(Self::build_error_response(
             StatusCode::BAD_GATEWAY,
             "BadGateway",
@@ -7065,7 +8495,7 @@ impl HttpProxy {
         range_spec: RangeSpec,
         overlap: crate::range_handler::RangeOverlap,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let status = s3_response.status;
@@ -7110,8 +8540,7 @@ impl HttpProxy {
                             let start = range_spec_clone.start;
                             let end = range_spec_clone.end;
                             let expected_size = end - start + 1;
-                            let resolved =
-                                cache_manager.resolve_settings(&cache_key_clone).await;
+                            let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
 
                             // Check capacity and evict if needed before beginning the write.
                             // `expected_size` is an upper bound on the bytes that will land on
@@ -7150,10 +8579,9 @@ impl HttpProxy {
                                     let mut writer = writer;
                                     let mut rx = cache_rx;
                                     while let Some(chunk) = rx.blocking_recv() {
-                                        if let Err(e) = DiskCacheManager::write_range_chunk(
-                                            &mut writer,
-                                            &chunk,
-                                        ) {
+                                        if let Err(e) =
+                                            DiskCacheManager::write_range_chunk(&mut writer, &chunk)
+                                        {
                                             return (writer, Err(e));
                                         }
                                     }
@@ -7187,11 +8615,7 @@ impl HttpProxy {
                             // serialize the journal append and size accumulator.
                             let disk_cache_guard = disk_cache.read().await;
                             if let Err(e) = disk_cache_guard
-                                .commit_incremental_range(
-                                    writer,
-                                    object_metadata,
-                                    resolved.get_ttl,
-                                )
+                                .commit_incremental_range(writer, object_metadata, resolved.get_ttl)
                                 .await
                             {
                                 if e.to_string().contains("size mismatch") {
@@ -7403,6 +8827,7 @@ impl HttpProxy {
     }
 
     /// Forward range request to S3 and merge with cached data
+    #[allow(clippy::too_many_arguments)]
     async fn forward_range_request_to_s3(
         method: Method,
         uri: hyper::Uri,
@@ -7413,7 +8838,7 @@ impl HttpProxy {
         overlap: crate::range_handler::RangeOverlap,
         cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
         proxy_referer: &Option<String>,
@@ -7452,9 +8877,10 @@ impl HttpProxy {
 
         // Complete cache miss - use streaming to avoid buffering large responses
         // Inject proxy identification Referer header if conditions are met
-        let auth_header_owned: Option<String> = headers.get("authorization")
-            .or_else(|| headers.get("Authorization")).cloned()
-            ;
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
         maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
 
         // This prevents AWS SDK throughput failures for large files
@@ -7683,6 +9109,7 @@ impl HttpProxy {
     /// The TeeStream wrapper sends data to both:
     /// 1. The client (immediately, as bytes arrive)
     /// 2. A background task that accumulates and caches the data
+    #[allow(clippy::too_many_arguments)]
     async fn stream_range_from_s3_with_caching(
         method: Method,
         uri: hyper::Uri,
@@ -7691,7 +9118,7 @@ impl HttpProxy {
         cache_key: String,
         range_spec: RangeSpec,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!(
@@ -7713,8 +9140,9 @@ impl HttpProxy {
         // inside the proxy to signal that `if-match` and/or `if-unmodified-since` were
         // proxy-injected.
         let proxy_injected_if_match = s3_headers.remove("x-proxy-injected-if-match").is_some();
-        let proxy_injected_if_unmodified_since =
-            s3_headers.remove("x-proxy-injected-if-unmodified-since").is_some();
+        let proxy_injected_if_unmodified_since = s3_headers
+            .remove("x-proxy-injected-if-unmodified-since")
+            .is_some();
 
         let mut context =
             build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host.clone());
@@ -7792,7 +9220,7 @@ impl HttpProxy {
                     }
                     retry_headers.remove("x-proxy-injected-if-match");
                     retry_headers.remove("x-proxy-injected-if-unmodified-since");
-                    return Box::pin(Self::stream_range_from_s3_with_caching(
+                    Box::pin(Self::stream_range_from_s3_with_caching(
                         method,
                         uri,
                         host,
@@ -7803,7 +9231,7 @@ impl HttpProxy {
                         s3_client,
                         config,
                     ))
-                    .await;
+                    .await
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED {
                     // Client sent their own If-Match and S3 rejected it. Forward the
                     // 412 to the client unchanged; cache is not touched.
@@ -7833,6 +9261,7 @@ impl HttpProxy {
     }
 
     /// Fetch complete range from S3 as fallback when merge fails
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_complete_range_from_s3(
         method: Method,
         uri: hyper::Uri,
@@ -7842,7 +9271,7 @@ impl HttpProxy {
         range_spec: RangeSpec,
         _cache_manager: Arc<CacheManager>,
         range_handler: Arc<RangeHandler>,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!(
@@ -7862,10 +9291,12 @@ impl HttpProxy {
 
         // Strip the internal sentinels before sending to S3.
         let proxy_injected_if_match = s3_headers.remove("x-proxy-injected-if-match").is_some();
-        let proxy_injected_if_unmodified_since =
-            s3_headers.remove("x-proxy-injected-if-unmodified-since").is_some();
+        let proxy_injected_if_unmodified_since = s3_headers
+            .remove("x-proxy-injected-if-unmodified-since")
+            .is_some();
 
-        let context = build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host.clone());
+        let context =
+            build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host.clone());
 
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
@@ -7913,7 +9344,7 @@ impl HttpProxy {
                     }
                     retry_headers.remove("x-proxy-injected-if-match");
                     retry_headers.remove("x-proxy-injected-if-unmodified-since");
-                    return Box::pin(Self::fetch_complete_range_from_s3(
+                    Box::pin(Self::fetch_complete_range_from_s3(
                         method,
                         uri,
                         host,
@@ -7925,7 +9356,7 @@ impl HttpProxy {
                         s3_client,
                         config,
                     ))
-                    .await;
+                    .await
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED {
                     // Client sent their own If-Match and S3 rejected it. Pass 412 through.
                     warn!("S3 returned 412 Precondition Failed, returning to client without invalidating cache");
@@ -7957,7 +9388,7 @@ impl HttpProxy {
     async fn forward_signed_request(
         req: Request<hyper::body::Incoming>,
         host: String,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!("Forwarding signed request without modification to preserve AWS SigV4 signature");
@@ -7969,7 +9400,7 @@ impl HttpProxy {
     async fn forward_signed_put_request_impl(
         req: Request<hyper::body::Incoming>,
         host: String,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Get connection pool to resolve DNS and get target IP
@@ -7984,19 +9415,9 @@ impl HttpProxy {
 
         match target_ip_opt {
             Some(target_ip) => {
-
                 // Create TLS connector
-                let mut root_store = rustls::RootCertStore::empty();
-
-                // Load system root certificates
-                match rustls_native_certs::load_native_certs() {
-                    Ok(certs) => {
-                        for cert in certs {
-                            if let Err(e) = root_store.add(cert) {
-                                warn!("Failed to add cert: {}", e);
-                            }
-                        }
-                    }
+                let root_store = match crate::tls_trust_store::load_root_cert_store() {
+                    Ok(rs) => rs,
                     Err(e) => {
                         error!("Failed to load native certs: {}", e);
                         return Ok(Self::build_error_response(
@@ -8006,7 +9427,7 @@ impl HttpProxy {
                             None,
                         ));
                     }
-                }
+                };
 
                 let tls_config = if s3_client.has_endpoint_overrides() {
                     // Check if this specific host is a PrivateLink destination
@@ -8014,9 +9435,9 @@ impl HttpProxy {
                     let pm = pool.read().await;
                     if pm.resolve_override(&host).is_some() {
                         drop(pm);
-                        rustls::ClientConfig::builder_with_protocol_versions(
-                            &[&rustls::version::TLS12],
-                        )
+                        rustls::ClientConfig::builder_with_protocol_versions(&[
+                            &rustls::version::TLS12,
+                        ])
                         .with_root_certificates(root_store)
                         .with_no_client_auth()
                     } else {
@@ -8119,7 +9540,10 @@ mod tests {
     fn test_has_sse_c_headers_absent() {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "example.com".to_string());
-        headers.insert("authorization".to_string(), "AWS4-HMAC-SHA256 ...".to_string());
+        headers.insert(
+            "authorization".to_string(),
+            "AWS4-HMAC-SHA256 ...".to_string(),
+        );
         assert!(!HttpProxy::has_sse_c_headers(&headers));
     }
 
@@ -8201,12 +9625,8 @@ mod tests {
     #[test]
     fn eval_if_match_missing_cached_etag_falls_back() {
         let headers = eval_headers(&[("if-match", "\"abc\"")]);
-        let r = HttpProxy::evaluate_client_conditions_against_cache(
-            &Method::GET,
-            &headers,
-            None,
-            None,
-        );
+        let r =
+            HttpProxy::evaluate_client_conditions_against_cache(&Method::GET, &headers, None, None);
         assert_eq!(r, ConditionalEvalResult::FallbackToForward);
     }
 
@@ -8262,8 +9682,7 @@ mod tests {
 
     #[test]
     fn eval_if_modified_since_not_modified_is_304() {
-        let headers =
-            eval_headers(&[("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
+        let headers = eval_headers(&[("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
         let r = HttpProxy::evaluate_client_conditions_against_cache(
             &Method::GET,
             &headers,
@@ -8275,8 +9694,7 @@ mod tests {
 
     #[test]
     fn eval_if_modified_since_modified_is_fresh() {
-        let headers =
-            eval_headers(&[("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
+        let headers = eval_headers(&[("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
         let r = HttpProxy::evaluate_client_conditions_against_cache(
             &Method::GET,
             &headers,
@@ -8288,8 +9706,7 @@ mod tests {
 
     #[test]
     fn eval_if_unmodified_since_stale_cache_is_412() {
-        let headers =
-            eval_headers(&[("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
+        let headers = eval_headers(&[("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT")]);
         let r = HttpProxy::evaluate_client_conditions_against_cache(
             &Method::GET,
             &headers,
@@ -8994,7 +10411,7 @@ mod tests {
         maybe_add_referer(&mut headers, &proxy_referer, Some(auth));
 
         // Referer must NOT be added because it's in SignedHeaders
-        assert!(headers.get("Referer").is_none());
+        assert!(!headers.contains_key("Referer"));
     }
 
     /// Test 6.4: maybe_add_referer skips when proxy_referer is None (feature disabled).
@@ -9009,7 +10426,7 @@ mod tests {
 
         maybe_add_referer(&mut headers, &proxy_referer, None);
 
-        assert!(headers.get("Referer").is_none());
+        assert!(!headers.contains_key("Referer"));
     }
 
     /// Test 6.5: Header format matches `s3-hybrid-cache/{version} ({hostname})`.
@@ -9027,7 +10444,9 @@ mod tests {
 
         maybe_add_referer(&mut headers, &proxy_referer, None);
 
-        let actual = headers.get("Referer").expect("Referer header should be present");
+        let actual = headers
+            .get("Referer")
+            .expect("Referer header should be present");
         assert_eq!(actual, &expected);
 
         // Verify the format structure: starts with "s3-hybrid-cache/", contains version, ends with "(hostname)"
@@ -9046,19 +10465,29 @@ mod tests {
     ///
     /// **Validates: Requirements 1.1, 1.4**
     #[quickcheck]
-    fn prop_absolute_uri_detection_is_correct(host: String, path: String, use_scheme: bool) -> TestResult {
+    fn prop_absolute_uri_detection_is_correct(
+        host: String,
+        path: String,
+        use_scheme: bool,
+    ) -> TestResult {
         // Filter out hosts that are empty or contain characters invalid in a URI authority
-        if host.is_empty() || host.contains('/') || host.contains(' ') || host.contains('#')
-            || host.contains('?') || host.contains('@') || host.contains('[') || host.contains(']')
+        if host.is_empty()
+            || host.contains('/')
+            || host.contains(' ')
+            || host.contains('#')
+            || host.contains('?')
+            || host.contains('@')
+            || host.contains('[')
+            || host.contains(']')
         {
             return TestResult::discard();
         }
 
         // Sanitize path: must start with '/' and not contain fragment/whitespace
         let path = if path.is_empty() || !path.starts_with('/') {
-            format!("/{}", path.replace(' ', "").replace('#', ""))
+            format!("/{}", path.replace([' ', '#'], ""))
         } else {
-            path.replace(' ', "").replace('#', "")
+            path.replace([' ', '#'], "")
         };
 
         // Discard if path still contains characters that break URI parsing
@@ -9332,13 +10761,7 @@ mod tests {
         let uri: Uri = "/bucket/key".parse().unwrap();
 
         // Call build_s3_request_context — the function under test
-        let context = build_s3_request_context(
-            Method::GET,
-            uri,
-            headers,
-            None,
-            host,
-        );
+        let context = build_s3_request_context(Method::GET, uri, headers, None, host);
 
         // Verify every original header appears unchanged in the context
         for (key, value) in &original_headers {

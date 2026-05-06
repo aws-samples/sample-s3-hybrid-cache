@@ -166,16 +166,16 @@ async fn test_complete_multipart_upload_bypassed() {
         std::time::Duration::from_secs(900),  // PUT_TTL
         false,                                // actively_remove_cached_data
         s3_proxy::config::SharedStorageConfig::default(),
-        10.0,                                          // 10% write cache
-        true,                                          // write_cache_enabled
-        std::time::Duration::from_secs(86400),         // incomplete_upload_ttl
+        10.0,                                  // 10% write cache
+        true,                                  // write_cache_enabled
+        std::time::Duration::from_secs(86400), // incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95,                                            // eviction_trigger_percent
-        80,                                            // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await.unwrap();

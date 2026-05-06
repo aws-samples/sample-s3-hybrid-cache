@@ -5,7 +5,6 @@ use s3_proxy::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio;
 
 /// Test helper function to detect conditional headers (mirrors the private method)
 fn has_conditional_headers(headers: &HashMap<String, String>) -> bool {

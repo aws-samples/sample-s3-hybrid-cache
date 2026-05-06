@@ -36,7 +36,7 @@ use crate::capacity_manager::{check_cache_capacity, log_bypass_decision, CacheDe
 use crate::compression::CompressionHandler;
 use crate::log_sampler::LogSampler;
 use crate::metrics::MetricsManager;
-use crate::s3_client::S3Client;
+use crate::s3_client::S3ClientApi;
 use crate::signed_request_proxy::{forward_signed_request, forward_signed_request_with_body};
 use crate::{ProxyError, Result};
 use bytes::Bytes;
@@ -182,8 +182,6 @@ fn normalize_etag(etag: &str) -> &str {
     etag.trim_matches('"')
 }
 
-
-
 /// Format bytes into human-readable string (MB with 1 decimal)
 fn format_size(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
@@ -271,7 +269,7 @@ pub struct SignedPutHandler {
     /// Cache manager for HEAD cache invalidation
     cache_manager: Option<Arc<crate::cache::CacheManager>>,
     /// S3 client for comprehensive response header extraction
-    s3_client: Option<Arc<S3Client>>,
+    s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
     /// Log sampler for reducing log volume
     log_sampler: LogSampler,
     /// Proxy identification Referer header value (None when disabled)
@@ -330,7 +328,7 @@ impl SignedPutHandler {
     /// # Arguments
     ///
     /// * `s3_client` - S3 client instance
-    pub fn set_s3_client(&mut self, s3_client: Arc<S3Client>) {
+    pub fn set_s3_client(&mut self, s3_client: Arc<dyn S3ClientApi + Send + Sync>) {
         self.s3_client = Some(s3_client);
     }
 
@@ -484,7 +482,14 @@ impl SignedPutHandler {
                     metrics.read().await.record_bypassed_put().await;
                 }
                 // Forward without caching
-                forward_signed_request(req, &target_host, target_ip, &tls_connector, self.proxy_referer.as_deref()).await
+                forward_signed_request(
+                    req,
+                    &target_host,
+                    target_ip,
+                    &tls_connector,
+                    self.proxy_referer.as_deref(),
+                )
+                .await
             }
             CacheDecision::StreamWithCapacityCheck => {
                 info!("Streaming signed PUT with capacity check: {}", cache_key);
@@ -538,6 +543,7 @@ impl SignedPutHandler {
     /// - Requirement 4.3: Handle cache writes in background tasks
     /// - Requirement 1.1: Continue with upload even if caching fails
     /// - Requirement 1.3: Return S3 response unchanged
+    #[allow(clippy::too_many_arguments)]
     async fn handle_with_caching(
         &self,
         req: Request<hyper::body::Incoming>,
@@ -685,19 +691,31 @@ impl SignedPutHandler {
         // Inject proxy identification Referer header if conditions are met
         if let Some(ref referer_value) = self.proxy_referer {
             if !headers.contains_key("referer") {
-                let should_add = if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                let should_add = if let Some(auth) =
+                    headers.get("authorization").and_then(|v| v.to_str().ok())
+                {
                     if crate::signed_request_proxy::is_sigv4_algorithm(auth) {
                         if let Some(pos) = auth.find("SignedHeaders=") {
                             let after_param = &auth[pos + 14..];
-                            let end = after_param.find(',').or_else(|| after_param.find(' ')).unwrap_or(after_param.len());
+                            let end = after_param
+                                .find(',')
+                                .or_else(|| after_param.find(' '))
+                                .unwrap_or(after_param.len());
                             let signed_headers = &after_param[..end];
                             !signed_headers.split(';').any(|h| h == "referer")
-                        } else { true }
-                    } else { true }
-                } else { true };
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
                 if should_add {
                     debug!("Adding proxy identification Referer header to raw streaming PUT request: {}", referer_value);
-                    raw_request.extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
+                    raw_request
+                        .extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
                 }
             }
         }
@@ -909,19 +927,34 @@ impl SignedPutHandler {
         // Inject proxy identification Referer header if conditions are met
         if let Some(ref referer_value) = self.proxy_referer {
             if !headers.contains_key("referer") {
-                let should_add = if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                let should_add = if let Some(auth) =
+                    headers.get("authorization").and_then(|v| v.to_str().ok())
+                {
                     if crate::signed_request_proxy::is_sigv4_algorithm(auth) {
                         if let Some(pos) = auth.find("SignedHeaders=") {
                             let after_param = &auth[pos + 14..];
-                            let end = after_param.find(',').or_else(|| after_param.find(' ')).unwrap_or(after_param.len());
+                            let end = after_param
+                                .find(',')
+                                .or_else(|| after_param.find(' '))
+                                .unwrap_or(after_param.len());
                             let signed_headers = &after_param[..end];
                             !signed_headers.split(';').any(|h| h == "referer")
-                        } else { true }
-                    } else { true }
-                } else { true };
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
                 if should_add {
-                    debug!("Adding proxy identification Referer header to raw PUT request: {}", referer_value);
-                    raw_request.extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
+                    debug!(
+                        "Adding proxy identification Referer header to raw PUT request: {}",
+                        referer_value
+                    );
+                    raw_request
+                        .extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
                 }
             }
         }
@@ -1406,8 +1439,14 @@ impl SignedPutHandler {
             .map(|s| s.to_string());
 
         // Forward request to S3
-        let s3_response =
-            forward_signed_request(req, &target_host, target_ip, &tls_connector, self.proxy_referer.as_deref()).await?;
+        let s3_response = forward_signed_request(
+            req,
+            &target_host,
+            target_ip,
+            &tls_connector,
+            self.proxy_referer.as_deref(),
+        )
+        .await?;
 
         let status = s3_response.status();
         let response_headers = s3_response.headers().clone();
@@ -1544,6 +1583,7 @@ impl SignedPutHandler {
     /// - Requirement 8.1: Handle cache write failures gracefully
     /// - Requirement 8.2: Clean up cached data on S3 error
     /// - Requirement 9.3: Log detailed error information
+    #[allow(clippy::too_many_arguments)]
     async fn handle_upload_part(
         &mut self,
         req: Request<hyper::body::Incoming>,
@@ -1605,7 +1645,9 @@ impl SignedPutHandler {
                 // metric recorded) rather than cache potentially-corrupt bytes.
                 //
                 // None = skip caching this part. Some(bytes) = cache these bytes.
-                let cache_body_bytes: Option<Bytes> = if aws_chunked_decoder::is_aws_chunked(&request_headers) {
+                let cache_body_bytes: Option<Bytes> = if aws_chunked_decoder::is_aws_chunked(
+                    &request_headers,
+                ) {
                     match aws_chunked_decoder::decode_aws_chunked(&original_body_bytes) {
                         Ok(decoded) => {
                             let decoded_len = decoded.len() as u64;
@@ -1794,7 +1836,14 @@ impl SignedPutHandler {
                 if let Some(metrics) = &self.metrics_manager {
                     metrics.read().await.record_bypassed_put().await;
                 }
-                forward_signed_request(req, &target_host, target_ip, &tls_connector, self.proxy_referer.as_deref()).await
+                forward_signed_request(
+                    req,
+                    &target_host,
+                    target_ip,
+                    &tls_connector,
+                    self.proxy_referer.as_deref(),
+                )
+                .await
             }
         }
     }
@@ -2105,8 +2154,14 @@ impl SignedPutHandler {
         );
 
         // Forward request to S3 first
-        let s3_response =
-            forward_signed_request(req, &target_host, target_ip, &tls_connector, self.proxy_referer.as_deref()).await?;
+        let s3_response = forward_signed_request(
+            req,
+            &target_host,
+            target_ip,
+            &tls_connector,
+            self.proxy_referer.as_deref(),
+        )
+        .await?;
 
         // Always clean up cached parts, regardless of S3 response status
         // This ensures we don't leave orphaned cache data
@@ -2851,6 +2906,7 @@ impl SignedPutHandler {
     /// - Requirement 1.2: Create metadata with ETag and Content-Type from S3 response (Last-Modified learned on first cache-miss GET or first HEAD after PUT)
     /// - Requirement 1.3: Set write cache TTL (default: 1 day)
     /// - Requirement 9.1: Don't cache on S3 failure
+    #[allow(clippy::too_many_arguments)]
     fn spawn_cache_write_task_with_capacity(
         cache_key: String,
         body_data: Bytes,
@@ -2861,7 +2917,7 @@ impl SignedPutHandler {
         request_headers: HashMap<String, String>,
         metrics: Option<Arc<RwLock<MetricsManager>>>,
         cache_manager: Option<Arc<crate::cache::CacheManager>>,
-        s3_client: Option<Arc<S3Client>>,
+        s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
     ) {
         tokio::spawn(async move {
             let start_time = std::time::Instant::now();
@@ -2969,7 +3025,8 @@ impl SignedPutHandler {
                                     let streaming_duration_ms =
                                         start_time.elapsed().as_millis() as u64;
                                     // Get the effective PUT TTL for logging - Requirement 11.1
-                                    let effective_ttl = cache_mgr.get_effective_put_ttl(&cache_key).await;
+                                    let effective_ttl =
+                                        cache_mgr.get_effective_put_ttl(&cache_key).await;
                                     info!(
                                         "Successfully stored PUT as write-cached range (with capacity check): cache_key={}, size={} bytes, ttl={:?}",
                                         cache_key, body_len, effective_ttl
@@ -3054,6 +3111,7 @@ impl SignedPutHandler {
     /// - Requirement 1.3: Set write cache TTL (default: 1 day)
     /// - Requirement 1.5: Return S3 response unchanged to client (handled by caller)
     /// - Requirement 9.1: Don't cache on S3 failure
+    #[allow(clippy::too_many_arguments)]
     fn spawn_cache_write_task(
         cache_key: String,
         body_data: Bytes,
@@ -3064,7 +3122,7 @@ impl SignedPutHandler {
         request_headers: HashMap<String, String>,
         metrics: Option<Arc<RwLock<MetricsManager>>>,
         cache_manager: Option<Arc<crate::cache::CacheManager>>,
-        s3_client: Option<Arc<S3Client>>,
+        s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
     ) {
         tokio::spawn(async move {
             // Track streaming start time
@@ -3166,7 +3224,8 @@ impl SignedPutHandler {
                                     let streaming_duration_ms =
                                         start_time.elapsed().as_millis() as u64;
                                     // Get the effective PUT TTL for logging - Requirement 11.1
-                                    let effective_ttl = cache_mgr.get_effective_put_ttl(&cache_key).await;
+                                    let effective_ttl =
+                                        cache_mgr.get_effective_put_ttl(&cache_key).await;
 
                                     info!(
                                         "Successfully stored PUT as write-cached range: cache_key={}, size={} bytes, etag={}, ttl={:?}",
@@ -3581,7 +3640,8 @@ mod tests {
                 iteration
             );
             assert_eq!(
-                tracked_part.size, expected_bytes.len() as u64,
+                tracked_part.size,
+                expected_bytes.len() as u64,
                 "iteration {}: tracker-recorded size must match payload size",
                 iteration
             );
@@ -3951,7 +4011,10 @@ mod tests {
     #[test]
     fn test_normalize_etag_with_quotes() {
         assert_eq!(normalize_etag("\"abc123\""), "abc123");
-        assert_eq!(normalize_etag("\"a54357aff0632cce46d942af68356b38\""), "a54357aff0632cce46d942af68356b38");
+        assert_eq!(
+            normalize_etag("\"a54357aff0632cce46d942af68356b38\""),
+            "a54357aff0632cce46d942af68356b38"
+        );
     }
 
     /// Test normalize_etag handles ETags without quotes
@@ -3959,7 +4022,10 @@ mod tests {
     #[test]
     fn test_normalize_etag_without_quotes() {
         assert_eq!(normalize_etag("abc123"), "abc123");
-        assert_eq!(normalize_etag("a54357aff0632cce46d942af68356b38"), "a54357aff0632cce46d942af68356b38");
+        assert_eq!(
+            normalize_etag("a54357aff0632cce46d942af68356b38"),
+            "a54357aff0632cce46d942af68356b38"
+        );
     }
 
     /// Test normalize_etag handles empty string and edge cases
@@ -4167,9 +4233,18 @@ mod tests {
         let part2_file = multipart_dir.join("part2.bin");
         let part3_file = multipart_dir.join("part3.bin");
 
-        assert!(part1_file.exists(), "Part 1 file should exist before finalization");
-        assert!(part2_file.exists(), "Part 2 file should exist before finalization");
-        assert!(part3_file.exists(), "Part 3 file should exist before finalization");
+        assert!(
+            part1_file.exists(),
+            "Part 1 file should exist before finalization"
+        );
+        assert!(
+            part2_file.exists(),
+            "Part 2 file should exist before finalization"
+        );
+        assert!(
+            part3_file.exists(),
+            "Part 3 file should exist before finalization"
+        );
 
         // Complete with only parts 1 and 3 (skip part 2)
         let requested_parts = vec![
@@ -4240,7 +4315,7 @@ mod tests {
             Some(&(1024, 1535))
         );
         // Part 2 should not be in part_ranges
-        assert!(metadata.object_metadata.part_ranges.get(&2).is_none());
+        assert!(!metadata.object_metadata.part_ranges.contains_key(&2));
     }
 
     /// Test part filtering with contiguous parts (all parts in sequence)
@@ -4458,30 +4533,37 @@ mod tests {
         assert_eq!(
             metadata.object_metadata.part_ranges.get(&1),
             Some(&(part1_start, part1_end)),
-            "Part 1 range should be 0-{}", part1_end
+            "Part 1 range should be 0-{}",
+            part1_end
         );
         assert_eq!(
             metadata.object_metadata.part_ranges.get(&2),
             Some(&(part2_start, part2_end)),
-            "Part 2 range should be {}-{}", part2_start, part2_end
+            "Part 2 range should be {}-{}",
+            part2_start,
+            part2_end
         );
         assert_eq!(
             metadata.object_metadata.part_ranges.get(&3),
             Some(&(part3_start, part3_end)),
-            "Part 3 range should be {}-{}", part3_start, part3_end
+            "Part 3 range should be {}-{}",
+            part3_start,
+            part3_end
         );
         assert_eq!(
             metadata.object_metadata.part_ranges.get(&4),
             Some(&(part4_start, part4_end)),
-            "Part 4 range should be {}-{}", part4_start, part4_end
+            "Part 4 range should be {}-{}",
+            part4_start,
+            part4_end
         );
 
         // Verify total content length
         let expected_total = part1_size + part2_size + part3_size + part4_size;
         assert_eq!(
-            metadata.object_metadata.content_length,
-            expected_total,
-            "Total content length should be {} bytes", expected_total
+            metadata.object_metadata.content_length, expected_total,
+            "Total content length should be {} bytes",
+            expected_total
         );
     }
 
@@ -4597,8 +4679,8 @@ mod tests {
         );
 
         // Parts 2 and 4 should not exist in part_ranges
-        assert!(metadata.object_metadata.part_ranges.get(&2).is_none());
-        assert!(metadata.object_metadata.part_ranges.get(&4).is_none());
+        assert!(!metadata.object_metadata.part_ranges.contains_key(&2));
+        assert!(!metadata.object_metadata.part_ranges.contains_key(&4));
 
         // Verify total content length
         assert_eq!(
@@ -4737,9 +4819,9 @@ mod tests {
         );
 
         // Parts 1, 3, 5 should not exist in part_ranges
-        assert!(metadata.object_metadata.part_ranges.get(&1).is_none());
-        assert!(metadata.object_metadata.part_ranges.get(&3).is_none());
-        assert!(metadata.object_metadata.part_ranges.get(&5).is_none());
+        assert!(!metadata.object_metadata.part_ranges.contains_key(&1));
+        assert!(!metadata.object_metadata.part_ranges.contains_key(&3));
+        assert!(!metadata.object_metadata.part_ranges.contains_key(&5));
 
         // Verify total content length (only parts 2 and 4)
         assert_eq!(
@@ -5408,5 +5490,4 @@ mod tests {
 
         TestResult::passed()
     }
-
 }

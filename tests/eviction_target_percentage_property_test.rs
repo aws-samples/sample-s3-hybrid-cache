@@ -30,14 +30,14 @@ impl Arbitrary for EvictionScenario {
         // Generate max_size in a reasonable range (1KB to 100GB)
         // Use non-zero values to avoid division issues
         let max_size = (u64::arbitrary(g) % 100_000_000_000).max(1024);
-        
+
         // Generate current_size in range from target to 2x max_size
         // (eviction only happens when cache is over threshold)
         let current_size = u64::arbitrary(g) % (max_size * 2 + 1);
-        
+
         // Generate target_percent in valid range (50-99)
         let target_percent = (u8::arbitrary(g) % 50) + 50; // 50-99
-        
+
         EvictionScenario {
             current_size,
             max_size,
@@ -92,11 +92,7 @@ fn calculate_target_size(max_size: u64, target_percent: u8) -> u64 {
 /// # Returns
 /// The number of bytes to free, or 0 if current_size <= target_size
 fn calculate_bytes_to_free(current_size: u64, target_size: u64) -> u64 {
-    if current_size > target_size {
-        current_size - target_size
-    } else {
-        0
-    }
+    current_size.saturating_sub(target_size)
 }
 
 /// Determines if eviction has reached its target.
@@ -123,21 +119,21 @@ fn prop_target_size_calculation(max_size: u64, target_percent: TargetPercent) ->
     if max_size == 0 {
         return TestResult::discard();
     }
-    
+
     // Skip extremely large values that would cause floating point precision issues
     const MAX_SAFE_SIZE: u64 = 1 << 52; // ~4.5 petabytes
     if max_size > MAX_SAFE_SIZE {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(max_size, target_percent.0);
-    
+
     // Verify using integer math (with rounding tolerance)
     let expected = (max_size as f64 * (target_percent.0 as f64 / 100.0)) as u64;
-    
+
     // Allow for floating point rounding (should be exact or off by 1)
     let close_enough = (target_size as i64 - expected as i64).abs() <= 1;
-    
+
     TestResult::from_bool(close_enough)
 }
 
@@ -148,10 +144,10 @@ fn prop_bytes_to_free_calculation(scenario: EvictionScenario) -> TestResult {
     if scenario.max_size == 0 {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(scenario.max_size, scenario.target_percent);
     let bytes_to_free = calculate_bytes_to_free(scenario.current_size, target_size);
-    
+
     if scenario.current_size > target_size {
         // Should free exactly current_size - target_size
         let expected = scenario.current_size - target_size;
@@ -169,9 +165,9 @@ fn prop_target_size_less_than_max(max_size: u64, target_percent: TargetPercent) 
     if max_size == 0 {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(max_size, target_percent.0);
-    
+
     // Target percent is 50-99, so target_size should always be < max_size
     // (99% of max_size is still less than max_size)
     TestResult::from_bool(target_size < max_size)
@@ -184,16 +180,16 @@ fn prop_target_size_at_least_half(max_size: u64, target_percent: TargetPercent) 
     if max_size == 0 {
         return TestResult::discard();
     }
-    
+
     // Skip extremely large values that would cause floating point precision issues
     const MAX_SAFE_SIZE: u64 = 1 << 52; // ~4.5 petabytes
     if max_size > MAX_SAFE_SIZE {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(max_size, target_percent.0);
     let half_max = max_size / 2;
-    
+
     // Target percent is 50-99, so target_size should be >= 50% of max_size
     // Allow for rounding (target_size should be at least half_max - 1)
     TestResult::from_bool(target_size >= half_max.saturating_sub(1))
@@ -205,10 +201,10 @@ fn prop_eviction_target_reached(scenario: EvictionScenario) -> TestResult {
     if scenario.max_size == 0 {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(scenario.max_size, scenario.target_percent);
     let reached = eviction_target_reached(scenario.current_size, target_size);
-    
+
     // Verify the condition matches
     let expected = scenario.current_size <= target_size;
     TestResult::from_bool(reached == expected)
@@ -216,14 +212,17 @@ fn prop_eviction_target_reached(scenario: EvictionScenario) -> TestResult {
 
 /// Property: Target size calculation is deterministic
 /// **Validates: Requirements 3.4**
-fn prop_target_calculation_deterministic(max_size: u64, target_percent: TargetPercent) -> TestResult {
+fn prop_target_calculation_deterministic(
+    max_size: u64,
+    target_percent: TargetPercent,
+) -> TestResult {
     if max_size == 0 {
         return TestResult::discard();
     }
-    
+
     let target1 = calculate_target_size(max_size, target_percent.0);
     let target2 = calculate_target_size(max_size, target_percent.0);
-    
+
     TestResult::from_bool(target1 == target2)
 }
 
@@ -234,21 +233,21 @@ fn prop_higher_percent_higher_target(max_size: u64) -> TestResult {
     if max_size < 100 {
         return TestResult::discard();
     }
-    
+
     let target_50 = calculate_target_size(max_size, 50);
     let target_60 = calculate_target_size(max_size, 60);
     let target_70 = calculate_target_size(max_size, 70);
     let target_80 = calculate_target_size(max_size, 80);
     let target_90 = calculate_target_size(max_size, 90);
     let target_99 = calculate_target_size(max_size, 99);
-    
+
     // Higher percentage should result in higher target (less eviction)
     let monotonic = target_50 <= target_60
         && target_60 <= target_70
         && target_70 <= target_80
         && target_80 <= target_90
         && target_90 <= target_99;
-    
+
     TestResult::from_bool(monotonic)
 }
 
@@ -259,16 +258,16 @@ fn prop_default_target_percent(max_size: u64) -> TestResult {
     if max_size < 100 {
         return TestResult::discard();
     }
-    
+
     let default_target_percent = 80u8;
     let target = calculate_target_size(max_size, default_target_percent);
-    
+
     // Target should be approximately 80% of max_size
     let expected = (max_size as f64 * 0.80) as u64;
-    
+
     // Allow for floating point rounding
     let close_enough = (target as i64 - expected as i64).abs() <= 1;
-    
+
     TestResult::from_bool(close_enough)
 }
 
@@ -278,10 +277,10 @@ fn prop_bytes_to_free_non_negative(scenario: EvictionScenario) -> TestResult {
     if scenario.max_size == 0 {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(scenario.max_size, scenario.target_percent);
     let bytes_to_free = calculate_bytes_to_free(scenario.current_size, target_size);
-    
+
     // bytes_to_free is u64, so it's always >= 0, but verify the logic is correct
     // (no underflow when current_size < target_size)
     TestResult::from_bool(bytes_to_free <= scenario.current_size)
@@ -293,13 +292,13 @@ fn prop_after_eviction_at_target(scenario: EvictionScenario) -> TestResult {
     if scenario.max_size == 0 {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(scenario.max_size, scenario.target_percent);
     let bytes_to_free = calculate_bytes_to_free(scenario.current_size, target_size);
-    
+
     // Simulate eviction: new_size = current_size - bytes_to_free
     let new_size = scenario.current_size.saturating_sub(bytes_to_free);
-    
+
     // After eviction, should be at or below target
     TestResult::from_bool(new_size <= target_size)
 }
@@ -310,21 +309,21 @@ fn prop_all_eviction_target_invariants(scenario: EvictionScenario) -> TestResult
     if scenario.max_size == 0 {
         return TestResult::discard();
     }
-    
+
     let target_size = calculate_target_size(scenario.max_size, scenario.target_percent);
     let bytes_to_free = calculate_bytes_to_free(scenario.current_size, target_size);
-    
+
     // Invariant 1: target_size < max_size (since target_percent is 50-99)
     if target_size >= scenario.max_size {
         return TestResult::failed();
     }
-    
+
     // Invariant 2: target_size >= 50% of max_size
     let half_max = scenario.max_size / 2;
     if target_size < half_max.saturating_sub(1) {
         return TestResult::failed();
     }
-    
+
     // Invariant 3: bytes_to_free is correct
     if scenario.current_size > target_size {
         if bytes_to_free != scenario.current_size - target_size {
@@ -333,13 +332,13 @@ fn prop_all_eviction_target_invariants(scenario: EvictionScenario) -> TestResult
     } else if bytes_to_free != 0 {
         return TestResult::failed();
     }
-    
+
     // Invariant 4: After eviction, at or below target
     let new_size = scenario.current_size.saturating_sub(bytes_to_free);
     if new_size > target_size {
         return TestResult::failed();
     }
-    
+
     TestResult::passed()
 }
 
@@ -437,7 +436,7 @@ mod unit_tests {
         // Default: target at 80% of max_size
         let max_size = 10_000_000_000u64; // 10GB
         let target = calculate_target_size(max_size, 80);
-        
+
         // 80% of 10GB = 8GB
         let expected = 8_000_000_000u64;
         assert_eq!(target, expected);
@@ -447,7 +446,7 @@ mod unit_tests {
     fn test_target_50_percent() {
         let max_size = 10_000_000_000u64; // 10GB
         let target = calculate_target_size(max_size, 50);
-        
+
         // 50% of 10GB = 5GB
         let expected = 5_000_000_000u64;
         assert_eq!(target, expected);
@@ -457,7 +456,7 @@ mod unit_tests {
     fn test_target_99_percent() {
         let max_size = 10_000_000_000u64; // 10GB
         let target = calculate_target_size(max_size, 99);
-        
+
         // 99% of 10GB = 9.9GB
         let expected = 9_900_000_000u64;
         assert_eq!(target, expected);
@@ -468,11 +467,11 @@ mod unit_tests {
         let max_size = 10_000_000_000u64; // 10GB
         let current_size = 9_500_000_000u64; // 9.5GB
         let target_percent = 80u8;
-        
+
         let target_size = calculate_target_size(max_size, target_percent);
         // target_size = 8GB
         assert_eq!(target_size, 8_000_000_000);
-        
+
         let bytes_to_free = calculate_bytes_to_free(current_size, target_size);
         // Need to free 9.5GB - 8GB = 1.5GB
         assert_eq!(bytes_to_free, 1_500_000_000);
@@ -483,11 +482,11 @@ mod unit_tests {
         let max_size = 10_000_000_000u64;
         let target_percent = 80u8;
         let target_size = calculate_target_size(max_size, target_percent);
-        
+
         // Current size exactly at target
         let current_size = target_size;
         let bytes_to_free = calculate_bytes_to_free(current_size, target_size);
-        
+
         // Should free 0 bytes
         assert_eq!(bytes_to_free, 0);
     }
@@ -497,11 +496,11 @@ mod unit_tests {
         let max_size = 10_000_000_000u64;
         let target_percent = 80u8;
         let target_size = calculate_target_size(max_size, target_percent);
-        
+
         // Current size below target
         let current_size = 5_000_000_000u64; // 5GB < 8GB target
         let bytes_to_free = calculate_bytes_to_free(current_size, target_size);
-        
+
         // Should free 0 bytes
         assert_eq!(bytes_to_free, 0);
     }
@@ -509,13 +508,13 @@ mod unit_tests {
     #[test]
     fn test_eviction_target_reached_true() {
         let target_size = 8_000_000_000u64;
-        
+
         // At target
         assert!(eviction_target_reached(target_size, target_size));
-        
+
         // Below target
         assert!(eviction_target_reached(7_000_000_000, target_size));
-        
+
         // Way below target
         assert!(eviction_target_reached(0, target_size));
     }
@@ -523,10 +522,10 @@ mod unit_tests {
     #[test]
     fn test_eviction_target_reached_false() {
         let target_size = 8_000_000_000u64;
-        
+
         // Above target
         assert!(!eviction_target_reached(8_000_000_001, target_size));
-        
+
         // Way above target
         assert!(!eviction_target_reached(10_000_000_000, target_size));
     }
@@ -534,7 +533,7 @@ mod unit_tests {
     #[test]
     fn test_target_always_less_than_max() {
         let max_size = 10_000_000_000u64;
-        
+
         // Test all valid target percentages (50-99)
         for percent in 50..=99 {
             let target = calculate_target_size(max_size, percent);
@@ -553,7 +552,7 @@ mod unit_tests {
         // Test with small cache to verify no overflow issues
         let max_size = 1000u64; // 1KB
         let target = calculate_target_size(max_size, 80);
-        
+
         // 80% of 1000 = 800
         assert_eq!(target, 800);
     }
@@ -563,7 +562,7 @@ mod unit_tests {
         // Test with large cache (100TB)
         let max_size = 100_000_000_000_000u64; // 100TB
         let target = calculate_target_size(max_size, 80);
-        
+
         // 80% of 100TB = 80TB
         let expected = 80_000_000_000_000u64;
         assert_eq!(target, expected);
@@ -575,15 +574,15 @@ mod unit_tests {
         let max_size = 10_737_418_240u64; // 10GB in bytes
         let target_percent = 80u8;
         let target_size = calculate_target_size(max_size, target_percent);
-        
+
         // 80% of 10GB ≈ 8GB
         let expected_target = 8_589_934_592u64; // 8GB in bytes
         assert_eq!(target_size, expected_target);
-        
+
         // If current size is 9.5GB, need to free 1.5GB
         let current_size = 10_200_547_328u64; // ~9.5GB
         let bytes_to_free = calculate_bytes_to_free(current_size, target_size);
-        
+
         // Should free ~1.5GB
         let expected_to_free = current_size - target_size;
         assert_eq!(bytes_to_free, expected_to_free);
@@ -593,22 +592,22 @@ mod unit_tests {
     fn test_comparison_with_old_80_percent_hardcoded() {
         // Old behavior: target = max_size * 0.8 (hardcoded)
         // New behavior: target = max_size * target_percent / 100 (configurable)
-        
+
         let max_size = 10_000_000_000u64; // 10GB
-        
+
         // Old hardcoded behavior (80%)
         let old_target = (max_size as f64 * 0.8) as u64;
-        
+
         // New configurable behavior with default (80%)
         let new_target = calculate_target_size(max_size, 80);
-        
+
         // Should be identical
         assert_eq!(old_target, new_target);
-        
+
         // But now we can configure different targets
         let aggressive_target = calculate_target_size(max_size, 50); // 50%
         let conservative_target = calculate_target_size(max_size, 90); // 90%
-        
+
         assert_eq!(aggressive_target, 5_000_000_000); // 5GB
         assert_eq!(conservative_target, 9_000_000_000); // 9GB
     }
@@ -616,7 +615,7 @@ mod unit_tests {
     #[test]
     fn test_target_monotonicity() {
         let max_size = 10_000_000u64;
-        
+
         // Verify targets increase with percentage
         let t50 = calculate_target_size(max_size, 50);
         let t60 = calculate_target_size(max_size, 60);
@@ -624,7 +623,7 @@ mod unit_tests {
         let t80 = calculate_target_size(max_size, 80);
         let t90 = calculate_target_size(max_size, 90);
         let t99 = calculate_target_size(max_size, 99);
-        
+
         assert!(t50 < t60);
         assert!(t60 < t70);
         assert!(t70 < t80);
@@ -638,16 +637,16 @@ mod unit_tests {
         let max_size = 10_000_000_000u64; // 10GB
         let target_percent = 80u8;
         let mut current_size = 9_800_000_000u64; // 9.8GB (over 95% trigger)
-        
+
         let target_size = calculate_target_size(max_size, target_percent);
         assert_eq!(target_size, 8_000_000_000); // 8GB
-        
+
         let bytes_to_free = calculate_bytes_to_free(current_size, target_size);
         assert_eq!(bytes_to_free, 1_800_000_000); // 1.8GB to free
-        
+
         // Simulate eviction
         current_size -= bytes_to_free;
-        
+
         // Verify target reached
         assert!(eviction_target_reached(current_size, target_size));
         assert_eq!(current_size, target_size);
@@ -658,13 +657,13 @@ mod unit_tests {
         let max_size = 1_000_000u64; // 1MB
         let target_percent = 80u8;
         let target_size = calculate_target_size(max_size, target_percent);
-        
+
         // At target: reached
         assert!(eviction_target_reached(target_size, target_size));
-        
+
         // One byte above: not reached
         assert!(!eviction_target_reached(target_size + 1, target_size));
-        
+
         // One byte below: reached
         assert!(eviction_target_reached(target_size - 1, target_size));
     }
@@ -674,11 +673,11 @@ mod unit_tests {
         let max_size = 10_000_000_000u64;
         let target_percent = 80u8;
         let target_size = calculate_target_size(max_size, target_percent);
-        
+
         // Empty cache
         let current_size = 0u64;
         let bytes_to_free = calculate_bytes_to_free(current_size, target_size);
-        
+
         // Should free 0 bytes (already below target)
         assert_eq!(bytes_to_free, 0);
         assert!(eviction_target_reached(current_size, target_size));

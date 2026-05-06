@@ -131,9 +131,11 @@ async fn create_test_tracker(
     consolidator: Arc<JournalConsolidator>,
     max_duration: Duration,
 ) -> Arc<CacheSizeTracker> {
-    let mut config = CacheSizeConfig::default();
-    config.validation_enabled = false;
-    config.validation_max_duration = max_duration;
+    let config = CacheSizeConfig {
+        validation_enabled: false,
+        validation_max_duration: max_duration,
+        ..CacheSizeConfig::default()
+    };
     Arc::new(
         CacheSizeTracker::new(cache_dir, config, false, consolidator)
             .await
@@ -266,11 +268,7 @@ async fn test_rolling_scan_cursor_advances_and_size_updated() {
                 continue;
             }
             for file_entry in std::fs::read_dir(l2_entry.path()).unwrap().flatten() {
-                if file_entry
-                    .path()
-                    .extension()
-                    .map_or(false, |e| e == "meta")
-                {
+                if file_entry.path().extension().is_some_and(|e| e == "meta") {
                     scanned_size += meta_size;
                     scanned_objects += 1;
                 }
@@ -373,7 +371,7 @@ async fn test_rolling_scan_cursor_continuity() {
     // --- First rolling scan cycle: scan dirs 0x00..0x03 ---
     let first_dirs_scanned = 4usize;
     let first_state = RollingState {
-        cursor: ((0 + first_dirs_scanned) % 256) as u8, // cursor = 4
+        cursor: (first_dirs_scanned % 256) as u8, // cursor = 4
         scan_rate: Some(0.1),
         full_rotation_count: 0,
         rotation_start_time: Some(
@@ -395,7 +393,10 @@ async fn test_rolling_scan_cursor_continuity() {
 
     // Verify first cycle persisted correctly
     let after_first = tracker.read_rolling_state().unwrap();
-    assert_eq!(after_first.cursor, 4, "After first cycle, cursor should be 4");
+    assert_eq!(
+        after_first.cursor, 4,
+        "After first cycle, cursor should be 4"
+    );
 
     // --- Second rolling scan cycle: should resume from cursor=4 ---
     let second_state_read = tracker.read_rolling_state().unwrap();
@@ -527,12 +528,14 @@ async fn test_full_scan_persists_duration_and_type() {
     // then persist full scan duration
     tracker
         .write_validation_metadata(
-            5000,  // scanned_size
-            5000,  // tracked_size
-            0,     // drift
+            5000,                     // scanned_size
+            5000,                     // tracked_size
+            0,                        // drift
             Duration::from_secs(120), // 2 minutes
-            10,    // files_scanned
-            0, 0, 0,
+            10,                       // files_scanned
+            0,
+            0,
+            0,
         )
         .await
         .unwrap();
@@ -594,8 +597,8 @@ async fn test_mode_transition_full_to_rolling_and_back() {
     // Simulate a rolling scan cycle
     let rolling_dirs_scanned = 64u64;
     let rolling_cycle_duration = 900.0; // 900 seconds for 64 dirs
-    // Extrapolated full time = (900 / 64) * 256 = 3600.0 seconds = exactly budget
-    // At exactly budget, extrapolated <= budget → should switch back to Full
+                                        // Extrapolated full time = (900 / 64) * 256 = 3600.0 seconds = exactly budget
+                                        // At exactly budget, extrapolated <= budget → should switch back to Full
     let scan_rate = rolling_cycle_duration / rolling_dirs_scanned as f64;
 
     let rolling_state = RollingState {
@@ -708,13 +711,23 @@ async fn test_complete_mode_lifecycle() {
     assert_eq!(mode, ScanMode::Rolling);
 
     // Step 4: Rolling scan, 64 dirs in 1800s → extrapolated 7200s > 3600 → stay Rolling
-    let (mode, _) =
-        determine_scan_mode(Some("rolling"), Some(5000.0), Some(1800.0), Some(64), max_duration);
+    let (mode, _) = determine_scan_mode(
+        Some("rolling"),
+        Some(5000.0),
+        Some(1800.0),
+        Some(64),
+        max_duration,
+    );
     assert_eq!(mode, ScanMode::Rolling);
 
     // Step 5: Rolling scan, 64 dirs in 400s → extrapolated 1600s < 3600 → switch to Full
-    let (mode, _) =
-        determine_scan_mode(Some("rolling"), Some(5000.0), Some(400.0), Some(64), max_duration);
+    let (mode, _) = determine_scan_mode(
+        Some("rolling"),
+        Some(5000.0),
+        Some(400.0),
+        Some(64),
+        max_duration,
+    );
     assert_eq!(mode, ScanMode::Full);
 
     // Step 6: Back to full, completes in 3000s (within budget) → stay Full

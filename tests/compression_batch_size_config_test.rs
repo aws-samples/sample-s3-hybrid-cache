@@ -102,7 +102,9 @@ fn test_property_above_max_rejected() {
 #[test]
 fn test_one_below_min_rejected() {
     // 65535 — one byte under the 64 KiB floor.
-    assert!(config_with_batch_size(MIN_BATCH_SIZE - 1).validate().is_err());
+    assert!(config_with_batch_size(MIN_BATCH_SIZE - 1)
+        .validate()
+        .is_err());
 }
 
 #[test]
@@ -120,7 +122,9 @@ fn test_max_boundary_accepted() {
 #[test]
 fn test_one_above_max_rejected() {
     // 16777217 — one byte over the 16 MiB ceiling.
-    assert!(config_with_batch_size(MAX_BATCH_SIZE + 1).validate().is_err());
+    assert!(config_with_batch_size(MAX_BATCH_SIZE + 1)
+        .validate()
+        .is_err());
 }
 
 #[test]

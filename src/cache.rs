@@ -157,7 +157,6 @@ pub fn extract_virtual_hosted_bucket(host: &str) -> Option<&str> {
     None
 }
 
-
 /// Multipart information extracted from S3 response headers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartInfo {
@@ -663,6 +662,7 @@ impl CacheManager {
     }
 
     /// Create a new cache manager with all TTL configurations
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_all_ttls(
         cache_dir: PathBuf,
         ram_cache_enabled: bool,
@@ -697,11 +697,12 @@ impl CacheManager {
             true,                                          // Default read cache enabled
             std::time::Duration::from_secs(60),            // Default 60s bucket settings staleness
             1_048_576,                                     // Default 1 MiB compression batch size
-            false,                                         // Default: don't evaluate conditions from cache
+            false, // Default: don't evaluate conditions from cache
         )
     }
 
     /// Create a new cache manager with all TTL configurations and shared storage config
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_shared_storage(
         cache_dir: PathBuf,
         ram_cache_enabled: bool,
@@ -726,9 +727,11 @@ impl CacheManager {
         compression_batch_size: usize,
         evaluate_conditions_from_cache: bool,
     ) -> Self {
-        let mut ram_cache_manager = RamCacheManager::default();
-        ram_cache_manager.max_size = max_ram_cache_size;
-        ram_cache_manager.eviction_algorithm = eviction_algorithm.clone();
+        let ram_cache_manager = RamCacheManager {
+            max_size: max_ram_cache_size,
+            eviction_algorithm: eviction_algorithm.clone(),
+            ..RamCacheManager::default()
+        };
 
         // Create RAM cache if enabled with the specified eviction algorithm
         let ram_cache = if ram_cache_enabled && max_ram_cache_size > 0 {
@@ -740,11 +743,15 @@ impl CacheManager {
             None
         };
 
-        let mut write_cache_tracker = WriteCacheSizeTracker::default();
-        write_cache_tracker.max_percent = write_cache_percent;
+        let write_cache_tracker = WriteCacheSizeTracker {
+            max_percent: write_cache_percent,
+            ..WriteCacheSizeTracker::default()
+        };
 
-        let mut statistics = CacheStatistics::default();
-        statistics.max_cache_size_limit = max_cache_size;
+        let statistics = CacheStatistics {
+            max_cache_size_limit: max_cache_size,
+            ..CacheStatistics::default()
+        };
 
         let inner = CacheManagerInner {
             statistics,
@@ -768,13 +775,11 @@ impl CacheManager {
             ram_cache_enabled,
             evaluate_conditions_from_cache,
         };
-        let bucket_settings_manager = Arc::new(
-            crate::bucket_settings::BucketSettingsManager::new(
-                cache_dir.clone(),
-                global_defaults,
-                bucket_settings_staleness_threshold,
-            ),
-        );
+        let bucket_settings_manager = Arc::new(crate::bucket_settings::BucketSettingsManager::new(
+            cache_dir.clone(),
+            global_defaults,
+            bucket_settings_staleness_threshold,
+        ));
 
         Self {
             cache_dir: cache_dir.clone(),
@@ -962,7 +967,8 @@ impl CacheManager {
     /// Extracts the bucket name from the path and delegates to BucketSettingsManager.
     /// Convenience method used by TTL lookups and future tasks (4.4-4.7).
     pub async fn resolve_settings(&self, path: &str) -> crate::bucket_settings::ResolvedSettings {
-        let bucket = crate::bucket_settings::BucketSettingsManager::extract_bucket(path).unwrap_or("");
+        let bucket =
+            crate::bucket_settings::BucketSettingsManager::extract_bucket(path).unwrap_or("");
         // Strip the leading "/{bucket}/" or "{bucket}/" so prefix matching in cascade
         // works against just the object key (e.g. "many/10x100M/..."), consistent
         // with how _settings.json prefix_overrides are documented and tested.
@@ -979,7 +985,9 @@ impl CacheManager {
                 path
             }
         };
-        self.bucket_settings_manager.resolve(bucket, object_path).await
+        self.bucket_settings_manager
+            .resolve(bucket, object_path)
+            .await
     }
 
     /// Get the effective GET TTL for a given path
@@ -1061,7 +1069,10 @@ impl CacheManager {
         // Create cache configuration for coordinator
         let (write_cache_percent, max_cache_size) = {
             let inner = self.inner.lock().unwrap();
-            (inner.write_cache_tracker.max_percent, inner.statistics.max_cache_size_limit)
+            (
+                inner.write_cache_tracker.max_percent,
+                inner.statistics.max_cache_size_limit,
+            )
         }; // Lock is released here
 
         let cache_config = CacheConfig {
@@ -1094,7 +1105,7 @@ impl CacheManager {
             full_object_check_threshold: 67_108_864, // 64 MiB
             disk_streaming_threshold: 1_048_576, // 1 MiB
             compression_batch_size: 1_048_576, // 1 MiB
-            read_cache_enabled: true, // Default enabled
+            read_cache_enabled: true,     // Default enabled
             bucket_settings_staleness_threshold: std::time::Duration::from_secs(60), // Default 60s
             evaluate_conditions_from_cache: false, // Default: strict always-forward
         };
@@ -1129,11 +1140,13 @@ impl CacheManager {
         // Initialize size tracker with reference to JournalConsolidator (Task 12.2)
         // The consolidator is the single source of truth for cache size
         // Requirement 9.3: Respect validation_enabled configuration
-        let mut size_tracker_config = crate::cache_size_tracker::CacheSizeConfig::default();
-        size_tracker_config.incomplete_upload_ttl = self.incomplete_upload_ttl;
-        size_tracker_config.validation_max_duration = self.shared_storage.validation_max_duration;
-        size_tracker_config.validation_threshold_warn = self.shared_storage.validation_threshold_warn;
-        size_tracker_config.validation_threshold_error = self.shared_storage.validation_threshold_error;
+        let size_tracker_config = crate::cache_size_tracker::CacheSizeConfig {
+            incomplete_upload_ttl: self.incomplete_upload_ttl,
+            validation_max_duration: self.shared_storage.validation_max_duration,
+            validation_threshold_warn: self.shared_storage.validation_threshold_warn,
+            validation_threshold_error: self.shared_storage.validation_threshold_error,
+            ..crate::cache_size_tracker::CacheSizeConfig::default()
+        };
         // Note: validation_enabled is handled within CacheSizeTracker
         // Note: size_tracking_flush_interval and size_tracking_buffer_size removed -
         // size tracking is now handled by JournalConsolidator
@@ -1538,7 +1551,12 @@ impl CacheManager {
     }
 
     /// Generate cache key for range requests
-    pub fn generate_range_cache_key(path: &str, start: u64, end: u64, host: Option<&str>) -> String {
+    pub fn generate_range_cache_key(
+        path: &str,
+        start: u64,
+        end: u64,
+        host: Option<&str>,
+    ) -> String {
         let base_key = Self::generate_cache_key(path, host);
         format!("{}:range:{}-{}", base_key, start, end)
     }
@@ -1716,7 +1734,9 @@ impl CacheManager {
             ranges: Vec::new(),
             metadata: metadata.clone(),
             created_at: now,
-            expires_at: self.calculate_expiration_time_with_context(&headers, &path).await,
+            expires_at: self
+                .calculate_expiration_time_with_context(&headers, &path)
+                .await,
             metadata_expires_at: now + effective_head_ttl,
             compression_info: CompressionInfo::default(),
             is_put_cached: false,
@@ -1858,8 +1878,12 @@ impl CacheManager {
                             // If this is a multipart object, find which part this range represents
                             if is_multipart {
                                 // Look up part number from part_ranges by matching the range start offset
-                                for (&part_num, &(start, _end)) in &new_metadata.object_metadata.part_ranges {
-                                    if range_spec.start == start && !evicted_part_numbers.contains(&part_num) {
+                                for (&part_num, &(start, _end)) in
+                                    &new_metadata.object_metadata.part_ranges
+                                {
+                                    if range_spec.start == start
+                                        && !evicted_part_numbers.contains(&part_num)
+                                    {
                                         evicted_part_numbers.push(part_num);
                                         break;
                                     }
@@ -1896,12 +1920,16 @@ impl CacheManager {
                     // (not just evicted through the normal eviction path)
                     if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
                         for range_spec in &new_metadata.ranges {
-                            consolidator.size_accumulator().subtract(range_spec.compressed_size);
+                            consolidator
+                                .size_accumulator()
+                                .subtract(range_spec.compressed_size);
                             // Check if write-cached
                             if range_spec.file_path.contains("mpus_in_progress/")
                                 || new_metadata.object_metadata.is_write_cached
                             {
-                                consolidator.size_accumulator().subtract_write_cache(range_spec.compressed_size);
+                                consolidator
+                                    .size_accumulator()
+                                    .subtract_write_cache(range_spec.compressed_size);
                             }
                         }
                     }
@@ -2603,26 +2631,24 @@ impl CacheManager {
         }
 
         if let Ok(entries) = std::fs::read_dir(&parts_cache_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let file_name = entry.file_name();
-                    let file_name_str = file_name.to_string_lossy();
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
 
-                    // Only process metadata files
-                    if !file_name_str.ends_with(".meta") {
-                        continue;
-                    }
+                // Only process metadata files
+                if !file_name_str.ends_with(".meta") {
+                    continue;
+                }
 
-                    // Extract cache key from filename
-                    if let Some(cache_key) = self.extract_cache_key_from_filename(&file_name_str) {
-                        // Check if this is a part cache entry for our object
-                        if self.is_part_cache_key_for_object(&cache_key, path) {
-                            // Extract part number
-                            if let Some(part_number) =
-                                self.extract_part_number_from_cache_key(&cache_key)
-                            {
-                                part_numbers.push(part_number);
-                            }
+                // Extract cache key from filename
+                if let Some(cache_key) = self.extract_cache_key_from_filename(&file_name_str) {
+                    // Check if this is a part cache entry for our object
+                    if self.is_part_cache_key_for_object(&cache_key, path) {
+                        // Extract part number
+                        if let Some(part_number) =
+                            self.extract_part_number_from_cache_key(&cache_key)
+                        {
+                            part_numbers.push(part_number);
                         }
                     }
                 }
@@ -2795,12 +2821,17 @@ impl CacheManager {
     /// Extracts the bucket from the cache key, checks if it has custom settings,
     /// and records the metric if so. Requirements: 11.1, 11.2
     pub async fn record_bucket_cache_access(&self, cache_key: &str, hit: bool, is_head: bool) {
-        let bucket = match crate::bucket_settings::BucketSettingsManager::extract_bucket(cache_key) {
+        let bucket = match crate::bucket_settings::BucketSettingsManager::extract_bucket(cache_key)
+        {
             Some(b) => b.to_string(),
             None => return,
         };
 
-        if !self.bucket_settings_manager.has_custom_settings(&bucket).await {
+        if !self
+            .bucket_settings_manager
+            .has_custom_settings(&bucket)
+            .await
+        {
             return;
         }
 
@@ -2813,7 +2844,10 @@ impl CacheManager {
 
         // Find the matching prefix override (longest prefix match)
         let matched_prefix = {
-            let overrides = self.bucket_settings_manager.get_prefix_overrides(&bucket).await;
+            let overrides = self
+                .bucket_settings_manager
+                .get_prefix_overrides(&bucket)
+                .await;
             overrides
                 .into_iter()
                 .filter(|po| object_path.starts_with(&po.prefix))
@@ -2826,12 +2860,14 @@ impl CacheManager {
             if hit {
                 mm.record_bucket_cache_hit(&bucket, is_head).await;
                 if let Some(ref prefix) = matched_prefix {
-                    mm.record_prefix_cache_hit(&format!("{}/{}", bucket, prefix), is_head).await;
+                    mm.record_prefix_cache_hit(&format!("{}/{}", bucket, prefix), is_head)
+                        .await;
                 }
             } else {
                 mm.record_bucket_cache_miss(&bucket, is_head).await;
                 if let Some(ref prefix) = matched_prefix {
-                    mm.record_prefix_cache_miss(&format!("{}/{}", bucket, prefix), is_head).await;
+                    mm.record_prefix_cache_miss(&format!("{}/{}", bucket, prefix), is_head)
+                        .await;
                 }
             }
         }
@@ -2968,7 +3004,6 @@ impl CacheManager {
         Ok((range_data, false))
     }
 
-
     /// Check if write cache can accommodate new entry
     pub fn can_write_cache_accommodate(&self, entry_size: u64) -> bool {
         let inner = self.inner.lock().unwrap();
@@ -2986,7 +3021,6 @@ impl CacheManager {
 
         new_total <= max_allowed
     }
-
 
     /// Compress cache entry data with external compression handler
     pub fn compress_cache_entry_with_handler(
@@ -3137,45 +3171,42 @@ impl CacheManager {
             }
 
             if let Ok(dir_entries) = std::fs::read_dir(&cache_type_dir) {
-                for entry in dir_entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                            // Read metadata to get cache entry details
-                            if let Ok(metadata_content) = std::fs::read_to_string(&path) {
-                                // Try new format first
-                                if let Ok(new_metadata) =
-                                    serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
-                                        &metadata_content,
-                                    )
-                                {
-                                    // Count ranges
-                                    if new_metadata.ranges.len() == 1 {
-                                        // Check if this is a full object (range 0 to content_length)
-                                        let range = &new_metadata.ranges[0];
-                                        if range.start == 0
-                                            && range.end
-                                                == new_metadata.object_metadata.content_length - 1
-                                        {
-                                            breakdown.full_objects += 1;
-                                        } else {
-                                            breakdown.range_objects += 1;
-                                        }
-                                    } else if new_metadata.ranges.len() > 1 {
+                for entry in dir_entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                        // Read metadata to get cache entry details
+                        if let Ok(metadata_content) = std::fs::read_to_string(&path) {
+                            // Try new format first
+                            if let Ok(new_metadata) =
+                                serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
+                                    &metadata_content,
+                                )
+                            {
+                                // Count ranges
+                                if new_metadata.ranges.len() == 1 {
+                                    // Check if this is a full object (range 0 to content_length)
+                                    let range = &new_metadata.ranges[0];
+                                    if range.start == 0
+                                        && range.end
+                                            == new_metadata.object_metadata.content_length - 1
+                                    {
+                                        breakdown.full_objects += 1;
+                                    } else {
                                         breakdown.range_objects += 1;
                                     }
+                                } else if new_metadata.ranges.len() > 1 {
+                                    breakdown.range_objects += 1;
+                                }
 
-                                    // Count compression statistics (all data uses frame format)
-                                    for range_spec in &new_metadata.ranges {
-                                        breakdown.compressed_objects += 1;
-                                        breakdown.total_compressed_size +=
-                                            range_spec.compressed_size;
-                                        breakdown.total_uncompressed_size +=
-                                            range_spec.uncompressed_size;
-                                        breakdown.compressed_bytes_saved += range_spec
-                                            .uncompressed_size
-                                            .saturating_sub(range_spec.compressed_size);
-                                    }
+                                // Count compression statistics (all data uses frame format)
+                                for range_spec in &new_metadata.ranges {
+                                    breakdown.compressed_objects += 1;
+                                    breakdown.total_compressed_size += range_spec.compressed_size;
+                                    breakdown.total_uncompressed_size +=
+                                        range_spec.uncompressed_size;
+                                    breakdown.compressed_bytes_saved += range_spec
+                                        .uncompressed_size
+                                        .saturating_sub(range_spec.compressed_size);
                                 }
                             }
                         }
@@ -3385,7 +3416,10 @@ impl CacheManager {
     }
 
     /// Internal implementation of enforce_disk_cache_limits
-    async fn enforce_disk_cache_limits_internal(&self, skip_pre_eviction_consolidation: bool) -> Result<u64> {
+    async fn enforce_disk_cache_limits_internal(
+        &self,
+        skip_pre_eviction_consolidation: bool,
+    ) -> Result<u64> {
         debug!(
             "Enforcing disk cache size limits using {:?} algorithm (skip_consolidation={})",
             self.eviction_algorithm, skip_pre_eviction_consolidation
@@ -3441,13 +3475,12 @@ impl CacheManager {
 
         // Re-read current size after acquiring lock — a previous eviction may have freed space
         // between our pre-lock check and lock acquisition
-        let current_size = if let Some(consolidator) =
-            self.journal_consolidator.read().await.as_ref()
-        {
-            consolidator.get_current_size().await
-        } else {
-            current_size // fall back to pre-lock value
-        };
+        let current_size =
+            if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
+                consolidator.get_current_size().await
+            } else {
+                current_size // fall back to pre-lock value
+            };
 
         if current_size <= max_size {
             info!(
@@ -3479,7 +3512,7 @@ impl CacheManager {
         // Eviction writes Remove journal entries via write_eviction_journal_entries().
         // Consolidation processes those Remove entries and subtracts from size_state.
         // Direct subtraction here would cause DOUBLE SUBTRACTION.
-        // 
+        //
         // The journal-based approach ensures single-writer pattern where consolidation
         // is the only component that updates size_state.json.
         if let Ok(bytes_freed) = &eviction_result {
@@ -3536,7 +3569,12 @@ impl CacheManager {
     /// * `skip_pre_eviction_consolidation` - If true, skip journal consolidation before eviction
     ///
     /// Requirements: 1.1, 1.4, 1.5, 5.1, 5.2, 5.3, 6.4
-    async fn perform_eviction_with_lock(&self, current_size: u64, max_size: u64, skip_pre_eviction_consolidation: bool) -> Result<u64> {
+    async fn perform_eviction_with_lock(
+        &self,
+        current_size: u64,
+        max_size: u64,
+        skip_pre_eviction_consolidation: bool,
+    ) -> Result<u64> {
         // Calculate usage percentage for logging
         let usage_percent = if max_size > 0 {
             (current_size as f64 / max_size as f64) * 100.0
@@ -3587,7 +3625,10 @@ impl CacheManager {
                                     }
                                 }
                                 Err(e) => {
-                                    debug!("Failed to consolidate journal for {}: {}", cache_key, e);
+                                    debug!(
+                                        "Failed to consolidate journal for {}: {}",
+                                        cache_key, e
+                                    );
                                 }
                             }
                         }
@@ -3693,7 +3734,8 @@ impl CacheManager {
         let mut all_deleted_paths: Vec<PathBuf> = Vec::new();
         // Collect evicted ranges for journal Remove entries and accumulator tracking
         // Tuple: (cache_key, range_start, range_end, size, bin_file_path, compressed_size, is_write_cached)
-        let mut evicted_ranges_for_journal: Vec<(String, u64, u64, u64, String, u64, bool)> = Vec::new();
+        let mut evicted_ranges_for_journal: Vec<(String, u64, u64, u64, String, u64, bool)> =
+            Vec::new();
 
         for result in object_results.into_iter().flatten() {
             if total_bytes_freed >= bytes_to_free {
@@ -3724,7 +3766,7 @@ impl CacheManager {
             // The metadata file path ends with .meta
             let metadata_deleted = deleted_paths
                 .iter()
-                .any(|p| p.extension().map_or(false, |ext| ext == "meta"));
+                .any(|p| p.extension().is_some_and(|ext| ext == "meta"));
             if metadata_deleted {
                 total_keys_evicted += 1;
             }
@@ -3744,22 +3786,44 @@ impl CacheManager {
         if !evicted_ranges_for_journal.is_empty() {
             if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
                 // Decrement accumulator for each evicted range using compressed_size
-                for (_cache_key, _range_start, _range_end, _size, bin_file_path, compressed_size, is_write_cached) in &evicted_ranges_for_journal {
+                for (
+                    _cache_key,
+                    _range_start,
+                    _range_end,
+                    _size,
+                    bin_file_path,
+                    compressed_size,
+                    is_write_cached,
+                ) in &evicted_ranges_for_journal
+                {
                     consolidator.size_accumulator().subtract(*compressed_size);
                     // Check if write-cached: either mpus_in_progress path or is_write_cached flag
                     if bin_file_path.contains("mpus_in_progress/") || *is_write_cached {
-                        consolidator.size_accumulator().subtract_write_cache(*compressed_size);
+                        consolidator
+                            .size_accumulator()
+                            .subtract_write_cache(*compressed_size);
                     }
                 }
 
                 // Convert to format expected by write_eviction_journal_entries
                 // (cache_key, range_start, range_end, size, bin_file_path)
-                let journal_entries: Vec<(String, u64, u64, u64, String)> = evicted_ranges_for_journal
-                    .into_iter()
-                    .map(|(cache_key, range_start, range_end, size, bin_file_path, _compressed_size, _is_write_cached)| {
-                        (cache_key, range_start, range_end, size, bin_file_path)
-                    })
-                    .collect();
+                let journal_entries: Vec<(String, u64, u64, u64, String)> =
+                    evicted_ranges_for_journal
+                        .into_iter()
+                        .map(
+                            |(
+                                cache_key,
+                                range_start,
+                                range_end,
+                                size,
+                                bin_file_path,
+                                _compressed_size,
+                                _is_write_cached,
+                            )| {
+                                (cache_key, range_start, range_end, size, bin_file_path)
+                            },
+                        )
+                        .collect();
 
                 // Write Remove journal entries for metadata cleanup
                 consolidator
@@ -3778,9 +3842,9 @@ impl CacheManager {
         if !all_deleted_paths.is_empty() {
             let disk_cache = crate::disk_cache::DiskCacheManager::new(
                 self.cache_dir.clone(),
-                true,  // compression_enabled
-                4096,  // compression_threshold
-                false, // write_cache_enabled
+                true,      // compression_enabled
+                4096,      // compression_threshold
+                false,     // write_cache_enabled
                 1_048_576, // compression_batch_size (default 1 MiB)
             );
             let dirs_removed = disk_cache.batch_cleanup_empty_directories(&all_deleted_paths);
@@ -3824,7 +3888,9 @@ impl CacheManager {
             // Decrement cached_objects count for each object whose metadata was fully deleted
             if total_keys_evicted > 0 {
                 if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
-                    consolidator.decrement_cached_objects(total_keys_evicted).await;
+                    consolidator
+                        .decrement_cached_objects(total_keys_evicted)
+                        .await;
                 }
             }
         }
@@ -3864,22 +3930,20 @@ impl CacheManager {
         let mut total_size = 0u64;
 
         if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
+            for entry in entries.flatten() {
+                let path = entry.path();
 
-                    if path.is_dir() {
-                        // Recursively traverse subdirectories
-                        total_size += Self::calculate_dir_size_recursive(&path)?;
-                    } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                        // Count all relevant file types:
-                        // - .meta (metadata files)
-                        // - .bin (range binary files)
-                        // - .lock (lock files for accurate tracking)
-                        if ext == "meta" || ext == "bin" || ext == "lock" {
-                            if let Ok(metadata) = std::fs::metadata(&path) {
-                                total_size += metadata.len();
-                            }
+                if path.is_dir() {
+                    // Recursively traverse subdirectories
+                    total_size += Self::calculate_dir_size_recursive(&path)?;
+                } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    // Count all relevant file types:
+                    // - .meta (metadata files)
+                    // - .bin (range binary files)
+                    // - .lock (lock files for accurate tracking)
+                    if ext == "meta" || ext == "bin" || ext == "lock" {
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            total_size += metadata.len();
                         }
                     }
                 }
@@ -3934,47 +3998,42 @@ impl CacheManager {
         entries: &mut Vec<(String, SystemTime, u64, u64)>,
     ) -> Result<()> {
         if let Ok(dir_entries) = std::fs::read_dir(dir) {
-            for entry in dir_entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
+            for entry in dir_entries.flatten() {
+                let path = entry.path();
 
-                    if path.is_dir() {
-                        // Recursively traverse subdirectories
-                        self.collect_entries_recursive(&path, entries)?;
-                    } else if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                        // Read metadata to get cache key and access time
-                        if let Ok(metadata_content) = std::fs::read_to_string(&path) {
-                            // Try new format first (NewCacheMetadata with ranges)
-                            if let Ok(new_metadata) =
-                                serde_json::from_str::<crate::cache_types::NewCacheMetadata>(
-                                    &metadata_content,
-                                )
-                            {
-                                // Calculate entry size: metadata file + all range binary files
-                                let mut entry_size = 0u64;
+                if path.is_dir() {
+                    // Recursively traverse subdirectories
+                    self.collect_entries_recursive(&path, entries)?;
+                } else if path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                    // Read metadata to get cache key and access time
+                    if let Ok(metadata_content) = std::fs::read_to_string(&path) {
+                        // Try new format first (NewCacheMetadata with ranges)
+                        if let Ok(new_metadata) = serde_json::from_str::<
+                            crate::cache_types::NewCacheMetadata,
+                        >(&metadata_content)
+                        {
+                            // Calculate entry size: metadata file + all range binary files
+                            let mut entry_size = 0u64;
 
-                                // Add metadata file size
-                                if let Ok(meta_file_metadata) = std::fs::metadata(&path) {
-                                    entry_size += meta_file_metadata.len();
-                                }
+                            // Add metadata file size
+                            if let Ok(meta_file_metadata) = std::fs::metadata(&path) {
+                                entry_size += meta_file_metadata.len();
+                            }
 
-                                // Add all range binary file sizes
-                                for range_spec in &new_metadata.ranges {
-                                    let range_file_path =
-                                        self.cache_dir.join("ranges").join(&range_spec.file_path);
-                                    if let Ok(range_file_metadata) =
-                                        std::fs::metadata(&range_file_path)
-                                    {
-                                        entry_size += range_file_metadata.len();
-                                    }
-                                }
-
-                                // Calculate aggregate last_accessed and access_count from all ranges
-                                // These values are populated by journal consolidation
-                                let (last_accessed, total_access_count) = if new_metadata
-                                    .ranges
-                                    .is_empty()
+                            // Add all range binary file sizes
+                            for range_spec in &new_metadata.ranges {
+                                let range_file_path =
+                                    self.cache_dir.join("ranges").join(&range_spec.file_path);
+                                if let Ok(range_file_metadata) = std::fs::metadata(&range_file_path)
                                 {
+                                    entry_size += range_file_metadata.len();
+                                }
+                            }
+
+                            // Calculate aggregate last_accessed and access_count from all ranges
+                            // These values are populated by journal consolidation
+                            let (last_accessed, total_access_count) =
+                                if new_metadata.ranges.is_empty() {
                                     // Fallback to created_at if no ranges (shouldn't happen normally)
                                     (new_metadata.created_at, 0u64)
                                 } else {
@@ -3991,58 +4050,54 @@ impl CacheManager {
                                     (most_recent, total_count)
                                 };
 
-                                // Decide eviction strategy based on range count
-                                // For objects with few ranges (≤3), evict full object
-                                // For objects with many ranges (>3), support granular eviction
-                                if new_metadata.ranges.len() <= 3 {
-                                    // Full object eviction
-                                    entries.push((
-                                        new_metadata.cache_key.clone(),
-                                        last_accessed,
-                                        entry_size,
-                                        total_access_count,
-                                    ));
-                                } else {
-                                    // Granular eviction: add each range as a separate eviction candidate
-                                    // This allows the eviction algorithm to choose specific ranges to evict
-                                    for (idx, range_spec) in new_metadata.ranges.iter().enumerate()
+                            // Decide eviction strategy based on range count
+                            // For objects with few ranges (≤3), evict full object
+                            // For objects with many ranges (>3), support granular eviction
+                            if new_metadata.ranges.len() <= 3 {
+                                // Full object eviction
+                                entries.push((
+                                    new_metadata.cache_key.clone(),
+                                    last_accessed,
+                                    entry_size,
+                                    total_access_count,
+                                ));
+                            } else {
+                                // Granular eviction: add each range as a separate eviction candidate
+                                // This allows the eviction algorithm to choose specific ranges to evict
+                                for (idx, range_spec) in new_metadata.ranges.iter().enumerate() {
+                                    let range_cache_key = format!(
+                                        "{}:range:{}:{}-{}",
+                                        new_metadata.cache_key,
+                                        idx,
+                                        range_spec.start,
+                                        range_spec.end
+                                    );
+
+                                    // Calculate size for this specific range
+                                    let mut range_size = 0u64;
+                                    let range_file_path =
+                                        self.cache_dir.join("ranges").join(&range_spec.file_path);
+                                    if let Ok(range_file_metadata) =
+                                        std::fs::metadata(&range_file_path)
                                     {
-                                        let range_cache_key = format!(
-                                            "{}:range:{}:{}-{}",
-                                            new_metadata.cache_key,
-                                            idx,
-                                            range_spec.start,
-                                            range_spec.end
-                                        );
-
-                                        // Calculate size for this specific range
-                                        let mut range_size = 0u64;
-                                        let range_file_path = self
-                                            .cache_dir
-                                            .join("ranges")
-                                            .join(&range_spec.file_path);
-                                        if let Ok(range_file_metadata) =
-                                            std::fs::metadata(&range_file_path)
-                                        {
-                                            range_size = range_file_metadata.len();
-                                        }
-
-                                        // Add proportional metadata overhead
-                                        if let Ok(meta_file_metadata) = std::fs::metadata(&path) {
-                                            let metadata_overhead = meta_file_metadata.len()
-                                                / new_metadata.ranges.len() as u64;
-                                            range_size += metadata_overhead;
-                                        }
-
-                                        // Use per-range last_accessed and access_count from RangeSpec
-                                        // These are populated by journal consolidation
-                                        entries.push((
-                                            range_cache_key,
-                                            range_spec.last_accessed,
-                                            range_size,
-                                            range_spec.access_count,
-                                        ));
+                                        range_size = range_file_metadata.len();
                                     }
+
+                                    // Add proportional metadata overhead
+                                    if let Ok(meta_file_metadata) = std::fs::metadata(&path) {
+                                        let metadata_overhead = meta_file_metadata.len()
+                                            / new_metadata.ranges.len() as u64;
+                                        range_size += metadata_overhead;
+                                    }
+
+                                    // Use per-range last_accessed and access_count from RangeSpec
+                                    // These are populated by journal consolidation
+                                    entries.push((
+                                        range_cache_key,
+                                        range_spec.last_accessed,
+                                        range_size,
+                                        range_spec.access_count,
+                                    ));
                                 }
                             }
                         }
@@ -4132,7 +4187,7 @@ impl CacheManager {
     /// Implements Requirements 1.2, 1.3 from range-based-disk-eviction spec:
     /// - 1.2: LRU mode uses each range's individual last_accessed timestamp
     /// - 1.3: TinyLFU mode uses each range's individual access_count and last_accessed values
-    pub fn sort_range_candidates(&self, candidates: &mut Vec<RangeEvictionCandidate>) {
+    pub fn sort_range_candidates(&self, candidates: &mut [RangeEvictionCandidate]) {
         match self.eviction_algorithm {
             CacheEvictionAlgorithm::LRU => {
                 // Sort by last access time (oldest first)
@@ -4161,7 +4216,7 @@ impl CacheManager {
     ///
     /// # Requirements
     /// Implements Requirement 1.3 from range-based-disk-eviction spec
-    fn sort_range_candidates_for_tinylfu(&self, candidates: &mut Vec<RangeEvictionCandidate>) {
+    fn sort_range_candidates_for_tinylfu(&self, candidates: &mut [RangeEvictionCandidate]) {
         let now = SystemTime::now();
 
         // Calculate TinyLFU scores and sort (lowest score first = evict first)
@@ -4517,9 +4572,9 @@ impl CacheManager {
         // Requirement 5.2: DiskCacheManager uses atomic write operations
         let disk_cache = crate::disk_cache::DiskCacheManager::new(
             self.cache_dir.clone(),
-            true,  // compression_enabled
-            4096,  // compression_threshold
-            false, // write_cache_enabled (not needed for eviction)
+            true,      // compression_enabled
+            4096,      // compression_threshold
+            false,     // write_cache_enabled (not needed for eviction)
             1_048_576, // compression_batch_size (default 1 MiB)
         );
 
@@ -4640,7 +4695,7 @@ impl CacheManager {
 
     /// Extract file extension from path
     fn extract_file_extension(path: &str) -> String {
-        if let Some(last_segment) = path.split('/').last() {
+        if let Some(last_segment) = path.split('/').next_back() {
             if let Some(dot_pos) = last_segment.rfind('.') {
                 return last_segment[dot_pos + 1..].to_lowercase();
             }
@@ -4703,9 +4758,9 @@ impl CacheManager {
         // Use the disk cache manager's implementation which handles sharding correctly
         let disk_cache = crate::disk_cache::DiskCacheManager::new(
             self.cache_dir.clone(),
-            true, // compression enabled
-            1024, // compression threshold
-            true, // write cache enabled
+            true,      // compression enabled
+            1024,      // compression threshold
+            true,      // write cache enabled
             1_048_576, // compression_batch_size (default 1 MiB)
         );
         disk_cache.get_new_metadata_file_path(cache_key)
@@ -4733,7 +4788,9 @@ impl CacheManager {
     }
 
     /// Get the bucket settings manager for per-bucket/prefix cache configuration
-    pub fn get_bucket_settings_manager(&self) -> Arc<crate::bucket_settings::BucketSettingsManager> {
+    pub fn get_bucket_settings_manager(
+        &self,
+    ) -> Arc<crate::bucket_settings::BucketSettingsManager> {
         self.bucket_settings_manager.clone()
     }
 
@@ -4799,7 +4856,9 @@ impl CacheManager {
                 self.metadata_cache.record_disk_hit();
                 debug!(
                     "Metadata loaded from disk for key: {} (ranges={}, cached_in_ram={})",
-                    cache_key, metadata.ranges.len(), !metadata.ranges.is_empty()
+                    cache_key,
+                    metadata.ranges.len(),
+                    !metadata.ranges.is_empty()
                 );
                 Ok(Some(metadata))
             }
@@ -5217,6 +5276,7 @@ impl CacheManager {
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
 
@@ -5356,25 +5416,22 @@ impl CacheManager {
         let locks_dir = self.cache_dir.join("locks");
         if locks_dir.exists() {
             if let Ok(lock_entries) = std::fs::read_dir(&locks_dir) {
-                for lock_entry in lock_entries {
-                    if let Ok(lock_entry) = lock_entry {
-                        let lock_path = lock_entry.path();
-                        if lock_path.extension().and_then(|s| s.to_str()) == Some("lock") {
-                            // Check if lock is expired
-                            if let Ok(lock_content) = std::fs::read_to_string(&lock_path) {
-                                if let Ok(lock_info) =
-                                    serde_json::from_str::<CacheLock>(&lock_content)
-                                {
-                                    if now > lock_info.expires_at {
-                                        // Lock is expired, remove it
-                                        if let Err(e) = std::fs::remove_file(&lock_path) {
-                                            warn!(
-                                                "Failed to remove expired lock file {:?}: {}",
-                                                lock_path, e
-                                            );
-                                        } else {
-                                            debug!("Removed expired lock file: {:?}", lock_path);
-                                        }
+                for lock_entry in lock_entries.flatten() {
+                    let lock_path = lock_entry.path();
+                    if lock_path.extension().and_then(|s| s.to_str()) == Some("lock") {
+                        // Check if lock is expired
+                        if let Ok(lock_content) = std::fs::read_to_string(&lock_path) {
+                            if let Ok(lock_info) = serde_json::from_str::<CacheLock>(&lock_content)
+                            {
+                                if now > lock_info.expires_at {
+                                    // Lock is expired, remove it
+                                    if let Err(e) = std::fs::remove_file(&lock_path) {
+                                        warn!(
+                                            "Failed to remove expired lock file {:?}: {}",
+                                            lock_path, e
+                                        );
+                                    } else {
+                                        debug!("Removed expired lock file: {:?}", lock_path);
                                     }
                                 }
                             }
@@ -5591,9 +5648,7 @@ impl CacheManager {
             let value_str = &cache_control[value_start..];
 
             // Find the end of the value (comma, semicolon, or end of string)
-            let value_end = value_str
-                .find(|c: char| c == ',' || c == ';')
-                .unwrap_or(value_str.len());
+            let value_end = value_str.find([',', ';']).unwrap_or(value_str.len());
             let value_str = &value_str[..value_end].trim();
 
             match value_str.parse::<u64>() {
@@ -5824,13 +5879,16 @@ impl CacheManager {
         // Check if calculated range is cached using disk cache
         let disk_cache = crate::disk_cache::DiskCacheManager::new(
             self.cache_dir.clone(),
-            true,  // compression_enabled
-            1024,  // compression_threshold
-            false, // actively_remove_cached_data
+            true,      // compression_enabled
+            1024,      // compression_threshold
+            false,     // actively_remove_cached_data
             1_048_576, // compression_batch_size (default 1 MiB)
         );
 
-        let overlapping_ranges = match disk_cache.find_cached_ranges(cache_key, start, end, None).await {
+        let overlapping_ranges = match disk_cache
+            .find_cached_ranges(cache_key, start, end, None)
+            .await
+        {
             Ok(ranges) => ranges,
             Err(e) => {
                 // Handle cached part read failures - log and fall back to S3 (Requirement 11.3)
@@ -6089,8 +6147,7 @@ impl CacheManager {
         let current_algorithm = inner.compression_handler.get_preferred_algorithm();
 
         // If the entry was compressed with a different algorithm than preferred, consider recompression
-        if compression_info.body_algorithm != *current_algorithm
-        {
+        if compression_info.body_algorithm != *current_algorithm {
             return true;
         }
 
@@ -6207,7 +6264,15 @@ impl CacheManager {
         let resolved = self.resolve_settings(cache_key).await;
 
         match disk_cache
-            .store_range(cache_key, start, end, body, object_metadata, self.get_ttl, resolved.compression_enabled)
+            .store_range(
+                cache_key,
+                start,
+                end,
+                body,
+                object_metadata,
+                self.get_ttl,
+                resolved.compression_enabled,
+            )
             .await
         {
             Ok(()) => {
@@ -6228,7 +6293,13 @@ impl CacheManager {
                 // Populate metadata on first part if needed - Handle metadata update failures (Requirement 11.4)
                 // Pass part_number and (start, end) to store in part_ranges (Requirements 3.1, 3.2, 3.3, 3.4)
                 if let Err(metadata_err) = self
-                    .populate_metadata_on_first_part(cache_key, headers, body.len() as u64, Some(part_number), Some((start, end)))
+                    .populate_metadata_on_first_part(
+                        cache_key,
+                        headers,
+                        body.len() as u64,
+                        Some(part_number),
+                        Some((start, end)),
+                    )
                     .await
                 {
                     // Handle metadata update failures - log and continue (Requirement 11.4)
@@ -6290,6 +6361,7 @@ impl CacheManager {
     /// - Update ObjectMetadata with multipart fields
     /// - Persist updated metadata to disk
     /// - Preserve existing ETag, last_modified, and cached ranges
+    ///
     /// Validates: Requirements 3.1, 3.2, 3.3, 3.4, 6.1, 6.2, 6.3, 6.4, 6.5, 11.4
     pub async fn populate_metadata_on_first_part(
         &self,
@@ -6328,7 +6400,10 @@ impl CacheManager {
             // Only update if this part is not already in part_ranges or has different range
             let existing_range = metadata.object_metadata.part_ranges.get(&pn);
             if existing_range != Some(&(start, end)) {
-                metadata.object_metadata.part_ranges.insert(pn, (start, end));
+                metadata
+                    .object_metadata
+                    .part_ranges
+                    .insert(pn, (start, end));
                 debug!(
                     "Stored part range: cache_key={}, part_number={}, range=({}, {})",
                     cache_key, pn, start, end
@@ -6374,10 +6449,7 @@ impl CacheManager {
                 }
             }
         } else {
-            debug!(
-                "No metadata updates needed for cache_key: {}",
-                cache_key
-            );
+            debug!("No metadata updates needed for cache_key: {}", cache_key);
             Ok(())
         }
     }
@@ -6682,14 +6754,14 @@ impl CacheManager {
                             "Updated HEAD fields in NewCacheMetadata for key: {} (preserved {} ranges)",
                             cache_key, existing_metadata.ranges.len()
                         );
-                        return Ok(());
+                        Ok(())
                     }
                     Err(e) => {
                         warn!(
                             "Failed to update HEAD fields in NewCacheMetadata for {}: {}",
                             cache_key, e
                         );
-                        return Err(e);
+                        Err(e)
                     }
                 }
             }
@@ -6703,15 +6775,18 @@ impl CacheManager {
                         // HEAD-only metadata has no ranges — don't cache in RAM.
                         // This prevents range lookups from getting stale empty-ranges
                         // entries when consolidation has already added ranges to disk.
-                        debug!("Created HEAD-only NewCacheMetadata for key: {} (not cached in RAM)", cache_key);
-                        return Ok(());
+                        debug!(
+                            "Created HEAD-only NewCacheMetadata for key: {} (not cached in RAM)",
+                            cache_key
+                        );
+                        Ok(())
                     }
                     Err(e) => {
                         warn!(
                             "Failed to create HEAD-only NewCacheMetadata for {}: {}",
                             cache_key, e
                         );
-                        return Err(e);
+                        Err(e)
                     }
                 }
             }
@@ -7194,49 +7269,45 @@ impl CacheManager {
             ProxyError::CacheError(format!("Failed to read metadata directory: {}", e))
         })?;
 
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
+        for entry in entries.flatten() {
+            let path = entry.path();
 
-                // Only process .meta files
-                if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                    // Read metadata
-                    if let Ok(metadata_json) = std::fs::read_to_string(&path) {
-                        if let Ok(metadata) = serde_json::from_str::<
-                            crate::cache_types::NewCacheMetadata,
-                        >(&metadata_json)
+            // Only process .meta files
+            if path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                // Read metadata
+                if let Ok(metadata_json) = std::fs::read_to_string(&path) {
+                    if let Ok(metadata) =
+                        serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_json)
+                    {
+                        // Requirement 7a.1: Check if upload is in InProgress state
+                        if metadata.object_metadata.upload_state
+                            == crate::cache_types::UploadState::InProgress
                         {
-                            // Requirement 7a.1: Check if upload is in InProgress state
-                            if metadata.object_metadata.upload_state
-                                == crate::cache_types::UploadState::InProgress
-                            {
-                                // Requirement 7a.1: Check if created_at is older than 1 hour
-                                if let Ok(age) = now.duration_since(metadata.created_at) {
-                                    if age > timeout {
-                                        debug!(
-                                            "Incomplete upload expired: cache_key={}, age={:?}",
+                            // Requirement 7a.1: Check if created_at is older than 1 hour
+                            if let Ok(age) = now.duration_since(metadata.created_at) {
+                                if age > timeout {
+                                    debug!(
+                                        "Incomplete upload expired: cache_key={}, age={:?}",
+                                        metadata.cache_key, age
+                                    );
+
+                                    // Requirement 7a.2: Invalidate metadata and cached parts
+                                    if let Err(e) =
+                                        self.invalidate_cache_hierarchy(&metadata.cache_key).await
+                                    {
+                                        warn!(
+                                            "Failed to clean up incomplete upload {}: {}",
+                                            metadata.cache_key, e
+                                        );
+                                    } else {
+                                        cleaned_count += 1;
+                                        // Record metric for incomplete upload eviction - Requirement 11.4
+                                        self.record_incomplete_upload_evicted();
+                                        // Requirement 7a.4: Log cleanup operations
+                                        info!(
+                                            "Cleaned up incomplete upload: {} (age: {:?})",
                                             metadata.cache_key, age
                                         );
-
-                                        // Requirement 7a.2: Invalidate metadata and cached parts
-                                        if let Err(e) = self
-                                            .invalidate_cache_hierarchy(&metadata.cache_key)
-                                            .await
-                                        {
-                                            warn!(
-                                                "Failed to clean up incomplete upload {}: {}",
-                                                metadata.cache_key, e
-                                            );
-                                        } else {
-                                            cleaned_count += 1;
-                                            // Record metric for incomplete upload eviction - Requirement 11.4
-                                            self.record_incomplete_upload_evicted();
-                                            // Requirement 7a.4: Log cleanup operations
-                                            info!(
-                                                "Cleaned up incomplete upload: {} (age: {:?})",
-                                                metadata.cache_key, age
-                                            );
-                                        }
                                     }
                                 }
                             }
@@ -7325,10 +7396,7 @@ impl CacheManager {
                 let entry_data = ram_entry.data;
 
                 let data = if compressed {
-                    debug!(
-                        "Decompressing RAM cache range data for {}-{}",
-                        start, end
-                    );
+                    debug!("Decompressing RAM cache range data for {}-{}", start, end);
                     match inner
                         .compression_handler
                         .decompress_data_with_fallback(&entry_data)
@@ -7408,7 +7476,10 @@ impl CacheManager {
         } = *inner;
         if let Some(ref mut cache) = ram_cache {
             if let Err(e) = cache.put(ram_entry, compression_handler) {
-                warn!("Failed to promote range {}-{} to RAM cache: {}", start, end, e);
+                warn!(
+                    "Failed to promote range {}-{} to RAM cache: {}",
+                    start, end, e
+                );
             }
         }
     }
@@ -7593,6 +7664,7 @@ impl CacheManager {
     /// Store PUT data as a write-cached range with an explicit TTL.
     /// Called by `store_put_as_write_cached_range` (which resolves TTL from bucket settings)
     /// and directly by callers that have already resolved settings.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_put_as_write_cached_range_with_ttl(
         &self,
         cache_key: &str,
@@ -7689,18 +7761,29 @@ impl CacheManager {
         // Compress the range data (Requirements 5.1, 5.2, 5.3: per-bucket compression control)
         let resolved = self.resolve_settings(cache_key).await;
         let path = Self::extract_path_from_cache_key(cache_key);
-        let (compressed_data, compression_algorithm, compressed_size, uncompressed_size) = if resolved.compression_enabled {
-            let compression_result = {
-                let mut inner = self.inner.lock().unwrap();
-                inner
-                    .compression_handler
-                    .compress_content_aware_with_metadata(data, &path)
+        let (compressed_data, compression_algorithm, compressed_size, uncompressed_size) =
+            if resolved.compression_enabled {
+                let compression_result = {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner
+                        .compression_handler
+                        .compress_content_aware_with_metadata(data, &path)
+                };
+                (
+                    compression_result.data,
+                    compression_result.algorithm,
+                    compression_result.compressed_size,
+                    compression_result.original_size,
+                )
+            } else {
+                // Compression disabled for this bucket
+                (
+                    data.to_vec(),
+                    crate::compression::CompressionAlgorithm::None,
+                    data.len() as u64,
+                    data.len() as u64,
+                )
             };
-            (compression_result.data, compression_result.algorithm, compression_result.compressed_size, compression_result.original_size)
-        } else {
-            // Compression disabled for this bucket
-            (data.to_vec(), crate::compression::CompressionAlgorithm::None, data.len() as u64, data.len() as u64)
-        };
 
         // Write range data to .tmp file then atomically rename
         let range_file_path = self.get_new_range_file_path(cache_key, start, end);
@@ -7996,18 +8079,29 @@ impl CacheManager {
         // Compress the range data (Requirements 5.1, 5.2, 5.3: per-bucket compression control)
         let resolved = self.resolve_settings(cache_key).await;
         let path = Self::extract_path_from_cache_key(cache_key);
-        let (compressed_data, compression_algorithm, compressed_size, uncompressed_size) = if resolved.compression_enabled {
-            let compression_result = {
-                let mut inner = self.inner.lock().unwrap();
-                inner
-                    .compression_handler
-                    .compress_content_aware_with_metadata(data, &path)
-            }; // Lock is dropped here
-            (compression_result.data, compression_result.algorithm, compression_result.compressed_size, compression_result.original_size)
-        } else {
-            // Compression disabled for this bucket
-            (data.to_vec(), crate::compression::CompressionAlgorithm::None, data.len() as u64, data.len() as u64)
-        };
+        let (compressed_data, compression_algorithm, compressed_size, uncompressed_size) =
+            if resolved.compression_enabled {
+                let compression_result = {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner
+                        .compression_handler
+                        .compress_content_aware_with_metadata(data, &path)
+                }; // Lock is dropped here
+                (
+                    compression_result.data,
+                    compression_result.algorithm,
+                    compression_result.compressed_size,
+                    compression_result.original_size,
+                )
+            } else {
+                // Compression disabled for this bucket
+                (
+                    data.to_vec(),
+                    crate::compression::CompressionAlgorithm::None,
+                    data.len() as u64,
+                    data.len() as u64,
+                )
+            };
 
         // Write range data to .tmp file then atomically rename
         let range_file_path = self.get_new_range_file_path(cache_key, start, end);
@@ -8066,8 +8160,8 @@ impl CacheManager {
             end,
             range_file_relative_path.clone(),
             compression_algorithm,
-            compressed_size as u64,
-            uncompressed_size as u64,
+            compressed_size,
+            uncompressed_size,
         );
 
         // Create metadata
@@ -8109,11 +8203,7 @@ impl CacheManager {
         // Without this, full object caching bypasses the journal system and size is never counted.
         if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
             consolidator
-                .write_multipart_journal_entries(
-                    cache_key,
-                    vec![range_spec],
-                    object_metadata_clone,
-                )
+                .write_multipart_journal_entries(cache_key, vec![range_spec], object_metadata_clone)
                 .await;
         } else {
             warn!(
@@ -8914,7 +9004,7 @@ impl CacheManager {
             let path = entry.path();
 
             // Only process .meta files
-            if path.extension().map_or(false, |ext| ext == "meta") {
+            if path.extension().is_some_and(|ext| ext == "meta") {
                 if let Ok(metadata_content) = std::fs::read_to_string(path) {
                     if let Ok(new_metadata) = serde_json::from_str::<
                         crate::cache_types::NewCacheMetadata,
@@ -9004,7 +9094,7 @@ impl CacheManager {
                 let path = entry.path();
 
                 // Only process .meta files
-                if path.extension().map_or(false, |ext| ext == "meta") {
+                if path.extension().is_some_and(|ext| ext == "meta") {
                     if let Ok(metadata_content) = std::fs::read_to_string(path) {
                         if let Ok(new_metadata) = serde_json::from_str::<
                             crate::cache_types::NewCacheMetadata,
@@ -9187,7 +9277,7 @@ impl CacheManager {
                                                 .response_headers
                                                 .get("cache-control")
                                                 .cloned(),
-                                            access_count: range_spec.access_count as u64,
+                                            access_count: range_spec.access_count,
                                             last_accessed: range_spec.last_accessed,
                                         },
                                         created_at: new_meta.created_at,
@@ -9352,8 +9442,13 @@ impl CacheManager {
         let resolved = self.resolve_settings(cache_key).await;
 
         // Use the disk cache manager to store the range
-        let mut disk_cache_manager =
-            crate::disk_cache::DiskCacheManager::new(self.cache_dir.clone(), true, 1024, false, 1_048_576);
+        let mut disk_cache_manager = crate::disk_cache::DiskCacheManager::new(
+            self.cache_dir.clone(),
+            true,
+            1024,
+            false,
+            1_048_576,
+        );
 
         disk_cache_manager
             .store_range(
@@ -9537,7 +9632,7 @@ impl CacheManager {
         // before any async operations
         let acquisition_result = {
             let mut guard = self.eviction_lock_file.lock().unwrap();
-            
+
             // Check if we already hold the lock
             if guard.is_some() {
                 debug!("Eviction lock already held by this instance, skipping");
@@ -9564,6 +9659,7 @@ impl CacheManager {
             let lock_file = match std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(false)
                 .open(&lock_file_path)
             {
                 Ok(file) => file,
@@ -9603,7 +9699,7 @@ impl CacheManager {
 
                     // Store the lock file so it stays open (and locked) until dropped
                     *guard = Some(lock_file);
-                    
+
                     // Return success - guard will be dropped at end of block
                     Ok(true)
                 }
@@ -9706,15 +9802,16 @@ impl CacheManager {
         );
 
         // Use preloaded metadata if provided, otherwise read from disk
-        let metadata = if let Some(preloaded) = preloaded_metadata {
-            debug!(
+        let metadata =
+            if let Some(preloaded) = preloaded_metadata {
+                debug!(
                 "[DIAGNOSTIC] Using preloaded metadata for key: {}, ranges={}, content_length={}",
                 cache_key, preloaded.ranges.len(), preloaded.object_metadata.content_length
             );
-            Some(preloaded.clone())
-        } else {
-            self.get_metadata_from_disk(cache_key).await?
-        };
+                Some(preloaded.clone())
+            } else {
+                self.get_metadata_from_disk(cache_key).await?
+            };
 
         match metadata {
             Some(meta) => {
@@ -9802,6 +9899,7 @@ impl CacheManager {
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_file_path)
             .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
 
@@ -9915,11 +10013,11 @@ mod http_date_parsing_tests {
             "Cache is newer - precondition should fail"
         );
         assert!(
-            !(cache_date > equal_date),
+            (cache_date <= equal_date),
             "Cache equals client date - precondition should pass"
         );
         assert!(
-            !(cache_date > after_date),
+            (cache_date <= after_date),
             "Cache is older - precondition should pass"
         );
     }
@@ -10240,9 +10338,9 @@ mod cache_key_sanitization_tests {
             let temp_dir = TempDir::new().unwrap();
             let mut disk_cache = crate::disk_cache::DiskCacheManager::new(
                 temp_dir.path().to_path_buf(),
-                true,  // compression enabled
-                1024,  // compression threshold
-                false, // write cache disabled
+                true,      // compression enabled
+                1024,      // compression threshold
+                false,     // write cache disabled
                 1_048_576, // compression_batch_size (default 1 MiB)
             );
             disk_cache.initialize().await.unwrap();
@@ -10308,7 +10406,9 @@ mod cache_key_sanitization_tests {
                             parsed_end,
                             &test_data,
                             object_metadata.clone(),
-                            Duration::from_secs(3600), true)
+                            Duration::from_secs(3600),
+                            true,
+                        )
                         .await;
 
                     match store_result {
@@ -10509,9 +10609,9 @@ mod cache_key_sanitization_tests {
             let temp_dir = TempDir::new().unwrap();
             let mut disk_cache = crate::disk_cache::DiskCacheManager::new(
                 temp_dir.path().to_path_buf(),
-                true,  // compression enabled
-                1024,  // compression threshold
-                false, // write cache disabled
+                true,      // compression enabled
+                1024,      // compression threshold
+                false,     // write cache disabled
                 1_048_576, // compression_batch_size (default 1 MiB)
             );
             disk_cache.initialize().await.unwrap();
@@ -10543,7 +10643,9 @@ mod cache_key_sanitization_tests {
                         end,
                         &test_data,
                         initial_metadata.clone(),
-                        Duration::from_secs(3600), true)
+                        Duration::from_secs(3600),
+                        true,
+                    )
                     .await;
 
                 if store_result.is_err() {
@@ -10602,7 +10704,9 @@ mod cache_key_sanitization_tests {
                     new_end,
                     &new_test_data,
                     updated_metadata.clone(),
-                    Duration::from_secs(3600), true)
+                    Duration::from_secs(3600),
+                    true,
+                )
                 .await;
 
             match update_result {
@@ -10713,7 +10817,7 @@ mod cache_key_sanitization_tests {
             let expected = valid_entries
                 .iter()
                 .filter(|(pn, _, _)| *pn == lookup_part_number)
-                .last();
+                .next_back();
 
             match expected {
                 Some((_, exp_start, exp_end)) => {
@@ -10754,7 +10858,7 @@ mod cache_key_sanitization_tests {
             false,       // RAM cache disabled for this test
             1024 * 1024, // 1MB RAM cache
         );
-        
+
         // Must call create_configured_disk_cache_manager() before initialize()
         // to set up the JournalConsolidator
         let _ = cache_manager.create_configured_disk_cache_manager();
@@ -10764,7 +10868,7 @@ mod cache_key_sanitization_tests {
 
         // Create ObjectMetadata with multipart info using part_ranges
         let mut part_ranges = HashMap::new();
-        part_ranges.insert(1, (0u64, 8388607u64));      // Part 1: 0-8388607 (8MB)
+        part_ranges.insert(1, (0u64, 8388607u64)); // Part 1: 0-8388607 (8MB)
         part_ranges.insert(2, (8388608u64, 16777215u64)); // Part 2: 8388608-16777215 (8MB)
 
         let object_metadata = ObjectMetadata {
@@ -10778,7 +10882,7 @@ mod cache_key_sanitization_tests {
             parts: Vec::new(),
             compression_algorithm: CompressionAlgorithm::Lz4,
             compressed_size: 0,
-            parts_count: Some(2),     // 2 parts
+            parts_count: Some(2), // 2 parts
             part_ranges,
             upload_id: None,
             is_write_cached: false,
@@ -10793,9 +10897,9 @@ mod cache_key_sanitization_tests {
         // Store the range data using disk cache
         let mut disk_cache = crate::disk_cache::DiskCacheManager::new(
             temp_dir.path().to_path_buf(),
-            true,  // compression_enabled
-            1024,  // compression_threshold
-            false, // actively_remove_cached_data
+            true,      // compression_enabled
+            1024,      // compression_threshold
+            false,     // actively_remove_cached_data
             1_048_576, // compression_batch_size (default 1 MiB)
         );
 
@@ -10806,7 +10910,9 @@ mod cache_key_sanitization_tests {
                 8388607,
                 &part1_data,
                 object_metadata.clone(),
-                std::time::Duration::from_secs(3600), true)
+                std::time::Duration::from_secs(3600),
+                true,
+            )
             .await
             .unwrap();
 
@@ -10974,9 +11080,9 @@ mod cache_key_sanitization_tests {
             // Store the range data using disk cache
             let mut disk_cache = crate::disk_cache::DiskCacheManager::new(
                 temp_dir.path().to_path_buf(),
-                true,  // compression_enabled
-                1024,  // compression_threshold
-                false, // actively_remove_cached_data
+                true,      // compression_enabled
+                1024,      // compression_threshold
+                false,     // actively_remove_cached_data
                 1_048_576, // compression_batch_size (default 1 MiB)
             );
 
@@ -10987,7 +11093,9 @@ mod cache_key_sanitization_tests {
                     expected_end,
                     &part_data,
                     object_metadata,
-                    std::time::Duration::from_secs(3600), true)
+                    std::time::Duration::from_secs(3600),
+                    true,
+                )
                 .await
             {
                 Ok(()) => {}
@@ -11068,6 +11176,7 @@ mod cache_key_sanitization_tests {
     /// and included in the cached response to ensure consistency.
     /// **Validates: Requirements 10.1-10.13**
     #[quickcheck]
+    #[allow(clippy::too_many_arguments)]
     fn prop_response_header_consistency(
         part_number: u32,
         parts_count: u32,
@@ -11208,9 +11317,9 @@ mod cache_key_sanitization_tests {
             // Store the range data using disk cache
             let mut disk_cache = crate::disk_cache::DiskCacheManager::new(
                 temp_dir.path().to_path_buf(),
-                true,  // compression_enabled
-                1024,  // compression_threshold
-                false, // actively_remove_cached_data
+                true,      // compression_enabled
+                1024,      // compression_threshold
+                false,     // actively_remove_cached_data
                 1_048_576, // compression_batch_size (default 1 MiB)
             );
 
@@ -11221,7 +11330,9 @@ mod cache_key_sanitization_tests {
                     expected_end,
                     &part_data,
                     object_metadata,
-                    std::time::Duration::from_secs(3600), true)
+                    std::time::Duration::from_secs(3600),
+                    true,
+                )
                 .await
             {
                 Ok(()) => {}
@@ -11270,24 +11381,19 @@ mod cache_key_sanitization_tests {
             // the full object, not individual parts. The lookup_part() function correctly
             // filters them out.
 
-            if has_version_id {
-                if !result.headers.contains_key("x-amz-version-id") {
-                    return TestResult::failed();
-                }
+            if has_version_id && !result.headers.contains_key("x-amz-version-id") {
+                return TestResult::failed();
             }
 
-            if has_encryption {
-                if !result.headers.contains_key("x-amz-server-side-encryption") {
-                    return TestResult::failed();
-                }
+            if has_encryption && !result.headers.contains_key("x-amz-server-side-encryption") {
+                return TestResult::failed();
             }
 
-            if has_custom_metadata {
-                if !result.headers.contains_key("x-amz-meta-custom-field")
-                    || !result.headers.contains_key("x-amz-meta-another-field")
-                {
-                    return TestResult::failed();
-                }
+            if has_custom_metadata
+                && (!result.headers.contains_key("x-amz-meta-custom-field")
+                    || !result.headers.contains_key("x-amz-meta-another-field"))
+            {
+                return TestResult::failed();
             }
 
             TestResult::passed()
@@ -11321,7 +11427,10 @@ mod cache_key_sanitization_tests {
         }
 
         // Validate data sizes are reasonable (1KB to 10MB)
-        if data_sizes.iter().any(|&s| s < 1024 || s > 10 * 1024 * 1024) {
+        if data_sizes
+            .iter()
+            .any(|&s| !(1024..=10 * 1024 * 1024).contains(&s))
+        {
             return TestResult::discard();
         }
 
@@ -11378,7 +11487,7 @@ mod cache_key_sanitization_tests {
                     .store_part_as_range(
                         cache_key,
                         part_number,
-                        &headers.get("content-range").unwrap(),
+                        headers.get("content-range").unwrap(),
                         &headers,
                         &test_data,
                     )
@@ -11432,7 +11541,10 @@ mod cache_key_sanitization_tests {
         }
 
         // Validate part sizes are reasonable (1KB to 1MB)
-        if part_sizes.iter().any(|&s| s < 1024 || s > 1024 * 1024) {
+        if part_sizes
+            .iter()
+            .any(|&s| !(1024..=1024 * 1024).contains(&s))
+        {
             return TestResult::discard();
         }
 
@@ -11473,7 +11585,7 @@ mod cache_key_sanitization_tests {
                     .store_part_as_range(
                         cache_key,
                         part_number,
-                        &headers.get("content-range").unwrap(),
+                        headers.get("content-range").unwrap(),
                         &headers,
                         &test_data,
                     )
@@ -11747,9 +11859,8 @@ mod cache_key_sanitization_tests {
                 ranges_dir.join(&range.file_path)
             } else {
                 // Try to find in sharded structure
-                let sharded_path =
-                    cache_manager.get_new_range_file_path(&cache_key, range.start, range.end);
-                sharded_path
+
+                cache_manager.get_new_range_file_path(&cache_key, range.start, range.end)
             };
 
             if !range_file_path.exists() {
@@ -11774,8 +11885,7 @@ mod cache_key_sanitization_tests {
 
             // Decompress frame-encoded data
             let decompressed_data = {
-                let compression_handler =
-                    crate::compression::CompressionHandler::new(1024, true);
+                let compression_handler = crate::compression::CompressionHandler::new(1024, true);
                 match compression_handler.decompress_with_algorithm(
                     &compressed_data,
                     range.compression_algorithm.clone(),
@@ -11899,9 +12009,10 @@ mod cache_key_sanitization_tests {
 
             // Invalidate existing cache entry first (simulating what happens in real PUT)
             // This is what the SignedPutHandler does before storing new data
-            if let Err(_) = cache_manager
+            if cache_manager
                 .invalidate_cache_unified_for_operation(&cache_key, "PUT")
                 .await
+                .is_err()
             {
                 // Invalidation failure is acceptable, continue with overwrite
             }
@@ -11948,9 +12059,9 @@ mod cache_key_sanitization_tests {
             // Property: TTL reset (Requirement 5.6)
             // The new TTL should be >= the old TTL (since time has passed and TTL is reset)
             let ttl_v2 = metadata_v2.object_metadata.write_cache_expires_at;
-            if ttl_v1.is_some() && ttl_v2.is_some() {
+            if let (Some(v1), Some(v2)) = (ttl_v1, ttl_v2) {
                 // TTL v2 should be >= TTL v1 (reset to new time + put_ttl)
-                if ttl_v2.unwrap() < ttl_v1.unwrap() {
+                if v2 < v1 {
                     return TestResult::failed();
                 }
             }
@@ -12141,6 +12252,7 @@ mod eviction_aggregation_tests {
         // Build simulated object_results matching the shape in perform_eviction_with_lock:
         // Vec<Option<(cache_key, ranges, bytes_freed, deleted_paths)>>
         // Some represents a successful eviction, None represents a skipped/failed object.
+        #[allow(clippy::type_complexity)]
         let object_results: Vec<Option<(String, Vec<()>, u64, Vec<PathBuf>)>> = results
             .iter()
             .enumerate()
@@ -12219,10 +12331,7 @@ mod eviction_early_exit_tests {
     ) -> TestResult {
         // Use u32 inputs to keep values realistic and avoid overflow.
         // Convert to u64 to match the actual eviction code types.
-        let bytes_per_object: Vec<u64> = raw_bytes_per_object
-            .iter()
-            .map(|&b| b as u64)
-            .collect();
+        let bytes_per_object: Vec<u64> = raw_bytes_per_object.iter().map(|&b| b as u64).collect();
         let bytes_to_free = raw_target as u64;
 
         // Discard empty vectors — no objects means nothing to test
@@ -12263,7 +12372,8 @@ mod eviction_early_exit_tests {
             assert!(
                 total_bytes_freed >= bytes_to_free,
                 "total_bytes_freed ({}) must be >= target ({})",
-                total_bytes_freed, bytes_to_free
+                total_bytes_freed,
+                bytes_to_free
             );
             return TestResult::passed();
         }
@@ -12274,7 +12384,8 @@ mod eviction_early_exit_tests {
                 objects_processed,
                 bytes_per_object.len(),
                 "When total available ({}) < target ({}), all objects should be processed",
-                total_available, bytes_to_free
+                total_available,
+                bytes_to_free
             );
             return TestResult::passed();
         }
@@ -12284,25 +12395,29 @@ mod eviction_early_exit_tests {
         assert!(
             total_bytes_freed >= bytes_to_free,
             "total_bytes_freed ({}) must be >= bytes_to_free ({})",
-            total_bytes_freed, bytes_to_free
+            total_bytes_freed,
+            bytes_to_free
         );
 
         // (b) removing the last processed object would make total < target
         // This proves we processed the minimum number of objects needed.
-        assert!(objects_processed > 0, "At least one object must be processed when target > 0");
+        assert!(
+            objects_processed > 0,
+            "At least one object must be processed when target > 0"
+        );
         let last_object_bytes = bytes_per_object[objects_processed - 1];
         let total_without_last = total_bytes_freed - last_object_bytes;
         assert!(
             total_without_last < bytes_to_free,
             "Removing last object: total_without_last ({}) must be < target ({}). \
              This means the last object was necessary to reach the target.",
-            total_without_last, bytes_to_free
+            total_without_last,
+            bytes_to_free
         );
 
         TestResult::passed()
     }
 }
-
 
 #[cfg(test)]
 mod eviction_early_exit_unit_tests {
@@ -12336,16 +12451,45 @@ mod eviction_early_exit_unit_tests {
         let bytes_to_free: u64 = 1000;
 
         let object_results = vec![
-            ("bucket/obj-a".to_string(), 3, 1500, vec![PathBuf::from("a1.bin"), PathBuf::from("a2.bin"), PathBuf::from("a3.bin")]),
-            ("bucket/obj-b".to_string(), 2, 800, vec![PathBuf::from("b1.bin"), PathBuf::from("b2.bin")]),
-            ("bucket/obj-c".to_string(), 1, 500, vec![PathBuf::from("c1.bin")]),
+            (
+                "bucket/obj-a".to_string(),
+                3,
+                1500,
+                vec![
+                    PathBuf::from("a1.bin"),
+                    PathBuf::from("a2.bin"),
+                    PathBuf::from("a3.bin"),
+                ],
+            ),
+            (
+                "bucket/obj-b".to_string(),
+                2,
+                800,
+                vec![PathBuf::from("b1.bin"), PathBuf::from("b2.bin")],
+            ),
+            (
+                "bucket/obj-c".to_string(),
+                1,
+                500,
+                vec![PathBuf::from("c1.bin")],
+            ),
         ];
 
-        let (total_freed, objects_processed) = simulate_early_exit_loop(object_results, bytes_to_free);
+        let (total_freed, objects_processed) =
+            simulate_early_exit_loop(object_results, bytes_to_free);
 
-        assert_eq!(objects_processed, 1, "Only the first object should be processed");
-        assert_eq!(total_freed, 1500, "Should have freed 1500 bytes from first object");
-        assert!(total_freed >= bytes_to_free, "Total freed must meet the target");
+        assert_eq!(
+            objects_processed, 1,
+            "Only the first object should be processed"
+        );
+        assert_eq!(
+            total_freed, 1500,
+            "Should have freed 1500 bytes from first object"
+        );
+        assert!(
+            total_freed >= bytes_to_free,
+            "Total freed must meet the target"
+        );
     }
 
     /// Test: first object is not enough, second object reaches the target.
@@ -12356,16 +12500,45 @@ mod eviction_early_exit_unit_tests {
         let bytes_to_free: u64 = 2000;
 
         let object_results = vec![
-            ("bucket/obj-a".to_string(), 2, 1200, vec![PathBuf::from("a1.bin"), PathBuf::from("a2.bin")]),
-            ("bucket/obj-b".to_string(), 1, 900, vec![PathBuf::from("b1.bin")]),
-            ("bucket/obj-c".to_string(), 3, 1500, vec![PathBuf::from("c1.bin"), PathBuf::from("c2.bin"), PathBuf::from("c3.bin")]),
+            (
+                "bucket/obj-a".to_string(),
+                2,
+                1200,
+                vec![PathBuf::from("a1.bin"), PathBuf::from("a2.bin")],
+            ),
+            (
+                "bucket/obj-b".to_string(),
+                1,
+                900,
+                vec![PathBuf::from("b1.bin")],
+            ),
+            (
+                "bucket/obj-c".to_string(),
+                3,
+                1500,
+                vec![
+                    PathBuf::from("c1.bin"),
+                    PathBuf::from("c2.bin"),
+                    PathBuf::from("c3.bin"),
+                ],
+            ),
         ];
 
-        let (total_freed, objects_processed) = simulate_early_exit_loop(object_results, bytes_to_free);
+        let (total_freed, objects_processed) =
+            simulate_early_exit_loop(object_results, bytes_to_free);
 
-        assert_eq!(objects_processed, 2, "Two objects should be processed to reach target");
-        assert_eq!(total_freed, 2100, "Should have freed 1200 + 900 = 2100 bytes");
-        assert!(total_freed >= bytes_to_free, "Total freed must meet the target");
+        assert_eq!(
+            objects_processed, 2,
+            "Two objects should be processed to reach target"
+        );
+        assert_eq!(
+            total_freed, 2100,
+            "Should have freed 1200 + 900 = 2100 bytes"
+        );
+        assert!(
+            total_freed >= bytes_to_free,
+            "Total freed must meet the target"
+        );
     }
 
     /// Test: target is zero — early exit triggers immediately, no objects processed.
@@ -12376,13 +12549,27 @@ mod eviction_early_exit_unit_tests {
         let bytes_to_free: u64 = 0;
 
         let object_results = vec![
-            ("bucket/obj-a".to_string(), 1, 500, vec![PathBuf::from("a1.bin")]),
-            ("bucket/obj-b".to_string(), 1, 300, vec![PathBuf::from("b1.bin")]),
+            (
+                "bucket/obj-a".to_string(),
+                1,
+                500,
+                vec![PathBuf::from("a1.bin")],
+            ),
+            (
+                "bucket/obj-b".to_string(),
+                1,
+                300,
+                vec![PathBuf::from("b1.bin")],
+            ),
         ];
 
-        let (total_freed, objects_processed) = simulate_early_exit_loop(object_results, bytes_to_free);
+        let (total_freed, objects_processed) =
+            simulate_early_exit_loop(object_results, bytes_to_free);
 
-        assert_eq!(objects_processed, 0, "No objects should be processed when target is 0");
+        assert_eq!(
+            objects_processed, 0,
+            "No objects should be processed when target is 0"
+        );
         assert_eq!(total_freed, 0, "No bytes should be freed");
     }
 
@@ -12394,16 +12581,38 @@ mod eviction_early_exit_unit_tests {
         let bytes_to_free: u64 = 2500;
 
         let object_results = vec![
-            ("bucket/obj-a".to_string(), 1, 800, vec![PathBuf::from("a1.bin")]),
-            ("bucket/obj-b".to_string(), 1, 900, vec![PathBuf::from("b1.bin")]),
-            ("bucket/obj-c".to_string(), 1, 800, vec![PathBuf::from("c1.bin")]),
+            (
+                "bucket/obj-a".to_string(),
+                1,
+                800,
+                vec![PathBuf::from("a1.bin")],
+            ),
+            (
+                "bucket/obj-b".to_string(),
+                1,
+                900,
+                vec![PathBuf::from("b1.bin")],
+            ),
+            (
+                "bucket/obj-c".to_string(),
+                1,
+                800,
+                vec![PathBuf::from("c1.bin")],
+            ),
         ];
 
-        let (total_freed, objects_processed) = simulate_early_exit_loop(object_results, bytes_to_free);
+        let (total_freed, objects_processed) =
+            simulate_early_exit_loop(object_results, bytes_to_free);
 
-        assert_eq!(objects_processed, 3, "All three objects should be processed");
+        assert_eq!(
+            objects_processed, 3,
+            "All three objects should be processed"
+        );
         assert_eq!(total_freed, 2500, "Should have freed exactly 2500 bytes");
-        assert!(total_freed >= bytes_to_free, "Total freed must meet the target");
+        assert!(
+            total_freed >= bytes_to_free,
+            "Total freed must meet the target"
+        );
     }
 
     /// Test: exact match — first object frees exactly the target amount.
@@ -12415,17 +12624,30 @@ mod eviction_early_exit_unit_tests {
         let bytes_to_free: u64 = 1000;
 
         let object_results = vec![
-            ("bucket/obj-a".to_string(), 2, 1000, vec![PathBuf::from("a1.bin"), PathBuf::from("a2.bin")]),
-            ("bucket/obj-b".to_string(), 1, 500, vec![PathBuf::from("b1.bin")]),
+            (
+                "bucket/obj-a".to_string(),
+                2,
+                1000,
+                vec![PathBuf::from("a1.bin"), PathBuf::from("a2.bin")],
+            ),
+            (
+                "bucket/obj-b".to_string(),
+                1,
+                500,
+                vec![PathBuf::from("b1.bin")],
+            ),
         ];
 
-        let (total_freed, objects_processed) = simulate_early_exit_loop(object_results, bytes_to_free);
+        let (total_freed, objects_processed) =
+            simulate_early_exit_loop(object_results, bytes_to_free);
 
-        assert_eq!(objects_processed, 1, "Only first object should be processed (exact match)");
+        assert_eq!(
+            objects_processed, 1,
+            "Only first object should be processed (exact match)"
+        );
         assert_eq!(total_freed, 1000, "Should have freed exactly 1000 bytes");
     }
 }
-
 
 #[cfg(test)]
 mod ram_cache_range_property_tests {
@@ -12462,22 +12684,16 @@ mod ram_cache_range_property_tests {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager = CacheManager::new(
             temp_dir.path().to_path_buf(),
-            true,                // ram_cache_enabled
-            max_ram_cache_size,  // max_ram_cache_size = 1 MiB
-            1024,                // compression_threshold
-            true,                // compression_enabled
+            true,               // ram_cache_enabled
+            max_ram_cache_size, // max_ram_cache_size = 1 MiB
+            1024,               // compression_threshold
+            true,               // compression_enabled
         );
 
         let etag = format!("\"etag-{}\"", etag_seed);
 
         // Promote range data to RAM cache
-        cache_manager.promote_range_to_ram_cache(
-            &cache_key,
-            start,
-            end,
-            &data,
-            etag,
-        );
+        cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag);
 
         // Look up the range from RAM cache
         match cache_manager.get_range_from_ram_cache(&cache_key, start, end) {
@@ -12519,23 +12735,17 @@ mod ram_cache_range_property_tests {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager = CacheManager::new(
             temp_dir.path().to_path_buf(),
-            true,                // ram_cache_enabled
-            max_ram_cache_size,  // max_ram_cache_size = 1 MiB
-            1024,                // compression_threshold
-            true,                // compression_enabled
+            true,               // ram_cache_enabled
+            max_ram_cache_size, // max_ram_cache_size = 1 MiB
+            1024,               // compression_threshold
+            true,               // compression_enabled
         );
 
         let etag = format!("\"etag-{}\"", etag_seed);
         let expected_content_length = data.len() as u64;
 
         // Promote range data to RAM cache
-        cache_manager.promote_range_to_ram_cache(
-            &cache_key,
-            start,
-            end,
-            &data,
-            etag.clone(),
-        );
+        cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag.clone());
 
         // Inspect the stored RamCacheEntry directly via the inner lock
         let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
@@ -12544,7 +12754,8 @@ mod ram_cache_range_property_tests {
             match ram_cache.entries.get(&range_cache_key) {
                 Some(entry) => {
                     let etag_matches = entry.metadata.etag == etag;
-                    let content_length_matches = entry.metadata.content_length == expected_content_length;
+                    let content_length_matches =
+                        entry.metadata.content_length == expected_content_length;
                     if etag_matches && content_length_matches {
                         TestResult::passed()
                     } else {
@@ -12565,8 +12776,18 @@ mod ram_cache_range_property_tests {
     /// `key_index` selects from a small pool of cache keys to increase hit probability.
     #[derive(Debug, Clone)]
     enum CacheOp {
-        Promote { key_idx: u8, start: u16, end: u16, data: Vec<u8>, etag_seed: u8 },
-        Get { key_idx: u8, start: u16, end: u16 },
+        Promote {
+            key_idx: u8,
+            start: u16,
+            end: u16,
+            data: Vec<u8>,
+            etag_seed: u8,
+        },
+        Get {
+            key_idx: u8,
+            start: u16,
+            end: u16,
+        },
     }
 
     impl quickcheck::Arbitrary for CacheOp {
@@ -12584,9 +12805,19 @@ mod ram_cache_range_property_tests {
                     .map(|_| quickcheck::Arbitrary::arbitrary(g))
                     .collect();
                 let etag_seed: u8 = quickcheck::Arbitrary::arbitrary(g);
-                CacheOp::Promote { key_idx, start, end, data, etag_seed }
+                CacheOp::Promote {
+                    key_idx,
+                    start,
+                    end,
+                    data,
+                    etag_seed,
+                }
             } else {
-                CacheOp::Get { key_idx, start, end }
+                CacheOp::Get {
+                    key_idx,
+                    start,
+                    end,
+                }
             }
         }
 
@@ -12616,28 +12847,43 @@ mod ram_cache_range_property_tests {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager = CacheManager::new(
             temp_dir.path().to_path_buf(),
-            true,                // ram_cache_enabled
-            max_ram_cache_size,  // max_ram_cache_size = 1 MiB
-            1024,                // compression_threshold
-            true,                // compression_enabled
+            true,               // ram_cache_enabled
+            max_ram_cache_size, // max_ram_cache_size = 1 MiB
+            1024,               // compression_threshold
+            true,               // compression_enabled
         );
 
         // Small pool of cache keys to increase hit probability
-        let key_pool: Vec<&str> = vec!["bucket/obj-a", "bucket/obj-b", "bucket/obj-c", "bucket/obj-d"];
+        let key_pool: Vec<&str> = vec![
+            "bucket/obj-a",
+            "bucket/obj-b",
+            "bucket/obj-c",
+            "bucket/obj-d",
+        ];
 
         let mut expected_hits: u64 = 0;
         let mut expected_misses: u64 = 0;
 
         for op in &ops {
             match op {
-                CacheOp::Promote { key_idx, start, end, data, etag_seed } => {
+                CacheOp::Promote {
+                    key_idx,
+                    start,
+                    end,
+                    data,
+                    etag_seed,
+                } => {
                     let key = key_pool[(*key_idx as usize) % key_pool.len()];
                     let s = *start as u64;
                     let e = s + (*end as u64); // ensure end >= start
                     let etag = format!("\"etag-{}\"", etag_seed);
                     cache_manager.promote_range_to_ram_cache(key, s, e, data, etag);
                 }
-                CacheOp::Get { key_idx, start, end } => {
+                CacheOp::Get {
+                    key_idx,
+                    start,
+                    end,
+                } => {
                     let key = key_pool[(*key_idx as usize) % key_pool.len()];
                     let s = *start as u64;
                     let e = s + (*end as u64); // ensure end >= start
@@ -12650,7 +12896,9 @@ mod ram_cache_range_property_tests {
         }
 
         // Compare with stats
-        let stats = cache_manager.get_ram_cache_stats().expect("RAM cache should be enabled");
+        let stats = cache_manager
+            .get_ram_cache_stats()
+            .expect("RAM cache should be enabled");
 
         if stats.hit_count == expected_hits && stats.miss_count == expected_misses {
             TestResult::passed()
@@ -12685,16 +12933,22 @@ mod ram_cache_range_property_tests {
             // and eviction is exercised aggressively.
             let size_selector: u8 = quickcheck::Arbitrary::arbitrary(g);
             let data_len = match size_selector % 4 {
-                0 => (size_selector as usize % 64) + 1,          // 1-64 bytes (tiny)
-                1 => (size_selector as usize % 1024) + 64,       // 64-1087 bytes (small)
-                2 => (size_selector as usize % 16384) + 1024,    // 1-17 KiB (medium)
-                _ => (size_selector as usize % 65536) + 16384,   // 16-80 KiB (large)
+                0 => (size_selector as usize % 64) + 1, // 1-64 bytes (tiny)
+                1 => (size_selector as usize % 1024) + 64, // 64-1087 bytes (small)
+                2 => (size_selector as usize % 16384) + 1024, // 1-17 KiB (medium)
+                _ => (size_selector as usize % 65536) + 16384, // 16-80 KiB (large)
             };
             let data: Vec<u8> = (0..data_len)
                 .map(|_| quickcheck::Arbitrary::arbitrary(g))
                 .collect();
 
-            PromotionOp { key_idx, start, end, data, etag_seed }
+            PromotionOp {
+                key_idx,
+                start,
+                end,
+                data,
+                etag_seed,
+            }
         }
 
         fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
@@ -12722,16 +12976,20 @@ mod ram_cache_range_property_tests {
         let temp_dir = TempDir::new().unwrap();
         let cache_manager = CacheManager::new(
             temp_dir.path().to_path_buf(),
-            true,                // ram_cache_enabled
-            max_ram_cache_size,  // max_ram_cache_size = 128 KiB
-            1024,                // compression_threshold
-            true,                // compression_enabled
+            true,               // ram_cache_enabled
+            max_ram_cache_size, // max_ram_cache_size = 128 KiB
+            1024,               // compression_threshold
+            true,               // compression_enabled
         );
 
         // Small pool of cache keys to increase key reuse and exercise replacement paths
         let key_pool: Vec<&str> = vec![
-            "bucket/obj-a", "bucket/obj-b", "bucket/obj-c",
-            "bucket/obj-d", "bucket/obj-e", "bucket/obj-f",
+            "bucket/obj-a",
+            "bucket/obj-b",
+            "bucket/obj-c",
+            "bucket/obj-d",
+            "bucket/obj-e",
+            "bucket/obj-f",
         ];
 
         for (i, op) in ops.iter().enumerate() {
@@ -12770,10 +13028,10 @@ mod ram_cache_range_unit_tests {
         let temp_dir = TempDir::new().unwrap();
         let cm = CacheManager::new(
             temp_dir.path().to_path_buf(),
-            true,               // ram_cache_enabled
+            true, // ram_cache_enabled
             max_ram_cache_size,
-            1024,               // compression_threshold
-            true,               // compression_enabled
+            1024, // compression_threshold
+            true, // compression_enabled
         );
         (cm, temp_dir)
     }
@@ -12783,8 +13041,8 @@ mod ram_cache_range_unit_tests {
         let temp_dir = TempDir::new().unwrap();
         let cm = CacheManager::new(
             temp_dir.path().to_path_buf(),
-            false,  // ram_cache_enabled = false
-            0,      // max_ram_cache_size
+            false, // ram_cache_enabled = false
+            0,     // max_ram_cache_size
             1024,
             true,
         );
@@ -12806,8 +13064,15 @@ mod ram_cache_range_unit_tests {
         cm.promote_range_to_ram_cache(cache_key, start, end, &data, etag);
 
         let result = cm.get_range_from_ram_cache(cache_key, start, end);
-        assert!(result.is_some(), "Expected data from RAM cache after promotion");
-        assert_eq!(result.unwrap(), data, "Retrieved data must match promoted data");
+        assert!(
+            result.is_some(),
+            "Expected data from RAM cache after promotion"
+        );
+        assert_eq!(
+            result.unwrap(),
+            data,
+            "Retrieved data must match promoted data"
+        );
     }
 
     /// Promoting data larger than max_ram_cache_size is skipped — get returns None.
@@ -12824,7 +13089,10 @@ mod ram_cache_range_unit_tests {
         cm.promote_range_to_ram_cache(cache_key, 0, data.len() as u64 - 1, &data, etag);
 
         let result = cm.get_range_from_ram_cache(cache_key, 0, data.len() as u64 - 1);
-        assert!(result.is_none(), "Oversized range must not be promoted to RAM cache");
+        assert!(
+            result.is_none(),
+            "Oversized range must not be promoted to RAM cache"
+        );
     }
 
     /// With RAM cache disabled, promote is a no-op and get returns None.
@@ -12845,6 +13113,9 @@ mod ram_cache_range_unit_tests {
         assert!(result.is_none(), "RAM cache disabled: get must return None");
 
         // Stats should also reflect disabled state
-        assert!(cm.get_ram_cache_stats().is_none(), "RAM cache disabled: stats must be None");
+        assert!(
+            cm.get_ram_cache_stats().is_none(),
+            "RAM cache disabled: stats must be None"
+        );
     }
 }

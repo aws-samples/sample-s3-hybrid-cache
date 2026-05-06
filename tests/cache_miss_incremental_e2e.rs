@@ -101,8 +101,8 @@ async fn simulate_incremental_miss_write(
     // Same shape as http_proxy.rs: closure returns (writer, Result<()>) so
     // the writer is always recovered (even on per-chunk error) and can be
     // handed to `abort_incremental_range` to clean up the .tmp file.
-    let write_result = tokio::task::spawn_blocking(
-        move || -> (IncrementalRangeWriter, Result<()>) {
+    let write_result =
+        tokio::task::spawn_blocking(move || -> (IncrementalRangeWriter, Result<()>) {
             let mut writer = writer;
             let mut rx = cache_rx;
             while let Some(chunk) = rx.blocking_recv() {
@@ -111,10 +111,9 @@ async fn simulate_incremental_miss_write(
                 }
             }
             (writer, Ok(()))
-        },
-    )
-    .await
-    .expect("cache-write blocking task panicked");
+        })
+        .await
+        .expect("cache-write blocking task panicked");
 
     let writer = match write_result {
         (w, Ok(())) => w,
@@ -126,7 +125,7 @@ async fn simulate_incremental_miss_write(
 
     producer.await.expect("body producer panicked");
 
-    let content_length = (end - start + 1) as u64;
+    let content_length = end - start + 1;
     disk_cache
         .commit_incremental_range(
             writer,
@@ -204,8 +203,7 @@ async fn assert_cached_range_matches(
 /// the manager (wrapped in `Arc` so the mock-producer + blocking-writer
 /// pattern can share it) and the owning `TempDir` so the caller can keep
 /// the cache on disk for the lifetime of the test.
-async fn setup_disk_cache(
-) -> (Arc<DiskCacheManager>, tempfile::TempDir) {
+async fn setup_disk_cache() -> (Arc<DiskCacheManager>, tempfile::TempDir) {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let disk_cache = DiskCacheManager::new(
         temp_dir.path().to_path_buf(),

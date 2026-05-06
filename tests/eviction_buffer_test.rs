@@ -31,31 +31,32 @@ fn create_test_cache_manager(
 ) -> CacheManager {
     CacheManager::new_with_shared_storage(
         temp_dir.path().to_path_buf(),
-        false,                                     // RAM cache disabled
-        0,                                         // max_ram_cache_size
-        max_cache_size,                            // max_cache_size (sets max_cache_size_limit)
+        false,          // RAM cache disabled
+        0,              // max_ram_cache_size
+        max_cache_size, // max_cache_size (sets max_cache_size_limit)
         eviction_algorithm,
-        1024,                                      // compression_threshold
-        true,                                      // compression_enabled
-        Duration::from_secs(315360000),            // GET TTL (~10 years)
-        Duration::from_secs(3600),                 // HEAD TTL (1 hour)
-        Duration::from_secs(3600),                 // PUT TTL (1 hour)
-        false,                                     // actively_remove_cached_data
+        1024,                           // compression_threshold
+        true,                           // compression_enabled
+        Duration::from_secs(315360000), // GET TTL (~10 years)
+        Duration::from_secs(3600),      // HEAD TTL (1 hour)
+        Duration::from_secs(3600),      // PUT TTL (1 hour)
+        false,                          // actively_remove_cached_data
         SharedStorageConfig::default(),
-        10.0,                                      // write_cache_percent
-        false,                                     // write_cache_enabled
-        Duration::from_secs(86400),                // incomplete_upload_ttl
+        10.0,                       // write_cache_percent
+        false,                      // write_cache_enabled
+        Duration::from_secs(86400), // incomplete_upload_ttl
         MetadataCacheConfig::default(),
-        95,                                        // eviction_trigger_percent
-        80,                                        // eviction_target_percent
-        true,                                      // read_cache_enabled
-        Duration::from_secs(60),                   // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                      // eviction_trigger_percent
+        80,                      // eviction_target_percent
+        true,                    // read_cache_enabled
+        Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,               // compression_batch_size
+        false,                   // evaluate_conditions_from_cache
     )
 }
 
 /// Helper to create and store a range in cache using sharded path structure
+#[allow(clippy::too_many_arguments)]
 async fn store_test_range(
     cache_manager: &CacheManager,
     cache_key: &str,
@@ -160,7 +161,7 @@ async fn test_eviction_triggers_at_95_percent() {
     // Verify cache size is around 900KB
     let current_size = cache_manager.calculate_disk_cache_size().await.unwrap();
     assert!(
-        current_size >= 900_000 && current_size < 950_000,
+        (900_000..950_000).contains(&current_size),
         "Cache size should be around 900KB, got {}",
         current_size
     );
@@ -438,7 +439,7 @@ async fn test_no_eviction_below_95_percent() {
     // Verify cache is at ~800KB (80%)
     let initial_size = cache_manager.calculate_disk_cache_size().await.unwrap();
     assert!(
-        initial_size >= 750_000 && initial_size < 850_000,
+        (750_000..850_000).contains(&initial_size),
         "Cache should be around 80%, got {}",
         initial_size
     );

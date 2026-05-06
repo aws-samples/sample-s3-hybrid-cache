@@ -112,7 +112,7 @@ fn prop_round_robin_bounded_distribution(ips: IpSet, mult: RequestMultiplier) ->
     }
 
     let min_expected = total_requests / len;
-    let max_expected = (total_requests + len - 1) / len; // ceil division
+    let max_expected = total_requests.div_ceil(len); // ceil division
 
     for ip in &ip_vec {
         let count = counts.get(ip).copied().unwrap_or(0);

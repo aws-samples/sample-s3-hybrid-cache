@@ -59,7 +59,7 @@ pub fn format_duration(d: Duration) -> String {
     if nanos > 0 {
         let total_ms = total_secs * 1000 + nanos as u64 / 1_000_000;
         // Check if nanos are an exact number of milliseconds
-        if nanos % 1_000_000 == 0 {
+        if nanos.is_multiple_of(1_000_000) {
             return format!("{}ms", total_ms);
         }
         // Fall back to seconds with fractional part
@@ -67,11 +67,11 @@ pub fn format_duration(d: Duration) -> String {
     }
 
     // Use the largest whole unit
-    if total_secs % 86400 == 0 {
+    if total_secs.is_multiple_of(86400) {
         format!("{}d", total_secs / 86400)
-    } else if total_secs % 3600 == 0 {
+    } else if total_secs.is_multiple_of(3600) {
         format!("{}h", total_secs / 3600)
-    } else if total_secs % 60 == 0 {
+    } else if total_secs.is_multiple_of(60) {
         format!("{}m", total_secs / 60)
     } else {
         format!("{}s", total_secs)
@@ -285,9 +285,7 @@ impl BucketSettingsManager {
 
         // Step 3: Read cached settings and apply cascade
         let cache = self.cache.read().await;
-        let settings = cache
-            .get(bucket)
-            .map(|c| &c.settings);
+        let settings = cache.get(bucket).map(|c| &c.settings);
 
         self.cascade(bucket, path, settings)
     }
@@ -297,7 +295,7 @@ impl BucketSettingsManager {
     /// Used to determine whether per-bucket metrics should be emitted.
     pub async fn has_custom_settings(&self, bucket: &str) -> bool {
         let cache = self.cache.read().await;
-        cache.get(bucket).map_or(false, |c| c.has_settings_file)
+        cache.get(bucket).is_some_and(|c| c.has_settings_file)
     }
 
     /// Return the list of bucket names that have a `_settings.json` file.
@@ -369,17 +367,17 @@ impl BucketSettingsManager {
                         if errors.is_empty() {
                             info!(bucket = bucket, "Bucket settings reloaded from disk");
                             let mut cache = self.cache.write().await;
-                            let previous_valid = cache
-                                .get(bucket)
-                                .and_then(|c| {
-                                    // Keep the current settings as previous_valid
-                                    // (only if they were themselves valid)
-                                    if c.settings != BucketSettings::default() || c.previous_valid.is_some() {
-                                        Some(c.settings.clone())
-                                    } else {
-                                        c.previous_valid.clone()
-                                    }
-                                });
+                            let previous_valid = cache.get(bucket).and_then(|c| {
+                                // Keep the current settings as previous_valid
+                                // (only if they were themselves valid)
+                                if c.settings != BucketSettings::default()
+                                    || c.previous_valid.is_some()
+                                {
+                                    Some(c.settings.clone())
+                                } else {
+                                    c.previous_valid.clone()
+                                }
+                            });
                             cache.insert(
                                 bucket.to_string(),
                                 CachedBucketSettings {
@@ -447,8 +445,8 @@ impl BucketSettingsManager {
             // The current `settings` is the last valid load. Use it as fallback
             // unless it's a default marker (from a previous file-not-found),
             // in which case try `previous_valid`.
-            let is_current_meaningful = existing.settings != BucketSettings::default()
-                || existing.previous_valid.is_none();
+            let is_current_meaningful =
+                existing.settings != BucketSettings::default() || existing.previous_valid.is_none();
             let (fallback_settings, previous_valid) = if is_current_meaningful {
                 // Current settings are valid — keep using them
                 (existing.settings.clone(), existing.previous_valid.clone())
@@ -616,18 +614,13 @@ impl BucketSettings {
 
         for (i, po) in self.prefix_overrides.iter().enumerate() {
             if po.prefix.is_empty() {
-                errors.push(format!(
-                    "prefix_overrides[{}]: prefix is empty",
-                    i
-                ));
+                errors.push(format!("prefix_overrides[{}]: prefix is empty", i));
             }
         }
 
         errors
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -784,22 +777,34 @@ mod tests {
 
     #[test]
     fn extract_bucket_with_leading_slash_and_key() {
-        assert_eq!(BucketSettingsManager::extract_bucket("/my-bucket/some/key"), Some("my-bucket"));
+        assert_eq!(
+            BucketSettingsManager::extract_bucket("/my-bucket/some/key"),
+            Some("my-bucket")
+        );
     }
 
     #[test]
     fn extract_bucket_without_leading_slash() {
-        assert_eq!(BucketSettingsManager::extract_bucket("my-bucket/some/key"), Some("my-bucket"));
+        assert_eq!(
+            BucketSettingsManager::extract_bucket("my-bucket/some/key"),
+            Some("my-bucket")
+        );
     }
 
     #[test]
     fn extract_bucket_with_trailing_slash_only() {
-        assert_eq!(BucketSettingsManager::extract_bucket("/my-bucket/"), Some("my-bucket"));
+        assert_eq!(
+            BucketSettingsManager::extract_bucket("/my-bucket/"),
+            Some("my-bucket")
+        );
     }
 
     #[test]
     fn extract_bucket_name_only() {
-        assert_eq!(BucketSettingsManager::extract_bucket("my-bucket"), Some("my-bucket"));
+        assert_eq!(
+            BucketSettingsManager::extract_bucket("my-bucket"),
+            Some("my-bucket")
+        );
     }
 
     #[test]
@@ -1039,11 +1044,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bucket_dir = tmp.path().join("metadata").join("my-bucket");
         std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{"get_ttl": "10s"}"#,
-        )
-        .unwrap();
+        std::fs::write(bucket_dir.join("_settings.json"), r#"{"get_ttl": "10s"}"#).unwrap();
 
         let mgr = test_manager(tmp.path());
 
@@ -1052,11 +1053,7 @@ mod tests {
         assert_eq!(r1.get_ttl, Duration::from_secs(10));
 
         // Modify file on disk — should NOT be picked up (within staleness threshold)
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{"get_ttl": "99s"}"#,
-        )
-        .unwrap();
+        std::fs::write(bucket_dir.join("_settings.json"), r#"{"get_ttl": "99s"}"#).unwrap();
 
         let r2 = mgr.resolve("my-bucket", "/key").await;
         assert_eq!(r2.get_ttl, Duration::from_secs(10)); // still cached
@@ -1119,7 +1116,11 @@ mod tests {
         let settings_path = bucket_dir.join("_settings.json");
 
         // Step 1: Load valid settings
-        std::fs::write(&settings_path, r#"{"get_ttl": "10s", "compression_enabled": false}"#).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"get_ttl": "10s", "compression_enabled": false}"#,
+        )
+        .unwrap();
         let mgr = test_manager_always_reload(tmp.path());
         let resolved = mgr.resolve("my-bucket", "/key").await;
         assert_eq!(resolved.get_ttl, Duration::from_secs(10));
@@ -1208,11 +1209,7 @@ mod tests {
         std::fs::create_dir_all(&bucket_dir).unwrap();
 
         // First load is already invalid JSON — no previous valid settings exist
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"NOT VALID JSON"#,
-        )
-        .unwrap();
+        std::fs::write(bucket_dir.join("_settings.json"), r#"NOT VALID JSON"#).unwrap();
 
         let mgr = test_manager_always_reload(tmp.path());
         let resolved = mgr.resolve("my-bucket", "/key").await;

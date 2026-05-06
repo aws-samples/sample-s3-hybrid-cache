@@ -155,11 +155,7 @@ impl CacheHitUpdateBuffer {
     }
 
     /// Record a TTL refresh (buffered in RAM)
-    pub async fn record_ttl_refresh(
-        &self,
-        cache_key: &str,
-        new_ttl: Duration,
-    ) -> Result<()> {
+    pub async fn record_ttl_refresh(&self, cache_key: &str, new_ttl: Duration) -> Result<()> {
         let entry = BufferedCacheHitUpdate {
             cache_key: cache_key.to_string(),
             range_start: 0,
@@ -460,10 +456,7 @@ mod tests {
         );
 
         buffer
-            .record_ttl_refresh(
-                "test-bucket/test-object",
-                Duration::from_secs(3600),
-            )
+            .record_ttl_refresh("test-bucket/test-object", Duration::from_secs(3600))
             .await
             .unwrap();
 
@@ -580,10 +573,7 @@ mod tests {
         // Record entries up to buffer limit
         for i in 0..5 {
             buffer
-                .record_ttl_refresh(
-                    &format!("test-bucket/obj{}", i),
-                    Duration::from_secs(3600),
-                )
+                .record_ttl_refresh(&format!("test-bucket/obj{}", i), Duration::from_secs(3600))
                 .await
                 .unwrap();
         }
@@ -689,10 +679,7 @@ mod tests {
             // Record the update
             if is_ttl_refresh {
                 buffer
-                    .record_ttl_refresh(
-                        &cache_key,
-                        Duration::from_secs(ttl_secs),
-                    )
+                    .record_ttl_refresh(&cache_key, Duration::from_secs(ttl_secs))
                     .await
                     .unwrap();
             } else {
@@ -722,7 +709,7 @@ mod tests {
                 walkdir::WalkDir::new(&metadata_path)
                     .into_iter()
                     .filter_map(|e| e.ok())
-                    .any(|e| e.path().extension().map_or(false, |ext| ext == "meta"))
+                    .any(|e| e.path().extension().is_some_and(|ext| ext == "meta"))
             } else {
                 false
             };
@@ -806,13 +793,11 @@ mod tests {
                         range_start, range_end, entry.range_spec.start, entry.range_spec.end
                     ));
                 }
-            } else {
-                if entry.range_spec.start != 0 || entry.range_spec.end != 0 {
-                    return TestResult::error(format!(
-                        "Expected range 0-0 for TTL refresh, got {}-{}",
-                        entry.range_spec.start, entry.range_spec.end
-                    ));
-                }
+            } else if entry.range_spec.start != 0 || entry.range_spec.end != 0 {
+                return TestResult::error(format!(
+                    "Expected range 0-0 for TTL refresh, got {}-{}",
+                    entry.range_spec.start, entry.range_spec.end
+                ));
             }
 
             TestResult::passed()

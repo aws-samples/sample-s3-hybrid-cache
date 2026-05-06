@@ -52,10 +52,7 @@ async fn setup_disk_cache_with_journal(temp_dir: &std::path::Path) -> DiskCacheM
         cache_dir.clone(),
         "test-instance".to_string(),
     ));
-    let consolidation_trigger = Arc::new(ConsolidationTrigger::new(
-        10 * 1024 * 1024,
-        1000,
-    ));
+    let consolidation_trigger = Arc::new(ConsolidationTrigger::new(10 * 1024 * 1024, 1000));
 
     let hybrid_writer = Arc::new(Mutex::new(HybridMetadataWriter::new(
         cache_dir,
@@ -77,7 +74,7 @@ fn count_bin_files(dir: &std::path::Path) -> usize {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "bin"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "bin"))
         .count()
 }
 
@@ -96,7 +93,8 @@ async fn test_buffered_store_range_high_concurrency_all_committed() {
     let cache_manager = setup_disk_cache_with_journal(temp_dir.path()).await;
     let disk_cache = Arc::new(RwLock::new(cache_manager));
 
-    let mut handles: Vec<(tokio::task::JoinHandle<usize>, tokio::task::JoinHandle<()>)> = Vec::with_capacity(NUM_CONCURRENT_TASKS);
+    let mut handles: Vec<(tokio::task::JoinHandle<usize>, tokio::task::JoinHandle<()>)> =
+        Vec::with_capacity(NUM_CONCURRENT_TASKS);
 
     for i in 0..NUM_CONCURRENT_TASKS {
         let dc = Arc::clone(&disk_cache);
@@ -122,8 +120,13 @@ async fn test_buffered_store_range_high_concurrency_all_committed() {
                 let mut cache = dc.write().await;
                 cache
                     .store_range(
-                        &cache_key, start, end, &data, metadata,
-                        Duration::from_secs(3600), true,
+                        &cache_key,
+                        start,
+                        end,
+                        &data,
+                        metadata,
+                        Duration::from_secs(3600),
+                        true,
                     )
                     .await
                     .unwrap();
@@ -138,9 +141,7 @@ async fn test_buffered_store_range_high_concurrency_all_committed() {
         // to ensure all chunks are delivered. This mirrors the fix approach where
         // accumulation happens reliably in the receiver task.
         let sender_handle = tokio::spawn(async move {
-            let data: Vec<u8> = (0..RANGE_SIZE)
-                .map(|b| ((i + b) % 256) as u8)
-                .collect();
+            let data: Vec<u8> = (0..RANGE_SIZE).map(|b| ((i + b) % 256) as u8).collect();
 
             let chunk_size = RANGE_SIZE / 4;
             for chunk_start in (0..RANGE_SIZE).step_by(chunk_size) {

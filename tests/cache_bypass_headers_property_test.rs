@@ -19,7 +19,7 @@ use std::collections::HashMap;
 // ============================================================================
 
 fn prop_case_insensitive_no_cache_parsing(case_variation: u8) -> TestResult {
-    let variations = vec![
+    let variations = [
         "no-cache", "NO-CACHE", "No-Cache", "nO-cAcHe", "NO-cache", "no-CACHE", "No-cache",
         "nO-CaChE",
     ];
@@ -28,7 +28,7 @@ fn prop_case_insensitive_no_cache_parsing(case_variation: u8) -> TestResult {
 }
 
 fn prop_case_insensitive_no_store_parsing(case_variation: u8) -> TestResult {
-    let variations = vec![
+    let variations = [
         "no-store", "NO-STORE", "No-Store", "nO-sToRe", "NO-store", "no-STORE", "No-store",
         "nO-StOrE",
     ];
@@ -37,7 +37,7 @@ fn prop_case_insensitive_no_store_parsing(case_variation: u8) -> TestResult {
 }
 
 fn prop_case_insensitive_mixed_directives(case_variation: u8) -> TestResult {
-    let variations = vec![
+    let variations = [
         "max-age=0, NO-CACHE",
         "NO-CACHE, max-age=0",
         "Max-Age=0, No-Cache",
@@ -157,8 +157,8 @@ fn test_property_whitespace_handling() {
 // ============================================================================
 
 fn prop_no_store_precedence_over_no_cache(order_variant: u8, whitespace_variant: u8) -> TestResult {
-    let order_variations = vec![("no-cache", "no-store"), ("no-store", "no-cache")];
-    let whitespace_patterns = vec![", ", ",", " , ", "\t,\t"];
+    let order_variations = [("no-cache", "no-store"), ("no-store", "no-cache")];
+    let whitespace_patterns = [", ", ",", " , ", "\t,\t"];
 
     let order_idx = (order_variant as usize) % order_variations.len();
     let ws_idx = (whitespace_variant as usize) % whitespace_patterns.len();
@@ -171,7 +171,7 @@ fn prop_no_store_precedence_over_no_cache(order_variant: u8, whitespace_variant:
 }
 
 fn prop_no_store_precedence_with_other_directives(variant: u8) -> TestResult {
-    let test_cases = vec![
+    let test_cases = [
         "no-cache, no-store, max-age=0",
         "no-store, no-cache, max-age=0",
         "max-age=0, no-cache, no-store",
@@ -186,7 +186,7 @@ fn prop_no_store_precedence_with_other_directives(variant: u8) -> TestResult {
 }
 
 fn prop_no_store_precedence_case_insensitive(variant: u8) -> TestResult {
-    let test_cases = vec![
+    let test_cases = [
         "NO-CACHE, NO-STORE",
         "NO-STORE, NO-CACHE",
         "No-Cache, No-Store",
@@ -308,7 +308,7 @@ fn strip_cache_headers(headers: &HashMap<String, String>) -> HashMap<String, Str
 fn prop_header_stripping_removes_cache_headers(seed: u64) -> TestResult {
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let cache_control_values = vec![
+    let cache_control_values = [
         "no-cache",
         "no-store",
         "no-cache, no-store",
@@ -320,7 +320,7 @@ fn prop_header_stripping_removes_cache_headers(seed: u64) -> TestResult {
         cache_control_values[cc_idx].to_string(),
     );
 
-    if seed % 2 == 0 {
+    if seed.is_multiple_of(2) {
         headers.insert("pragma".to_string(), "no-cache".to_string());
     }
 
@@ -352,7 +352,7 @@ fn prop_only_cache_headers_removed(seed: u64) -> TestResult {
         "AWS4-HMAC-SHA256...".to_string(),
     );
 
-    if seed % 3 == 0 {
+    if seed.is_multiple_of(3) {
         headers.insert("cache-control".to_string(), "no-cache".to_string());
     }
     if seed % 3 == 1 {

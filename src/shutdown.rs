@@ -159,12 +159,7 @@ impl ShutdownCoordinator {
         // handles all size tracking persistence via size_state.json
         if let Some(journal_consolidator) = &self.journal_consolidator {
             info!("Running final journal consolidation and persisting size state");
-            match timeout(
-                Duration::from_secs(15),
-                journal_consolidator.shutdown(),
-            )
-            .await
-            {
+            match timeout(Duration::from_secs(15), journal_consolidator.shutdown()).await {
                 Ok(result) => {
                     if let Err(e) = result {
                         warn!("Error during journal consolidator shutdown: {}", e);

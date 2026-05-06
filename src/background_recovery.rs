@@ -635,7 +635,7 @@ impl BackgroundRecoverySystem {
 
         // Apply minimum threshold
         if orphan.access_frequency < config.min_access_frequency_threshold {
-            score = score / 2; // Reduce priority for low-frequency orphans
+            score /= 2; // Reduce priority for low-frequency orphans
         }
 
         score

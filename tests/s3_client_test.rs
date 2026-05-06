@@ -78,7 +78,7 @@ fn test_build_s3_request_context() {
     assert_eq!(context.body, body);
     assert_eq!(context.host, host);
     assert_eq!(context.request_size, Some(9)); // "test body".len()
-    // Conditional request handling lives in http_proxy.rs; s3_client forwards headers as-is.
+                                               // Conditional request handling lives in http_proxy.rs; s3_client forwards headers as-is.
     assert_eq!(
         context.headers.get("if-match"),
         Some(&"\"etag123\"".to_string())

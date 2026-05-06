@@ -191,6 +191,19 @@ pub struct CoalescingMetrics {
     pub fetcher_completions_success: u64,
     /// Number of fetcher completions (error)
     pub fetcher_completions_error: u64,
+    /// Number of waiter conditional requests that returned `304 Not Modified`
+    /// (IAM-validated cache serve). Added by the download-coordination TTL
+    /// correctness fix.
+    pub waiter_conditional_304: u64,
+    /// Number of waiter conditional requests that returned `200 OK`
+    /// (object changed mid-flight; waiter served S3's fresh body).
+    pub waiter_conditional_200: u64,
+    /// Number of waiter conditional requests that returned a `4xx`
+    /// status (auth / client error; returned to client, cache preserved).
+    pub waiter_conditional_4xx: u64,
+    /// Number of waiter conditional requests that failed with a `5xx`
+    /// from S3 or a transport error (degraded cache-serve fallback).
+    pub waiter_conditional_error: u64,
 }
 
 /// System-wide metrics
@@ -448,6 +461,23 @@ pub struct CoalescingStats {
     pub fetcher_completions_success: u64,
     /// Number of fetcher completions (error)
     pub fetcher_completions_error: u64,
+    /// Waiter conditional GET/HEAD returned `304 Not Modified` — the
+    /// canonical "validated cache serve" outcome. Added by the
+    /// download-coordination TTL correctness fix.
+    pub waiter_conditional_304: u64,
+    /// Waiter conditional GET/HEAD returned `200 OK` — object changed
+    /// mid-flight between the fetcher's commit and the waiter's
+    /// validation; the waiter serves S3's fresh body and updates the
+    /// cache.
+    pub waiter_conditional_200: u64,
+    /// Waiter conditional GET/HEAD returned a `4xx` — credentials issue
+    /// or client error. S3's response flows through to the client
+    /// unchanged; the cache is preserved.
+    pub waiter_conditional_4xx: u64,
+    /// Waiter conditional GET/HEAD failed with a `5xx` from S3 or a
+    /// transport error — the helper logs a warning and falls back to
+    /// the existing cache entry (degraded path).
+    pub waiter_conditional_error: u64,
 }
 
 impl Default for MetricsManager {
@@ -522,7 +552,11 @@ impl MetricsManager {
     }
 
     /// Set active connections counter and max concurrent requests for metrics reporting
-    pub fn set_active_connections(&mut self, active_connections: Arc<std::sync::atomic::AtomicUsize>, max_concurrent_requests: usize) {
+    pub fn set_active_connections(
+        &mut self,
+        active_connections: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent_requests: usize,
+    ) {
         self.active_connections = Some(active_connections);
         self.max_concurrent_requests = max_concurrent_requests;
     }
@@ -838,7 +872,9 @@ impl MetricsManager {
             failed_requests: stats.failed_requests,
             average_response_time_ms,
             requests_per_second,
-            active_requests: self.active_connections.as_ref()
+            active_requests: self
+                .active_connections
+                .as_ref()
                 .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64)
                 .unwrap_or(0),
             max_concurrent_requests: self.max_concurrent_requests as u64,
@@ -892,6 +928,10 @@ impl MetricsManager {
             average_wait_duration_ms,
             fetcher_completions_success: stats.fetcher_completions_success,
             fetcher_completions_error: stats.fetcher_completions_error,
+            waiter_conditional_304: stats.waiter_conditional_304,
+            waiter_conditional_200: stats.waiter_conditional_200,
+            waiter_conditional_4xx: stats.waiter_conditional_4xx,
+            waiter_conditional_error: stats.waiter_conditional_error,
         })
     }
 
@@ -1707,10 +1747,7 @@ impl MetricsManager {
     pub async fn record_coalesce_wait(&self) {
         let mut stats = self.coalescing_stats.write().await;
         stats.waits_total += 1;
-        debug!(
-            "Recorded coalesce wait (total: {})",
-            stats.waits_total
-        );
+        debug!("Recorded coalesce wait (total: {})", stats.waits_total);
     }
 
     /// Record a cache hit after waiting for coalescing
@@ -1721,8 +1758,7 @@ impl MetricsManager {
         stats.s3_fetches_saved_total += 1;
         debug!(
             "Recorded coalesce cache hit (total hits: {}, fetches saved: {})",
-            stats.cache_hits_after_wait_total,
-            stats.s3_fetches_saved_total
+            stats.cache_hits_after_wait_total, stats.s3_fetches_saved_total
         );
     }
 
@@ -1765,13 +1801,65 @@ impl MetricsManager {
         let mut stats = self.coalescing_stats.write().await;
         stats.fetcher_completions_error += 1;
     }
+
+    /// Record a waiter's conditional request returning `304 Not Modified`.
+    /// This is the "validated cache serve" outcome — the waiter's
+    /// credentials were just validated by S3 and the cache entry is
+    /// authoritative for the waiter.
+    pub async fn record_coalesce_waiter_conditional_304(&self) {
+        let mut stats = self.coalescing_stats.write().await;
+        stats.waiter_conditional_304 += 1;
+        debug!(
+            "Recorded coalesce waiter conditional 304 (total: {})",
+            stats.waiter_conditional_304
+        );
+    }
+
+    /// Record a waiter's conditional request returning `200 OK` — the
+    /// object changed between the fetcher's commit and the waiter's
+    /// validation, and S3 returned a fresh body.
+    pub async fn record_coalesce_waiter_conditional_200(&self) {
+        let mut stats = self.coalescing_stats.write().await;
+        stats.waiter_conditional_200 += 1;
+        debug!(
+            "Recorded coalesce waiter conditional 200 (total: {})",
+            stats.waiter_conditional_200
+        );
+    }
+
+    /// Record a waiter's conditional request returning a `4xx` status —
+    /// credentials issue (401/403) or other client error. The response
+    /// is returned to the client unchanged; the cache is preserved.
+    pub async fn record_coalesce_waiter_conditional_4xx(&self) {
+        let mut stats = self.coalescing_stats.write().await;
+        stats.waiter_conditional_4xx += 1;
+        debug!(
+            "Recorded coalesce waiter conditional 4xx (total: {})",
+            stats.waiter_conditional_4xx
+        );
+    }
+
+    /// Record a waiter's conditional request failing with a `5xx` from S3
+    /// or a transport error. Triggers the degraded cache-serve fallback.
+    pub async fn record_coalesce_waiter_conditional_error(&self) {
+        let mut stats = self.coalescing_stats.write().await;
+        stats.waiter_conditional_error += 1;
+        debug!(
+            "Recorded coalesce waiter conditional error (total: {})",
+            stats.waiter_conditional_error
+        );
+    }
     /// Record a per-bucket cache hit.
     /// Only call this for buckets that have a `_settings.json` file.
     pub async fn record_bucket_cache_hit(&self, bucket: &str, is_head: bool) {
         let mut stats = self.bucket_cache_stats.write().await;
         let entry = stats.entry(bucket.to_string()).or_default();
         entry.hit_count += 1;
-        if is_head { entry.head_hit_count += 1; } else { entry.get_hit_count += 1; }
+        if is_head {
+            entry.head_hit_count += 1;
+        } else {
+            entry.get_hit_count += 1;
+        }
     }
 
     /// Record a per-bucket cache miss.
@@ -1780,7 +1868,11 @@ impl MetricsManager {
         let mut stats = self.bucket_cache_stats.write().await;
         let entry = stats.entry(bucket.to_string()).or_default();
         entry.miss_count += 1;
-        if is_head { entry.head_miss_count += 1; } else { entry.get_miss_count += 1; }
+        if is_head {
+            entry.head_miss_count += 1;
+        } else {
+            entry.get_miss_count += 1;
+        }
     }
 
     /// Get per-bucket cache stats for all tracked buckets.
@@ -1795,7 +1887,11 @@ impl MetricsManager {
         let mut stats = self.prefix_cache_stats.write().await;
         let entry = stats.entry(key.to_string()).or_default();
         entry.hit_count += 1;
-        if is_head { entry.head_hit_count += 1; } else { entry.get_hit_count += 1; }
+        if is_head {
+            entry.head_hit_count += 1;
+        } else {
+            entry.get_hit_count += 1;
+        }
     }
 
     /// Record a per-prefix cache miss. Key is "bucket/prefix".
@@ -1803,7 +1899,11 @@ impl MetricsManager {
         let mut stats = self.prefix_cache_stats.write().await;
         let entry = stats.entry(key.to_string()).or_default();
         entry.miss_count += 1;
-        if is_head { entry.head_miss_count += 1; } else { entry.get_miss_count += 1; }
+        if is_head {
+            entry.head_miss_count += 1;
+        } else {
+            entry.get_miss_count += 1;
+        }
     }
 
     /// Get per-prefix cache stats. Keys are "bucket/prefix".

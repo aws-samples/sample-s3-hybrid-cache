@@ -17,7 +17,7 @@ use s3_proxy::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, R
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::disk_cache::{get_sharded_path, DiskCacheManager};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -119,7 +119,7 @@ fn create_test_cache_dir() -> (TempDir, PathBuf) {
 }
 
 fn create_test_metadata(
-    cache_dir: &PathBuf,
+    cache_dir: &Path,
     cache_key: &str,
     num_ranges: usize,
     range_sizes: &[u64],
@@ -194,7 +194,7 @@ fn create_test_metadata(
 }
 
 fn create_test_metadata_with_times(
-    cache_dir: &PathBuf,
+    cache_dir: &Path,
     cache_key: &str,
     num_ranges: usize,
     time_offsets: &[u64],
@@ -270,12 +270,12 @@ fn create_test_metadata_with_times(
 }
 
 fn create_test_metadata_with_ranges(
-    cache_dir: &PathBuf,
+    cache_dir: &Path,
     cache_key: &str,
     range_sizes: &[u64],
 ) -> Result<(Vec<(u64, u64)>, PathBuf), String> {
     let now = SystemTime::now();
-    let disk_cache = DiskCacheManager::new(cache_dir.clone(), false, 0, false, 1_048_576);
+    let disk_cache = DiskCacheManager::new(cache_dir.to_path_buf(), false, 0, false, 1_048_576);
 
     let object_metadata = ObjectMetadata::new(
         format!("etag-{}", cache_key),
@@ -589,10 +589,10 @@ fn prop_metadata_removes_evicted_ranges(config: MetadataUpdateConfig) -> TestRes
                         .collect();
 
                     for (i, &(start, end)) in range_bounds.iter().enumerate() {
-                        if !config.ranges_to_delete.contains(&i) {
-                            if !remaining_set.contains(&(start, end)) {
-                                return TestResult::failed();
-                            }
+                        if !config.ranges_to_delete.contains(&i)
+                            && !remaining_set.contains(&(start, end))
+                        {
+                            return TestResult::failed();
                         }
                     }
                 }

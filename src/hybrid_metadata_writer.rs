@@ -139,8 +139,14 @@ impl HybridMetadataWriter {
             )
         };
 
-        self.write_range_metadata(cache_key, range_spec, write_mode, Some(object_metadata), ttl)
-            .await
+        self.write_range_metadata(
+            cache_key,
+            range_spec,
+            write_mode,
+            Some(object_metadata),
+            ttl,
+        )
+        .await
     }
 
     /// Write empty object metadata (no ranges)
@@ -175,7 +181,12 @@ impl HybridMetadataWriter {
     }
 
     /// Write metadata immediately only (no journal)
-    async fn write_immediate_only(&mut self, cache_key: &str, range_spec: RangeSpec, ttl: std::time::Duration) -> Result<()> {
+    async fn write_immediate_only(
+        &mut self,
+        cache_key: &str,
+        range_spec: RangeSpec,
+        ttl: std::time::Duration,
+    ) -> Result<()> {
         let lock = match self.lock_manager.acquire_lock(cache_key).await {
             Ok(lock) => lock,
             Err(e) => {
@@ -309,7 +320,12 @@ impl HybridMetadataWriter {
     }
 
     /// Write both immediate and journal (hybrid mode)
-    async fn write_hybrid(&mut self, cache_key: &str, range_spec: RangeSpec, ttl: std::time::Duration) -> Result<()> {
+    async fn write_hybrid(
+        &mut self,
+        cache_key: &str,
+        range_spec: RangeSpec,
+        ttl: std::time::Duration,
+    ) -> Result<()> {
         // Try immediate write first
         match self
             .write_immediate_only(cache_key, range_spec.clone(), ttl)
@@ -361,7 +377,10 @@ impl HybridMetadataWriter {
 
                 // Fall back to journal-only with proper error handling
                 // Note: In hybrid fallback, we don't have object_metadata since immediate write failed
-                match self.write_journal_only(cache_key, range_spec, None, ttl).await {
+                match self
+                    .write_journal_only(cache_key, range_spec, None, ttl)
+                    .await
+                {
                     Ok(()) => {
                         info!(
                             "Successfully fell back to journal-only mode: cache_key={}",
@@ -813,7 +832,11 @@ mod tests {
 
         // Write empty object metadata
         writer
-            .write_full_object_metadata(cache_key, object_metadata, std::time::Duration::from_secs(3600))
+            .write_full_object_metadata(
+                cache_key,
+                object_metadata,
+                std::time::Duration::from_secs(3600),
+            )
             .await
             .unwrap();
 
@@ -872,6 +895,9 @@ mod tests {
         );
 
         let result = writer.get_metadata_file_path("noslash");
-        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
+        assert!(
+            result.is_err(),
+            "Malformed cache key must return Err, got Ok"
+        );
     }
 }

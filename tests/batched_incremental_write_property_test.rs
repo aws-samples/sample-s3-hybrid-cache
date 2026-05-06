@@ -139,11 +139,7 @@ fn test_object_metadata(len: u64) -> ObjectMetadata {
 /// any valid batch size round-trips through `load_range_data` byte-for-byte.
 #[test]
 fn prop_batched_write_byte_identity() {
-    fn property(
-        data_seed: Vec<u8>,
-        split_seeds: Vec<u8>,
-        batch_size_seed: u32,
-    ) -> TestResult {
+    fn property(data_seed: Vec<u8>, split_seeds: Vec<u8>, batch_size_seed: u32) -> TestResult {
         if data_seed.is_empty() {
             return TestResult::discard();
         }
@@ -156,13 +152,8 @@ fn prop_batched_write_byte_identity() {
 
         rt.block_on(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let cache_manager = DiskCacheManager::new(
-                temp_dir.path().to_path_buf(),
-                true,
-                1024,
-                false,
-                batch_size,
-            );
+            let cache_manager =
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
             cache_manager.initialize().await.unwrap();
 
             let cache_key = "test-bucket/prop-batched-roundtrip";
@@ -193,7 +184,7 @@ fn prop_batched_write_byte_identity() {
 
             // Capture compressed bytes before the writer is consumed by commit.
             // commit will add the residual frame (if any) after this snapshot,
-                // so we read the final compressed length from disk below.
+            // so we read the final compressed length from disk below.
             let _pre_commit_compressed = writer.compressed_bytes_written;
 
             if let Err(e) = cache_manager
@@ -208,8 +199,7 @@ fn prop_batched_write_byte_identity() {
             }
 
             // Build a RangeSpec from the committed .bin file; read it back.
-            let final_path =
-                cache_manager.get_new_range_file_path(cache_key, start, end);
+            let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
             let ranges_dir = temp_dir.path().join("ranges");
             let relative_path = final_path
                 .strip_prefix(&ranges_dir)
@@ -219,10 +209,7 @@ fn prop_batched_write_byte_identity() {
             let bin_len = match std::fs::metadata(&final_path) {
                 Ok(m) => m.len(),
                 Err(e) => {
-                    return TestResult::error(format!(
-                        "Failed to stat committed .bin file: {}",
-                        e
-                    ));
+                    return TestResult::error(format!("Failed to stat committed .bin file: {}", e));
                 }
             };
 
@@ -270,11 +257,7 @@ fn prop_batched_write_byte_identity() {
 /// `store_range`, for any input, partition, and valid `batch_size`.
 #[test]
 fn prop_batched_write_equivalence_to_single_shot() {
-    fn property(
-        data_seed: Vec<u8>,
-        split_seeds: Vec<u8>,
-        batch_size_seed: u32,
-    ) -> TestResult {
+    fn property(data_seed: Vec<u8>, split_seeds: Vec<u8>, batch_size_seed: u32) -> TestResult {
         if data_seed.is_empty() {
             return TestResult::discard();
         }
@@ -288,13 +271,8 @@ fn prop_batched_write_equivalence_to_single_shot() {
         rt.block_on(async {
             // --- Batched incremental path ---
             let incr_dir = tempfile::TempDir::new().unwrap();
-            let incr_cache = DiskCacheManager::new(
-                incr_dir.path().to_path_buf(),
-                true,
-                1024,
-                false,
-                batch_size,
-            );
+            let incr_cache =
+                DiskCacheManager::new(incr_dir.path().to_path_buf(), true, 1024, false, batch_size);
             incr_cache.initialize().await.unwrap();
 
             let cache_key = "test-bucket/prop-batched-equivalence";
@@ -334,13 +312,8 @@ fn prop_batched_write_equivalence_to_single_shot() {
 
             // --- Single-shot store_range path ---
             let shot_dir = tempfile::TempDir::new().unwrap();
-            let mut shot_cache = DiskCacheManager::new(
-                shot_dir.path().to_path_buf(),
-                true,
-                1024,
-                false,
-                1_048_576,
-            );
+            let mut shot_cache =
+                DiskCacheManager::new(shot_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
             shot_cache.initialize().await.unwrap();
 
             if let Err(e) = shot_cache
@@ -467,7 +440,7 @@ fn prop_residual_flush_on_commit() {
         // Focus the property on non-exact-multiple lengths. If we happened
         // to land on a multiple, discard — other properties already cover
         // the exact-multiple path.
-        if original_data.len() % batch_size == 0 {
+        if original_data.len().is_multiple_of(batch_size) {
             return TestResult::discard();
         }
 
@@ -477,13 +450,8 @@ fn prop_residual_flush_on_commit() {
 
         rt.block_on(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let cache_manager = DiskCacheManager::new(
-                temp_dir.path().to_path_buf(),
-                true,
-                1024,
-                false,
-                batch_size,
-            );
+            let cache_manager =
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
             cache_manager.initialize().await.unwrap();
 
             let cache_key = "test-bucket/prop-residual-flush";
@@ -542,8 +510,7 @@ fn prop_residual_flush_on_commit() {
                 return TestResult::error(format!("commit_incremental_range failed: {}", e));
             }
 
-            let final_path =
-                cache_manager.get_new_range_file_path(cache_key, start, end);
+            let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
             let ranges_dir = temp_dir.path().join("ranges");
             let relative_path = final_path
                 .strip_prefix(&ranges_dir)
@@ -553,10 +520,7 @@ fn prop_residual_flush_on_commit() {
             let bin_len = match std::fs::metadata(&final_path) {
                 Ok(m) => m.len(),
                 Err(e) => {
-                    return TestResult::error(format!(
-                        "Failed to stat committed .bin file: {}",
-                        e
-                    ));
+                    return TestResult::error(format!("Failed to stat committed .bin file: {}", e));
                 }
             };
 
@@ -626,13 +590,8 @@ async fn test_residual_flush_100k_bytes_64k_batch() {
     );
 
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(
-        temp_dir.path().to_path_buf(),
-        true,
-        1024,
-        false,
-        batch_size,
-    );
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
     cache_manager.initialize().await.unwrap();
 
     // Pseudo-random but deterministic pattern so the round-trip is meaningful.
@@ -721,13 +680,8 @@ async fn test_residual_flush_3mib_plus_1_byte_at_1mib_batch() {
     let total_len: usize = 3 * 1_048_576 + 1;
 
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(
-        temp_dir.path().to_path_buf(),
-        true,
-        1024,
-        false,
-        batch_size,
-    );
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, batch_size);
     cache_manager.initialize().await.unwrap();
 
     let input: Vec<u8> = (0..total_len).map(|i| (i as u8).wrapping_mul(31)).collect();

@@ -59,8 +59,7 @@ fn test_decoder_survives_and_serves_subsequent_legitimate_request() {
 
     // Well-formed aws-chunked body: one data chunk "hello" then terminator.
     // Format: "<hex-size>;chunk-signature=<sig>\r\n<data>\r\n0;chunk-signature=<sig>\r\n\r\n"
-    let legitimate: &[u8] =
-        b"5;chunk-signature=abc\r\nhello\r\n0;chunk-signature=abc\r\n\r\n";
+    let legitimate: &[u8] = b"5;chunk-signature=abc\r\nhello\r\n0;chunk-signature=abc\r\n\r\n";
     let decoded = decode_aws_chunked(legitimate)
         .expect("Legitimate aws-chunked body must still decode after a rejected one");
     assert_eq!(

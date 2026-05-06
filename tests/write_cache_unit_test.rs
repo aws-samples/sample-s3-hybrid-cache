@@ -39,12 +39,12 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     // Test data
@@ -64,7 +64,13 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata.clone(),
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -131,12 +137,12 @@ async fn test_upload_state_is_complete() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/complete-state.txt";
@@ -154,7 +160,13 @@ async fn test_upload_state_is_complete() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata,
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -201,12 +213,12 @@ async fn test_put_ttl_is_used_for_expiration() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/ttl-test.txt";
@@ -222,15 +234,21 @@ async fn test_put_ttl_is_used_for_expiration() {
         last_accessed: SystemTime::now(),
     };
 
-    let before_store = SystemTime::now();
+    let _before_store = SystemTime::now();
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata,
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
-    let after_store = SystemTime::now();
+    let _after_store = SystemTime::now();
 
     // Verify expiration time is set to PUT_TTL
     let stored_metadata = cache_manager
@@ -300,12 +318,12 @@ async fn test_put_cached_objects_not_in_ram_cache() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/no-ram-cache.txt";
@@ -323,7 +341,13 @@ async fn test_put_cached_objects_not_in_ram_cache() {
 
     // Store as write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata,
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -374,12 +398,12 @@ async fn test_put_storage_with_headers() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/with-headers.txt";
@@ -401,7 +425,13 @@ async fn test_put_storage_with_headers() {
 
     // Store with headers
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, headers.clone(), metadata.clone(), HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            headers.clone(),
+            metadata.clone(),
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -445,12 +475,12 @@ async fn test_multiple_put_operations_same_key() {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = "/test-bucket/overwrite-test.txt";
@@ -468,7 +498,13 @@ async fn test_multiple_put_operations_same_key() {
     };
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data_1, HashMap::new(), metadata_1, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data_1,
+            HashMap::new(),
+            metadata_1,
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -493,7 +529,13 @@ async fn test_multiple_put_operations_same_key() {
     };
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data_2, HashMap::new(), metadata_2, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data_2,
+            HashMap::new(),
+            metadata_2,
+            HashMap::new(),
+        )
         .await
         .unwrap();
 

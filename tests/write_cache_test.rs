@@ -34,12 +34,12 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         true,                       // write_cache_enabled: true - required for write cache tests
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     )
 }
 
@@ -68,7 +68,13 @@ async fn test_write_cache_basic_operations() -> Result<()> {
 
     // Store write cache entry
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata.clone(), HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata.clone(),
+            HashMap::new(),
+        )
         .await?;
 
     // Retrieve and verify
@@ -143,7 +149,13 @@ async fn test_write_cache_ttl_expiration() -> Result<()> {
     let metadata = create_test_metadata("expired-etag", test_data.len() as u64);
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata,
+            HashMap::new(),
+        )
         .await?;
 
     // Should exist and not be expired yet
@@ -171,7 +183,13 @@ async fn test_write_cache_cleanup() -> Result<()> {
     let metadata = create_test_metadata("cleanup-etag", test_data.len() as u64);
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata,
+            HashMap::new(),
+        )
         .await?;
 
     // Cleanup should remove the entry
@@ -198,10 +216,19 @@ async fn test_write_cache_statistics() -> Result<()> {
     let metadata = create_test_metadata("stats-etag", test_data.len() as u64);
 
     // Verify no entry exists before store
-    assert!(cache_manager.get_write_cache_entry(cache_key).await?.is_none());
+    assert!(cache_manager
+        .get_write_cache_entry(cache_key)
+        .await?
+        .is_none());
 
     cache_manager
-        .store_write_cache_entry(cache_key, test_data, HashMap::new(), metadata, HashMap::new())
+        .store_write_cache_entry(
+            cache_key,
+            test_data,
+            HashMap::new(),
+            metadata,
+            HashMap::new(),
+        )
         .await?;
 
     // Verify the entry was stored (write cache size tracking is async via JournalConsolidator,

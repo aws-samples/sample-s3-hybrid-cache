@@ -1046,7 +1046,7 @@ mod property_tests {
     #[quickcheck]
     fn prop_write_cache_eviction_order(num_objects: u8, use_tinylfu: bool) -> TestResult {
         // Filter invalid inputs
-        if num_objects < 2 || num_objects > 10 {
+        if !(2..=10).contains(&num_objects) {
             return TestResult::discard();
         }
 

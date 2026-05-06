@@ -294,7 +294,10 @@ impl SizeAccumulator {
     pub fn add(&self, compressed_size: u64) {
         self.delta
             .fetch_add(compressed_size as i64, Ordering::Relaxed);
-        debug!("SIZE_ACCUM add: +{} bytes, instance={}", compressed_size, self.instance_id);
+        debug!(
+            "SIZE_ACCUM add: +{} bytes, instance={}",
+            compressed_size, self.instance_id
+        );
     }
 
     /// Increment the total size delta with stampede deduplication.
@@ -334,7 +337,10 @@ impl SizeAccumulator {
     pub fn subtract(&self, compressed_size: u64) {
         self.delta
             .fetch_sub(compressed_size as i64, Ordering::Relaxed);
-        debug!("SIZE_ACCUM subtract: -{} bytes, instance={}", compressed_size, self.instance_id);
+        debug!(
+            "SIZE_ACCUM subtract: -{} bytes, instance={}",
+            compressed_size, self.instance_id
+        );
     }
 
     /// Decrement the write-cache size delta. Called after write-cached range eviction.
@@ -374,7 +380,8 @@ impl SizeAccumulator {
             Err(e) => {
                 // Restore values on failure so the delta is not lost
                 self.delta.fetch_add(delta, Ordering::Relaxed);
-                self.write_cache_delta.fetch_add(wc_delta, Ordering::Relaxed);
+                self.write_cache_delta
+                    .fetch_add(wc_delta, Ordering::Relaxed);
                 warn!(
                     "SIZE_ACCUM flush failed, restored: instance={}, delta={:+}, wc_delta={:+}, error={}",
                     self.instance_id, delta, wc_delta, e
@@ -390,12 +397,14 @@ impl SizeAccumulator {
     /// File name: `delta_{instance_id}_{sequence}.json`
     /// JSON format: {"delta": i64, "write_cache_delta": i64, "instance_id": string, "timestamp": string}
     async fn write_delta_file(&self, delta: i64, write_cache_delta: i64) -> Result<()> {
-        tokio::fs::create_dir_all(&self.size_tracking_dir).await.map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to create size_tracking directory {:?}: {}",
-                self.size_tracking_dir, e
-            ))
-        })?;
+        tokio::fs::create_dir_all(&self.size_tracking_dir)
+            .await
+            .map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to create size_tracking directory {:?}: {}",
+                    self.size_tracking_dir, e
+                ))
+            })?;
 
         let seq = self.flush_sequence.fetch_add(1, Ordering::Relaxed);
         let file_name = format!("delta_{}_{}.json", self.instance_id, seq);
@@ -487,7 +496,6 @@ fn get_instance_id() -> String {
     )
 }
 
-
 impl JournalConsolidator {
     /// Create a new journal consolidator
     pub fn new(
@@ -537,12 +545,10 @@ impl JournalConsolidator {
     fn has_pending_journal_files(&self) -> bool {
         let journals_dir = self.cache_dir.join("metadata").join("_journals");
         match std::fs::read_dir(&journals_dir) {
-            Ok(entries) => entries
-                .filter_map(|e| e.ok())
-                .any(|e| {
-                    e.path().extension().map_or(false, |ext| ext == "journal")
-                        && e.metadata().map_or(false, |m| m.len() > 0)
-                }),
+            Ok(entries) => entries.filter_map(|e| e.ok()).any(|e| {
+                e.path().extension().is_some_and(|ext| ext == "journal")
+                    && e.metadata().is_ok_and(|m| m.len() > 0)
+            }),
             Err(_) => false,
         }
     }
@@ -672,10 +678,7 @@ impl JournalConsolidator {
         let mut deleted_count = 0u32;
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if !file_name.starts_with("delta_") || !file_name.ends_with(".json") {
                 continue;
@@ -696,7 +699,10 @@ impl JournalConsolidator {
         }
 
         if deleted_count > 0 {
-            info!("SIZE_ACCUM reset_all: deleted {} delta files", deleted_count);
+            info!(
+                "SIZE_ACCUM reset_all: deleted {} delta files",
+                deleted_count
+            );
         }
     }
 
@@ -883,7 +889,8 @@ impl JournalConsolidator {
                     if range_spec.file_path.contains("mpus_in_progress/")
                         || object_metadata.is_write_cached
                     {
-                        self.size_accumulator.add_write_cache(range_spec.compressed_size);
+                        self.size_accumulator
+                            .add_write_cache(range_spec.compressed_size);
                     }
                 }
                 Err(e) => {
@@ -1049,14 +1056,17 @@ impl JournalConsolidator {
     }
 
     /// Get size state for metrics/dashboard (async version)
-    /// 
+    ///
     /// Reads from the shared disk file to ensure all instances see the same value.
     /// Returns default state if file doesn't exist or read fails.
     pub async fn get_size_state(&self) -> SizeState {
         match self.load_size_state().await {
             Ok(state) => state,
             Err(e) => {
-                debug!("Failed to read size state from disk, returning default: {}", e);
+                debug!(
+                    "Failed to read size state from disk, returning default: {}",
+                    e
+                );
                 SizeState::default()
             }
         }
@@ -1073,7 +1083,10 @@ impl JournalConsolidator {
         let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
         if let Some(parent) = lock_file_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                warn!("Failed to create size_tracking directory for object count update: {}", e);
+                warn!(
+                    "Failed to create size_tracking directory for object count update: {}",
+                    e
+                );
                 return;
             }
         }
@@ -1087,6 +1100,7 @@ impl JournalConsolidator {
                     let file = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
+                        .truncate(false)
                         .open(&lock_path)?;
                     file.lock_exclusive()?;
                     Ok::<_, std::io::Error>(file)
@@ -1106,7 +1120,10 @@ impl JournalConsolidator {
             Ok(s) => s,
             Err(e) => {
                 let _ = lock_file.unlock();
-                warn!("Failed to load size state for cached_objects decrement: {}", e);
+                warn!(
+                    "Failed to load size state for cached_objects decrement: {}",
+                    e
+                );
                 return;
             }
         };
@@ -1115,10 +1132,16 @@ impl JournalConsolidator {
         state.last_updated_by = get_instance_id();
 
         if let Err(e) = self.persist_size_state_internal(&state).await {
-            warn!("Failed to persist size state after cached_objects decrement: {}", e);
+            warn!(
+                "Failed to persist size state after cached_objects decrement: {}",
+                e
+            );
         }
         let _ = lock_file.unlock();
-        debug!("Decremented cached_objects by {}, new count={}", objects_removed, state.cached_objects);
+        debug!(
+            "Decremented cached_objects by {}, new count={}",
+            objects_removed, state.cached_objects
+        );
     }
 
     /// Atomically increment cached_objects count when a new object is first cached.
@@ -1132,7 +1155,10 @@ impl JournalConsolidator {
         let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
         if let Some(parent) = lock_file_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                warn!("Failed to create size_tracking directory for object count update: {}", e);
+                warn!(
+                    "Failed to create size_tracking directory for object count update: {}",
+                    e
+                );
                 return;
             }
         }
@@ -1146,6 +1172,7 @@ impl JournalConsolidator {
                     let file = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
+                        .truncate(false)
                         .open(&lock_path)?;
                     file.lock_exclusive()?;
                     Ok::<_, std::io::Error>(file)
@@ -1165,7 +1192,10 @@ impl JournalConsolidator {
             Ok(s) => s,
             Err(e) => {
                 let _ = lock_file.unlock();
-                warn!("Failed to load size state for cached_objects increment: {}", e);
+                warn!(
+                    "Failed to load size state for cached_objects increment: {}",
+                    e
+                );
                 return;
             }
         };
@@ -1174,10 +1204,16 @@ impl JournalConsolidator {
         state.last_updated_by = get_instance_id();
 
         if let Err(e) = self.persist_size_state_internal(&state).await {
-            warn!("Failed to persist size state after cached_objects increment: {}", e);
+            warn!(
+                "Failed to persist size state after cached_objects increment: {}",
+                e
+            );
         }
         let _ = lock_file.unlock();
-        debug!("Incremented cached_objects by {}, new count={}", objects_added, state.cached_objects);
+        debug!(
+            "Incremented cached_objects by {}, new count={}",
+            objects_added, state.cached_objects
+        );
     }
 
     /// Try to acquire the global consolidation lock
@@ -1204,7 +1240,10 @@ impl JournalConsolidator {
             return Ok(false);
         }
 
-        let lock_file_path = self.cache_dir.join("locks").join("global_consolidation.lock");
+        let lock_file_path = self
+            .cache_dir
+            .join("locks")
+            .join("global_consolidation.lock");
 
         // Ensure locks directory exists
         if let Some(parent_dir) = lock_file_path.parent() {
@@ -1221,6 +1260,7 @@ impl JournalConsolidator {
         let lock_file = match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_file_path)
         {
             Ok(file) => file,
@@ -1303,7 +1343,7 @@ impl JournalConsolidator {
                 SizeState::default()
             }
         };
-        
+
         let old_size = state.total_size;
         state.total_size = scanned_size;
         if let Some(wc_size) = write_cache_size {
@@ -1382,6 +1422,7 @@ impl JournalConsolidator {
                     let file = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
+                        .truncate(false)
                         .open(&lock_path)?;
                     file.lock_exclusive()?;
                     Ok::<_, std::io::Error>(file)
@@ -1407,7 +1448,9 @@ impl JournalConsolidator {
             }
             Err(_) => {
                 warn!("Size state lock timeout for delta update");
-                return Err(ProxyError::CacheError("Size state lock timeout".to_string()));
+                return Err(ProxyError::CacheError(
+                    "Size state lock timeout".to_string(),
+                ));
             }
         };
 
@@ -1482,14 +1525,14 @@ impl JournalConsolidator {
     pub async fn atomic_subtract_size(&self, bytes_freed: u64) -> Result<u64> {
         #[allow(unused_imports)]
         use fs2::FileExt;
-        
+
         if bytes_freed == 0 {
             return Ok(self.get_current_size().await);
         }
 
         // Use a dedicated lock file for size state updates
         let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
-        
+
         // Ensure directory exists
         if let Some(parent) = lock_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -1507,6 +1550,7 @@ impl JournalConsolidator {
                     let file = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
+                        .truncate(false)
                         .open(&lock_path)?;
                     file.lock_exclusive()?;
                     Ok::<_, std::io::Error>(file)
@@ -1532,7 +1576,9 @@ impl JournalConsolidator {
             }
             Err(_) => {
                 warn!("Size state lock timeout");
-                return Err(ProxyError::CacheError("Size state lock timeout".to_string()));
+                return Err(ProxyError::CacheError(
+                    "Size state lock timeout".to_string(),
+                ));
             }
         };
 
@@ -1586,14 +1632,14 @@ impl JournalConsolidator {
     pub async fn atomic_add_size(&self, bytes_added: u64) -> Result<u64> {
         #[allow(unused_imports)]
         use fs2::FileExt;
-        
+
         if bytes_added == 0 {
             return Ok(self.get_current_size().await);
         }
 
         // Use a dedicated lock file for size state updates
         let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
-        
+
         // Ensure directory exists
         if let Some(parent) = lock_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -1611,6 +1657,7 @@ impl JournalConsolidator {
                     let file = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
+                        .truncate(false)
                         .open(&lock_path)?;
                     file.lock_exclusive()?;
                     Ok::<_, std::io::Error>(file)
@@ -1636,7 +1683,9 @@ impl JournalConsolidator {
             }
             Err(_) => {
                 warn!("Size state lock timeout for add");
-                return Err(ProxyError::CacheError("Size state lock timeout".to_string()));
+                return Err(ProxyError::CacheError(
+                    "Size state lock timeout".to_string(),
+                ));
             }
         };
 
@@ -1711,14 +1760,15 @@ impl JournalConsolidator {
                             .follow_links(false)
                             .into_iter()
                             .filter_map(|e| e.ok())
-                            .filter(|e| e.path().extension().map_or(false, |ext| ext == "meta"))
+                            .filter(|e| e.path().extension().is_some_and(|ext| ext == "meta"))
                             .count() as u64
                     })
                     .await
                     .unwrap_or(0);
 
                     if count > 0 {
-                        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
+                        let lock_file_path =
+                            self.cache_dir.join("size_tracking").join("size_state.lock");
                         let lock_acquired = tokio::time::timeout(
                             std::time::Duration::from_secs(10),
                             tokio::task::spawn_blocking({
@@ -1728,6 +1778,7 @@ impl JournalConsolidator {
                                     let file = std::fs::OpenOptions::new()
                                         .create(true)
                                         .write(true)
+                                        .truncate(false)
                                         .open(&lock_path)?;
                                     file.lock_exclusive()?;
                                     Ok::<_, std::io::Error>(file)
@@ -1744,7 +1795,10 @@ impl JournalConsolidator {
                                 updated.cached_objects = count;
                                 updated.last_updated_by = get_instance_id();
                                 if let Err(e) = self.persist_size_state_internal(&updated).await {
-                                    warn!("Failed to persist cached_objects after startup scan: {}", e);
+                                    warn!(
+                                        "Failed to persist cached_objects after startup scan: {}",
+                                        e
+                                    );
                                 } else {
                                     info!("Initialized cached_objects={} from startup .meta file count", count);
                                 }
@@ -1753,7 +1807,9 @@ impl JournalConsolidator {
                             }
                             let _ = lock_file.unlock();
                         } else {
-                            warn!("Could not acquire size state lock for cached_objects startup init");
+                            warn!(
+                                "Could not acquire size state lock for cached_objects startup init"
+                            );
                         }
                     }
                 }
@@ -1777,8 +1833,9 @@ impl JournalConsolidator {
     /// Returns (eviction_triggered, bytes_freed).
     ///
     /// # Arguments
+    ///
     /// * `known_size` - Optional pre-fetched current size to avoid extra NFS read.
-    ///                  If None, will read from disk.
+    ///   If None, will read from disk.
     async fn maybe_trigger_eviction(&self, known_size: Option<u64>) -> (bool, u64) {
         // Check if max_cache_size is configured (0 means disabled)
         if self.config.max_cache_size == 0 {
@@ -1794,7 +1851,8 @@ impl JournalConsolidator {
         // Calculate trigger threshold using configurable percentage
         // Requirement 3.3: Trigger eviction when current_size > max_size * trigger_percent / 100
         let trigger_threshold = (self.config.max_cache_size as f64
-            * (self.config.eviction_trigger_percent as f64 / 100.0)) as u64;
+            * (self.config.eviction_trigger_percent as f64 / 100.0))
+            as u64;
 
         // Check if we're over the trigger threshold
         if current_size <= trigger_threshold {
@@ -1855,10 +1913,7 @@ impl JournalConsolidator {
             {
                 Ok(bytes_freed) => {
                     if bytes_freed > 0 {
-                        info!(
-                            "Background eviction completed: bytes_freed={}",
-                            bytes_freed
-                        );
+                        info!("Background eviction completed: bytes_freed={}", bytes_freed);
                     }
                 }
                 Err(e) => {
@@ -1954,13 +2009,14 @@ impl JournalConsolidator {
 
         // Collect and apply deltas from all instances' delta files (under global lock)
         // This replaces the journal-based size tracking with accumulator-based tracking
-        let (accumulator_size_delta, accumulator_wc_delta) = match self.collect_and_apply_deltas().await {
-            Ok(deltas) => deltas,
-            Err(e) => {
-                warn!("Failed to collect and apply deltas: {}", e);
-                (0, 0)
-            }
-        };
+        let (accumulator_size_delta, accumulator_wc_delta) =
+            match self.collect_and_apply_deltas().await {
+                Ok(deltas) => deltas,
+                Err(e) => {
+                    warn!("Failed to collect and apply deltas: {}", e);
+                    (0, 0)
+                }
+            };
 
         // Apply accumulator deltas to size state (with clamping to 0)
         if accumulator_size_delta != 0 || accumulator_wc_delta != 0 {
@@ -1980,13 +2036,17 @@ impl JournalConsolidator {
 
         // Discover pending cache keys with index, capped to limit NFS I/O
         let max_keys = self.config.max_keys_per_cycle;
-        let discovery = match self.discover_pending_cache_keys_indexed_capped(max_keys).await {
+        let discovery = match self
+            .discover_pending_cache_keys_indexed_capped(max_keys)
+            .await
+        {
             Ok(result) => result,
             Err(e) => {
                 warn!("Failed to discover pending journal entries: {}", e);
                 // Even on error, check if eviction is needed
                 let current_size = self.get_current_size().await;
-                let (eviction_triggered, bytes_evicted) = self.maybe_trigger_eviction(Some(current_size)).await;
+                let (eviction_triggered, bytes_evicted) =
+                    self.maybe_trigger_eviction(Some(current_size)).await;
                 return Ok(ConsolidationCycleResult {
                     keys_processed: 0,
                     entries_consolidated: 0,
@@ -2007,7 +2067,8 @@ impl JournalConsolidator {
         // This handles the case where cache is over capacity but no new data is being added
         if cache_keys.is_empty() {
             let current_size = self.get_current_size().await;
-            let (eviction_triggered, bytes_evicted) = self.maybe_trigger_eviction(Some(current_size)).await;
+            let (eviction_triggered, bytes_evicted) =
+                self.maybe_trigger_eviction(Some(current_size)).await;
             return Ok(ConsolidationCycleResult {
                 keys_processed: 0,
                 entries_consolidated: 0,
@@ -2026,8 +2087,8 @@ impl JournalConsolidator {
 
         // Accumulate results across all cache keys
         let mut total_entries_consolidated = 0;
-        let mut _total_size_delta: i64 = 0;  // Kept for debugging, not used for size tracking
-        let mut _total_write_cache_delta: i64 = 0;  // Kept for debugging, not used for size tracking
+        let mut _total_size_delta: i64 = 0; // Kept for debugging, not used for size tracking
+        let mut _total_write_cache_delta: i64 = 0; // Kept for debugging, not used for size tracking
         let mut all_consolidated_entries = Vec::new();
         let mut new_objects_count: u64 = 0;
         let mut keys_processed = 0;
@@ -2041,12 +2102,11 @@ impl JournalConsolidator {
             .map(|cache_key| {
                 let cache_key = cache_key.clone();
                 // Clone the file list for this key from the index so the async block is 'static
-                let journal_files = key_index
-                    .get(&cache_key)
-                    .cloned()
-                    .unwrap_or_default();
+                let journal_files = key_index.get(&cache_key).cloned().unwrap_or_default();
                 async move {
-                    let result = self.consolidate_object_with_files(&cache_key, &journal_files).await;
+                    let result = self
+                        .consolidate_object_with_files(&cache_key, &journal_files)
+                        .await;
                     (cache_key, result)
                 }
             })
@@ -2054,10 +2114,8 @@ impl JournalConsolidator {
 
         // Process results incrementally with the deadline set before discovery.
         // Completed keys are counted and cleaned up even when the deadline fires.
-        let mut stream = std::pin::pin!(
-            stream::iter(key_futures)
-                .buffer_unordered(KEY_CONCURRENCY_LIMIT)
-        );
+        let mut stream =
+            std::pin::pin!(stream::iter(key_futures).buffer_unordered(KEY_CONCURRENCY_LIMIT));
 
         loop {
             match tokio::time::timeout_at(deadline, stream.next()).await {
@@ -2126,12 +2184,13 @@ impl JournalConsolidator {
         if new_objects_count > 0 {
             self.increment_cached_objects(new_objects_count).await;
         }
-        
+
         // Get current size and check if eviction is needed
         // Always check eviction at the end of every cycle, not just when size_delta > 0
         // This ensures eviction triggers even during idle periods when cache is over capacity
         let current_size = self.get_current_size().await;
-        let (eviction_triggered, bytes_evicted) = self.maybe_trigger_eviction(Some(current_size)).await;
+        let (eviction_triggered, bytes_evicted) =
+            self.maybe_trigger_eviction(Some(current_size)).await;
 
         // Log summary if there was activity
         if total_entries_consolidated > 0 || eviction_triggered || accumulator_size_delta != 0 {
@@ -2145,7 +2204,7 @@ impl JournalConsolidator {
         Ok(ConsolidationCycleResult {
             keys_processed,
             entries_consolidated: total_entries_consolidated,
-            size_delta: accumulator_size_delta,  // Use accumulator delta (what was actually applied)
+            size_delta: accumulator_size_delta, // Use accumulator delta (what was actually applied)
             cycle_duration,
             eviction_triggered,
             bytes_evicted,
@@ -2233,7 +2292,9 @@ impl JournalConsolidator {
         // Entries with missing range files but recent timestamps are NOT returned - they stay in
         // journal for retry on next consolidation cycle. This prevents counting size for ranges
         // that don't exist on disk yet (e.g., due to NFS caching delays).
-        let (valid_entries, stale_entries) = self.validate_journal_entries_with_staleness(&all_entries).await;
+        let (valid_entries, stale_entries) = self
+            .validate_journal_entries_with_staleness(&all_entries)
+            .await;
         let stale_count = stale_entries.len();
         // Pending entries are those with missing range files but recent timestamps
         // They are NOT in valid_entries or stale_entries - they stay in journal for retry
@@ -2312,7 +2373,8 @@ impl JournalConsolidator {
         // only entries that affect size tracking (Add entries that weren't skipped, Remove entries)
         // NOTE: size_affecting_entries is no longer used for size tracking - size is now tracked
         // at write/eviction time via the in-memory accumulator (see SizeAccumulator).
-        let (entries_consolidated, _size_affecting_entries) = self.apply_journal_entries(&mut metadata, &valid_entries);
+        let (entries_consolidated, _size_affecting_entries) =
+            self.apply_journal_entries(&mut metadata, &valid_entries);
 
         // Size tracking is handled by the accumulator at write/eviction time, not during consolidation.
         // Journal entries are processed only for metadata updates via apply_journal_entries() above.
@@ -2594,7 +2656,9 @@ impl JournalConsolidator {
 
         for entry in entries {
             // Check if the range file exists
-            let range_file_path = match self.get_range_file_path(&entry.cache_key, &entry.range_spec) {
+            let range_file_path = match self
+                .get_range_file_path(&entry.cache_key, &entry.range_spec)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(
@@ -2695,16 +2759,17 @@ impl JournalConsolidator {
             // TtlRefresh and AccessUpdate are object-level operations that don't target
             // a specific range file. They update object metadata (expires_at, access_count).
             // Validate by checking the metadata file exists instead of a range file.
-            if matches!(entry.operation, JournalOperation::TtlRefresh | JournalOperation::AccessUpdate) {
+            if matches!(
+                entry.operation,
+                JournalOperation::TtlRefresh | JournalOperation::AccessUpdate
+            ) {
                 let metadata_base_dir = self.cache_dir.join("metadata");
                 let metadata_path = crate::disk_cache::get_sharded_path(
                     &metadata_base_dir,
                     &entry.cache_key,
                     ".meta",
                 );
-                let metadata_exists = metadata_path
-                    .as_ref()
-                    .map_or(false, |p| p.exists());
+                let metadata_exists = metadata_path.as_ref().is_ok_and(|p| p.exists());
                 if metadata_exists {
                     valid_entries.push(entry.clone());
                     debug!(
@@ -2712,7 +2777,9 @@ impl JournalConsolidator {
                         entry.cache_key, entry.operation
                     );
                 } else {
-                    let entry_age = now.duration_since(entry.timestamp).unwrap_or(Duration::ZERO);
+                    let entry_age = now
+                        .duration_since(entry.timestamp)
+                        .unwrap_or(Duration::ZERO);
                     if entry_age > stale_timeout {
                         stale_entries.push(entry.clone());
                         debug!(
@@ -2730,7 +2797,9 @@ impl JournalConsolidator {
             }
 
             // Check if the range file exists
-            let range_file_path = match self.get_range_file_path(&entry.cache_key, &entry.range_spec) {
+            let range_file_path = match self
+                .get_range_file_path(&entry.cache_key, &entry.range_spec)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(
@@ -2751,8 +2820,10 @@ impl JournalConsolidator {
             } else {
                 // Range file doesn't exist - check if entry is stale based on timestamp
                 // Entry is stale if: entry.timestamp + stale_timeout < now
-                let entry_age = now.duration_since(entry.timestamp).unwrap_or(Duration::ZERO);
-                
+                let entry_age = now
+                    .duration_since(entry.timestamp)
+                    .unwrap_or(Duration::ZERO);
+
                 if entry_age > stale_timeout {
                     // Entry is stale - mark for removal
                     stale_entries.push(entry.clone());
@@ -2928,7 +2999,7 @@ impl JournalConsolidator {
                     entries_applied += 1;
                     // Always count Remove entries for size tracking (file was deleted)
                     size_affecting_entries.push(entry.clone());
-                    
+
                     if metadata.ranges.len() < original_len {
                         debug!(
                             "Applied REMOVE journal entry: cache_key={}, range={}-{}",
@@ -3066,9 +3137,10 @@ impl JournalConsolidator {
             }
 
             // Use TTL from first Add journal entry, or Duration::ZERO (immediately expired) as safe default
-            let object_ttl = journal_entries.iter()
+            let object_ttl = journal_entries
+                .iter()
                 .find_map(|e| e.object_ttl_secs)
-                .map(|secs| Duration::from_secs(secs))
+                .map(Duration::from_secs)
                 .unwrap_or(Duration::ZERO);
 
             Ok(NewCacheMetadata {
@@ -3183,16 +3255,19 @@ impl JournalConsolidator {
         // determine this by checking which files contain entries for each key
         // (from the key_index built during discovery). Instead, build a HashSet
         // for matching and count per-file during the scan.
-        let consolidated_set: HashSet<(String, u64, u64, SystemTime, String)> = consolidated_entries
-            .iter()
-            .map(|ce| (
-                ce.cache_key.clone(),
-                ce.range_spec.start,
-                ce.range_spec.end,
-                ce.timestamp,
-                ce.instance_id.clone(),
-            ))
-            .collect();
+        let consolidated_set: HashSet<(String, u64, u64, SystemTime, String)> =
+            consolidated_entries
+                .iter()
+                .map(|ce| {
+                    (
+                        ce.cache_key.clone(),
+                        ce.range_spec.start,
+                        ce.range_spec.end,
+                        ce.timestamp,
+                        ce.instance_id.clone(),
+                    )
+                })
+                .collect();
 
         let journal_files = std::fs::read_dir(&journals_dir).map_err(|e| {
             ProxyError::CacheError(format!("Failed to read journals directory: {}", e))
@@ -3232,11 +3307,9 @@ impl JournalConsolidator {
             // skip it — its entries weren't processed this cycle.
             // When file_entry_counts is empty (e.g., called from tests or outside the
             // discovery flow), process all journal files (fallback to old behavior).
-            if !file_entry_counts.is_empty() {
-                if !file_entry_counts.contains_key(&journal_path) {
-                    files_skipped += 1;
-                    continue;
-                }
+            if !file_entry_counts.is_empty() && !file_entry_counts.contains_key(&journal_path) {
+                files_skipped += 1;
+                continue;
             }
 
             // Acquire file-level lock to prevent races with append operations
@@ -3380,7 +3453,9 @@ impl JournalConsolidator {
                         files_rewritten += 1;
                         debug!(
                             "Rewritten journal file: path={:?}, removed={}, remaining={}",
-                            journal_path, removed_count, remaining_entries.len()
+                            journal_path,
+                            removed_count,
+                            remaining_entries.len()
                         );
                     }
                     Err(e) => {
@@ -3496,7 +3571,10 @@ impl JournalConsolidator {
         let entries = match std::fs::read_dir(&journals_dir) {
             Ok(e) => e,
             Err(e) => {
-                warn!("Failed to read journals dir for dead instance cleanup: {}", e);
+                warn!(
+                    "Failed to read journals dir for dead instance cleanup: {}",
+                    e
+                );
                 return;
             }
         };
@@ -3829,12 +3907,14 @@ mod tests {
 
         // Without creating the range file, validation should filter it out
         let valid_entries = consolidator
-            .validate_journal_entries(&[entry.clone()])
+            .validate_journal_entries(std::slice::from_ref(&entry))
             .await;
         assert_eq!(valid_entries.len(), 0);
 
         // Create the range file
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
+        let range_file_path = consolidator
+            .get_range_file_path(cache_key, &range_spec)
+            .unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -3938,7 +4018,8 @@ mod tests {
             // (entries are already in reverse timestamp order)
 
             // Apply entries - consolidator should sort by timestamp
-            let (entries_applied, _applied_entries) = consolidator.apply_journal_entries(&mut metadata, &entries);
+            let (entries_applied, _applied_entries) =
+                consolidator.apply_journal_entries(&mut metadata, &entries);
 
             // Property 1: All entries should be applied
             if entries_applied != num_entries as usize {
@@ -4125,7 +4206,8 @@ mod tests {
             ];
 
             // Apply all entries
-            let (entries_applied, _applied_entries) = consolidator.apply_journal_entries(&mut metadata, &entries);
+            let (entries_applied, _applied_entries) =
+                consolidator.apply_journal_entries(&mut metadata, &entries);
 
             // Property 1: All 4 entries should be applied
             if entries_applied != 4 {
@@ -4286,7 +4368,7 @@ mod tests {
 
         // Create a state to persist
         let state = SizeState {
-            total_size: 1024 * 1024 * 50, // 50MB
+            total_size: 1024 * 1024 * 50,      // 50MB
             write_cache_size: 1024 * 1024 * 5, // 5MB
             cached_objects: 0,
             consolidation_count: 10,
@@ -4298,7 +4380,10 @@ mod tests {
         consolidator.persist_size_state(&state).await.unwrap();
 
         // Verify file exists
-        let size_state_path = temp_dir.path().join("size_tracking").join("size_state.json");
+        let size_state_path = temp_dir
+            .path()
+            .join("size_tracking")
+            .join("size_state.json");
         assert!(size_state_path.exists());
 
         // Load and verify
@@ -4407,7 +4492,7 @@ mod tests {
 
         // Persist a state to disk
         let state = SizeState {
-            total_size: 1024 * 1024 * 200, // 200MB
+            total_size: 1024 * 1024 * 200,      // 200MB
             write_cache_size: 1024 * 1024 * 20, // 20MB
             cached_objects: 0,
             consolidation_count: 100,
@@ -4481,7 +4566,10 @@ mod tests {
 
         // Directory should now exist
         assert!(size_tracking_dir.exists());
-        let size_state_path = temp_dir.path().join("size_tracking").join("size_state.json");
+        let size_state_path = temp_dir
+            .path()
+            .join("size_tracking")
+            .join("size_state.json");
         assert!(size_state_path.exists());
     }
 
@@ -4635,7 +4723,9 @@ mod tests {
         };
 
         // Create the range file so validation passes
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
+        let range_file_path = consolidator
+            .get_range_file_path(cache_key, &range_spec)
+            .unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -4645,7 +4735,9 @@ mod tests {
 
         // Simulate what store_range() does: add size to accumulator
         // In the real code path, store_range() calls accumulator.add() after writing the range file
-        consolidator.size_accumulator().add(range_spec.compressed_size);
+        consolidator
+            .size_accumulator()
+            .add(range_spec.compressed_size);
 
         // Write journal entry
         let entry = JournalEntry {
@@ -4712,7 +4804,10 @@ mod tests {
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
         };
-        consolidator.persist_size_state(&initial_state).await.unwrap();
+        consolidator
+            .persist_size_state(&initial_state)
+            .await
+            .unwrap();
 
         // Create a journal entry for an Add operation
         let cache_key = "test-bucket/test-object2";
@@ -4731,7 +4826,9 @@ mod tests {
         };
 
         // Create the range file
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
+        let range_file_path = consolidator
+            .get_range_file_path(cache_key, &range_spec)
+            .unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -4741,7 +4838,9 @@ mod tests {
 
         // Simulate what store_range() does: add size to accumulator
         // In the real code path, store_range() calls accumulator.add() after writing the range file
-        consolidator.size_accumulator().add(range_spec.compressed_size);
+        consolidator
+            .size_accumulator()
+            .add(range_spec.compressed_size);
 
         // Write journal entry
         let entry = JournalEntry {
@@ -4833,7 +4932,10 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify size state was persisted
-        let size_state_path = temp_dir.path().join("size_tracking").join("size_state.json");
+        let size_state_path = temp_dir
+            .path()
+            .join("size_tracking")
+            .join("size_state.json");
         assert!(size_state_path.exists());
 
         // Read and verify the persisted state
@@ -4881,7 +4983,9 @@ mod tests {
         };
 
         // Create the range file
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
+        let range_file_path = consolidator
+            .get_range_file_path(cache_key, &range_spec)
+            .unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -4891,7 +4995,9 @@ mod tests {
 
         // Simulate what store_range() does: add size to accumulator
         // In the real code path, store_range() calls accumulator.add() after writing the range file
-        consolidator.size_accumulator().add(range_spec.compressed_size);
+        consolidator
+            .size_accumulator()
+            .add(range_spec.compressed_size);
 
         // Write journal entry
         let entry = JournalEntry {
@@ -4918,7 +5024,10 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify size state reflects the consolidated entry
-        let size_state_path = temp_dir.path().join("size_tracking").join("size_state.json");
+        let size_state_path = temp_dir
+            .path()
+            .join("size_tracking")
+            .join("size_state.json");
         let content = tokio::fs::read_to_string(&size_state_path).await.unwrap();
         let persisted_state: SizeState = serde_json::from_str(&content).unwrap();
         assert_eq!(persisted_state.total_size, 512); // The Add operation added 512 bytes
@@ -5156,18 +5265,22 @@ mod tests {
             // Find the delta file (append-only: one file per flush with sequence number)
             let size_tracking_dir = temp_dir.path().join("size_tracking");
             let mut found_file = None;
-            let mut read_dir = tokio::fs::read_dir(&size_tracking_dir).await
+            let mut read_dir = tokio::fs::read_dir(&size_tracking_dir)
+                .await
                 .expect("size_tracking dir should exist after flush");
             while let Some(entry) = read_dir.next_entry().await.unwrap() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("delta_test-flush-rt_") && name.ends_with(".json") && !name.ends_with(".json.tmp") {
+                if name.starts_with("delta_test-flush-rt_")
+                    && name.ends_with(".json")
+                    && !name.ends_with(".json.tmp")
+                {
                     found_file = Some(entry.path());
                     break;
                 }
             }
             let delta_file_path = found_file.expect("delta file should exist after flush");
-            let content = std::fs::read_to_string(&delta_file_path)
-                .expect("delta file should be readable");
+            let content =
+                std::fs::read_to_string(&delta_file_path).expect("delta file should be readable");
             let json: serde_json::Value =
                 serde_json::from_str(&content).expect("delta file should contain valid JSON");
 
@@ -5198,9 +5311,7 @@ mod tests {
 
             let timestamp = json.get("timestamp").and_then(|v| v.as_str());
             if timestamp.is_none() {
-                return TestResult::error(
-                    "delta file missing timestamp string field".to_string(),
-                );
+                return TestResult::error("delta file missing timestamp string field".to_string());
             }
 
             TestResult::passed()
@@ -5230,34 +5341,27 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    temp_dir.path(),
-                    std::fs::Permissions::from_mode(0o444),
-                )
-                .expect("failed to set read-only permissions");
+                std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o444))
+                    .expect("failed to set read-only permissions");
             }
 
             let acc = SizeAccumulator::new(temp_dir.path(), "test-fail".to_string());
 
-            // Build up the expected delta and write_cache_delta
-            let expected_delta: i64;
-            let expected_wc_delta: i64;
-
-            if delta_val >= 0 {
+            let expected_delta: i64 = if delta_val >= 0 {
                 acc.add(delta_val as u64);
-                expected_delta = delta_val as i64;
+                delta_val as i64
             } else {
                 acc.subtract(delta_val.unsigned_abs() as u64);
-                expected_delta = -(delta_val.unsigned_abs() as i64);
-            }
+                -(delta_val.unsigned_abs() as i64)
+            };
 
-            if wc_delta_val >= 0 {
+            let expected_wc_delta: i64 = if wc_delta_val >= 0 {
                 acc.add_write_cache(wc_delta_val as u64);
-                expected_wc_delta = wc_delta_val as i64;
+                wc_delta_val as i64
             } else {
                 acc.subtract_write_cache(wc_delta_val.unsigned_abs() as u64);
-                expected_wc_delta = -(wc_delta_val.unsigned_abs() as i64);
-            }
+                -(wc_delta_val.unsigned_abs() as i64)
+            };
 
             // flush() should fail because the directory is read-only
             let result = acc.flush().await;
@@ -5409,11 +5513,10 @@ mod tests {
             }
 
             // Property 3: all delta files SHALL be deleted after collection
-            for i in 0..file_deltas.len() {
+            for (i, &(d, w)) in file_deltas.iter().enumerate() {
                 let path = size_tracking_dir.join(format!("delta_instance-{}.json", i));
                 if path.exists() {
                     // Zero-delta files are skipped (not deleted), so only check non-zero ones
-                    let (d, w) = file_deltas[i];
                     if d != 0 || w != 0 {
                         return TestResult::error(format!(
                             "delta file {} still exists after collection (had non-zero delta)",
@@ -5543,12 +5646,8 @@ mod tests {
         }
 
         // Over threshold — attempt the guard
-        let exchange_result = eviction_in_progress.compare_exchange(
-            false,
-            true,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        let exchange_result =
+            eviction_in_progress.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
 
         if guard_state {
             // Guard was already true → compare_exchange should fail
@@ -5557,9 +5656,8 @@ mod tests {
                 "compare_exchange must fail when guard is already true"
             );
             // The function would return (false, 0) — skip spawning
-            assert_eq!(
+            assert!(
                 eviction_in_progress.load(Ordering::SeqCst),
-                true,
                 "Guard must remain true after failed exchange"
             );
         } else {
@@ -5569,9 +5667,8 @@ mod tests {
                 "compare_exchange must succeed when guard is false"
             );
             // The function would return (true, 0) — spawn eviction
-            assert_eq!(
+            assert!(
                 eviction_in_progress.load(Ordering::SeqCst),
-                true,
                 "Guard must be true after successful exchange"
             );
         }
@@ -5598,9 +5695,11 @@ mod tests {
             3,
         ));
 
-        let mut config = ConsolidationConfig::default();
-        config.max_cache_size = 1000;
-        config.eviction_trigger_percent = 95; // threshold = 950
+        let config = ConsolidationConfig {
+            max_cache_size: 1000,
+            eviction_trigger_percent: 95, // threshold = 950
+            ..ConsolidationConfig::default()
+        };
 
         let consolidator = JournalConsolidator::new(
             temp_dir.path().to_path_buf(),
@@ -5617,12 +5716,11 @@ mod tests {
         // Call with size over threshold (1000 > 950)
         let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(1000)).await;
 
-        assert_eq!(triggered, false, "Should not trigger when guard is already true");
+        assert!(!triggered, "Should not trigger when guard is already true");
         assert_eq!(bytes, 0, "Bytes should be 0 when skipping");
         // Guard should remain true (unchanged)
-        assert_eq!(
+        assert!(
             consolidator.eviction_in_progress.load(Ordering::SeqCst),
-            true,
             "Guard should remain true after skip"
         );
     }
@@ -5644,9 +5742,11 @@ mod tests {
             3,
         ));
 
-        let mut config = ConsolidationConfig::default();
-        config.max_cache_size = 1000;
-        config.eviction_trigger_percent = 95; // threshold = 950
+        let config = ConsolidationConfig {
+            max_cache_size: 1000,
+            eviction_trigger_percent: 95, // threshold = 950
+            ..ConsolidationConfig::default()
+        };
 
         let consolidator = JournalConsolidator::new(
             temp_dir.path().to_path_buf(),
@@ -5656,9 +5756,8 @@ mod tests {
         );
 
         // Guard starts false
-        assert_eq!(
-            consolidator.eviction_in_progress.load(Ordering::SeqCst),
-            false,
+        assert!(
+            !consolidator.eviction_in_progress.load(Ordering::SeqCst),
             "Guard should start as false"
         );
 
@@ -5667,12 +5766,14 @@ mod tests {
         // This validates the guard acquisition + reset-on-failure path.
         let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(1000)).await;
 
-        assert_eq!(triggered, false, "Should return false when cache_manager unavailable");
+        assert!(
+            !triggered,
+            "Should return false when cache_manager unavailable"
+        );
         assert_eq!(bytes, 0);
         // Guard should be reset to false after the cache_manager failure path
-        assert_eq!(
-            consolidator.eviction_in_progress.load(Ordering::SeqCst),
-            false,
+        assert!(
+            !consolidator.eviction_in_progress.load(Ordering::SeqCst),
             "Guard should be reset to false after cache_manager unavailable"
         );
     }
@@ -5693,9 +5794,11 @@ mod tests {
             3,
         ));
 
-        let mut config = ConsolidationConfig::default();
-        config.max_cache_size = 1000;
-        config.eviction_trigger_percent = 95; // threshold = 950
+        let config = ConsolidationConfig {
+            max_cache_size: 1000,
+            eviction_trigger_percent: 95, // threshold = 950
+            ..ConsolidationConfig::default()
+        };
 
         let consolidator = JournalConsolidator::new(
             temp_dir.path().to_path_buf(),
@@ -5707,12 +5810,11 @@ mod tests {
         // Call with size under threshold (500 <= 950)
         let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(500)).await;
 
-        assert_eq!(triggered, false, "Should not trigger when under threshold");
+        assert!(!triggered, "Should not trigger when under threshold");
         assert_eq!(bytes, 0);
         // Guard should remain false (never touched)
-        assert_eq!(
-            consolidator.eviction_in_progress.load(Ordering::SeqCst),
-            false,
+        assert!(
+            !consolidator.eviction_in_progress.load(Ordering::SeqCst),
             "Guard should remain false when under threshold"
         );
     }
@@ -5726,18 +5828,16 @@ mod tests {
         let eviction_in_progress = Arc::new(AtomicBool::new(false));
 
         // Simulate the guard acquisition (compare_exchange in maybe_trigger_eviction)
-        let result = eviction_in_progress.compare_exchange(
-            false,
-            true,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+        let result =
+            eviction_in_progress.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(
+            result.is_ok(),
+            "compare_exchange should succeed when guard is false"
         );
-        assert!(result.is_ok(), "compare_exchange should succeed when guard is false");
 
         // Guard is true immediately after acquisition (Requirement 1.2)
-        assert_eq!(
+        assert!(
             eviction_in_progress.load(Ordering::SeqCst),
-            true,
             "Guard must be true immediately after compare_exchange succeeds"
         );
 
@@ -5760,9 +5860,8 @@ mod tests {
         handle.await.unwrap();
 
         // Guard should be false after task completes (Requirement 1.3)
-        assert_eq!(
-            eviction_in_progress.load(Ordering::SeqCst),
-            false,
+        assert!(
+            !eviction_in_progress.load(Ordering::SeqCst),
             "Guard must be false after spawned task completes (scopeguard reset)"
         );
     }
@@ -5794,7 +5893,7 @@ mod tests {
 
         let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(999999)).await;
 
-        assert_eq!(triggered, false, "Should not trigger when max_cache_size is 0");
+        assert!(!triggered, "Should not trigger when max_cache_size is 0");
         assert_eq!(bytes, 0);
     }
 
@@ -5804,9 +5903,7 @@ mod tests {
     /// shall equal the total number of discovered keys — no `.take()` truncation occurs.
     /// **Validates: Requirements 1.1**
     #[quickcheck]
-    fn prop_all_discovered_keys_submitted_for_processing(
-        key_count: u16,
-    ) -> TestResult {
+    fn prop_all_discovered_keys_submitted_for_processing(key_count: u16) -> TestResult {
         // Constrain to 0..=500 keys
         let key_count = (key_count % 501) as usize;
 
@@ -5918,13 +6015,15 @@ mod tests {
         let consolidated_set: HashSet<(String, u64, u64, SystemTime, String)> =
             consolidated_entries
                 .iter()
-                .map(|ce| (
-                    ce.cache_key.clone(),
-                    ce.range_spec.start,
-                    ce.range_spec.end,
-                    ce.timestamp,
-                    ce.instance_id.clone(),
-                ))
+                .map(|ce| {
+                    (
+                        ce.cache_key.clone(),
+                        ce.range_spec.start,
+                        ce.range_spec.end,
+                        ce.timestamp,
+                        ce.instance_id.clone(),
+                    )
+                })
                 .collect();
 
         let mut new_removed = Vec::new();
@@ -5970,28 +6069,25 @@ mod tests {
         let eviction_in_progress = Arc::new(AtomicBool::new(false));
 
         // First acquisition succeeds
-        let first = eviction_in_progress.compare_exchange(
-            false,
-            true,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        let first =
+            eviction_in_progress.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
         assert!(first.is_ok(), "First compare_exchange should succeed");
 
         // Second acquisition fails (guard already true)
-        let second = eviction_in_progress.compare_exchange(
-            false,
-            true,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+        let second =
+            eviction_in_progress.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(
+            second.is_err(),
+            "Second compare_exchange must fail when guard is true"
         );
-        assert!(second.is_err(), "Second compare_exchange must fail when guard is true");
-        assert_eq!(second.unwrap_err(), true, "Failed exchange should return current value (true)");
+        assert!(
+            second.unwrap_err(),
+            "Failed exchange should return current value (true)"
+        );
 
         // Guard remains true
-        assert_eq!(
+        assert!(
             eviction_in_progress.load(Ordering::SeqCst),
-            true,
             "Guard must remain true after failed second acquisition"
         );
     }
@@ -6017,7 +6113,10 @@ mod tests {
         );
 
         let result = consolidator.get_metadata_file_path("noslash");
-        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
+        assert!(
+            result.is_err(),
+            "Malformed cache key must return Err, got Ok"
+        );
     }
 
     #[tokio::test]
@@ -6042,6 +6141,9 @@ mod tests {
 
         let range_spec = create_test_range_spec(0, 100);
         let result = consolidator.get_range_file_path("noslash", &range_spec);
-        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
+        assert!(
+            result.is_err(),
+            "Malformed cache key must return Err, got Ok"
+        );
     }
 }

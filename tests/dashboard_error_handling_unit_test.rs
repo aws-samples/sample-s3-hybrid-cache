@@ -127,7 +127,7 @@ async fn test_logs_with_valid_parameters() {
         let params = LogQueryParams {
             limit: Some(limit),
             level_filter: None,
-        text_filter: None,
+            text_filter: None,
             since: None,
         };
 
@@ -271,7 +271,10 @@ async fn test_concurrent_api_requests() {
         temp_dir.path().to_path_buf(),
         "test-host".to_string(),
     ));
-    let api_handler = Arc::new(ApiHandler::new(log_reader, Arc::new(DashboardConfig::default())));
+    let api_handler = Arc::new(ApiHandler::new(
+        log_reader,
+        Arc::new(DashboardConfig::default()),
+    ));
 
     // Create multiple concurrent requests
     let mut handles = Vec::new();

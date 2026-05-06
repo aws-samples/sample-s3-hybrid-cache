@@ -5,7 +5,8 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn test_disk_cache_basic_operations() {
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     // Initialize
     cache_manager.initialize().await.unwrap();
@@ -28,7 +29,9 @@ async fn test_disk_cache_basic_operations() {
             test_data.len() as u64 - 1,
             test_data,
             object_metadata.clone(),
-            std::time::Duration::from_secs(3600), true)
+            std::time::Duration::from_secs(3600),
+            true,
+        )
         .await
         .unwrap();
 
@@ -61,7 +64,8 @@ async fn test_disk_cache_basic_operations() {
 #[tokio::test]
 async fn test_cache_key_sanitization() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     let unsafe_key = "bucket/path:with*special?chars<>|";
     let safe_key = cache_manager.sanitize_cache_key(unsafe_key);
@@ -77,7 +81,8 @@ async fn test_cache_key_sanitization() {
 #[tokio::test]
 async fn test_cache_type_determination() {
     let temp_dir = TempDir::new().unwrap();
-    let cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     // Test basic cache types
     assert_eq!(
@@ -117,7 +122,8 @@ async fn test_atomic_write_operations_with_sharded_paths() {
     // 3. Operations work with multiple buckets
 
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     // Initialize cache
     cache_manager.initialize().await.unwrap();
@@ -160,7 +166,8 @@ async fn test_atomic_write_operations_with_sharded_paths() {
                 data_bytes,
                 metadata.clone(),
                 std::time::Duration::from_secs(315360000), // 10 years TTL
-                true)
+                true,
+            )
             .await
             .unwrap();
 
@@ -348,7 +355,8 @@ async fn test_range_spec_file_path_is_relative() {
     use s3_proxy::cache_types::ObjectMetadata;
 
     let temp_dir = TempDir::new().unwrap();
-    let mut cache_manager = DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+    let mut cache_manager =
+        DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
 
     // Initialize
     cache_manager.initialize().await.unwrap();
@@ -372,7 +380,8 @@ async fn test_range_spec_file_path_is_relative() {
             test_data,
             object_metadata.clone(),
             std::time::Duration::from_secs(315360000), // 10 years TTL
-            true)
+            true,
+        )
         .await
         .unwrap();
 

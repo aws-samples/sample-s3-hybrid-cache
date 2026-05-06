@@ -132,12 +132,12 @@ async fn test_get_object_part_bypasses_cache() -> Result<(), Box<dyn std::error:
         false, // write_cache_enabled
         config.cache.incomplete_upload_ttl,
         config.cache.metadata_cache.clone(),
-        95,  // eviction_trigger_percent
-        80,  // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = CacheManager::generate_cache_key("/my-bucket/my-object", None);
@@ -177,12 +177,12 @@ async fn test_metadata_operations_bypass_cache() -> Result<(), Box<dyn std::erro
         false, // write_cache_enabled
         config.cache.incomplete_upload_ttl,
         config.cache.metadata_cache.clone(),
-        95,  // eviction_trigger_percent
-        80,  // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     let cache_key = CacheManager::generate_cache_key("/my-bucket/my-object", None);
@@ -222,12 +222,12 @@ async fn test_cache_state_after_bypass_operations() -> Result<(), Box<dyn std::e
         false, // write_cache_enabled
         config.cache.incomplete_upload_ttl,
         config.cache.metadata_cache.clone(),
-        95,  // eviction_trigger_percent
-        80,  // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     // Get initial cache statistics
@@ -301,12 +301,12 @@ async fn test_head_object_is_cached() -> Result<(), Box<dyn std::error::Error>> 
         false, // write_cache_enabled
         config.cache.incomplete_upload_ttl,
         config.cache.metadata_cache.clone(),
-        95,  // eviction_trigger_percent
-        80,  // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     );
 
     // Object path (not root) for HeadObject
@@ -380,7 +380,6 @@ async fn test_error_passthrough_for_bypass_requests() -> Result<(), Box<dyn std:
 
     // Verify the implementation exists and has the correct signature
     // This is a compile-time check that the function exists
-    
 
     // The function is private, but we can verify it's used correctly
     // by checking that bypass operations work end-to-end in integration tests

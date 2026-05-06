@@ -32,12 +32,12 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         true,                      // write_cache_enabled - RE-ENABLED
         Duration::from_secs(3600), // incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
-        95, // eviction_trigger_percent
-        80, // eviction_target_percent
-        true,                                          // read_cache_enabled
-        std::time::Duration::from_secs(60),            // bucket_settings_staleness_threshold
-        1_048_576,                                     // compression_batch_size
-        false, // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache
     )
 }
 
@@ -151,10 +151,7 @@ async fn test_property_multiple_puts_use_unified_storage() {
                     response_headers,
                 )
                 .await
-                .expect(&format!(
-                    "Failed to store PUT {} at iteration {}",
-                    i, iteration
-                ));
+                .unwrap_or_else(|_| panic!("Failed to store PUT {} at iteration {}", i, iteration));
         }
 
         let metadata_dir = temp_dir.path().join("metadata");
@@ -165,7 +162,7 @@ async fn test_property_multiple_puts_use_unified_storage() {
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_type().is_file() && e.path().extension().map_or(false, |ext| ext == "meta")
+                e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "meta")
             })
             .count();
 
@@ -218,7 +215,7 @@ async fn test_property_invalidation_completeness() {
                 response_headers,
             )
             .await
-            .expect(&format!("Failed to store PUT at iteration {}", iteration));
+            .unwrap_or_else(|_| panic!("Failed to store PUT at iteration {}", iteration));
 
         let metadata_path = cache_manager.get_new_metadata_file_path(&cache_key);
         assert!(
@@ -227,15 +224,11 @@ async fn test_property_invalidation_completeness() {
             iteration
         );
 
-        let metadata_content = std::fs::read_to_string(&metadata_path).expect(&format!(
-            "Iteration {}: Could not read metadata file",
-            iteration
-        ));
+        let metadata_content = std::fs::read_to_string(&metadata_path)
+            .unwrap_or_else(|_| panic!("Iteration {}: Could not read metadata file", iteration));
         let metadata: s3_proxy::cache_types::NewCacheMetadata =
-            serde_json::from_str(&metadata_content).expect(&format!(
-                "Iteration {}: Could not parse metadata",
-                iteration
-            ));
+            serde_json::from_str(&metadata_content)
+                .unwrap_or_else(|_| panic!("Iteration {}: Could not parse metadata", iteration));
 
         let range_file_paths: Vec<_> = metadata
             .ranges
@@ -262,7 +255,7 @@ async fn test_property_invalidation_completeness() {
         cache_manager
             .invalidate_write_cache_entry(&cache_key)
             .await
-            .expect(&format!("Failed to invalidate at iteration {}", iteration));
+            .unwrap_or_else(|_| panic!("Failed to invalidate at iteration {}", iteration));
 
         assert!(
             !metadata_path.exists(),
@@ -316,10 +309,9 @@ async fn test_property_multiple_invalidations_use_unified_storage() {
                     response_headers,
                 )
                 .await
-                .expect(&format!(
-                    "Failed to store entry {} at iteration {}",
-                    i, iteration
-                ));
+                .unwrap_or_else(|_| {
+                    panic!("Failed to store entry {} at iteration {}", i, iteration)
+                });
 
             cache_keys.push(cache_key);
         }
@@ -338,10 +330,12 @@ async fn test_property_multiple_invalidations_use_unified_storage() {
             cache_manager
                 .invalidate_write_cache_entry(cache_key)
                 .await
-                .expect(&format!(
-                    "Failed to invalidate {} at iteration {}",
-                    cache_key, iteration
-                ));
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Failed to invalidate {} at iteration {}",
+                        cache_key, iteration
+                    )
+                });
         }
 
         for cache_key in &cache_keys {

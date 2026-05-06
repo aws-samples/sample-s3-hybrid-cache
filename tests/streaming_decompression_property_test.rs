@@ -34,8 +34,8 @@ fn prop_streaming_decompression_byte_identity() {
             data_seed.len()
         } else {
             // Larger seed: scale up by repeating, capped at 10 MiB
-            let scale = (data_seed.len() * 256).min(10 * 1024 * 1024);
-            scale
+
+            (data_seed.len() * 256).min(10 * 1024 * 1024)
         };
 
         let original_data: Vec<u8> = data_seed

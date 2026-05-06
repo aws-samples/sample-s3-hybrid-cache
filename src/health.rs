@@ -188,7 +188,11 @@ impl HealthManager {
             .unwrap_or(Duration::from_millis(0))
             .as_millis() as u64;
 
-        let total_ips: usize = stats.endpoints.iter().map(|e| e.total_distributor_ips).sum();
+        let total_ips: usize = stats
+            .endpoints
+            .iter()
+            .map(|e| e.total_distributor_ips)
+            .sum();
 
         // Healthy if IPs are populated, or if no endpoints have been registered yet
         // (normal at startup before first request). Only Degraded if an endpoint is

@@ -185,11 +185,7 @@ fn test_regional_ap_cache_key_collision() {
 // **Validates: Requirements 1.4, 1.6**
 // ============================================================================
 
-fn prop_mrap_collision(
-    alias1: MrapAlias,
-    alias2: MrapAlias,
-    path: ObjectPath,
-) -> TestResult {
+fn prop_mrap_collision(alias1: MrapAlias, alias2: MrapAlias, path: ObjectPath) -> TestResult {
     let host1 = mrap_host(&alias1.0);
     let host2 = mrap_host(&alias2.0);
 
@@ -288,7 +284,11 @@ impl Arbitrary for BucketName {
 // **Validates: Requirements 3.1**
 // ============================================================================
 
-fn prop_path_style_preservation(region: AwsRegion, bucket: BucketName, path: ObjectPath) -> TestResult {
+fn prop_path_style_preservation(
+    region: AwsRegion,
+    bucket: BucketName,
+    path: ObjectPath,
+) -> TestResult {
     let host = format!("s3.{}.amazonaws.com", region.0);
 
     // Build a path-style path: /{bucket}/{object_path_without_leading_slash}
@@ -516,7 +516,7 @@ fn prop_detect_ap_alias_path_style(
             TestResult::from_bool(
                 detected.upstream_host == expected_host
                     && detected.forwarded_path == expected_path
-                    && detected.cache_key_prefix == alias
+                    && detected.cache_key_prefix == alias,
             )
         }
         None => TestResult::failed(),
@@ -537,10 +537,7 @@ fn test_detect_ap_alias_path_style() {
 /// assert detection returns reconstructed host (`.mrap` stripped from hostname),
 /// stripped path, and cache key prefix (with `.mrap`).
 /// **Validates: Requirements 2.5, 2.7**
-fn prop_detect_mrap_alias_path_style(
-    mrap_alias: MrapAlias,
-    path: ObjectPath,
-) -> TestResult {
+fn prop_detect_mrap_alias_path_style(mrap_alias: MrapAlias, path: ObjectPath) -> TestResult {
     let alias_with_suffix = format!("{}.mrap", mrap_alias.0);
     let host = "accesspoint.s3-global.amazonaws.com";
     let object_part = path.0.strip_prefix('/').unwrap_or(&path.0);
@@ -555,7 +552,7 @@ fn prop_detect_mrap_alias_path_style(
             TestResult::from_bool(
                 detected.upstream_host == expected_host
                     && detected.forwarded_path == expected_path
-                    && detected.cache_key_prefix == alias_with_suffix
+                    && detected.cache_key_prefix == alias_with_suffix,
             )
         }
         None => TestResult::failed(),
@@ -564,10 +561,9 @@ fn prop_detect_mrap_alias_path_style(
 
 #[test]
 fn test_detect_mrap_alias_path_style() {
-    QuickCheck::new().tests(100).quickcheck(
-        prop_detect_mrap_alias_path_style
-            as fn(MrapAlias, ObjectPath) -> TestResult,
-    );
+    QuickCheck::new()
+        .tests(100)
+        .quickcheck(prop_detect_mrap_alias_path_style as fn(MrapAlias, ObjectPath) -> TestResult);
 }
 
 // ============================================================================
@@ -593,7 +589,10 @@ fn test_ap_alias_path_style_detected_as_access_point() {
 
     // Base AP domain should return None from extract_access_point_prefix (correct)
     let prefix = extract_access_point_prefix(host);
-    assert!(prefix.is_none(), "Base AP domain should return None from extract_access_point_prefix");
+    assert!(
+        prefix.is_none(),
+        "Base AP domain should return None from extract_access_point_prefix"
+    );
 
     // detect_path_style_alias should detect the alias in the path
     let result = detect_path_style_alias(host, path);
@@ -621,7 +620,10 @@ fn test_mrap_alias_path_style_detected_as_access_point() {
 
     // Base MRAP domain should return None from extract_access_point_prefix (correct)
     let prefix = extract_access_point_prefix(host);
-    assert!(prefix.is_none(), "Base MRAP domain should return None from extract_access_point_prefix");
+    assert!(
+        prefix.is_none(),
+        "Base MRAP domain should return None from extract_access_point_prefix"
+    );
 
     // detect_path_style_alias should detect the alias in the path
     let result = detect_path_style_alias(host, path);
@@ -669,10 +671,10 @@ impl Arbitrary for NonAliasSegment {
         // Ensure the segment does NOT end with reserved suffixes
         let mut s = segment;
         if s.ends_with("-s3alias") {
-            s.push_str("x");
+            s.push('x');
         }
         if s.ends_with(".mrap") {
-            s.push_str("x");
+            s.push('x');
         }
         NonAliasSegment(s)
     }
@@ -719,8 +721,7 @@ fn prop_non_alias_path_segment_guard_mrap(
 #[test]
 fn test_non_alias_path_segment_guard_mrap() {
     QuickCheck::new().tests(200).quickcheck(
-        prop_non_alias_path_segment_guard_mrap
-            as fn(NonAliasSegment, ObjectPath) -> TestResult,
+        prop_non_alias_path_segment_guard_mrap as fn(NonAliasSegment, ObjectPath) -> TestResult,
     );
 }
 
@@ -801,7 +802,6 @@ fn prop_virtual_hosted_mrap_routing_unchanged(
 #[test]
 fn test_virtual_hosted_mrap_routing_unchanged() {
     QuickCheck::new().tests(200).quickcheck(
-        prop_virtual_hosted_mrap_routing_unchanged
-            as fn(MrapAlias, ObjectPath) -> TestResult,
+        prop_virtual_hosted_mrap_routing_unchanged as fn(MrapAlias, ObjectPath) -> TestResult,
     );
 }

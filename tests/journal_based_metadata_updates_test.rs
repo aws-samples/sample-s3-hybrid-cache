@@ -204,7 +204,7 @@ async fn test_concurrent_writes_no_corruption() {
                 }
                 // Verify each line is valid JSON
                 let entry: JournalEntry = serde_json::from_str(line)
-                    .expect(&format!("Line should be valid JSON: {}", line));
+                    .unwrap_or_else(|_| panic!("Line should be valid JSON: {}", line));
                 assert_eq!(entry.cache_key, cache_key);
             }
         }
@@ -296,7 +296,10 @@ async fn test_consolidation_cleanup_on_success() {
 
     // Clean up ONLY the consolidated entries (not all entries)
     consolidator
-        .cleanup_consolidated_entries(&result.consolidated_entries, &std::collections::HashMap::new())
+        .cleanup_consolidated_entries(
+            &result.consolidated_entries,
+            &std::collections::HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -418,7 +421,10 @@ async fn test_consolidation_preserves_entries_with_missing_range_files() {
 
     // Clean up ONLY the consolidated entries
     consolidator
-        .cleanup_consolidated_entries(&result.consolidated_entries, &std::collections::HashMap::new())
+        .cleanup_consolidated_entries(
+            &result.consolidated_entries,
+            &std::collections::HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -473,10 +479,7 @@ async fn test_consolidation_applies_ttl_refresh() {
     );
 
     let new_ttl = Duration::from_secs(7200); // 2 hours
-    buffer
-        .record_ttl_refresh(cache_key, new_ttl)
-        .await
-        .unwrap();
+    buffer.record_ttl_refresh(cache_key, new_ttl).await.unwrap();
     buffer.force_flush().await.unwrap();
 
     // Create consolidator and run consolidation
