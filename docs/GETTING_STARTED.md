@@ -14,6 +14,7 @@ Quick start guide for installing, configuring, and running S3 Hybrid Cache.
     - [Option A: HTTP_PROXY (Single-Instance / No DNS Changes)](#option-a-http_proxy-single-instance--no-dns-changes)
     - [Option B: DNS Zone (Production Deployments)](#option-b-dns-zone-production-deployments)
     - [Option C: Hosts File (Testing/Development)](#option-c-hosts-file-testingdevelopment)
+    - [Option D: Layer 4 Load Balancer (Multi-Instance)](#option-d-layer-4-load-balancer-multi-instance)
     - [S3 PrivateLink (Interface VPC Endpoints)](#s3-privatelink-interface-vpc-endpoints)
     - [Access Point and MRAP Endpoint Requirements](#access-point-and-mrap-endpoint-requirements)
     - [Access Point Alias Usage](#access-point-alias-usage)
@@ -58,8 +59,8 @@ Quick start guide for installing, configuring, and running S3 Hybrid Cache.
 
 ```bash
 # Clone repository
-git clone <repository>
-cd s3-proxy
+git clone https://github.com/aws-samples/sample-s3-hybrid-cache
+cd sample-s3-hybrid-cache
 
 # Build release binary
 cargo build --release
@@ -114,54 +115,78 @@ The proxy starts on:
 
 **Security Note**: All communication between the proxy and Amazon S3 uses HTTPS encryption, regardless of whether clients connect via HTTP or HTTPS. Secure client-to-proxy HTTP traffic using network controls (VPC, security groups, firewall rules).
 
+**Quickest path for a local test**: Skip standard ports and run in [Proxy-Only Mode](#proxy-only-mode) on port 3128 instead. No sudo, no DNS changes, no hosts file edits — set `HTTP_PROXY=http://127.0.0.1:3128` on the client and go. Recommended for development and single-machine setups; see [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) below.
+
 ### 3. Configure Client Routing
 
-The proxy intercepts S3 traffic by routing client requests to the proxy's IP address. Choose the appropriate method for your environment:
+The proxy intercepts S3 traffic by routing client requests to the proxy. Choose the appropriate method for your environment:
 
-- **Option A (HTTP_PROXY)** — set an environment variable for single-instance setups with no DNS changes
-- **Option B (DNS Zone)** — configure DNS for production multi-instance deployments
-- **Option C (Hosts File)** — edit `/etc/hosts` for local testing
+- **Option A (HTTP_PROXY)** — **recommended starting point**. Set an environment variable on the client; no DNS or hosts file changes required. Works for localhost and remote single-instance setups.
+- **Option B (DNS Zone)** — configure DNS for production multi-instance deployments with HA via multi-value routing.
+- **Option C (Hosts File)** — edit `/etc/hosts`. Rarely the easiest choice anymore; prefer Option A unless the client cannot set `HTTP_PROXY`.
+- **Option D (Layer 4 Load Balancer)** — front a proxy fleet with a TCP load balancer. Centralised failover and health checking with a single stable endpoint.
 
 #### Option A: HTTP_PROXY (Single-Instance / No DNS Changes)
 
-Instead of modifying DNS or hosts files, you can route S3 traffic through the proxy using the `HTTP_PROXY` environment variable. The client sends requests with absolute URIs (`GET http://s3.amazonaws.com/bucket/key`), and the proxy extracts the target host from the URI and processes the request through the caching pipeline.
+Route S3 traffic through the proxy using the `HTTP_PROXY` environment variable. The client sends requests with absolute URIs (`GET http://s3.amazonaws.com/bucket/key`), and the proxy extracts the target host from the URI and processes the request through the caching pipeline.
 
 **When to use HTTP_PROXY vs DNS routing:**
 
 | Approach | Best for | Trade-offs |
 |----------|----------|------------|
-| `HTTP_PROXY` | Single-instance, dev/test, quick setup | No HA — if the proxy is down, clients fail. No multi-instance load balancing. |
-| DNS routing (Option B/C) | Production, multi-instance, HA | Requires DNS infrastructure. Supports multi-value A records for load balancing and failover. |
+| `HTTP_PROXY` | Localhost, single-instance, dev/test, quick setup | No HA at the network layer — if the proxy is down, clients fail. For multi-instance HA with localhost proxies, see the [Shared NFS Cache pattern](#high-availability-shared-nfs-cache-pattern). |
+| DNS routing (Option B/C) | Centralized proxy fleet with many clients | Requires DNS infrastructure. Supports multi-value A records for load balancing and failover. |
 
-**Unencrypted (private networks):**
+##### Localhost (simplest)
+
+When the proxy runs on the same host as the client, TLS is unnecessary — loopback traffic never leaves the machine. Run the proxy in [Proxy-Only Mode](#proxy-only-mode) on port 3128 (no sudo, no port 80/443 binding), then:
 
 ```bash
-export HTTP_PROXY=http://<proxy-ip>:80
-export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
+export HTTP_PROXY=http://127.0.0.1:3128
 aws s3 cp s3://your-bucket/key ./local \
   --endpoint-url http://s3.us-east-1.amazonaws.com \
   --region us-east-1
 ```
 
-**Encrypted (recommended):**
+The `--endpoint-url http://s3.<region>.amazonaws.com` is required so the SDK signs the request against the real S3 hostname (`Host: s3.us-east-1.amazonaws.com`), not the proxy hostname. SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer.
+
+On EC2 — or any host where you need to bypass IMDS or other IPs — set `NO_PROXY`:
+
+```bash
+export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
+```
+
+Without this on EC2, credential retrieval from the instance metadata service will fail because IMDS requests get forwarded through the proxy instead of going directly to `169.254.169.254`. Add other IPs or hostnames that should bypass the proxy to the same list.
+
+##### Remote proxy
+
+When the proxy is on a different host than the client, the `HTTP_PROXY` connection traverses the network — use TLS to protect it.
+
+**Encrypted (recommended for remote proxies):**
 
 ```bash
 export HTTP_PROXY=https://<proxy-ip>:3129
-export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
 aws s3 cp s3://your-bucket/key ./local \
   --endpoint-url http://s3.us-east-1.amazonaws.com \
   --region us-east-1
 ```
 
-The `--endpoint-url http://s3.region.amazonaws.com` is required so the SDK signs the request against the real S3 hostname (`Host: s3.us-east-1.amazonaws.com`), not the proxy hostname. SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer, so they remain valid regardless of whether the client connects via HTTP or TLS.
+**Unencrypted (private networks only):**
 
-`NO_PROXY=169.254.169.254` prevents EC2 instance metadata (IMDS) requests from being sent through the proxy. Without this, credential retrieval from the instance metadata service will fail.
+```bash
+export HTTP_PROXY=http://<proxy-ip>:80
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1
+```
+
+On EC2, add `export NO_PROXY=169.254.169.254` to keep IMDS off the proxy path.
 
 **Why `HTTP_PROXY`, not `HTTPS_PROXY`?** When `HTTPS_PROXY` is set, the SDK sends a `CONNECT` request asking the proxy to establish a TCP tunnel to S3. The traffic inside the tunnel is end-to-end encrypted between the client and S3 — the proxy cannot decrypt, inspect, or cache it. The TLS proxy listener handles `CONNECT` as a passthrough tunnel (same as port 443), so the request succeeds but bypasses the cache entirely. Use `HTTP_PROXY` instead. The `HTTP_PROXY` variable controls where the SDK sends HTTP requests, regardless of whether the proxy URL uses `http://` or `https://`. With `HTTP_PROXY=https://proxy:3129`, the client opens a TLS connection to the proxy, then sends plaintext HTTP inside that tunnel. The proxy decrypts the TLS layer and sees the HTTP request for caching.
 
 ##### TLS Proxy Listener Configuration
 
-To use `HTTP_PROXY=https://...`, enable the TLS proxy listener in your config:
+To use `HTTP_PROXY=https://...` against a remote proxy, enable the TLS proxy listener in your config:
 
 ```yaml
 server:
@@ -387,6 +412,8 @@ This approach mirrors how [S3 itself uses multi-value answer routing for DNS que
 
 #### Option C: Hosts File (Testing/Development)
 
+> Consider [Option A (HTTP_PROXY)](#option-a-http_proxy-single-instance--no-dns-changes) first. It avoids the need for sudo, root-owned files, and the per-bucket/per-access-point entries required here. Use hosts file routing only when the client can't set `HTTP_PROXY` or you specifically want to exercise DNS-style routing.
+
 For local testing or single-machine setups, edit `/etc/hosts`:
 
 ```bash
@@ -418,6 +445,108 @@ sudo nano /etc/hosts
 - For production deployments with multiple proxy instances or high availability requirements, use DNS-based routing instead
 
 See [AWS S3 endpoints documentation](https://docs.aws.amazon.com/general/latest/gr/s3.html) for complete list of regional endpoints.
+
+#### Option D: Layer 4 Load Balancer (Multi-Instance)
+
+Front a fleet of proxy instances with a Layer 4 (TCP) load balancer to give clients a single stable endpoint with centralised health checking and failover. The proxy is protocol-agnostic behind the load balancer — it sees whatever bytes the load balancer forwards. Any L4 load balancer works: a cloud-managed TCP load balancer (for example AWS Network Load Balancer), HAProxy in TCP mode, nginx's `stream` module, F5 LTM, or similar.
+
+Two deployment patterns, depending on where TLS terminates.
+
+##### Pattern 1: Load Balancer Terminates TLS → Proxy Serves HTTP
+
+```
+Client (HTTPS) → Load Balancer (TLS, cert on LB) → Proxy (HTTP :80 or :3128) → S3
+```
+
+The load balancer handles TLS using a certificate attached to the LB itself. Backends receive plain HTTP, so the proxy needs no TLS configuration — it runs in `standard` mode on port 80 or `proxy_only` mode on port 3128.
+
+Typical load balancer configuration:
+- TLS listener on port 443 with a server certificate attached
+- Target/backend pool forwarding TCP to the proxy's HTTP port (80 or 3128)
+- TCP health check against the proxy's health port (`:8080/health`) or the HTTP port itself
+
+Client configuration:
+
+```bash
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url https://<load-balancer-hostname> \
+  --region us-east-1
+```
+
+SigV4 signs against the real S3 Host header (e.g., `s3.us-east-1.amazonaws.com`) — the load balancer hostname only determines where the TCP connection goes. Clients must trust the LB's certificate. If using a managed certificate service (AWS ACM, Let's Encrypt via cert-manager, internal CA), trust is usually already in place.
+
+This pattern is the simplest: one certificate managed on the load balancer, no cert distribution to instances, no TLS config in the proxy.
+
+##### Pattern 2: Load Balancer TCP Passthrough → Proxy Terminates TLS
+
+```
+Client (HTTPS) → Load Balancer (TCP :443 passthrough) → Proxy (TLS :3129, terminates) → S3
+```
+
+The load balancer forwards encrypted TCP bytes without decrypting. Each proxy instance terminates TLS itself using a certificate on the instance. Use this pattern when:
+- You cannot or prefer not to attach certificates to the load balancer
+- You need the client-to-proxy connection to remain encrypted end-to-end across the VPC/internal network
+- You want the proxy's access logs to reflect the full TLS session (the LB in passthrough mode contributes no TLS metadata)
+
+Typical load balancer configuration:
+- TCP listener on port 443 forwarding to the backend pool
+- Target/backend pool forwarding TCP to the proxy's `tls_proxy_port` (default 3129)
+- TCP health check against `:8080/health` or the TLS port
+
+Enable the TLS proxy listener in each proxy's config (see [TLS Proxy Listener Configuration](#tls-proxy-listener-configuration) for full details and cert generation):
+
+```yaml
+server:
+  tls:
+    enabled: true
+    tls_proxy_port: 3129
+    cert_path: "/etc/proxy/tls/cert.pem"
+    key_path: "/etc/proxy/tls/key.pem"
+```
+
+The certificate's subject alternative names must match the load balancer hostname (clients connect to the LB, not to individual proxies, so the LB hostname is what gets verified during the TLS handshake). Every instance needs the same cert or certs covering the same SANs.
+
+Client configuration:
+
+```bash
+export AWS_CA_BUNDLE=/path/to/proxy-cert.pem
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url https://<load-balancer-hostname>:3129 \
+  --region us-east-1
+```
+
+The proxy listens on `tls_proxy_port` (3129 by default). Either point the LB's TCP listener at port 3129 on the backends and advertise the LB on port 443 (so clients use the default port), or expose the LB on port 3129 directly.
+
+##### Which Pattern to Choose
+
+| | Pattern 1 (LB terminates TLS) | Pattern 2 (Proxy terminates TLS) |
+|---|---|---|
+| Cert management | One cert on the LB | Cert on every proxy instance |
+| Cert rotation | Update once at the LB | Update on every instance (automate it) |
+| Proxy config | No TLS needed | `tls.enabled: true` + cert/key paths |
+| Encryption scope | Client-to-LB only | Client-to-proxy |
+| Performance | LB handles TLS (often hardware-accelerated on cloud LBs) | Each proxy burns CPU on TLS |
+| Best for | Most deployments | Strict end-to-end encryption requirements |
+
+Pattern 1 is the default recommendation unless an explicit requirement drives you to Pattern 2.
+
+##### Load Balancer vs DNS Multi-Value Routing
+
+Option B (DNS multi-value routing with the AWS CRT transfer client) and Option D (Layer 4 load balancer) both distribute traffic across a proxy fleet. The trade-offs:
+
+| | Option B (DNS Multi-Value) | Option D (L4 Load Balancer) |
+|---|---|---|
+| Infrastructure | Private DNS zones + A records | Load balancer (managed or self-hosted) |
+| Failover | Client retries alternate IP from DNS response | LB removes unhealthy members from backend pool |
+| Health checking | Client-side (connection attempts) | Server-side (LB probes backends) |
+| Client requirement | AWS CRT transfer client for automatic failover | Any client |
+| Single endpoint | No (clients resolve multiple IPs) | Yes (LB hostname or IP) |
+
+Use Option B when you want to avoid load balancer infrastructure and all clients use the AWS CRT. Use Option D when you need a single stable endpoint, server-side health checking, or support for clients that don't do DNS-based failover.
+
+##### Why Layer 4, Not Layer 7
+
+L7 (HTTP) load balancers like AWS ALB, nginx in HTTP mode, or Envoy in HTTP mode work functionally in Pattern 1, but they add per-request HTTP parsing and re-serialisation overhead that's unnecessary — the proxy already handles HTTP semantics, caching decisions, and range optimisation. L7 load balancers also commonly impose idle timeouts and request/response size limits that can interfere with large streaming transfers. Use a pure TCP (L4) load balancer for best throughput and lowest latency.
 
 #### S3 PrivateLink (Interface VPC Endpoints)
 
@@ -680,7 +809,7 @@ Notes:
 - The `https` proxy URL typically uses the `http://` scheme — that is the scheme of the proxy connection, not the target.
 - For encrypted client-to-proxy transport, point the proxy URL at the TLS proxy listener (e.g., `'https://<proxy-ip>:3129'`) and set `AWS_CA_BUNDLE` or pass `verify=` on the client.
 - Without `config=`, boto3 picks up `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` from the environment. The per-client `Config` only overrides proxy settings for that specific client, leaving other clients in the same process unaffected.
-- Set `NO_PROXY=169.254.169.254` to keep IMDS credential retrieval off the proxy path.
+- Set `NO_PROXY=169.254.169.254` on EC2 to keep IMDS credential retrieval off the proxy path. Not needed off EC2 unless you have other IPs to bypass.
 - Use `proxies_config={'proxy_use_forwarding_for_https': False}` (the default) to make HTTPS requests tunnel via `CONNECT`. Setting it to `True` switches to forward-proxy style, which bypasses caching.
 
 ### Mountpoint for Amazon S3
@@ -793,30 +922,28 @@ This starts both listeners — port 3128 (unencrypted) and port 3129 (TLS-termin
 
 Set `HTTP_PROXY` to route S3 traffic through the proxy. Use `--endpoint-url` so the SDK signs requests against the real S3 hostname (not the proxy hostname). SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer, so they remain valid regardless of whether the client connects via HTTP or TLS.
 
-**Unencrypted (private networks or localhost):**
+**Unencrypted (localhost or private networks):**
 
 ```bash
 export HTTP_PROXY=http://127.0.0.1:3128
-export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
 aws s3 cp s3://bucket/key ./local \
   --endpoint-url http://s3.us-east-1.amazonaws.com \
   --region us-east-1
 ```
 
-**Encrypted via TLS listener (recommended):**
+**Encrypted via TLS listener (for remote clients):**
 
 ```bash
-export HTTP_PROXY=https://127.0.0.1:3129
-export NO_PROXY=169.254.169.254  # Exclude IMDS from proxying
+export HTTP_PROXY=https://<proxy-ip>:3129
 export AWS_CA_BUNDLE=/path/to/proxy-cert.pem
 aws s3 cp s3://bucket/key ./local \
   --endpoint-url http://s3.us-east-1.amazonaws.com \
   --region us-east-1
 ```
 
-**Why `HTTP_PROXY`, not `HTTPS_PROXY`?** See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for why `HTTP_PROXY` is required instead of `HTTPS_PROXY`.
+**On EC2, add `export NO_PROXY=169.254.169.254`** so IMDS credential retrieval bypasses the proxy (otherwise instance-profile credentials fail to load). Add other IPs or hostnames to `NO_PROXY` as needed.
 
-`NO_PROXY=169.254.169.254` prevents EC2 instance metadata (IMDS) requests from being sent through the proxy. Without this, credential retrieval from the instance metadata service will fail.
+**Why `HTTP_PROXY`, not `HTTPS_PROXY`?** See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for why `HTTP_PROXY` is required instead of `HTTPS_PROXY`.
 
 See [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) for TLS certificate generation, self-signed certificate SANs, and client trust configuration details.
 
@@ -896,6 +1023,8 @@ tail -f <access-log-dir>/$(date +%Y/%m/%d)/*
    # Use sudo for privileged ports
    sudo cargo run --release -- -c config/config.example.yaml
    ```
+
+   Or avoid sudo entirely by switching to [Proxy-Only Mode](#proxy-only-mode) (`server.mode: proxy_only` on port 3128). Clients then route via `HTTP_PROXY=http://<proxy-ip>:3128` instead of DNS or hosts file.
 
 2. **AWS credentials not configured on the client**:
    The proxy does not use AWS credentials — it forwards pre-signed requests from clients. Ensure credentials are configured on the *client* machine:

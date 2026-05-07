@@ -50,6 +50,29 @@ The S3 proxy includes comprehensive Rust integration tests in the `tests/` direc
 
 3. **S3 Hybrid Cache running**:
    ```bash
+   # Write a minimal proxy_only config (no sudo, no DNS or hosts changes)
+   cat > ./config/test.yaml <<'EOF'
+   server:
+     mode: "proxy_only"
+     proxy_port: 3128
+   cache:
+     cache_dir: "./tmp/cache"
+     max_cache_size: 524288000
+   logging:
+     access_log_dir: "./tmp/logs/access"
+     app_log_dir: "./tmp/logs/app"
+   EOF
+
+   cargo run --release -- -c ./config/test.yaml
+   ```
+
+   Then in the shell running AWS CLI against the proxy:
+   ```bash
+   export HTTP_PROXY=http://127.0.0.1:3128
+   ```
+
+   Prefer standard ports 80/443 instead? Run with sudo and the example config:
+   ```bash
    sudo cargo run --release -- -c config/config.example.yaml
    ```
 
@@ -155,6 +178,10 @@ The Rust test suite provides standard cargo test output with pass/fail status fo
 
 2. **Proxy not running**:
    ```bash
+   # proxy_only mode on 127.0.0.1:3128, no sudo (see prerequisites above)
+   cargo run --release -- -c ./config/test.yaml
+
+   # Or on standard ports 80/443:
    sudo cargo run --release -- -c config/config.example.yaml
    ```
 

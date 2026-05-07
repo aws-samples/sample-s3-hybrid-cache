@@ -82,22 +82,44 @@ S3 Hybrid Cache provides an intelligent caching layer that accelerates performan
 
 ## Quick Start
 
+The fastest way to try the proxy is to run it on localhost in `proxy_only` mode and point clients at it with `HTTP_PROXY`. No sudo, no DNS changes, no hosts file edits, no TLS — the client-to-proxy hop is loopback.
+
 ```bash
 # Clone and build
-git clone <repository>
-cd s3-proxy
+git clone https://github.com/aws-samples/sample-s3-hybrid-cache
+cd sample-s3-hybrid-cache
 cargo build --release
 
-# Add hosts file entry to route S3 traffic to localhost
-echo "127.0.0.1 s3.<region>.amazonaws.com" | sudo tee -a /etc/hosts
+# Write a minimal proxy_only config
+cat > ./config/quickstart.yaml <<'EOF'
+server:
+  mode: "proxy_only"
+  proxy_port: 3128
+cache:
+  cache_dir: "./tmp/cache"
+  max_cache_size: 524288000  # 500 MB
+logging:
+  access_log_dir: "./tmp/logs/access"
+  app_log_dir: "./tmp/logs/app"
+EOF
 
-# Start proxy (requires sudo for ports 80/443)
-sudo cargo run --release -- -c config/config.example.yaml
+# Start proxy on 127.0.0.1:3128 (no sudo required)
+cargo run --release -- -c ./config/quickstart.yaml
+
+# In another shell, route the AWS CLI through the proxy
+export HTTP_PROXY=http://127.0.0.1:3128
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1
 ```
 
-**Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to automatically route AWS CLI S3 traffic through the proxy for buckets in that region. DNS zones are preferable to hosts file entries - see the [limitations and details](docs/GETTING_STARTED.md#3-configure-dns-routing).
+The `--endpoint-url http://...` is required so the SDK signs the request against the real S3 hostname while connecting through the proxy — SigV4 signatures are computed at the HTTP level, so TLS is only needed when the proxy is on a different host.
 
-**Alternative: HTTP_PROXY routing** — Instead of DNS routing, you can point clients at the proxy using the `HTTP_PROXY` environment variable. This avoids DNS or hosts file changes entirely and works well for single-instance deployments. With the optional TLS proxy listener enabled, use `HTTP_PROXY=https://proxy-host:3129` for encrypted client-to-proxy traffic with full caching. See the [Getting Started Guide](docs/GETTING_STARTED.md) for configuration details.
+**Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to avoid passing `--endpoint-url` on every command (works for buckets in that region).
+
+**On EC2 (or any host with IPs you don't want proxied)**, also set `NO_PROXY=169.254.169.254` so IMDS credential retrieval bypasses the proxy. Add other hosts to `NO_PROXY` as needed.
+
+**Alternative: DNS or hosts file routing** — For multi-instance deployments with HA via DNS multi-value routing, or for clients that can't set `HTTP_PROXY`, point S3 hostnames at the proxy via DNS or `/etc/hosts` and run on standard ports 80/443. With the optional TLS proxy listener enabled, clients on other hosts can use `HTTP_PROXY=https://proxy-host:3129` for encrypted client-to-proxy traffic with full caching. See the [Getting Started Guide](docs/GETTING_STARTED.md) for configuration details.
 
 **Deployment**: `target/release/s3-proxy` is a single portable binary (same arch and Linux, glibc ≥ build host). Upgrading is rebuild, replace the binary, restart — config is backward-compatible across versions. See [Binary Portability](docs/GETTING_STARTED.md#binary-portability) and [Upgrading](docs/GETTING_STARTED.md#upgrading).
 
