@@ -49,7 +49,7 @@
 
 ## Overview
 
-S3 Hybrid Cache provides intelligent caching to accelerate S3 access while maintaining data consistency. The proxy is a **transparent forwarder** - it only responds to client requests and cannot initiate requests to S3 (as it has no AWS credentials and cannot sign requests).
+Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access while maintaining data consistency. The proxy is a **transparent forwarder** - it only responds to client requests and cannot initiate requests to S3 (as it has no AWS credentials and cannot sign requests).
 
 ## Cache Architecture
 

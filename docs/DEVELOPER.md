@@ -1,6 +1,6 @@
 # Developer Documentation
 
-Implementation details, architectural decisions, and technical notes for S3 Hybrid Cache developers.
+Implementation details, architectural decisions, and technical notes for Hybrid Cache for Amazon S3 developers.
 
 ## Table of Contents
 

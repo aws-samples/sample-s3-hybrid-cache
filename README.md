@@ -1,10 +1,10 @@
-# S3 Hybrid Cache - Intelligent, Transparent Caching for Amazon S3
+# Hybrid Cache for Amazon S3 - Intelligent, Transparent Caching
 
 A high-performance, transparent S3 caching proxy with intelligent multi-tier caching, streaming architecture, and comprehensive observability. 
 
-📖 Read the introductory blog post: [Introducing S3 Hybrid Cache: An Intelligent Caching Proxy for Amazon S3](https://repost.aws/articles/ARaWiUYarLQSanDgHfMAfbsA)
+📖 Read the introductory blog post: [Introducing Hybrid Cache for Amazon S3: An Intelligent Caching Proxy](https://repost.aws/articles/ARaWiUYarLQSanDgHfMAfbsA)
 
->Important: S3 Hybrid Cache is sample code provided for demonstration and educational purposes. It is not intended for production use without thorough testing, security review, and validation for your specific use case and environment. You are responsible for evaluating whether this solution meets your requirements before deploying it.
+>Important: Hybrid Cache for Amazon S3 is sample code provided for demonstration and educational purposes. It is not intended for production use without thorough testing, security review, and validation for your specific use case and environment. You are responsible for evaluating whether this solution meets your requirements before deploying it.
 
 ## The Problem
 
@@ -17,7 +17,7 @@ This is particularly acute in healthcare, life sciences, quantitative trading, a
 
 ## The Solution
 
-S3 Hybrid Cache provides an intelligent caching layer that accelerates performance while minimizing data transfer costs. It allows users to retain S3's full capabilities while leveraging minimal, user-defined on-premises resources.
+Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerates performance while minimizing data transfer costs. It allows users to retain S3's full capabilities while leveraging minimal, user-defined on-premises resources.
 
 **Key Differentiators**
 
@@ -136,7 +136,7 @@ The `--endpoint-url http://...` is required so the SDK signs the request against
             │                         │                          │
             ▼                         ▼                          ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                        S3 Hybrid Cache (1..N)                              │
+│                    Hybrid Cache for Amazon S3 (1..N)                        │
 │                                                                            │
 │  ┌────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐  │
 │  │ HTTP (Port 80)     │ │ TLS Proxy (Port 3129)│ │ HTTPS (Port 443)     │  │
@@ -190,6 +190,8 @@ Endpoints:
 > **Your Responsibility**: You are responsible for restricting network access to the proxy to only clients authorized to access all objects that may be cached, and for securing file system access to the shared cache volume. This is the same security model as any shared cache — the proxy does not weaken S3's security, but depending on [TTL configuration](docs/CONFIGURATION.md#time-to-live-ttl-configuration), cached data may be accessible without S3 authorization checks.
 
 **Network access**: With [TTL](docs/CACHING.md#time-to-live-ttl-configuration) > 0, cache hits bypass S3 entirely — any client that can reach the proxy over the network can read any cached object without IAM authorization checks. Restrict proxy access using security groups, firewalls, or network segmentation.
+
+**Outbound destination restrictions**: The proxy restricts CONNECT tunnels (TLS proxy listener) and SNI passthrough (HTTPS listener) to port 443 only. Destinations resolving to link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), or private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) IP ranges are rejected. IPv6 equivalents (`::1`, `fe80::/10`, `fc00::/7`) are also rejected. This prevents clients from using the proxy as a relay to IMDS, internal services, or arbitrary network destinations. IPs listed in `endpoint_overrides` are exempt from the IP-range restriction, allowing PrivateLink ENIs, on-premises object stores, and other explicitly configured endpoints to function normally. An optional `server.tls.connect_allowlist` can further restrict allowed hostnames via glob patterns (e.g., `*.amazonaws.com`); when configured, only hostnames matching a pattern are permitted.
 
 **Cache storage access**: Cached data is stored unencrypted (LZ4 compressed) on the shared volume. Restrict file system access to authorized proxy instances only. Encryption at rest can be provided by the storage layer if required.
 
@@ -261,7 +263,7 @@ A: The proxy caches accelerate requests correctly **if** they reach it. Use any 
 
 ## Status
 
-S3 Hybrid Cache is sample code provided for demonstration and educational purposes. It is not intended for production use without thorough testing, security review, and validation for your specific use case and environment. You are responsible for evaluating whether this solution meets your requirements before deploying it.
+Hybrid Cache for Amazon S3 is sample code provided for demonstration and educational purposes. It is not intended for production use without thorough testing, security review, and validation for your specific use case and environment. You are responsible for evaluating whether this solution meets your requirements before deploying it.
 
 ## Author
 

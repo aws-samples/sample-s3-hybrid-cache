@@ -1,6 +1,6 @@
 # OTLP Metrics Export
 
-S3 Hybrid Cache supports exporting metrics using OpenTelemetry Protocol (OTLP), providing visibility into proxy requests, S3 API calls, cache performance, and system health.
+Hybrid Cache for Amazon S3 supports exporting metrics using OpenTelemetry Protocol (OTLP), providing visibility into proxy requests, S3 API calls, cache performance, and system health.
 
 ## Enabling OTLP Metrics
 

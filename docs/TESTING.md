@@ -1,4 +1,4 @@
-# S3 Hybrid Cache Testing Guide
+# Hybrid Cache for Amazon S3 Testing Guide
 
 Comprehensive testing documentation for validating S3 proxy functionality, including conditional request handling, cache behavior, and AWS CLI compatibility.
 
@@ -48,7 +48,7 @@ The S3 proxy includes comprehensive Rust integration tests in the `tests/` direc
    
    This eliminates the need for `--endpoint-url` on every command when working with buckets in that region. For buckets in other regions, specify both `--region` and `--endpoint-url` explicitly.
 
-3. **S3 Hybrid Cache running**:
+3. **Hybrid Cache for Amazon S3 running**:
    ```bash
    # Write a minimal proxy_only config (no sudo, no DNS or hosts changes)
    cat > ./config/test.yaml <<'EOF'

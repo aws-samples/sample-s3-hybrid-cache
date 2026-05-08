@@ -174,6 +174,29 @@ pub fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
     Some((start, end, total))
 }
 
+/// Extract the expected byte-range length from a Content-Range header.
+///
+/// For `Content-Range: bytes 100-199/500`, returns `Some(100)` (end - start + 1),
+/// NOT the total object size.
+///
+/// Returns `None` if the header is missing, malformed, or uses an unknown total (`*`).
+///
+/// Requirements: 2.1, 2.2
+pub fn parse_content_range_length(headers: &HashMap<String, String>) -> Option<u64> {
+    let value = headers
+        .get("content-range")
+        .or_else(|| headers.get("Content-Range"))?;
+    let (start, end, _total) = parse_content_range(value)?;
+    Some(end - start + 1)
+}
+
+/// Construct an empty `BoxBody` suitable for error responses (e.g., 504 Gateway Timeout).
+pub fn empty_boxed_body() -> BoxBody<Bytes, hyper::Error> {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
 /// Result of evaluating client conditional headers against cached metadata
 /// in Mode B (`evaluate_conditions_from_cache = true`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1982,6 +2005,10 @@ impl HttpProxy {
                         range_handler.clone(),
                         config.cache.download_coordination.enabled,
                         config.cache.download_coordination.wait_timeout(),
+                        config
+                            .cache
+                            .download_coordination
+                            .max_waiter_resubscriptions,
                         metrics_manager,
                         proxy_referer,
                     )
@@ -2022,6 +2049,10 @@ impl HttpProxy {
                         range_handler,
                         config.cache.download_coordination.enabled,
                         config.cache.download_coordination.wait_timeout(),
+                        config
+                            .cache
+                            .download_coordination
+                            .max_waiter_resubscriptions,
                         metrics_manager,
                         proxy_referer,
                     )
@@ -6275,131 +6306,178 @@ impl HttpProxy {
                 }
                 let wait_start = std::time::Instant::now();
 
-                // Wait with timeout for the fetcher to complete
-                // Requirement 17.3: Waiter timeout falls back to own S3 fetch
-                match tokio::time::timeout(wait_timeout, rx.recv()).await {
-                    Ok(Ok(Ok(()))) => {
-                        // Record wait duration.
-                        // Requirement 19.5 (cache-hit metric is recorded
-                        // inside `serve_from_cache_validated` on the 304
-                        // branch for backward compatibility).
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
-                                .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
+                let max_resubscriptions = config
+                    .cache
+                    .download_coordination
+                    .max_waiter_resubscriptions;
+                let mut re_subscribe_count: u32 = 0;
+
+                // Re-subscription loop: on timeout, check if FetchGuard is still present
+                // and re-subscribe rather than launching a duplicate S3 fetch.
+                // Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
+                loop {
+                    match tokio::time::timeout(wait_timeout, rx.recv()).await {
+                        Ok(Ok(Ok(()))) => {
+                            // Record wait duration.
+                            // Requirement 19.5 (cache-hit metric is recorded
+                            // inside `serve_from_cache_validated` on the 304
+                            // branch for backward compatibility).
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
+
+                            // Fetcher completed successfully - issue our own
+                            // signed conditional request before serving from
+                            // cache (validated-serve; fixes IAM bypass).
+                            debug!(
+                                "Download coordination: fetcher completed, issuing validated serve for {}",
+                                cache_key
+                            );
+
+                            return Self::serve_from_cache_validated(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                metrics_manager.clone(),
+                                proxy_referer,
+                            )
+                            .await;
                         }
+                        Ok(Ok(Err(error))) => {
+                            // Record wait duration (no cache hit since fetcher failed)
+                            // Requirement 19.5
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
 
-                        // Fetcher completed successfully - issue our own
-                        // signed conditional request before serving from
-                        // cache (validated-serve; fixes IAM bypass).
-                        debug!(
-                            "Download coordination: fetcher completed, issuing validated serve for {}",
-                            cache_key
-                        );
-
-                        Self::serve_from_cache_validated(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            cache_manager,
-                            range_handler,
-                            s3_client,
-                            config,
-                            metrics_manager.clone(),
-                            proxy_referer,
-                        )
-                        .await
-                    }
-                    Ok(Ok(Err(error))) => {
-                        // Record wait duration (no cache hit since fetcher failed)
-                        // Requirement 19.5
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
-                                .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
+                            // Fetcher completed with error - fall back to own S3 fetch
+                            // Requirement 17.2: Waiter falls back on fetcher error
+                            debug!(
+                                "Download coordination: fetcher error ({}), falling back to S3 for {}",
+                                error, cache_key
+                            );
+                            return Self::forward_get_head_to_s3_and_cache(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                cache_manager,
+                                s3_client,
+                                range_handler.clone(),
+                                proxy_referer,
+                            )
+                            .await;
                         }
+                        Ok(Err(_recv_error)) => {
+                            // Record wait duration (no cache hit since channel closed)
+                            // Requirement 19.5
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
 
-                        // Fetcher completed with error - fall back to own S3 fetch
-                        // Requirement 17.2: Waiter falls back on fetcher error
-                        debug!(
-                            "Download coordination: fetcher error ({}), falling back to S3 for {}",
-                            error, cache_key
-                        );
-                        Self::forward_get_head_to_s3_and_cache(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            cache_manager,
-                            s3_client,
-                            range_handler.clone(),
-                            proxy_referer,
-                        )
-                        .await
-                    }
-                    Ok(Err(_recv_error)) => {
-                        // Record wait duration (no cache hit since channel closed)
-                        // Requirement 19.5
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
-                                .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
+                            // Channel closed (fetcher dropped without completing)
+                            // Requirement 7.2: Become the new fetcher
+                            debug!(
+                                "Download coordination: channel closed, falling back to S3 for {}",
+                                cache_key
+                            );
+                            return Self::forward_get_head_to_s3_and_cache(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                cache_manager,
+                                s3_client,
+                                range_handler.clone(),
+                                proxy_referer,
+                            )
+                            .await;
                         }
+                        Err(_timeout) => {
+                            // Timeout fired — check if FetchGuard is still present
+                            // Requirements: 7.1, 7.2, 7.5
+                            re_subscribe_count += 1;
 
-                        // Channel closed (fetcher dropped without completing) - fall back to S3
-                        // Requirement 20.2: Waiters detect channel closure and fall back
-                        debug!(
-                            "Download coordination: channel closed, falling back to S3 for {}",
-                            cache_key
-                        );
-                        Self::forward_get_head_to_s3_and_cache(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            cache_manager,
-                            s3_client,
-                            range_handler.clone(),
-                            proxy_referer,
-                        )
-                        .await
-                    }
-                    Err(_timeout) => {
-                        // Record wait duration and timeout metric
-                        // Requirements 19.3, 19.5
-                        if let Some(ref mm) = metrics_manager {
-                            let mm_guard = mm.read().await;
-                            mm_guard
-                                .record_coalesce_wait_duration(wait_start.elapsed())
+                            if re_subscribe_count > max_resubscriptions {
+                                // Requirement 7.5: Fail with gateway timeout after max re-subscriptions
+                                if let Some(ref mm) = metrics_manager {
+                                    let mm_guard = mm.read().await;
+                                    mm_guard
+                                        .record_coalesce_wait_duration(wait_start.elapsed())
+                                        .await;
+                                    mm_guard.record_coalesce_timeout().await;
+                                }
+
+                                warn!(
+                                    cache_key = %cache_key,
+                                    re_subscribe_count = re_subscribe_count,
+                                    max_resubscriptions = max_resubscriptions,
+                                    "Download coordination: waiter exceeded max re-subscriptions, returning 504"
+                                );
+
+                                let response = Response::builder()
+                                    .status(hyper::StatusCode::GATEWAY_TIMEOUT)
+                                    .body(crate::http_proxy::empty_boxed_body())
+                                    .unwrap();
+                                return Ok(response);
+                            }
+
+                            // Check if FetchGuard still exists under the same lock guard
+                            // Requirement 7.1: Re-subscribe if FetchGuard present
+                            // Requirement 7.2: Become fetcher if FetchGuard absent
+                            if let Some(new_rx) = inflight_tracker.try_resubscribe(&flight_key) {
+                                // FetchGuard still present — re-subscribe with fresh receiver
+                                debug!(
+                                    "Download coordination: timeout #{}, re-subscribing for {}",
+                                    re_subscribe_count, cache_key
+                                );
+                                rx = new_rx;
+                                continue; // loop again with fresh timeout
+                            } else {
+                                // FetchGuard gone — become the new fetcher
+                                if let Some(ref mm) = metrics_manager {
+                                    let mm_guard = mm.read().await;
+                                    mm_guard
+                                        .record_coalesce_wait_duration(wait_start.elapsed())
+                                        .await;
+                                    mm_guard.record_coalesce_timeout().await;
+                                }
+
+                                debug!(
+                                    "Download coordination: FetchGuard absent after timeout, becoming fetcher for {}",
+                                    cache_key
+                                );
+                                return Self::forward_get_head_to_s3_and_cache(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    cache_manager,
+                                    s3_client,
+                                    range_handler,
+                                    proxy_referer,
+                                )
                                 .await;
-                            mm_guard.record_coalesce_timeout().await;
+                            }
                         }
-
-                        // Timeout waiting for fetcher - fall back to own S3 fetch
-                        // Requirement 17.3: Waiter timeout falls back
-                        debug!(
-                            "Download coordination: timeout waiting for fetcher, falling back to S3 for {}",
-                            cache_key
-                        );
-                        Self::forward_get_head_to_s3_and_cache(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            cache_manager,
-                            s3_client,
-                            range_handler,
-                            proxy_referer,
-                        )
-                        .await
                     }
                 }
             }
@@ -6424,6 +6502,7 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         coordination_enabled: bool,
         wait_timeout: std::time::Duration,
+        max_resubscriptions: u32,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
@@ -6500,111 +6579,156 @@ impl HttpProxy {
                     mm.read().await.record_coalesce_wait().await;
                 }
                 let wait_start = std::time::Instant::now();
+                let mut re_subscribe_count: u32 = 0;
 
-                match tokio::time::timeout(wait_timeout, rx.recv()).await {
-                    Ok(Ok(Ok(()))) => {
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
-                                .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
-                        }
+                // Re-subscription loop for part waiter
+                // Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
+                loop {
+                    match tokio::time::timeout(wait_timeout, rx.recv()).await {
+                        Ok(Ok(Ok(()))) => {
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
 
-                        debug!(
-                            "Download coordination: part fetcher completed, issuing validated serve for {}:part{}",
-                            cache_key, part_number
-                        );
+                            debug!(
+                                "Download coordination: part fetcher completed, issuing validated serve for {}:part{}",
+                                cache_key, part_number
+                            );
 
-                        // Validated serve: every waiter issues its own
-                        // signed conditional request before serving cached
-                        // bytes (fixes IAM bypass on part coalescing).
-                        Self::serve_cached_part_validated(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            part_number,
-                            cache_manager,
-                            range_handler,
-                            s3_client,
-                            metrics_manager.clone(),
-                            proxy_referer,
-                        )
-                        .await
-                    }
-                    Ok(Ok(Err(error))) => {
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
-                                .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
+                            // Validated serve: every waiter issues its own
+                            // signed conditional request before serving cached
+                            // bytes (fixes IAM bypass on part coalescing).
+                            return Self::serve_cached_part_validated(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                part_number,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                metrics_manager.clone(),
+                                proxy_referer,
+                            )
+                            .await;
                         }
-                        debug!(
-                            "Download coordination: part fetcher error ({}), falling back for {}:part{}",
-                            error, cache_key, part_number
-                        );
-                        Self::forward_get_head_to_s3_and_cache(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            cache_manager,
-                            s3_client,
-                            range_handler.clone(),
-                            proxy_referer,
-                        )
-                        .await
-                    }
-                    Ok(Err(_recv_error)) => {
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
-                                .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
+                        Ok(Ok(Err(error))) => {
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
+                            debug!(
+                                "Download coordination: part fetcher error ({}), falling back for {}:part{}",
+                                error, cache_key, part_number
+                            );
+                            return Self::forward_get_head_to_s3_and_cache(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                cache_manager,
+                                s3_client,
+                                range_handler.clone(),
+                                proxy_referer,
+                            )
+                            .await;
                         }
-                        debug!(
-                            "Download coordination: part channel closed, falling back for {}:part{}",
-                            cache_key, part_number
-                        );
-                        Self::forward_get_head_to_s3_and_cache(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            cache_manager,
-                            s3_client,
-                            range_handler.clone(),
-                            proxy_referer,
-                        )
-                        .await
-                    }
-                    Err(_timeout) => {
-                        if let Some(ref mm) = metrics_manager {
-                            let mm_guard = mm.read().await;
-                            mm_guard
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
-                            mm_guard.record_coalesce_timeout().await;
+                        Ok(Err(_recv_error)) => {
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
+                            debug!(
+                                "Download coordination: part channel closed, falling back for {}:part{}",
+                                cache_key, part_number
+                            );
+                            return Self::forward_get_head_to_s3_and_cache(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                cache_manager,
+                                s3_client,
+                                range_handler.clone(),
+                                proxy_referer,
+                            )
+                            .await;
                         }
-                        debug!(
-                            "Download coordination: part waiter timeout, falling back for {}:part{}",
-                            cache_key, part_number
-                        );
-                        Self::forward_get_head_to_s3_and_cache(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            cache_manager,
-                            s3_client,
-                            range_handler,
-                            proxy_referer,
-                        )
-                        .await
+                        Err(_timeout) => {
+                            // Timeout fired — re-subscribe or fail
+                            // Requirements: 7.1, 7.2, 7.5
+                            re_subscribe_count += 1;
+
+                            if re_subscribe_count > max_resubscriptions {
+                                if let Some(ref mm) = metrics_manager {
+                                    let mm_guard = mm.read().await;
+                                    mm_guard
+                                        .record_coalesce_wait_duration(wait_start.elapsed())
+                                        .await;
+                                    mm_guard.record_coalesce_timeout().await;
+                                }
+
+                                warn!(
+                                    cache_key = %cache_key,
+                                    part_number = part_number,
+                                    re_subscribe_count = re_subscribe_count,
+                                    max_resubscriptions = max_resubscriptions,
+                                    "Download coordination: part waiter exceeded max re-subscriptions, returning 504"
+                                );
+
+                                let response = Response::builder()
+                                    .status(hyper::StatusCode::GATEWAY_TIMEOUT)
+                                    .body(crate::http_proxy::empty_boxed_body())
+                                    .unwrap();
+                                return Ok(response);
+                            }
+
+                            // Check if FetchGuard still exists
+                            if let Some(new_rx) = inflight_tracker.try_resubscribe(&flight_key) {
+                                debug!(
+                                    "Download coordination: part timeout #{}, re-subscribing for {}:part{}",
+                                    re_subscribe_count, cache_key, part_number
+                                );
+                                rx = new_rx;
+                                continue;
+                            } else {
+                                // FetchGuard gone — become the new fetcher
+                                if let Some(ref mm) = metrics_manager {
+                                    let mm_guard = mm.read().await;
+                                    mm_guard
+                                        .record_coalesce_wait_duration(wait_start.elapsed())
+                                        .await;
+                                    mm_guard.record_coalesce_timeout().await;
+                                }
+
+                                debug!(
+                                    "Download coordination: part FetchGuard absent after timeout, becoming fetcher for {}:part{}",
+                                    cache_key, part_number
+                                );
+                                return Self::forward_get_head_to_s3_and_cache(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    cache_manager,
+                                    s3_client,
+                                    range_handler,
+                                    proxy_referer,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
             }
@@ -6756,178 +6880,228 @@ impl HttpProxy {
                     mm.read().await.record_coalesce_wait().await;
                 }
                 let wait_start = std::time::Instant::now();
+                let max_resubscriptions = config
+                    .cache
+                    .download_coordination
+                    .max_waiter_resubscriptions;
+                let mut re_subscribe_count: u32 = 0;
 
-                match tokio::time::timeout(wait_timeout, rx.recv()).await {
-                    Ok(Ok(Ok(()))) => {
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
-                                .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
-                        }
+                // Re-subscription loop for range waiter
+                // Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
+                loop {
+                    match tokio::time::timeout(wait_timeout, rx.recv()).await {
+                        Ok(Ok(Ok(()))) => {
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
 
-                        debug!(
-                            "Download coordination: range fetcher completed, issuing validated serve for {}:{}-{}",
-                            cache_key, range_spec.start, range_spec.end
-                        );
+                            debug!(
+                                "Download coordination: range fetcher completed, issuing validated serve for {}:{}-{}",
+                                cache_key, range_spec.start, range_spec.end
+                            );
 
-                        // Validated serve: every waiter issues its own
-                        // signed conditional GET before serving cached
-                        // bytes (fixes IAM bypass on range coalescing).
-                        Self::serve_range_from_cache_validated(
-                            method,
-                            uri,
-                            host,
-                            headers,
-                            cache_key,
-                            range_spec,
-                            cache_manager,
-                            range_handler,
-                            s3_client,
-                            config,
-                            is_signed,
-                            metrics_manager.clone(),
-                            proxy_referer,
-                        )
-                        .await
-                    }
-                    Ok(Ok(Err(error))) => {
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
+                            // Validated serve: every waiter issues its own
+                            // signed conditional GET before serving cached
+                            // bytes (fixes IAM bypass on range coalescing).
+                            return Self::serve_range_from_cache_validated(
+                                method,
+                                uri,
+                                host,
+                                headers,
+                                cache_key,
+                                range_spec,
+                                cache_manager,
+                                range_handler,
+                                s3_client,
+                                config,
+                                is_signed,
+                                metrics_manager.clone(),
+                                proxy_referer,
+                            )
+                            .await;
+                        }
+                        Ok(Ok(Err(error))) => {
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
+                            debug!(
+                                "Download coordination: range fetcher error ({}), falling back for {}:{}-{}",
+                                error, cache_key, range_spec.start, range_spec.end
+                            );
+                            return if is_signed {
+                                Self::forward_signed_range_request(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    range_spec,
+                                    overlap,
+                                    cache_manager,
+                                    range_handler,
+                                    s3_client,
+                                    config,
+                                    proxy_referer,
+                                )
                                 .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
-                        }
-                        debug!(
-                            "Download coordination: range fetcher error ({}), falling back for {}:{}-{}",
-                            error, cache_key, range_spec.start, range_spec.end
-                        );
-                        if is_signed {
-                            Self::forward_signed_range_request(
-                                method,
-                                uri,
-                                host,
-                                headers,
-                                cache_key,
-                                range_spec,
-                                overlap,
-                                cache_manager,
-                                range_handler,
-                                s3_client,
-                                config,
-                                proxy_referer,
-                            )
-                            .await
-                        } else {
-                            Self::forward_range_request_to_s3(
-                                method,
-                                uri,
-                                host,
-                                headers,
-                                cache_key,
-                                range_spec,
-                                overlap,
-                                cache_manager,
-                                range_handler,
-                                s3_client,
-                                config,
-                                preloaded_metadata,
-                                proxy_referer,
-                            )
-                            .await
-                        }
-                    }
-                    Ok(Err(_recv_error)) => {
-                        if let Some(ref mm) = metrics_manager {
-                            mm.read()
+                            } else {
+                                Self::forward_range_request_to_s3(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    range_spec,
+                                    overlap,
+                                    cache_manager,
+                                    range_handler,
+                                    s3_client,
+                                    config,
+                                    preloaded_metadata,
+                                    proxy_referer,
+                                )
                                 .await
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
+                            };
                         }
-                        debug!(
-                            "Download coordination: range channel closed, falling back for {}:{}-{}",
-                            cache_key, range_spec.start, range_spec.end
-                        );
-                        if is_signed {
-                            Self::forward_signed_range_request(
-                                method,
-                                uri,
-                                host,
-                                headers,
-                                cache_key,
-                                range_spec,
-                                overlap,
-                                cache_manager,
-                                range_handler,
-                                s3_client,
-                                config,
-                                proxy_referer,
-                            )
-                            .await
-                        } else {
-                            Self::forward_range_request_to_s3(
-                                method,
-                                uri,
-                                host,
-                                headers,
-                                cache_key,
-                                range_spec,
-                                overlap,
-                                cache_manager,
-                                range_handler,
-                                s3_client,
-                                config,
-                                preloaded_metadata,
-                                proxy_referer,
-                            )
-                            .await
+                        Ok(Err(_recv_error)) => {
+                            if let Some(ref mm) = metrics_manager {
+                                mm.read()
+                                    .await
+                                    .record_coalesce_wait_duration(wait_start.elapsed())
+                                    .await;
+                            }
+                            debug!(
+                                "Download coordination: range channel closed, falling back for {}:{}-{}",
+                                cache_key, range_spec.start, range_spec.end
+                            );
+                            return if is_signed {
+                                Self::forward_signed_range_request(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    range_spec,
+                                    overlap,
+                                    cache_manager,
+                                    range_handler,
+                                    s3_client,
+                                    config,
+                                    proxy_referer,
+                                )
+                                .await
+                            } else {
+                                Self::forward_range_request_to_s3(
+                                    method,
+                                    uri,
+                                    host,
+                                    headers,
+                                    cache_key,
+                                    range_spec,
+                                    overlap,
+                                    cache_manager,
+                                    range_handler,
+                                    s3_client,
+                                    config,
+                                    preloaded_metadata,
+                                    proxy_referer,
+                                )
+                                .await
+                            };
                         }
-                    }
-                    Err(_timeout) => {
-                        if let Some(ref mm) = metrics_manager {
-                            let mm_guard = mm.read().await;
-                            mm_guard
-                                .record_coalesce_wait_duration(wait_start.elapsed())
-                                .await;
-                            mm_guard.record_coalesce_timeout().await;
-                        }
-                        debug!(
-                            "Download coordination: range waiter timeout, falling back for {}:{}-{}",
-                            cache_key, range_spec.start, range_spec.end
-                        );
-                        if is_signed {
-                            Self::forward_signed_range_request(
-                                method,
-                                uri,
-                                host,
-                                headers,
-                                cache_key,
-                                range_spec,
-                                overlap,
-                                cache_manager,
-                                range_handler,
-                                s3_client,
-                                config,
-                                proxy_referer,
-                            )
-                            .await
-                        } else {
-                            Self::forward_range_request_to_s3(
-                                method,
-                                uri,
-                                host,
-                                headers,
-                                cache_key,
-                                range_spec,
-                                overlap,
-                                cache_manager,
-                                range_handler,
-                                s3_client,
-                                config,
-                                preloaded_metadata,
-                                proxy_referer,
-                            )
-                            .await
+                        Err(_timeout) => {
+                            // Timeout fired — re-subscribe or fail
+                            // Requirements: 7.1, 7.2, 7.5
+                            re_subscribe_count += 1;
+
+                            if re_subscribe_count > max_resubscriptions {
+                                if let Some(ref mm) = metrics_manager {
+                                    let mm_guard = mm.read().await;
+                                    mm_guard
+                                        .record_coalesce_wait_duration(wait_start.elapsed())
+                                        .await;
+                                    mm_guard.record_coalesce_timeout().await;
+                                }
+
+                                warn!(
+                                    cache_key = %cache_key,
+                                    range_start = range_spec.start,
+                                    range_end = range_spec.end,
+                                    re_subscribe_count = re_subscribe_count,
+                                    max_resubscriptions = max_resubscriptions,
+                                    "Download coordination: range waiter exceeded max re-subscriptions, returning 504"
+                                );
+
+                                let response = Response::builder()
+                                    .status(hyper::StatusCode::GATEWAY_TIMEOUT)
+                                    .body(crate::http_proxy::empty_boxed_body())
+                                    .unwrap();
+                                return Ok(response);
+                            }
+
+                            // Check if FetchGuard still exists
+                            if let Some(new_rx) = inflight_tracker.try_resubscribe(&flight_key) {
+                                debug!(
+                                    "Download coordination: range timeout #{}, re-subscribing for {}:{}-{}",
+                                    re_subscribe_count, cache_key, range_spec.start, range_spec.end
+                                );
+                                rx = new_rx;
+                                continue;
+                            } else {
+                                // FetchGuard gone — become the new fetcher
+                                if let Some(ref mm) = metrics_manager {
+                                    let mm_guard = mm.read().await;
+                                    mm_guard
+                                        .record_coalesce_wait_duration(wait_start.elapsed())
+                                        .await;
+                                    mm_guard.record_coalesce_timeout().await;
+                                }
+
+                                debug!(
+                                    "Download coordination: range FetchGuard absent after timeout, becoming fetcher for {}:{}-{}",
+                                    cache_key, range_spec.start, range_spec.end
+                                );
+                                return if is_signed {
+                                    Self::forward_signed_range_request(
+                                        method,
+                                        uri,
+                                        host,
+                                        headers,
+                                        cache_key,
+                                        range_spec,
+                                        overlap,
+                                        cache_manager,
+                                        range_handler,
+                                        s3_client,
+                                        config,
+                                        proxy_referer,
+                                    )
+                                    .await
+                                } else {
+                                    Self::forward_range_request_to_s3(
+                                        method,
+                                        uri,
+                                        host,
+                                        headers,
+                                        cache_key,
+                                        range_spec,
+                                        overlap,
+                                        cache_manager,
+                                        range_handler,
+                                        s3_client,
+                                        config,
+                                        preloaded_metadata,
+                                        proxy_referer,
+                                    )
+                                    .await
+                                };
+                            }
                         }
                     }
                 }
@@ -8187,30 +8361,65 @@ impl HttpProxy {
 
                                     if !accumulated.is_empty() {
                                         let body_size = accumulated.len() as u64;
-                                        debug!(
-                                            "Caching streamed GET response (fallback): cache_key={}, content_length={} bytes",
-                                            cache_key_clone, body_size
-                                        );
 
-                                        if let Err(e) = Self::cache_response_appropriately(
-                                            &cache_manager_clone,
-                                            &cache_key_clone,
-                                            &uri_clone,
-                                            &accumulated,
-                                            &headers_for_cache,
-                                            &metadata_for_cache,
-                                        )
-                                        .await
-                                        {
-                                            warn!(
-                                                "Failed to cache streamed response: cache_key={}, error={}",
-                                                cache_key_clone, e
-                                            );
+                                        // Length-validation gate: reject truncated bodies before committing to cache
+                                        // Requirements: 2.1, 2.2, 2.4
+                                        let declared_length = headers_for_cache
+                                            .get("content-length")
+                                            .and_then(|v| v.parse::<u64>().ok())
+                                            .or_else(|| {
+                                                parse_content_range_length(&headers_for_cache)
+                                            });
+
+                                        let should_cache = if let Some(expected) = declared_length {
+                                            if body_size != expected {
+                                                warn!(
+                                                    cache_key = %cache_key_clone,
+                                                    declared_length = expected,
+                                                    accumulated_length = body_size,
+                                                    cause = "stream ended before declared length reached",
+                                                    "Rejecting truncated body — not committing to cache"
+                                                );
+                                                false
+                                            } else {
+                                                true
+                                            }
                                         } else {
+                                            // No Content-Length or Content-Range: do not commit
+                                            // (chunked or unknown-length responses)
                                             debug!(
-                                                "Cached streamed response: cache_key={}, size={} bytes",
+                                                "Skipping cache for response with no declared length: cache_key={}",
+                                                cache_key_clone
+                                            );
+                                            false
+                                        };
+
+                                        if should_cache {
+                                            debug!(
+                                                "Caching streamed GET response (fallback): cache_key={}, content_length={} bytes",
                                                 cache_key_clone, body_size
                                             );
+
+                                            if let Err(e) = Self::cache_response_appropriately(
+                                                &cache_manager_clone,
+                                                &cache_key_clone,
+                                                &uri_clone,
+                                                &accumulated,
+                                                &headers_for_cache,
+                                                &metadata_for_cache,
+                                            )
+                                            .await
+                                            {
+                                                warn!(
+                                                    "Failed to cache streamed response: cache_key={}, error={}",
+                                                    cache_key_clone, e
+                                                );
+                                            } else {
+                                                debug!(
+                                                    "Cached streamed response: cache_key={}, size={} bytes",
+                                                    cache_key_clone, body_size
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -10879,5 +11088,132 @@ mod tests {
         // Validates: Requirements 5.9
         let _ = HttpProxy::parse_host_header(&value);
         true
+    }
+
+    /// **Property 2: Cache integrity on truncation**
+    ///
+    /// For every generated (declared_length, actual_bytes) pair, the length-validation
+    /// gate allows caching if and only if `actual_bytes.len() as u64 == declared_length`.
+    ///
+    /// This tests the core invariant of the truncated body rejection logic added in
+    /// the streaming GET fallback path: a cache entry is committed only when the
+    /// accumulated byte count matches the declared Content-Length or Content-Range length.
+    ///
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    #[quickcheck]
+    fn prop_cache_integrity_on_truncation_content_length(
+        declared_length: u16,
+        actual_size: u16,
+    ) -> TestResult {
+        // Simulate the length-validation gate logic from the streaming GET fallback path.
+        // The gate compares accumulated byte count to declared Content-Length.
+        let declared = declared_length as u64;
+        let actual = actual_size as u64;
+
+        // Build a headers map with Content-Length set to declared_length
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("content-length".to_string(), declared.to_string());
+
+        // Extract declared length the same way the production code does:
+        // headers.get("content-length").and_then(|v| v.parse::<u64>().ok())
+        //     .or_else(|| parse_content_range_length(&headers))
+        let extracted_length = headers
+            .get("content-length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| parse_content_range_length(&headers));
+
+        // The validation gate: should_cache = (actual == declared)
+        let should_cache = if let Some(expected) = extracted_length {
+            actual == expected
+        } else {
+            false
+        };
+
+        // Property: cache entry exists iff lengths match
+        let lengths_match = actual == declared;
+        TestResult::from_bool(should_cache == lengths_match)
+    }
+
+    /// **Property 2 (Content-Range variant): Cache integrity on truncation**
+    ///
+    /// For every generated Content-Range header with (start, end, total) and an actual
+    /// byte count, the length-validation gate allows caching if and only if
+    /// `actual_bytes == (end - start + 1)`.
+    ///
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    #[quickcheck]
+    fn prop_cache_integrity_on_truncation_content_range(
+        start: u16,
+        range_size: u16,
+        extra_total: u16,
+        actual_size: u16,
+    ) -> TestResult {
+        // Filter: range_size must be at least 1 (valid range has at least 1 byte)
+        if range_size == 0 {
+            return TestResult::discard();
+        }
+
+        let start = start as u64;
+        let range_size = range_size as u64;
+        let extra_total = extra_total as u64;
+        let actual = actual_size as u64;
+
+        // Calculate end and total ensuring validity constraints:
+        // - start <= end (guaranteed by range_size >= 1)
+        // - end < total (guaranteed by extra_total >= 0, so total = end + 1 + extra_total)
+        let end = start + range_size - 1;
+        let total = end + 1 + extra_total;
+
+        // Build a headers map with Content-Range (no Content-Length)
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert(
+            "content-range".to_string(),
+            format!("bytes {}-{}/{}", start, end, total),
+        );
+
+        // Extract declared length the same way the production code does
+        let extracted_length = headers
+            .get("content-length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| parse_content_range_length(&headers));
+
+        // The validation gate: should_cache = (actual == declared)
+        let should_cache = if let Some(expected) = extracted_length {
+            actual == expected
+        } else {
+            false
+        };
+
+        // Property: cache entry exists iff actual matches the range size (end - start + 1)
+        let lengths_match = actual == range_size;
+        TestResult::from_bool(should_cache == lengths_match)
+    }
+
+    /// **Property 2 (no-length variant): Cache integrity on truncation**
+    ///
+    /// For every generated byte buffer with no Content-Length or Content-Range header,
+    /// the validation gate rejects caching (returns false).
+    ///
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    #[quickcheck]
+    fn prop_cache_integrity_no_declared_length_rejects(actual_size: u16) -> bool {
+        // Build an empty headers map (no Content-Length, no Content-Range)
+        let headers: HashMap<String, String> = HashMap::new();
+
+        // Extract declared length the same way the production code does
+        let extracted_length = headers
+            .get("content-length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| parse_content_range_length(&headers));
+
+        // The validation gate: should_cache = false when no declared length
+        let should_cache = if let Some(expected) = extracted_length {
+            actual_size as u64 == expected
+        } else {
+            false
+        };
+
+        // Property: no declared length means no caching regardless of actual size
+        !should_cache
     }
 }

@@ -1,6 +1,6 @@
-# S3 Hybrid Cache Architecture
+# Hybrid Cache for Amazon S3 Architecture
 
-Technical architecture overview and design principles for S3 Hybrid Cache.
+Technical architecture overview and design principles for Hybrid Cache for Amazon S3.
 
 ## Table of Contents
 
@@ -47,7 +47,7 @@ Technical architecture overview and design principles for S3 Hybrid Cache.
             │                         │                          │
             ▼                         ▼                          ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                       S3 Hybrid Cache (1..N)                               │
+│                    Hybrid Cache for Amazon S3 (1..N)                        │
 │                                                                            │
 │  ┌────────────────────┐ ┌─────────────────────┐ ┌───────────────────────┐  │
 │  │ HTTP (Port 80)     │ │ TLS Proxy (Port 3129)│ │ HTTPS (Port 443)     │  │
@@ -292,7 +292,7 @@ Each instance operates independently - the shared storage is the only integratio
 **Implementation**:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      S3 Hybrid Cache Instance                   │
+│                 Hybrid Cache for Amazon S3 Instance              │
 │  ┌─────────────────────┐    ┌─────────────────────────────────┐ │
 │  │  Request Handler    │    │  Cache Operations               │ │
 │  │                     │    │                                 │ │

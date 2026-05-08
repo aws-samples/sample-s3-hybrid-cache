@@ -1,6 +1,6 @@
-# S3 Hybrid Cache Documentation
+# Hybrid Cache for Amazon S3 Documentation
 
-Deep-dive reference documentation for S3 Hybrid Cache. For an overview and quick start, see the [project README](../README.md).
+Deep-dive reference documentation for Hybrid Cache for Amazon S3. For an overview and quick start, see the [project README](../README.md).
 
 ## Table of Contents
 

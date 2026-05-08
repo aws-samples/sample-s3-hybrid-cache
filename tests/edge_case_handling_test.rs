@@ -351,15 +351,17 @@ async fn test_stale_eviction_lock_handling() {
     std::fs::create_dir_all(&lock_dir).unwrap();
     let lock_path = lock_dir.join("global_eviction.lock");
 
-    let stale_lock = s3_proxy::cache::GlobalEvictionLock {
-        instance_id: "stale-instance".to_string(),
-        process_id: 12345,
+    let stale_lock = s3_proxy::cache::EvictionLockPayload {
+        uuid: "stale-uuid-12345".to_string(),
+        acquired_at_ms: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 61_000, // 61 seconds ago
         hostname: "stale-host".to_string(),
-        acquired_at: SystemTime::now() - Duration::from_secs(61), // 61 seconds ago
-        timeout_seconds: 60,
     };
 
-    let lock_json = serde_json::to_string_pretty(&stale_lock).unwrap();
+    let lock_json = serde_json::to_string(&stale_lock).unwrap();
     std::fs::write(&lock_path, lock_json).unwrap();
 
     // Try to acquire lock - should break stale lock and succeed

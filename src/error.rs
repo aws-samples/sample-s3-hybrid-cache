@@ -63,6 +63,9 @@ pub enum ProxyError {
 
     #[error("Retry after {0} seconds")]
     RetryAfter(u64),
+
+    #[error("Eviction fence lost: {0}")]
+    EvictionFenceLost(String),
 }
 
 impl From<std::io::Error> for ProxyError {

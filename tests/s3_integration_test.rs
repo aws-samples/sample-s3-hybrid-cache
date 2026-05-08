@@ -11,10 +11,12 @@ use s3_proxy::{
         MetricsConfig, OtlpCompression, OtlpConfig, ServerConfig, SharedStorageConfig,
     },
     connection_pool::ConnectionPoolManager,
+    destination_policy::DestinationPolicy,
     http_proxy::HttpProxy,
     tcp_proxy::TcpProxy,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -157,6 +159,7 @@ async fn test_tcp_passthrough_mode() {
     let _tcp_proxy = TcpProxy::new(
         tcp_addr,
         s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+        Arc::new(DestinationPolicy::new(443, None, HashSet::new())),
     );
 
     // Verify TCP proxy can be created and configured
@@ -288,6 +291,7 @@ async fn test_end_to_end_proxy_setup() {
     let _tcp_proxy = TcpProxy::new(
         tcp_addr,
         s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+        Arc::new(DestinationPolicy::new(443, None, HashSet::new())),
     );
 
     // Connection pool manager setup

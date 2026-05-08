@@ -1,6 +1,6 @@
-# Getting Started with S3 Hybrid Cache
+# Getting Started with Hybrid Cache for Amazon S3
 
-Quick start guide for installing, configuring, and running S3 Hybrid Cache.
+Quick start guide for installing, configuring, and running Hybrid Cache for Amazon S3.
 
 ## Table of Contents
 
@@ -94,7 +94,7 @@ sudo systemctl restart s3-proxy                          # Restart service
 
 If you build on a separate host, copy the binary to each target (see [Binary Portability](#binary-portability)) and run only the last three commands. No Rust toolchain needed on the proxy servers.
 
-The proxy also logs its version and build timestamp on startup (`Starting S3 Hybrid Cache server v<version> (built: <timestamp>)`), so `journalctl -u s3-proxy | grep Starting` confirms which binary is actually running.
+The proxy also logs its version and build timestamp on startup (`Starting Hybrid Cache for Amazon S3 server v<version> (built: <timestamp>)`), so `journalctl -u s3-proxy | grep Starting` confirms which binary is actually running.
 
 For multi-instance deployments, restart one proxy at a time. Clients using the AWS CRT transfer client fail over to the remaining instances via DNS multi-value routing while each instance restarts. The shared cache is preserved across restarts — the journal system handles concurrent reads and consolidation without coordination.
 

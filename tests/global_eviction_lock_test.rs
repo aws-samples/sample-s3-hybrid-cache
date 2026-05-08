@@ -337,7 +337,7 @@ mod helper_methods_tests {
 #[cfg(test)]
 mod lock_acquisition_tests {
     use s3_proxy::cache::CacheManager;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -365,23 +365,15 @@ mod lock_acquisition_tests {
             "Lock file should exist after acquisition"
         );
 
-        // Verify lock file contains valid JSON
+        // Verify lock file contains valid JSON (new EvictionLockPayload format)
         let lock_json = std::fs::read_to_string(&lock_file_path).expect("Failed to read lock file");
-        let lock: s3_proxy::cache::GlobalEvictionLock =
+        let lock: s3_proxy::cache::EvictionLockPayload =
             serde_json::from_str(&lock_json).expect("Lock file should contain valid JSON");
 
         // Verify lock contains expected fields
-        assert!(
-            !lock.instance_id.is_empty(),
-            "Instance ID should not be empty"
-        );
-        assert!(lock.process_id > 0, "Process ID should be valid");
+        assert!(!lock.uuid.is_empty(), "UUID should not be empty");
         assert!(!lock.hostname.is_empty(), "Hostname should not be empty");
-        // Requirement 2.4: Default lock timeout is 60 seconds
-        assert_eq!(
-            lock.timeout_seconds, 60,
-            "Timeout should be 60 seconds (default per requirements 2.4 and 6.2)"
-        );
+        assert!(lock.acquired_at_ms > 0, "acquired_at_ms should be set");
     }
 
     #[tokio::test]
@@ -424,18 +416,19 @@ mod lock_acquisition_tests {
         let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
         std::fs::create_dir_all(lock_file_path.parent().unwrap())
             .expect("Failed to create locks dir");
-        let stale_time = SystemTime::now() - Duration::from_secs(400); // 400 seconds ago (stale)
+        let stale_time_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 400_000; // 400 seconds ago (stale)
 
-        let stale_lock = s3_proxy::cache::GlobalEvictionLock {
-            instance_id: "old-instance:99999".to_string(),
-            process_id: 99999,
+        let stale_lock = s3_proxy::cache::EvictionLockPayload {
+            uuid: "old-uuid-99999".to_string(),
+            acquired_at_ms: stale_time_ms,
             hostname: "old-host".to_string(),
-            acquired_at: stale_time,
-            timeout_seconds: 300,
         };
 
-        let lock_json =
-            serde_json::to_string_pretty(&stale_lock).expect("Failed to serialize stale lock");
+        let lock_json = serde_json::to_string(&stale_lock).expect("Failed to serialize stale lock");
         std::fs::write(&lock_file_path, lock_json).expect("Failed to write stale lock file");
 
         // Try to acquire lock - should succeed by forcibly acquiring stale lock
@@ -446,21 +439,14 @@ mod lock_acquisition_tests {
 
         assert!(acquired, "Should successfully acquire stale lock");
 
-        // Verify lock file was updated with new instance
+        // Verify lock file was updated with new UUID
         let lock_json = std::fs::read_to_string(&lock_file_path).expect("Failed to read lock file");
-        let lock: s3_proxy::cache::GlobalEvictionLock =
+        let lock: s3_proxy::cache::EvictionLockPayload =
             serde_json::from_str(&lock_json).expect("Lock file should contain valid JSON");
 
         // Verify lock is now owned by current instance (not the old one)
-        assert_ne!(
-            lock.instance_id, "old-instance:99999",
-            "Lock should be owned by new instance"
-        );
-        assert_eq!(
-            lock.process_id,
-            std::process::id(),
-            "Lock should have current process ID"
-        );
+        assert_ne!(lock.uuid, "old-uuid-99999", "Lock should have a new UUID");
+        assert!(!lock.uuid.is_empty(), "New UUID should be set");
     }
 
     #[tokio::test]
@@ -488,17 +474,14 @@ mod lock_acquisition_tests {
             "Should successfully acquire lock when existing lock is corrupted"
         );
 
-        // Verify lock file was replaced with valid lock
+        // Verify lock file was replaced with valid lock (new EvictionLockPayload format)
         let lock_json = std::fs::read_to_string(&lock_file_path).expect("Failed to read lock file");
-        let lock: s3_proxy::cache::GlobalEvictionLock =
+        let lock: s3_proxy::cache::EvictionLockPayload =
             serde_json::from_str(&lock_json).expect("Lock file should now contain valid JSON");
 
         // Verify lock contains expected fields
-        assert!(
-            !lock.instance_id.is_empty(),
-            "Instance ID should not be empty"
-        );
-        assert!(lock.process_id > 0, "Process ID should be valid");
+        assert!(!lock.uuid.is_empty(), "UUID should not be empty");
+        assert!(lock.acquired_at_ms > 0, "acquired_at_ms should be set");
     }
 
     #[tokio::test]
@@ -541,33 +524,27 @@ mod lock_acquisition_tests {
             .expect("Failed to acquire lock");
         assert!(acquired, "Should acquire lock");
 
-        // Read and parse lock file
+        // Read and parse lock file (new EvictionLockPayload format)
         let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
         let lock_json = std::fs::read_to_string(&lock_file_path).expect("Failed to read lock file");
-        let lock: s3_proxy::cache::GlobalEvictionLock =
+        let lock: s3_proxy::cache::EvictionLockPayload =
             serde_json::from_str(&lock_json).expect("Lock file should contain valid JSON");
 
         // Verify all required fields are present and valid
-        assert!(
-            !lock.instance_id.is_empty(),
-            "instance_id should be present"
-        );
-        assert!(
-            lock.process_id > 0,
-            "process_id should be present and valid"
-        );
+        assert!(!lock.uuid.is_empty(), "uuid should be present");
         assert!(!lock.hostname.is_empty(), "hostname should be present");
         assert!(
-            lock.timeout_seconds > 0,
-            "timeout_seconds should be present and valid"
+            lock.acquired_at_ms > 0,
+            "acquired_at_ms should be present and valid"
         );
 
-        // Verify acquired_at is recent (within last 5 seconds)
-        let now = SystemTime::now();
-        let elapsed = now
-            .duration_since(lock.acquired_at)
-            .expect("acquired_at should be in the past");
-        assert!(elapsed.as_secs() < 5, "acquired_at should be recent");
+        // Verify acquired_at_ms is recent (within last 5 seconds)
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let elapsed_ms = now_ms.saturating_sub(lock.acquired_at_ms);
+        assert!(elapsed_ms < 5000, "acquired_at_ms should be recent");
     }
 
     #[tokio::test]
@@ -675,16 +652,16 @@ mod lock_release_tests {
         let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
         std::fs::create_dir_all(lock_file_path.parent().unwrap())
             .expect("Failed to create locks dir");
-        let fake_lock = s3_proxy::cache::GlobalEvictionLock {
-            instance_id: "different-host:99999".to_string(),
-            process_id: 99999,
+        let fake_lock = s3_proxy::cache::EvictionLockPayload {
+            uuid: "different-host-uuid".to_string(),
+            acquired_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
             hostname: "different-host".to_string(),
-            acquired_at: std::time::SystemTime::now(),
-            timeout_seconds: 300,
         };
 
-        let lock_json =
-            serde_json::to_string_pretty(&fake_lock).expect("Failed to serialize fake lock");
+        let lock_json = serde_json::to_string(&fake_lock).expect("Failed to serialize fake lock");
         std::fs::write(&lock_file_path, lock_json).expect("Failed to write fake lock file");
 
         // Verify lock file exists

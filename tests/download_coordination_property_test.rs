@@ -698,6 +698,7 @@ async fn launch_part_concurrent(
                 range_handler,
                 true,
                 wait_timeout,
+                3,
                 None,
                 &None,
             )
@@ -735,6 +736,7 @@ async fn launch_part_concurrent(
                 range_handler,
                 true,
                 wait_timeout,
+                3,
                 None,
                 &None,
             )
@@ -1602,8 +1604,10 @@ async fn run_preservation_fetcher_error(seed: u64) -> TestResult {
 
 /// Fetcher timeout preservation (Requirement 3.9).
 ///
-/// When the fetcher exceeds wait_timeout_secs, waiters fall back to their
-/// own independent S3 fetch.
+/// When the fetcher exceeds wait_timeout_secs, waiters re-subscribe to the
+/// in-flight fetch (Requirement 7.1). After max_waiter_resubscriptions
+/// re-subscriptions without receiving a result, the waiter returns 504
+/// Gateway Timeout (Requirement 7.5).
 async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
     let mut config_inner = Config::default();
     config_inner.cache.get_ttl = Duration::from_secs(3600);
@@ -1611,6 +1615,8 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
     config_inner.cache.download_coordination.enabled = true;
     // Very short timeout so the test completes quickly.
     config_inner.cache.download_coordination.wait_timeout_secs = 1;
+    // Set max_waiter_resubscriptions to 1 so the test completes quickly.
+    config_inner.cache.download_coordination.max_waiter_resubscriptions = 1;
     config_inner.cache.ram_cache_enabled = false;
     let config = Arc::new(config_inner);
 
@@ -1621,45 +1627,19 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
     ));
     let inflight_tracker = Arc::new(InFlightTracker::new());
 
-    let fetcher_auth = make_auth(seed as usize % 256, true);
     let waiter_auth = make_auth((seed as usize % 256) + 1, true);
 
     let cache_key = format!("bucket-preserve/fetcher-timeout-{seed}.bin");
     let uri_path = format!("/{cache_key}");
 
-    // Stub: fetcher gets 200 OK (but delayed beyond timeout).
-    // Waiter gets 200 OK immediately on its fallback request.
-    let fetcher_response = StubResponse::ok(Bytes::from_static(FETCHER_BODY))
-        .with_header("etag", CACHED_ETAG)
-        .with_header("last-modified", CACHED_LAST_MODIFIED)
-        .with_header("content-type", "application/octet-stream");
+    // Stub: waiter's fallback response (not expected to be called now).
     let waiter_response = StubResponse::ok(Bytes::from_static(FETCHER_BODY))
         .with_header("etag", CACHED_ETAG)
         .with_header("last-modified", CACHED_LAST_MODIFIED)
         .with_header("content-type", "application/octet-stream");
 
     let stub_inner = StubS3Client::new()
-        .with_response_for_authorization(&fetcher_auth, fetcher_response)
         .with_response_for_authorization(&waiter_auth, waiter_response);
-
-    // Delay the fetcher's response beyond the wait_timeout.
-    let mut delays = HashMap::new();
-    delays.insert(fetcher_auth.clone(), Duration::from_millis(2500));
-
-    // Use a wrapper that delays the fetcher's S3 response.
-    // We need to implement the DelayedStub pattern inline since it's
-    // defined in the preservation test file. Instead, we'll use a simpler
-    // approach: just use the stub directly and rely on the coordination
-    // timeout mechanism.
-    //
-    // Actually, the timeout in forward_get_head_with_coordination is on
-    // the broadcast channel recv, not on the S3 request itself. So we need
-    // the fetcher to take longer than wait_timeout to complete its S3 request.
-    // We can't easily delay the stub response without the DelayedStub wrapper.
-    //
-    // Alternative approach: register the fetcher manually on the inflight
-    // tracker so the waiter times out waiting for it, then the waiter
-    // falls back to its own S3 request.
 
     // Pre-register a flight so the waiter will find an existing flight and wait.
     let flight_key = s3_proxy::inflight_tracker::InFlightTracker::make_full_key(&cache_key);
@@ -1706,32 +1686,19 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
         (status, body)
     });
 
-    // Wait for the waiter to time out and fall back (wait_timeout = 1s).
-    // After the waiter times out, drop the guard to clean up.
-    let (waiter_status, waiter_body) = waiter_handle.await.expect("waiter join");
+    // Wait for the waiter to exhaust re-subscriptions and return 504.
+    // With wait_timeout=1s and max_waiter_resubscriptions=1, this takes ~2s.
+    let (waiter_status, _waiter_body) = waiter_handle.await.expect("waiter join");
 
     // Drop the guard to clean up the flight registration.
     drop(guard);
 
-    let captured = stub_inner.captured();
-
-    // Waiter's auth must be in the trace (it fell back to its own S3 request).
-    if !trace_contains_auth(&captured, &waiter_auth) {
+    // Requirement 7.5: Waiter returns 504 Gateway Timeout after max re-subscriptions
+    // when the FetchGuard is still present (fetcher is still working).
+    if waiter_status != StatusCode::GATEWAY_TIMEOUT {
         return TestResult::error(format!(
-            "Fetcher-timeout preservation violated: waiter's auth not in S3 trace. seed={seed}",
-        ));
-    }
-
-    // Waiter must get 200 OK with the body.
-    if waiter_status != StatusCode::OK {
-        return TestResult::error(format!(
-            "Fetcher-timeout preservation violated: waiter expected 200 OK, \
+            "Fetcher-timeout preservation violated: waiter expected 504 Gateway Timeout, \
              got {waiter_status:?}. seed={seed}",
-        ));
-    }
-    if waiter_body.as_ref() != FETCHER_BODY {
-        return TestResult::error(format!(
-            "Fetcher-timeout preservation violated: waiter body differs. seed={seed}",
         ));
     }
 
