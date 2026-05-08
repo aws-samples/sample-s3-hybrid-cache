@@ -292,12 +292,6 @@ pub struct TlsConfig {
     /// Path to PEM-encoded private key file
     #[serde(default)]
     pub key_path: String,
-    /// Optional hostname allowlist for CONNECT and SNI passthrough destinations.
-    /// When present, only hostnames matching a pattern in this list are permitted.
-    /// When absent (None), no hostname filtering is applied — only IP-range checks apply.
-    /// No hardcoded default patterns are shipped; operators add their own patterns.
-    #[serde(default)]
-    pub connect_allowlist: Option<Vec<String>>,
 }
 
 impl Default for TlsConfig {
@@ -307,7 +301,6 @@ impl Default for TlsConfig {
             tls_proxy_port: default_tls_proxy_port(),
             cert_path: String::new(),
             key_path: String::new(),
-            connect_allowlist: None,
         }
     }
 }
@@ -362,16 +355,6 @@ pub struct DownloadCoordinationConfig {
     /// Requirement: 18.2, 18.3, 18.5
     #[serde(default = "default_download_coordination_wait_timeout_secs")]
     pub wait_timeout_secs: u64,
-
-    /// Maximum number of times a waiter will re-subscribe after timeout before
-    /// returning a gateway timeout error (default: 3).
-    /// When a waiter's timeout fires and the FetchGuard is still present, the waiter
-    /// re-subscribes to the in-flight fetch rather than launching a duplicate S3 request.
-    /// After this many re-subscriptions without receiving a result, the waiter fails
-    /// with HTTP 504 Gateway Timeout.
-    /// Requirement: 7.5
-    #[serde(default = "default_max_waiter_resubscriptions")]
-    pub max_waiter_resubscriptions: u32,
 }
 
 fn default_download_coordination_enabled() -> bool {
@@ -382,16 +365,11 @@ fn default_download_coordination_wait_timeout_secs() -> u64 {
     30
 }
 
-fn default_max_waiter_resubscriptions() -> u32 {
-    3
-}
-
 impl Default for DownloadCoordinationConfig {
     fn default() -> Self {
         Self {
             enabled: default_download_coordination_enabled(),
             wait_timeout_secs: default_download_coordination_wait_timeout_secs(),
-            max_waiter_resubscriptions: default_max_waiter_resubscriptions(),
         }
     }
 }
@@ -527,14 +505,6 @@ pub struct SharedStorageConfig {
     )]
     pub eviction_lock_timeout: Duration,
 
-    /// Metadata lock timeout in milliseconds (default: 30_000ms = 30s)
-    /// How long a metadata lock owned by another host must be idle before it's considered
-    /// stale and eligible for takeover. Only applies to cross-host lock evaluation;
-    /// same-host staleness uses PID checks instead.
-    /// Requirement: 3.3
-    #[serde(default = "default_metadata_lock_timeout_ms")]
-    pub metadata_lock_timeout_ms: u64,
-
     /// Enable background orphan recovery (default: true when shared_storage is enabled)
     /// Scans for orphaned .bin files that aren't tracked in metadata and recovers them.
     /// Essential for shared storage where journal consolidation may lag behind writes.
@@ -592,13 +562,6 @@ fn default_eviction_lock_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
-/// Default metadata lock timeout: 30 seconds (30_000ms)
-/// How long a metadata lock owned by another host must be idle before takeover.
-/// Requirement: 3.3
-fn default_metadata_lock_timeout_ms() -> u64 {
-    30_000
-}
-
 fn default_orphan_recovery_enabled() -> bool {
     true
 }
@@ -633,7 +596,6 @@ impl Default for SharedStorageConfig {
             lock_max_retries: default_lock_max_retries(),
             validation_frequency: default_validation_frequency(),
             eviction_lock_timeout: default_eviction_lock_timeout(),
-            metadata_lock_timeout_ms: default_metadata_lock_timeout_ms(),
             orphan_recovery_enabled: default_orphan_recovery_enabled(),
             orphan_recovery_interval: default_orphan_recovery_interval(),
             orphan_scan_timeout: default_orphan_scan_timeout(),
@@ -4723,7 +4685,6 @@ max_log_entries: 200
         let config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 45,
-            max_waiter_resubscriptions: 3,
         };
         assert_eq!(config.wait_timeout(), Duration::from_secs(45));
     }
@@ -4734,7 +4695,6 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 2, // Below minimum of 5
-            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 5);
@@ -4746,7 +4706,6 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 200, // Above maximum of 120
-            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 120);
@@ -4758,7 +4717,6 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 60,
-            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 60);
@@ -4770,7 +4728,6 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 5,
-            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 5);
@@ -4782,7 +4739,6 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 120,
-            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 120);
@@ -5039,7 +4995,6 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: String::new(),
             key_path: "/path/to/key.pem".to_string(),
-            connect_allowlist: None,
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -5053,7 +5008,6 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: "/path/to/cert.pem".to_string(),
             key_path: String::new(),
-            connect_allowlist: None,
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -5067,7 +5021,6 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: "/path/to/cert.pem".to_string(),
             key_path: "/path/to/key.pem".to_string(),
-            connect_allowlist: None,
         };
         assert!(tls.validate().is_ok());
     }
@@ -5079,7 +5032,6 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: String::new(),
             key_path: String::new(),
-            connect_allowlist: None,
         };
         assert!(tls.validate().is_ok());
     }
@@ -5091,7 +5043,6 @@ metrics:
             tls_proxy_port: 0,
             cert_path: String::new(),
             key_path: String::new(),
-            connect_allowlist: None,
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -5106,7 +5057,6 @@ metrics:
             tls_proxy_port: config.server.http_port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5122,7 +5072,6 @@ metrics:
             tls_proxy_port: config.server.https_port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5138,7 +5087,6 @@ metrics:
             tls_proxy_port: config.health.port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5156,7 +5104,6 @@ metrics:
             tls_proxy_port: 9090,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5172,7 +5119,6 @@ metrics:
             tls_proxy_port: config.dashboard.port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5188,7 +5134,6 @@ metrics:
             tls_proxy_port: 9999,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
         assert!(config.validate_tls_config().is_ok());
     }
@@ -5207,7 +5152,6 @@ metrics:
             tls_proxy_port: config.server.http_port, // conflicts, but TLS is disabled
             cert_path: String::new(),
             key_path: String::new(),
-            connect_allowlist: None,
         });
         // Port 0 check still applies
         // But http_port (80) is not 0, so this should pass since enabled=false skips conflict check
@@ -5315,7 +5259,6 @@ metrics:
             tls_proxy_port: 3129,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
         let result = config.validate_proxy_only_mode();
         assert!(result.is_err());
@@ -5779,7 +5722,6 @@ mod tls_config_property_tests {
                 tls_proxy_port,
                 cert_path,
                 key_path,
-                connect_allowlist: None,
             }
         }
     }
@@ -5838,7 +5780,6 @@ mod tls_config_property_tests {
             tls_proxy_port: 8443,
             cert_path,
             key_path,
-            connect_allowlist: None,
         };
 
         let result = config.validate();
@@ -5914,7 +5855,6 @@ mod tls_config_property_tests {
             tls_proxy_port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
-            connect_allowlist: None,
         });
 
         let result = config.validate_tls_config();

@@ -3321,7 +3321,6 @@ impl SignedPutHandler {
             ProxyError::InvalidRange(_) => "invalid_range",
             ProxyError::SystemError(_) => "system_error",
             ProxyError::RetryAfter(_) => "retry_after",
-            ProxyError::EvictionFenceLost(_) => "eviction_fence_lost",
         }
     }
 }

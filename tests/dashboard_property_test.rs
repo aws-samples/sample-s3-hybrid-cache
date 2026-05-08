@@ -506,7 +506,7 @@ mod unit_tests {
         let js_content = handler.get_script_js();
 
         assert!(html_content.contains("<!DOCTYPE html>"));
-        assert!(html_content.contains("Hybrid Cache for Amazon S3"));
+        assert!(html_content.contains("S3 Hybrid Cache"));
         assert!(css_content.contains("body"));
         assert!(js_content.contains("loadCacheStats"));
         assert!(js_content.contains("showTab"));

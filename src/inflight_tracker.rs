@@ -114,28 +114,6 @@ impl InFlightTracker {
         }
     }
 
-    /// Attempts to re-subscribe to an existing in-flight fetch for the given flight key.
-    ///
-    /// This is used by waiters that have timed out but want to continue waiting
-    /// rather than launching a duplicate S3 fetch. The lookup and subscribe happen
-    /// atomically under the same DashMap shard lock to prevent a race with the
-    /// fetcher completing between the check and the subscribe.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(receiver)` if the flight key is still present (FetchGuard exists)
-    /// - `None` if the flight key is absent (fetcher completed or was dropped)
-    ///
-    /// # Requirements
-    ///
-    /// - 7.1: Re-subscribe waiter when FetchGuard still present
-    /// - 7.2: Return None when FetchGuard absent so waiter becomes new fetcher
-    pub fn try_resubscribe(&self, flight_key: &str) -> Option<broadcast::Receiver<FetchResult>> {
-        // The DashMap ref guard holds the shard lock, ensuring the sender
-        // cannot be removed between the lookup and the subscribe() call.
-        self.pending.get(flight_key).map(|entry| entry.subscribe())
-    }
-
     /// Returns the number of in-flight fetches currently being tracked.
     pub fn in_flight_count(&self) -> usize {
         self.pending.len()

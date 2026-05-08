@@ -1,4 +1,4 @@
-//! Hybrid Cache for Amazon S3 - High-performance HTTP/HTTPS proxy for S3 with intelligent caching
+//! S3 Hybrid Cache - High-performance HTTP/HTTPS proxy for S3 with intelligent caching
 //!
 //! This library provides the core functionality for the S3 proxy server,
 //! including HTTP/HTTPS request handling, caching, compression, and logging.
@@ -18,7 +18,6 @@ pub mod compression;
 pub mod config;
 pub mod connection_pool;
 pub mod dashboard;
-pub mod destination_policy;
 pub mod disk_cache;
 pub mod error;
 pub mod health;

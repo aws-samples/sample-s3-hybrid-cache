@@ -1384,7 +1384,6 @@ async fn part_fetcher_branch_completes_success_on_2xx() {
         Arc::clone(&range_handler),
         true,
         wait_timeout,
-        3,
         None,
         &None,
     )
@@ -1430,7 +1429,6 @@ async fn part_fetcher_branch_completes_error_on_non_2xx() {
         Arc::clone(&range_handler),
         true,
         wait_timeout,
-        3,
         None,
         &None,
     )

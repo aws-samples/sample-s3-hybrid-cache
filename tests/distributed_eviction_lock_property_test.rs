@@ -11,7 +11,7 @@
 //! - Property 9: Location Consistency (Requirements 4.1, 4.2)
 
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use s3_proxy::cache::{CacheManager, EvictionLockPayload};
+use s3_proxy::cache::{CacheManager, GlobalEvictionLock};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -232,10 +232,12 @@ fn prop_lock_file_contains_all_required_fields(_config: LockCompletenessConfig) 
                     Err(_) => return TestResult::failed(),
                 };
 
-                // Check all required fields (new EvictionLockPayload format)
-                if json_value.get("uuid").is_none()
-                    || json_value.get("acquired_at_ms").is_none()
+                // Check all required fields
+                if json_value.get("instance_id").is_none()
+                    || json_value.get("process_id").is_none()
                     || json_value.get("hostname").is_none()
+                    || json_value.get("acquired_at").is_none()
+                    || json_value.get("timeout_seconds").is_none()
                 {
                     return TestResult::failed();
                 }
@@ -263,21 +265,25 @@ fn prop_lock_file_fields_have_valid_values(_config: LockCompletenessConfig) -> T
                     Err(_) => return TestResult::failed(),
                 };
 
-                let lock: EvictionLockPayload = match serde_json::from_str(&content) {
+                let lock: GlobalEvictionLock = match serde_json::from_str(&content) {
                     Ok(l) => l,
                     Err(_) => return TestResult::failed(),
                 };
 
-                if lock.uuid.is_empty() || lock.hostname.is_empty() || lock.acquired_at_ms == 0 {
+                if lock.instance_id.is_empty()
+                    || lock.process_id == 0
+                    || lock.hostname.is_empty()
+                    || lock.timeout_seconds == 0
+                {
                     return TestResult::failed();
                 }
 
-                // Verify acquired_at_ms is recent (within 60 seconds)
-                let now_ms = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                if now_ms.saturating_sub(lock.acquired_at_ms) > 60_000 {
+                let now = SystemTime::now();
+                if let Ok(duration_since_acquired) = now.duration_since(lock.acquired_at) {
+                    if duration_since_acquired.as_secs() > 60 {
+                        return TestResult::failed();
+                    }
+                } else {
                     return TestResult::failed();
                 }
 
@@ -296,6 +302,8 @@ fn prop_process_id_matches_current(_config: LockCompletenessConfig) -> TestResul
         let (_temp_dir, cache_dir) = create_test_cache_dir();
         let cache_manager = CacheManager::new_with_defaults(cache_dir.clone(), false, 0);
 
+        let current_pid = std::process::id();
+
         match cache_manager.try_acquire_global_eviction_lock().await {
             Ok(true) => {
                 let lock_path = cache_dir.join("locks").join("global_eviction.lock");
@@ -304,13 +312,12 @@ fn prop_process_id_matches_current(_config: LockCompletenessConfig) -> TestResul
                     Err(_) => return TestResult::failed(),
                 };
 
-                let lock: EvictionLockPayload = match serde_json::from_str(&content) {
+                let lock: GlobalEvictionLock = match serde_json::from_str(&content) {
                     Ok(l) => l,
                     Err(_) => return TestResult::failed(),
                 };
 
-                // Verify UUID is a valid v4 UUID format (8-4-4-4-12 hex chars)
-                if lock.uuid.len() != 36 || lock.uuid.chars().filter(|c| *c == '-').count() != 4 {
+                if lock.process_id != current_pid {
                     return TestResult::failed();
                 }
 
@@ -570,7 +577,7 @@ mod unit_tests {
                 let json_result: Result<serde_json::Value, _> = serde_json::from_str(&content);
                 assert!(json_result.is_ok());
 
-                let lock_result: Result<EvictionLockPayload, _> = serde_json::from_str(&content);
+                let lock_result: Result<GlobalEvictionLock, _> = serde_json::from_str(&content);
                 assert!(lock_result.is_ok());
 
                 cache_manager.release_global_eviction_lock().await.ok();
@@ -588,7 +595,7 @@ mod unit_tests {
             Ok(true) => {
                 let lock_path = cache_dir.join("locks").join("global_eviction.lock");
                 let content = std::fs::read_to_string(&lock_path).unwrap();
-                let lock: EvictionLockPayload = serde_json::from_str(&content).unwrap();
+                let lock: GlobalEvictionLock = serde_json::from_str(&content).unwrap();
 
                 assert!(!lock.hostname.is_empty());
                 assert!(!lock.hostname.chars().any(|c| c.is_control()));
@@ -609,11 +616,10 @@ mod unit_tests {
             Ok(true) => {
                 let lock_path = cache_dir.join("locks").join("global_eviction.lock");
                 let content = std::fs::read_to_string(&lock_path).unwrap();
-                let lock: EvictionLockPayload = serde_json::from_str(&content).unwrap();
+                let lock: GlobalEvictionLock = serde_json::from_str(&content).unwrap();
 
-                // UUID should be a valid v4 UUID (36 chars with dashes)
-                assert!(lock.uuid.len() == 36);
-                assert!(!lock.uuid.trim().is_empty());
+                assert!(lock.instance_id.len() >= 3);
+                assert!(!lock.instance_id.trim().is_empty());
 
                 cache_manager.release_global_eviction_lock().await.ok();
             }

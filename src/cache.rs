@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
 const OBJECT_CONCURRENCY_LIMIT: usize = 8;
@@ -288,23 +287,6 @@ impl GlobalEvictionLock {
     pub fn expires_at(&self) -> SystemTime {
         self.acquired_at + std::time::Duration::from_secs(self.timeout_seconds)
     }
-}
-
-/// UUID-fenced eviction lock payload for distributed fencing (Requirement 5)
-///
-/// Written to the lockfile on acquisition and verified before each filesystem mutation
-/// during an eviction pass. If the UUID no longer matches, the eviction pass is aborted
-/// immediately to prevent a stale holder from corrupting the cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvictionLockPayload {
-    /// Unique fence token generated on each acquisition
-    pub uuid: String,
-
-    /// Wall-clock timestamp (milliseconds since epoch) when the lock was acquired
-    pub acquired_at_ms: u64,
-
-    /// Hostname of the machine holding the lock
-    pub hostname: String,
 }
 
 /// Tracks active S3 part fetches for per-instance request deduplication
@@ -595,9 +577,6 @@ pub struct CacheManager {
     >,
     // Eviction lock file handle (kept open while lock is held)
     eviction_lock_file: Arc<Mutex<Option<std::fs::File>>>,
-    // UUID fence token for the current eviction pass (Requirement 5)
-    // Set on lock acquisition, verified before each filesystem mutation
-    eviction_uuid: Arc<Mutex<Option<String>>>,
     // Size of the in-memory compression batch used by the incremental range writer.
     // Incoming body chunks are accumulated into a batch buffer and flushed as a
     // single LZ4 frame once the buffer reaches this size. Forwarded to
@@ -828,7 +807,6 @@ impl CacheManager {
             )),
             bucket_settings_manager,
             eviction_lock_file: Arc::new(Mutex::new(None)),
-            eviction_uuid: Arc::new(Mutex::new(None)),
             compression_batch_size,
             inner: Arc::new(Mutex::new(inner)),
         }
@@ -3717,15 +3695,6 @@ impl CacheManager {
                 let cache_key = cache_key.clone();
                 let ranges = ranges.clone();
                 async move {
-                    // Requirement 5.3: Verify eviction fence before each batched filesystem mutation
-                    if let Err(e) = self.verify_eviction_fence() {
-                        warn!(
-                            "Eviction fence verification failed before batch eviction of {}: {}. Aborting eviction pass.",
-                            cache_key, e
-                        );
-                        return None;
-                    }
-
                     // Check if entry is actively being used by other instances
                     if self.is_cache_entry_active(&cache_key).await.unwrap_or(false) {
                         debug!(
@@ -3776,16 +3745,6 @@ impl CacheManager {
                 );
                 break;
             }
-
-            // Requirement 5.3: Verify fence is still valid before processing more results
-            if let Err(e) = self.verify_eviction_fence() {
-                warn!(
-                    "Eviction fence lost during result aggregation: {}. Aborting eviction pass with {} bytes freed so far.",
-                    e, total_bytes_freed
-                );
-                break;
-            }
-
             let (cache_key, ranges, bytes_freed, deleted_paths) = result;
             total_bytes_freed += bytes_freed;
             total_ranges_evicted += ranges.len() as u64;
@@ -5166,86 +5125,12 @@ impl CacheManager {
     /// With flock-based locking, release is automatic when the file handle is dropped.
     /// This method explicitly drops the lock file handle.
     ///
-    /// Requirement 5.4: Only truncate lockfile if current UUID still matches
+    /// - Requirement 5.6: Lock is released when eviction completes
     pub async fn release_global_eviction_lock(&self) -> Result<()> {
-        let my_uuid = self.eviction_uuid.lock().unwrap().take();
-
-        // Requirement 5.4: Only truncate the lockfile if our UUID still matches
-        if let Some(uuid) = &my_uuid {
-            let lock_file_path = self.get_global_eviction_lock_path();
-            if let Ok(content) = std::fs::read_to_string(&lock_file_path) {
-                if let Ok(payload) = serde_json::from_str::<EvictionLockPayload>(&content) {
-                    if payload.uuid == *uuid {
-                        // Our UUID still matches — safe to truncate
-                        if let Ok(f) = std::fs::OpenOptions::new()
-                            .write(true)
-                            .truncate(true)
-                            .open(&lock_file_path)
-                        {
-                            let _ = f.sync_all();
-                        }
-                    } else {
-                        debug!(
-                            "Eviction lock UUID changed during release (expected={}, found={}), not truncating",
-                            uuid, payload.uuid
-                        );
-                    }
-                }
-            }
-        }
-
         // Drop the lock file handle, which automatically releases the flock
         *self.eviction_lock_file.lock().unwrap() = None;
         debug!("Released global eviction lock (flock)");
         Ok(())
-    }
-
-    /// Verify the eviction fence token before a filesystem mutation
-    ///
-    /// Re-reads the lockfile and checks that the UUID matches the one written at acquisition.
-    /// If the UUID has changed, another instance has taken over the lock and this eviction
-    /// pass must abort immediately.
-    ///
-    /// Requirement 5.3: Re-verify lockfile UUID before each batched filesystem mutation
-    pub fn verify_eviction_fence(&self) -> Result<()> {
-        let my_uuid = self.eviction_uuid.lock().unwrap().clone();
-        let my_uuid = match my_uuid {
-            Some(uuid) => uuid,
-            None => {
-                // No UUID set — we don't hold the eviction lock
-                return Err(ProxyError::EvictionFenceLost(
-                    "No eviction UUID set (lock not held)".to_string(),
-                ));
-            }
-        };
-
-        let lock_file_path = self.get_global_eviction_lock_path();
-        let content = std::fs::read_to_string(&lock_file_path).map_err(|e| {
-            ProxyError::EvictionFenceLost(format!(
-                "Failed to read eviction lock file for fence verification: {}",
-                e
-            ))
-        })?;
-
-        let payload: EvictionLockPayload = serde_json::from_str(&content).map_err(|e| {
-            ProxyError::EvictionFenceLost(format!(
-                "Failed to parse eviction lock payload for fence verification: {}",
-                e
-            ))
-        })?;
-
-        if payload.uuid != my_uuid {
-            warn!(
-                "Eviction fence lost: expected uuid={}, found uuid={} (holder={}). Aborting eviction pass.",
-                my_uuid, payload.uuid, payload.hostname
-            );
-            Err(ProxyError::EvictionFenceLost(format!(
-                "UUID mismatch: expected={}, found={}",
-                my_uuid, payload.uuid
-            )))
-        } else {
-            Ok(())
-        }
     }
 
     /// Trigger eviction when 95% capacity reached
@@ -9732,9 +9617,16 @@ impl CacheManager {
         self.cache_dir.join("locks").join("global_eviction.lock")
     }
 
-    /// Try to acquire the global eviction lock using flock with UUID fencing
+    /// Get eviction lock timeout in seconds
+    /// Returns configured eviction lock timeout in seconds
+    /// Requirement: 2.4, 6.1, 6.2
+    fn get_eviction_lock_timeout_seconds(&self) -> u64 {
+        self.shared_storage.eviction_lock_timeout.as_secs()
+    }
+
+    /// Try to acquire the global eviction lock using flock
     /// Returns Ok(true) if lock acquired, Ok(false) if held by another instance
-    /// Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
+    /// Requirements: 1.1, 1.2, 1.3, 1.5, 2.1, 2.2, 2.3, 2.5, 8.1, 8.2, 8.4, 8.5
     pub async fn try_acquire_global_eviction_lock(&self) -> Result<bool> {
         // Perform the synchronous lock acquisition in a block to ensure guard is dropped
         // before any async operations
@@ -9763,41 +9655,9 @@ impl CacheManager {
                 }
             }
 
-            // Check if existing lock is stale (for takeover)
-            // Requirement 5.5: treat lockfile whose acquired_at exceeds eviction_lock_timeout as stale
-            let eviction_lock_timeout = self.shared_storage.eviction_lock_timeout;
-            if lock_file_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&lock_file_path) {
-                    if let Ok(existing_payload) =
-                        serde_json::from_str::<EvictionLockPayload>(&content)
-                    {
-                        let now_ms = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let age_ms = now_ms.saturating_sub(existing_payload.acquired_at_ms);
-                        let timeout_ms = eviction_lock_timeout.as_millis() as u64;
-
-                        if age_ms <= timeout_ms {
-                            // Lock is not stale — another instance holds it legitimately
-                            debug!(
-                                "Eviction lock held by {} (age={}ms, timeout={}ms), not stale",
-                                existing_payload.hostname, age_ms, timeout_ms
-                            );
-                        } else {
-                            debug!(
-                                "Eviction lock is stale (age={}ms > timeout={}ms), eligible for takeover",
-                                age_ms, timeout_ms
-                            );
-                        }
-                    }
-                }
-            }
-
             // Try to acquire lock using flock (non-blocking)
             let lock_file = match std::fs::OpenOptions::new()
                 .create(true)
-                .read(true)
                 .write(true)
                 .truncate(false)
                 .open(&lock_file_path)
@@ -9816,204 +9676,34 @@ impl CacheManager {
             };
 
             // Try to acquire exclusive lock (non-blocking)
+            use fs2::FileExt;
             match lock_file.try_lock_exclusive() {
                 Ok(()) => {
                     debug!("Acquired global eviction lock using flock");
 
-                    // Generate a fresh UUID fence token
-                    let my_uuid = Uuid::new_v4().to_string();
-                    let now_ms = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let my_hostname = hostname::get()
-                        .unwrap_or_else(|_| "unknown".into())
-                        .to_string_lossy()
-                        .to_string();
-
-                    // Requirement 5.1: Write UUID + acquired_at_ms + hostname, then fsync
-                    let payload = EvictionLockPayload {
-                        uuid: my_uuid.clone(),
-                        acquired_at_ms: now_ms,
-                        hostname: my_hostname,
+                    // Write lock metadata for debugging
+                    let lock_data = GlobalEvictionLock {
+                        instance_id: self.get_instance_id(),
+                        process_id: std::process::id(),
+                        hostname: hostname::get()
+                            .unwrap_or_else(|_| "unknown".into())
+                            .to_string_lossy()
+                            .to_string(),
+                        acquired_at: SystemTime::now(),
+                        timeout_seconds: self.get_eviction_lock_timeout_seconds(),
                     };
 
-                    let payload_json = serde_json::to_string(&payload).map_err(|e| {
-                        ProxyError::CacheError(format!(
-                            "Failed to serialize eviction lock payload: {}",
-                            e
-                        ))
-                    })?;
-
-                    // Truncate and write the payload
-                    use std::io::Write;
-                    lock_file.set_len(0).map_err(|e| {
-                        ProxyError::CacheError(format!(
-                            "Failed to truncate eviction lock file: {}",
-                            e
-                        ))
-                    })?;
-                    use std::io::Seek;
-                    (&lock_file)
-                        .seek(std::io::SeekFrom::Start(0))
-                        .map_err(|e| {
-                            ProxyError::CacheError(format!(
-                                "Failed to seek eviction lock file: {}",
-                                e
-                            ))
-                        })?;
-                    (&lock_file)
-                        .write_all(payload_json.as_bytes())
-                        .map_err(|e| {
-                            ProxyError::CacheError(format!(
-                                "Failed to write eviction lock payload: {}",
-                                e
-                            ))
-                        })?;
-                    (&lock_file).flush().map_err(|e| {
-                        ProxyError::CacheError(format!("Failed to flush eviction lock file: {}", e))
-                    })?;
-                    lock_file.sync_all().map_err(|e| {
-                        ProxyError::CacheError(format!("Failed to fsync eviction lock file: {}", e))
-                    })?;
-
-                    // Requirement 5.2: Read back the file content and verify UUID matches.
-                    // We keep the flock held on the original file handle to prevent races.
-                    // Reading via the path (not the fd) defeats NFS attribute caching.
-                    let readback = std::fs::read_to_string(&lock_file_path).map_err(|e| {
-                        ProxyError::CacheError(format!(
-                            "Failed to read back eviction lock file: {}",
-                            e
-                        ))
-                    })?;
-
-                    let readback_payload: EvictionLockPayload = serde_json::from_str(&readback)
-                        .map_err(|e| {
-                            ProxyError::CacheError(format!(
-                                "Failed to parse eviction lock readback: {}",
-                                e
-                            ))
-                        })?;
-
-                    if readback_payload.uuid != my_uuid {
-                        warn!(
-                            "Eviction lock UUID mismatch after acquisition: expected={}, found={}. Another instance took over.",
-                            my_uuid, readback_payload.uuid
-                        );
-                        // Release the flock and abort
-                        let _ = lock_file.unlock();
-                        return Ok(false);
+                    if let Ok(lock_json) = serde_json::to_string_pretty(&lock_data) {
+                        let _ = std::io::Write::write_all(&mut &lock_file, lock_json.as_bytes());
                     }
 
-                    // Store the UUID and the verified lock file handle
-                    *self.eviction_uuid.lock().unwrap() = Some(my_uuid.clone());
+                    // Store the lock file so it stays open (and locked) until dropped
                     *guard = Some(lock_file);
 
-                    debug!(
-                        "Eviction lock acquired and verified: uuid={}, acquired_at_ms={}",
-                        my_uuid, now_ms
-                    );
-
+                    // Return success - guard will be dropped at end of block
                     Ok(true)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Lock is held by another process — check if it's stale for takeover
-                    // Requirement 5.5: stale takeover via eviction_lock_timeout
-                    if let Ok(content) = std::fs::read_to_string(&lock_file_path) {
-                        if let Ok(existing_payload) =
-                            serde_json::from_str::<EvictionLockPayload>(&content)
-                        {
-                            let now_ms = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-                            let age_ms = now_ms.saturating_sub(existing_payload.acquired_at_ms);
-                            let timeout_ms = eviction_lock_timeout.as_millis() as u64;
-
-                            if age_ms > timeout_ms {
-                                info!(
-                                    "Eviction lock is stale (age={}ms > timeout={}ms, holder={}), attempting takeover",
-                                    age_ms, timeout_ms, existing_payload.hostname
-                                );
-                                // Attempt blocking lock acquisition for stale takeover
-                                // Use a short timeout to avoid indefinite blocking
-                                let lock_file_for_takeover = match std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .read(true)
-                                    .write(true)
-                                    .truncate(false)
-                                    .open(&lock_file_path)
-                                {
-                                    Ok(f) => f,
-                                    Err(_) => return Ok(false),
-                                };
-
-                                // Try blocking lock — if the stale holder crashed, this succeeds
-                                match lock_file_for_takeover.try_lock_exclusive() {
-                                    Ok(()) => {
-                                        // Stale takeover succeeded — write our UUID
-                                        let my_uuid = Uuid::new_v4().to_string();
-                                        let my_hostname = hostname::get()
-                                            .unwrap_or_else(|_| "unknown".into())
-                                            .to_string_lossy()
-                                            .to_string();
-
-                                        let payload = EvictionLockPayload {
-                                            uuid: my_uuid.clone(),
-                                            acquired_at_ms: now_ms,
-                                            hostname: my_hostname,
-                                        };
-
-                                        let payload_json =
-                                            serde_json::to_string(&payload).unwrap_or_default();
-
-                                        use std::io::Write;
-                                        let _ = lock_file_for_takeover.set_len(0);
-                                        use std::io::Seek;
-                                        let _ = (&lock_file_for_takeover)
-                                            .seek(std::io::SeekFrom::Start(0));
-                                        if (&lock_file_for_takeover)
-                                            .write_all(payload_json.as_bytes())
-                                            .is_ok()
-                                        {
-                                            let _ = lock_file_for_takeover.sync_all();
-
-                                            // Verify readback
-                                            if let Ok(readback) =
-                                                std::fs::read_to_string(&lock_file_path)
-                                            {
-                                                if let Ok(rb_payload) =
-                                                    serde_json::from_str::<EvictionLockPayload>(
-                                                        &readback,
-                                                    )
-                                                {
-                                                    if rb_payload.uuid == my_uuid {
-                                                        info!(
-                                                            "Stale eviction lock takeover succeeded: uuid={}",
-                                                            my_uuid
-                                                        );
-                                                        *self.eviction_uuid.lock().unwrap() =
-                                                            Some(my_uuid);
-                                                        *guard = Some(lock_file_for_takeover);
-                                                        return Ok(true);
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // Takeover write/verify failed
-                                        let _ = lock_file_for_takeover.unlock();
-                                        return Ok(false);
-                                    }
-                                    Err(_) => {
-                                        debug!("Stale lock takeover failed — lock still held");
-                                        return Ok(false);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     debug!("Global eviction lock held by another instance");
                     Ok(false)
                 }

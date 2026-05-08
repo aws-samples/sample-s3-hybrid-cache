@@ -154,7 +154,7 @@ async fn main() -> Result<()> {
     logger.initialize()?;
 
     info!(
-        "Starting Hybrid Cache for Amazon S3 server v{} (built: {})",
+        "Starting S3 Hybrid Cache server v{} (built: {})",
         env!("CARGO_PKG_VERSION"),
         env!("BUILD_TIMESTAMP")
     );
@@ -507,11 +507,8 @@ async fn main() -> Result<()> {
             let recovery_config =
                 BackgroundRecoveryConfig::from_shared_storage_config(&config.cache.shared_storage);
 
-            let mut background_recovery = BackgroundRecoverySystem::new(
-                orphaned_recovery,
-                recovery_config,
-                config.cache.cache_dir.clone(),
-            );
+            let mut background_recovery =
+                BackgroundRecoverySystem::new(orphaned_recovery, recovery_config);
 
             // Start the background recovery system
             if let Err(e) = background_recovery.start().await {
@@ -698,6 +695,6 @@ async fn main() -> Result<()> {
     // Give server tasks a moment to finish after receiving their shutdown signals
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    info!("Hybrid Cache for Amazon S3 shutdown complete");
+    info!("S3 Hybrid Cache shutdown complete");
     Ok(())
 }
