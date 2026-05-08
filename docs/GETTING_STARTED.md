@@ -163,6 +163,33 @@ curl -s http://localhost:8080/health
 
 The service runs as root (required for binding ports 80/443) and restarts automatically on failure. Logs go to the systemd journal and are accessible via `journalctl -u s3-proxy`.
 
+#### Proxy-Only Mode (No sudo Required)
+
+If you don't need ports 80/443, run in proxy-only mode on port 3128. No root privileges, no DNS changes, no hosts file edits:
+
+```bash
+/usr/local/bin/s3-proxy -c /etc/s3-proxy/config.yaml
+```
+
+With a config that sets:
+
+```yaml
+server:
+  mode: "proxy_only"
+  # proxy_port: 3128  (default)
+```
+
+Clients route traffic by setting an environment variable:
+
+```bash
+export HTTP_PROXY=http://<proxy-ip>:3128
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1
+```
+
+This is the simplest deployment path — build the binary, copy it to the target, write a minimal config, and run. See [Proxy-Only Mode](#proxy-only-mode) below for full details including TLS and shared-cache patterns.
+
 **Security Note**: All communication between the proxy and Amazon S3 uses HTTPS encryption, regardless of whether clients connect via HTTP or HTTPS. Secure client-to-proxy HTTP traffic using network controls (VPC, security groups, firewall rules).
 
 **Quickest path for a local test**: Skip standard ports and run in [Proxy-Only Mode](#proxy-only-mode) on port 3128 instead. No sudo, no DNS changes, no hosts file edits — set `HTTP_PROXY=http://127.0.0.1:3128` on the client and go. Recommended for development and single-machine setups; see [Option A: HTTP_PROXY](#option-a-http_proxy-single-instance--no-dns-changes) below.
