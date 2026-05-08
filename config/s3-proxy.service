@@ -1,0 +1,15 @@
+[Unit]
+Description=S3 Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/s3-proxy -c /etc/s3-proxy/config.yaml
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -82,7 +82,7 @@ The binary has no bundled assets. At runtime it needs a config file, cache direc
 
 Configuration is backward-compatible: new options always have defaults, so existing config files keep working across versions. Review `CHANGELOG.md` and `config/config.example.yaml` for new features and tuning knobs, but no config edits are required to upgrade.
 
-The upgrade flow is: rebuild, replace the binary, restart.
+The upgrade flow is: rebuild (or copy the binary from a build host), replace, restart.
 
 ```bash
 git pull                                                 # Sync latest source
@@ -92,6 +92,8 @@ sudo systemctl restart s3-proxy                          # Restart service
 /usr/local/bin/s3-proxy --version                        # Verify new version
 ```
 
+If you build on a separate host, copy the binary to each target (see [Binary Portability](#binary-portability)) and run only the last three commands. No Rust toolchain needed on the proxy servers.
+
 The proxy also logs its version and build timestamp on startup (`Starting S3 Hybrid Cache server v<version> (built: <timestamp>)`), so `journalctl -u s3-proxy | grep Starting` confirms which binary is actually running.
 
 For multi-instance deployments, restart one proxy at a time. Clients using the AWS CRT transfer client fail over to the remaining instances via DNS multi-value routing while each instance restarts. The shared cache is preserved across restarts — the journal system handles concurrent reads and consolidation without coordination.
@@ -100,8 +102,16 @@ Build once and copy the binary to each target host (same architecture and glibc 
 
 ### 2. Start the Proxy
 
+Run the compiled binary directly — no Rust toolchain needed on the target host:
+
 ```bash
 # Start on standard ports 80/443 (requires sudo)
+sudo /usr/local/bin/s3-proxy -c /etc/s3-proxy/config.yaml
+```
+
+For development (requires Rust toolchain):
+
+```bash
 sudo cargo run --release -- -c config/config.example.yaml
 ```
 
@@ -112,6 +122,46 @@ The proxy starts on:
 - **Health**: `<proxy-ip>:8080/health`
 - **Dashboard**: `<proxy-ip>:8081` (real-time statistics)
 - **Metrics**: `<proxy-ip>:9090/metrics`
+
+#### Running as a systemd Service (Recommended for Production)
+
+Create `/etc/systemd/system/s3-proxy.service`:
+
+```ini
+[Unit]
+Description=S3 Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/s3-proxy -c /etc/s3-proxy/config.yaml
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable s3-proxy
+sudo systemctl start s3-proxy
+```
+
+Verify:
+
+```bash
+sudo systemctl status s3-proxy
+journalctl -u s3-proxy --no-pager | tail -20
+curl -s http://localhost:8080/health
+```
+
+The service runs as root (required for binding ports 80/443) and restarts automatically on failure. Logs go to the systemd journal and are accessible via `journalctl -u s3-proxy`.
 
 **Security Note**: All communication between the proxy and Amazon S3 uses HTTPS encryption, regardless of whether clients connect via HTTP or HTTPS. Secure client-to-proxy HTTP traffic using network controls (VPC, security groups, firewall rules).
 
