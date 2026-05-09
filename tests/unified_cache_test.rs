@@ -38,7 +38,8 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     )
 }
 
@@ -164,7 +165,8 @@ async fn test_independent_head_get_ttls() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     );
 
     let cache_key = "test-bucket/ttl-test-object.txt";
@@ -304,7 +306,8 @@ async fn test_metadata_cache_integration() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     );
 
     let cache_key = "test-bucket/metadata-cache-test.txt";

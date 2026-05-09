@@ -273,6 +273,7 @@ async fn make_stampede_cache(
         config.cache.bucket_settings_staleness_threshold,
         config.cache.compression_batch_size,
         config.cache.evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(

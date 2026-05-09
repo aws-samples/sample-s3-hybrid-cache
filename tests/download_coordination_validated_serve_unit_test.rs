@@ -120,6 +120,7 @@ async fn make_cache_infra(
         config.cache.bucket_settings_staleness_threshold,
         config.cache.compression_batch_size,
         config.cache.evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
@@ -1384,6 +1385,7 @@ async fn part_fetcher_branch_completes_success_on_2xx() {
         Arc::clone(&range_handler),
         true,
         wait_timeout,
+        3,
         None,
         &None,
     )
@@ -1429,6 +1431,7 @@ async fn part_fetcher_branch_completes_error_on_non_2xx() {
         Arc::clone(&range_handler),
         true,
         wait_timeout,
+        3,
         None,
         &None,
     )

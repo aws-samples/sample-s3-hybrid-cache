@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -183,43 +183,146 @@ impl IpDistributor {
 }
 
 // ---------------------------------------------------------------------------
-// IpHealthTracker — lock-free per-IP failure tracking
+// IpHealthTracker — lock-free per-IP failure tracking with recovery
 // ---------------------------------------------------------------------------
+
+/// Per-IP health state tracking unhealthy status and cooldown for recovery probing.
+#[derive(Debug, Clone)]
+pub struct IpHealthEntry {
+    /// Timestamp when the IP was marked unhealthy (threshold reached).
+    pub unhealthy_at: Instant,
+    /// Current cooldown duration before the IP becomes a probe candidate.
+    pub cooldown: Duration,
+}
 
 /// Tracks consecutive failures per IP for automatic exclusion from round-robin.
 ///
 /// Uses `DashMap` for lock-free concurrent access. When an IP's consecutive
 /// failure count reaches the threshold, the caller should remove it from the
 /// `IpDistributor`. Successes reset the counter. DNS refresh restores excluded IPs.
+///
+/// Recovery: once an IP has been marked unhealthy and its cooldown elapses,
+/// it becomes a "probe candidate". A successful probe clears the unhealthy state;
+/// a failed probe doubles the cooldown (capped at `max_cooldown`).
 pub struct IpHealthTracker {
     failures: DashMap<IpAddr, u32>,
+    /// Tracks unhealthy IPs with their cooldown state for recovery probing.
+    unhealthy: DashMap<IpAddr, IpHealthEntry>,
     threshold: u32,
+    /// Initial cooldown before an unhealthy IP becomes a probe candidate.
+    initial_cooldown: Duration,
+    /// Maximum cooldown duration (caps exponential backoff).
+    max_cooldown: Duration,
 }
 
 impl IpHealthTracker {
     pub fn new(threshold: u32) -> Self {
         Self {
             failures: DashMap::new(),
+            unhealthy: DashMap::new(),
             threshold,
+            initial_cooldown: Duration::from_secs(5),
+            max_cooldown: Duration::from_secs(300),
         }
     }
 
-    /// Record a successful request. Resets failure count for the IP.
+    /// Create a new tracker with configurable cooldown parameters.
+    pub fn new_with_cooldown(
+        threshold: u32,
+        initial_cooldown: Duration,
+        max_cooldown: Duration,
+    ) -> Self {
+        Self {
+            failures: DashMap::new(),
+            unhealthy: DashMap::new(),
+            threshold,
+            initial_cooldown,
+            max_cooldown,
+        }
+    }
+
+    /// Record a successful request. Resets failure count and clears unhealthy state for the IP.
     pub fn record_success(&self, ip: &IpAddr) {
         self.failures.remove(ip);
+        self.unhealthy.remove(ip);
     }
 
     /// Record a failed request. Returns `true` if the threshold is reached
     /// and the IP should be excluded from the distributor.
+    ///
+    /// When the threshold is reached, the IP is also recorded as unhealthy
+    /// with the initial cooldown for recovery probing.
     pub fn record_failure(&self, ip: &IpAddr) -> bool {
         let mut count = self.failures.entry(*ip).or_insert(0);
         *count += 1;
-        *count >= self.threshold
+        let threshold_reached = *count >= self.threshold;
+        if threshold_reached {
+            // Mark as unhealthy with initial cooldown if not already tracked
+            self.unhealthy.entry(*ip).or_insert(IpHealthEntry {
+                unhealthy_at: Instant::now(),
+                cooldown: self.initial_cooldown,
+            });
+        }
+        threshold_reached
     }
 
-    /// Clear all failure counts (e.g., on DNS refresh when IPs are restored).
+    /// Record a failed probe attempt on an unhealthy IP.
+    /// Doubles the cooldown (capped at max_cooldown) and resets the unhealthy_at timestamp.
+    pub fn record_probe_failure(&self, ip: &IpAddr) {
+        if let Some(mut entry) = self.unhealthy.get_mut(ip) {
+            let new_cooldown = entry.cooldown.saturating_mul(2);
+            entry.cooldown = if new_cooldown > self.max_cooldown {
+                self.max_cooldown
+            } else {
+                new_cooldown
+            };
+            entry.unhealthy_at = Instant::now();
+        }
+    }
+
+    /// Record a successful probe on a formerly unhealthy IP.
+    /// Clears the unhealthy state and failure count.
+    pub fn record_probe_success(&self, ip: &IpAddr) {
+        self.failures.remove(ip);
+        self.unhealthy.remove(ip);
+    }
+
+    /// Returns IPs whose cooldown has elapsed and are eligible for probing.
+    /// These IPs are still considered unhealthy until a probe succeeds.
+    pub fn get_probe_candidates(&self) -> Vec<IpAddr> {
+        let now = Instant::now();
+        self.unhealthy
+            .iter()
+            .filter_map(|entry| {
+                let elapsed = now.duration_since(entry.value().unhealthy_at);
+                if elapsed >= entry.value().cooldown {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Check if a specific IP is a probe candidate (cooldown elapsed).
+    pub fn is_probe_candidate(&self, ip: &IpAddr) -> bool {
+        if let Some(entry) = self.unhealthy.get(ip) {
+            let elapsed = Instant::now().duration_since(entry.unhealthy_at);
+            elapsed >= entry.cooldown
+        } else {
+            false
+        }
+    }
+
+    /// Check if an IP is currently marked as unhealthy.
+    pub fn is_unhealthy(&self, ip: &IpAddr) -> bool {
+        self.unhealthy.contains_key(ip)
+    }
+
+    /// Clear all failure counts and unhealthy state (e.g., on DNS refresh when IPs are restored).
     pub fn clear(&self) {
         self.failures.clear();
+        self.unhealthy.clear();
     }
 }
 
@@ -714,6 +817,164 @@ mod tests {
         tracker.clear();
         // After clear, count starts from 0
         assert!(!tracker.record_failure(&ip)); // 1
+    }
+
+    #[test]
+    fn test_health_tracker_marks_unhealthy_at_threshold() {
+        let tracker = IpHealthTracker::new(3);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        assert!(!tracker.is_unhealthy(&ip));
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        assert!(!tracker.is_unhealthy(&ip));
+        tracker.record_failure(&ip); // threshold reached
+        assert!(tracker.is_unhealthy(&ip));
+    }
+
+    #[test]
+    fn test_health_tracker_probe_candidate_after_cooldown() {
+        // Use a very short cooldown so it elapses immediately
+        let tracker = IpHealthTracker::new_with_cooldown(
+            3,
+            Duration::from_millis(1),
+            Duration::from_secs(300),
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Hit threshold
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        assert!(tracker.is_unhealthy(&ip));
+
+        // Wait for cooldown to elapse
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(tracker.is_probe_candidate(&ip));
+        let candidates = tracker.get_probe_candidates();
+        assert!(candidates.contains(&ip));
+    }
+
+    #[test]
+    fn test_health_tracker_not_probe_candidate_before_cooldown() {
+        // Use a long cooldown so it doesn't elapse
+        let tracker = IpHealthTracker::new_with_cooldown(
+            3,
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        assert!(tracker.is_unhealthy(&ip));
+        assert!(!tracker.is_probe_candidate(&ip));
+        assert!(tracker.get_probe_candidates().is_empty());
+    }
+
+    #[test]
+    fn test_health_tracker_probe_success_clears_unhealthy() {
+        let tracker = IpHealthTracker::new_with_cooldown(
+            3,
+            Duration::from_millis(1),
+            Duration::from_secs(300),
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Hit threshold
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        assert!(tracker.is_unhealthy(&ip));
+
+        // Probe success clears unhealthy state
+        tracker.record_probe_success(&ip);
+        assert!(!tracker.is_unhealthy(&ip));
+        assert!(!tracker.is_probe_candidate(&ip));
+    }
+
+    #[test]
+    fn test_health_tracker_probe_failure_doubles_cooldown() {
+        let tracker = IpHealthTracker::new_with_cooldown(
+            3,
+            Duration::from_millis(10),
+            Duration::from_secs(300),
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Hit threshold — initial cooldown is 10ms
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+
+        // Wait for initial cooldown
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(tracker.is_probe_candidate(&ip));
+
+        // Probe fails — cooldown doubles to 20ms, unhealthy_at resets
+        tracker.record_probe_failure(&ip);
+        assert!(!tracker.is_probe_candidate(&ip)); // not yet, cooldown reset
+
+        // Wait less than doubled cooldown (20ms)
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!tracker.is_probe_candidate(&ip));
+
+        // Wait for the full doubled cooldown
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(tracker.is_probe_candidate(&ip));
+    }
+
+    #[test]
+    fn test_health_tracker_probe_failure_caps_at_max_cooldown() {
+        let tracker = IpHealthTracker::new_with_cooldown(
+            3,
+            Duration::from_secs(200),
+            Duration::from_secs(300), // max 5 min
+        );
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Hit threshold
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+
+        // Probe failure: 200s * 2 = 400s, but capped at 300s
+        tracker.record_probe_failure(&ip);
+
+        // Verify cooldown is capped
+        let entry = tracker.unhealthy.get(&ip).unwrap();
+        assert_eq!(entry.cooldown, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_health_tracker_success_clears_unhealthy_state() {
+        let tracker = IpHealthTracker::new(3);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Hit threshold
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        assert!(tracker.is_unhealthy(&ip));
+
+        // Regular success also clears unhealthy state
+        tracker.record_success(&ip);
+        assert!(!tracker.is_unhealthy(&ip));
+    }
+
+    #[test]
+    fn test_health_tracker_clear_resets_unhealthy() {
+        let tracker = IpHealthTracker::new(3);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        assert!(tracker.is_unhealthy(&ip));
+
+        tracker.clear();
+        assert!(!tracker.is_unhealthy(&ip));
     }
 
     // --- ConnectionPoolManager tests ---

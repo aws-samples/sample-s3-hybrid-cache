@@ -274,6 +274,8 @@ pub struct SignedPutHandler {
     log_sampler: LogSampler,
     /// Proxy identification Referer header value (None when disabled)
     proxy_referer: Option<String>,
+    /// Maximum request body size to buffer into memory (Requirement 11.1)
+    max_buffered_request_body_bytes: u64,
 }
 
 impl SignedPutHandler {
@@ -285,12 +287,14 @@ impl SignedPutHandler {
     /// * `compression_handler` - Handler for compressing cached data
     /// * `current_cache_usage` - Current cache usage in bytes
     /// * `max_cache_capacity` - Maximum cache capacity in bytes
+    /// * `max_buffered_request_body_bytes` - Maximum request body size to buffer
     pub fn new(
         cache_dir: PathBuf,
         compression_handler: CompressionHandler,
         current_cache_usage: u64,
         max_cache_capacity: u64,
         proxy_referer: Option<String>,
+        max_buffered_request_body_bytes: u64,
     ) -> Self {
         Self {
             cache_dir,
@@ -302,6 +306,7 @@ impl SignedPutHandler {
             s3_client: None,
             log_sampler: LogSampler::new(),
             proxy_referer,
+            max_buffered_request_body_bytes,
         }
     }
 
@@ -476,7 +481,7 @@ impl SignedPutHandler {
             CacheDecision::Bypass(reason) => {
                 // Log bypass decision (Requirement 2.5)
                 log_bypass_decision(&cache_key, &reason);
-                info!("Bypassing cache for signed PUT: {}", cache_key);
+                debug!("Bypassing cache for signed PUT: {}", cache_key);
                 // Record bypassed PUT (Requirement 9.2)
                 if let Some(metrics) = &self.metrics_manager {
                     metrics.read().await.record_bypassed_put().await;
@@ -560,15 +565,13 @@ impl SignedPutHandler {
         let headers = req.headers().clone();
         let version = req.version();
 
-        // Read the request body once into Bytes (Requirement 1.5)
-        // This preserves AWS SigV4 signatures
-        use http_body_util::BodyExt;
-        let body = req.into_body();
-        let collected = body
-            .collect()
-            .await
-            .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?;
-        let body_bytes = collected.to_bytes();
+        // Read the request body with bounded size (Requirements 1.5, 11.1, 11.2, 11.4)
+        // This preserves AWS SigV4 signatures while enforcing body size limits
+        let body_bytes = crate::signed_request_proxy::read_request_body_bounded(
+            req,
+            self.max_buffered_request_body_bytes,
+        )
+        .await?;
 
         debug!("Read request body: {} bytes", body_bytes.len());
 
@@ -584,7 +587,7 @@ impl SignedPutHandler {
             );
             match aws_chunked_decoder::decode_aws_chunked(&body_bytes) {
                 Ok(decoded) => {
-                    let decoded_len = decoded.len() as u64;
+                    let decoded_len = decoded.data.len() as u64;
                     // Validate against x-amz-decoded-content-length if present (Requirement 1.5)
                     if let Some(expected) =
                         aws_chunked_decoder::get_decoded_content_length(&request_headers)
@@ -612,14 +615,14 @@ impl SignedPutHandler {
                                 "aws-chunked decoded successfully: cache_key={}, raw_size={}, decoded_size={}",
                                 cache_key, body_bytes.len(), decoded_len
                             );
-                            (Some(Bytes::from(decoded)), Some(decoded_len))
+                            (Some(Bytes::from(decoded.data)), Some(decoded_len))
                         }
                     } else {
                         info!(
                             "aws-chunked decoded (no expected length header): cache_key={}, raw_size={}, decoded_size={}",
                             cache_key, body_bytes.len(), decoded_len
                         );
-                        (Some(Bytes::from(decoded)), Some(decoded_len))
+                        (Some(Bytes::from(decoded.data)), Some(decoded_len))
                     }
                 }
                 Err(e) => {
@@ -781,15 +784,13 @@ impl SignedPutHandler {
         let headers = req.headers().clone();
         let version = req.version();
 
-        // Read the request body once into Bytes (Requirement 1.5)
-        // This preserves AWS SigV4 signatures
-        use http_body_util::BodyExt;
-        let body = req.into_body();
-        let collected = body
-            .collect()
-            .await
-            .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?;
-        let body_bytes = collected.to_bytes();
+        // Read the request body with bounded size (Requirements 1.5, 11.1, 11.2, 11.4)
+        // This preserves AWS SigV4 signatures while enforcing body size limits
+        let body_bytes = crate::signed_request_proxy::read_request_body_bounded(
+            req,
+            self.max_buffered_request_body_bytes,
+        )
+        .await?;
 
         debug!("Read request body: {} bytes", body_bytes.len());
 
@@ -805,7 +806,7 @@ impl SignedPutHandler {
             );
             match aws_chunked_decoder::decode_aws_chunked(&body_bytes) {
                 Ok(decoded) => {
-                    let decoded_len = decoded.len() as u64;
+                    let decoded_len = decoded.data.len() as u64;
                     // Validate against x-amz-decoded-content-length if present
                     if let Some(expected) =
                         aws_chunked_decoder::get_decoded_content_length(&request_headers)
@@ -832,14 +833,14 @@ impl SignedPutHandler {
                                 "aws-chunked decoded successfully (streaming): cache_key={}, raw_size={}, decoded_size={}",
                                 cache_key, body_bytes.len(), decoded_len
                             );
-                            (Some(Bytes::from(decoded)), Some(decoded_len))
+                            (Some(Bytes::from(decoded.data)), Some(decoded_len))
                         }
                     } else {
                         info!(
                             "aws-chunked decoded (streaming, no expected length header): cache_key={}, raw_size={}, decoded_size={}",
                             cache_key, body_bytes.len(), decoded_len
                         );
-                        (Some(Bytes::from(decoded)), Some(decoded_len))
+                        (Some(Bytes::from(decoded.data)), Some(decoded_len))
                     }
                 }
                 Err(e) => {
@@ -1611,22 +1612,17 @@ impl SignedPutHandler {
 
         match cache_decision {
             CacheDecision::Cache | CacheDecision::StreamWithCapacityCheck => {
-                // Read the request body
+                // Read the request body with bounded size (Requirements 11.1, 11.2, 11.4)
                 let method = req.method().clone();
                 let uri = req.uri().clone();
                 let headers = req.headers().clone();
                 let version = req.version();
 
-                use http_body_util::BodyExt;
-                let body = req.into_body();
-                let collected = body.collect().await.map_err(|e| {
-                    error!(
-                        "Failed to read UploadPart body: cache_key={}, upload_id={}, part_number={}, error={}",
-                        cache_key, upload_id, part_number, e
-                    );
-                    ProxyError::HttpError(format!("Failed to read request body: {}", e))
-                })?;
-                let original_body_bytes = collected.to_bytes();
+                let original_body_bytes = crate::signed_request_proxy::read_request_body_bounded(
+                    req,
+                    self.max_buffered_request_body_bytes,
+                )
+                .await?;
 
                 debug!(
                     "Read UploadPart body: {} bytes for part {}, first 20 bytes: {:?}, last 20 bytes: {:?}",
@@ -1650,7 +1646,7 @@ impl SignedPutHandler {
                 ) {
                     match aws_chunked_decoder::decode_aws_chunked(&original_body_bytes) {
                         Ok(decoded) => {
-                            let decoded_len = decoded.len() as u64;
+                            let decoded_len = decoded.data.len() as u64;
 
                             // If the header is present, validate the decoded length.
                             // A mismatch means the framing parsed but produced wrong
@@ -1684,7 +1680,7 @@ impl SignedPutHandler {
                                             "aws-chunked decoded for caching"
                                         );
                                     }
-                                    Some(Bytes::from(decoded))
+                                    Some(Bytes::from(decoded.data))
                                 }
                             } else {
                                 // No length header to validate against; trust the decoder.
@@ -1696,7 +1692,7 @@ impl SignedPutHandler {
                                         "aws-chunked decoded for caching (no length header)"
                                     );
                                 }
-                                Some(Bytes::from(decoded))
+                                Some(Bytes::from(decoded.data))
                             }
                         }
                         Err(e) => {
@@ -3321,6 +3317,8 @@ impl SignedPutHandler {
             ProxyError::InvalidRange(_) => "invalid_range",
             ProxyError::SystemError(_) => "system_error",
             ProxyError::RetryAfter(_) => "retry_after",
+            ProxyError::EvictionFenceLost(_) => "eviction_fence_lost",
+            ProxyError::RequestBodyTooLarge { .. } => "request_body_too_large",
         }
     }
 }
@@ -3338,6 +3336,7 @@ mod tests {
             0,
             10 * 1024 * 1024, // 10MB capacity
             None,
+            128 * 1024 * 1024, // 128 MiB max request body
         )
     }
 
@@ -3557,6 +3556,7 @@ mod tests {
                     0,
                     10 * 1024 * 1024,
                     None,
+                    128 * 1024 * 1024,
                 );
                 handler
                     .cache_upload_part(&key, &upload, part_number, &data_a_clone, &etag_a_s)
@@ -3574,6 +3574,7 @@ mod tests {
                     0,
                     10 * 1024 * 1024,
                     None,
+                    128 * 1024 * 1024,
                 );
                 handler
                     .cache_upload_part(&key_b, &upload_b, part_number, &data_b_clone, &etag_b_s)

@@ -94,6 +94,7 @@ pub(crate) mod duration_serde {
 
 /// Dashboard configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DashboardConfig {
     pub enabled: bool,
     pub port: u16,
@@ -102,15 +103,19 @@ pub struct DashboardConfig {
     pub cache_stats_refresh_interval: Duration,
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub logs_refresh_interval: Duration,
+    /// DEPRECATED: This field is not read by any logic. Log entries displayed on the dashboard
+    /// are managed internally. Retained for one release cycle for backward-compatible config
+    /// parsing. Will be removed in a future release.
+    #[serde(default = "default_max_log_entries")]
     pub max_log_entries: usize,
 }
 
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
-            enabled: true, // Enabled by default per requirements
-            port: 8081,    // Changed from 8080 to avoid conflict with health server
-            bind_address: "0.0.0.0".to_string(),
+            enabled: true,                         // Enabled by default per requirements
+            port: 8081, // Changed from 8080 to avoid conflict with health server
+            bind_address: "127.0.0.1".to_string(), // Localhost-only by default (Req 13)
             cache_stats_refresh_interval: Duration::from_secs(5),
             logs_refresh_interval: Duration::from_secs(10),
             max_log_entries: 100,
@@ -226,6 +231,14 @@ pub struct ServerConfig {
     /// Enable adding Referer header for proxy identification in S3 Server Access Logs
     #[serde(default = "default_add_referer_header")]
     pub add_referer_header: bool,
+    /// Maximum size in bytes for request bodies that the proxy buffers into memory.
+    /// Applies to single-part PUT, UploadPart, and other requests with a body.
+    /// Default: 5 GiB (5_368_709_120) — matches the S3 single-part and UploadPart maximum,
+    /// ensuring the proxy is transparent to all valid S3 clients.
+    /// Operators on memory-constrained instances can lower this value.
+    /// Requirement: 11.1, 11.2, 11.3
+    #[serde(default = "default_max_buffered_request_body_bytes")]
+    pub max_buffered_request_body_bytes: u64,
     /// Optional TLS proxy listener configuration
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -254,6 +267,31 @@ fn default_add_referer_header() -> bool {
     true
 }
 
+/// Helper for deprecated boolean fields that default to true
+fn default_true() -> bool {
+    true
+}
+
+/// Default for deprecated max_log_entries field
+fn default_max_log_entries() -> usize {
+    100
+}
+
+/// Default for deprecated max_connections_per_ip field
+fn default_max_connections_per_ip() -> usize {
+    10
+}
+
+/// Default maximum buffered request body size: 5 GiB (S3 single-part and UploadPart maximum).
+///
+/// This matches the S3 protocol limit so the proxy is transparent to all valid S3 clients.
+/// Operators on memory-constrained instances can lower this value; note that
+/// `max_concurrent_requests` bounds the worst-case concurrent memory usage.
+/// Requirement: 11.1, 11.3
+fn default_max_buffered_request_body_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024 // 5 GiB — S3 single-part / UploadPart maximum
+}
+
 fn default_tls_proxy_port() -> u16 {
     3129
 }
@@ -268,6 +306,7 @@ impl Default for ServerConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             request_timeout: default_request_timeout(),
             add_referer_header: default_add_referer_header(),
+            max_buffered_request_body_bytes: default_max_buffered_request_body_bytes(),
             tls: None,
         }
     }
@@ -292,6 +331,12 @@ pub struct TlsConfig {
     /// Path to PEM-encoded private key file
     #[serde(default)]
     pub key_path: String,
+    /// Optional hostname allowlist for CONNECT and SNI passthrough destinations.
+    /// When present, only hostnames matching a pattern in this list are permitted.
+    /// When absent (None), no hostname filtering is applied — only IP-range checks apply.
+    /// No hardcoded default patterns are shipped; operators add their own patterns.
+    #[serde(default)]
+    pub connect_allowlist: Option<Vec<String>>,
 }
 
 impl Default for TlsConfig {
@@ -301,6 +346,7 @@ impl Default for TlsConfig {
             tls_proxy_port: default_tls_proxy_port(),
             cert_path: String::new(),
             key_path: String::new(),
+            connect_allowlist: None,
         }
     }
 }
@@ -355,6 +401,16 @@ pub struct DownloadCoordinationConfig {
     /// Requirement: 18.2, 18.3, 18.5
     #[serde(default = "default_download_coordination_wait_timeout_secs")]
     pub wait_timeout_secs: u64,
+
+    /// Maximum number of times a waiter will re-subscribe after timeout before
+    /// returning a gateway timeout error (default: 3).
+    /// When a waiter's timeout fires and the FetchGuard is still present, the waiter
+    /// re-subscribes to the in-flight fetch rather than launching a duplicate S3 request.
+    /// After this many re-subscriptions without receiving a result, the waiter fails
+    /// with HTTP 504 Gateway Timeout.
+    /// Requirement: 7.5
+    #[serde(default = "default_max_waiter_resubscriptions")]
+    pub max_waiter_resubscriptions: u32,
 }
 
 fn default_download_coordination_enabled() -> bool {
@@ -365,11 +421,16 @@ fn default_download_coordination_wait_timeout_secs() -> u64 {
     30
 }
 
+fn default_max_waiter_resubscriptions() -> u32 {
+    3
+}
+
 impl Default for DownloadCoordinationConfig {
     fn default() -> Self {
         Self {
             enabled: default_download_coordination_enabled(),
             wait_timeout_secs: default_download_coordination_wait_timeout_secs(),
+            max_waiter_resubscriptions: default_max_waiter_resubscriptions(),
         }
     }
 }
@@ -505,6 +566,14 @@ pub struct SharedStorageConfig {
     )]
     pub eviction_lock_timeout: Duration,
 
+    /// Metadata lock timeout in milliseconds (default: 30_000ms = 30s)
+    /// How long a metadata lock owned by another host must be idle before it's considered
+    /// stale and eligible for takeover. Only applies to cross-host lock evaluation;
+    /// same-host staleness uses PID checks instead.
+    /// Requirement: 3.3
+    #[serde(default = "default_metadata_lock_timeout_ms")]
+    pub metadata_lock_timeout_ms: u64,
+
     /// Enable background orphan recovery (default: true when shared_storage is enabled)
     /// Scans for orphaned .bin files that aren't tracked in metadata and recovers them.
     /// Essential for shared storage where journal consolidation may lag behind writes.
@@ -562,6 +631,13 @@ fn default_eviction_lock_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
+/// Default metadata lock timeout: 30 seconds (30_000ms)
+/// How long a metadata lock owned by another host must be idle before takeover.
+/// Requirement: 3.3
+fn default_metadata_lock_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_orphan_recovery_enabled() -> bool {
     true
 }
@@ -596,6 +672,7 @@ impl Default for SharedStorageConfig {
             lock_max_retries: default_lock_max_retries(),
             validation_frequency: default_validation_frequency(),
             eviction_lock_timeout: default_eviction_lock_timeout(),
+            metadata_lock_timeout_ms: default_metadata_lock_timeout_ms(),
             orphan_recovery_enabled: default_orphan_recovery_enabled(),
             orphan_recovery_interval: default_orphan_recovery_interval(),
             orphan_scan_timeout: default_orphan_scan_timeout(),
@@ -763,7 +840,7 @@ fn default_eviction_target_percent() -> u8 {
 }
 
 fn default_ram_cache_flush_interval() -> Duration {
-    Duration::from_secs(60) // 60 seconds
+    Duration::from_secs(10) // 10 seconds (shortened for cross-instance access visibility, Req 19.1)
 }
 
 fn default_ram_cache_flush_threshold() -> usize {
@@ -1089,13 +1166,15 @@ pub struct CacheConfig {
     /// maintaining compatibility with signed requests.
     #[serde(default = "default_range_merge_gap_threshold")]
     pub range_merge_gap_threshold: u64,
-    /// Eviction buffer percentage (default: 5)
-    /// When eviction is triggered at 95% capacity, evict to (100 - eviction_buffer_percent)%
-    /// to create a buffer and minimize scan frequency
+    /// DEPRECATED: This field is not read by any logic. Eviction behavior is controlled by
+    /// `eviction_trigger_percent` (default 95%) and `eviction_target_percent` (default 80%).
+    /// Retained for one release cycle for backward-compatible config parsing.
+    /// Will be removed in a future release.
     #[serde(default = "default_eviction_buffer_percent")]
     pub eviction_buffer_percent: u8,
     /// Interval between periodic flushes of RAM cache access statistics to disk
-    /// Default: 60 seconds, Range: 10-600 seconds
+    /// Default: 10 seconds, Range: 10-600 seconds
+    /// Shorter intervals improve cross-instance access visibility for eviction decisions (Req 19).
     #[serde(
         default = "default_ram_cache_flush_interval",
         deserialize_with = "duration_serde::deserialize"
@@ -1240,11 +1319,18 @@ impl Default for CacheConfig {
 }
 
 impl CacheConfig {
+    /// Maximum allowed TTL value: 315,360,000 seconds (10 years).
+    /// TTL fields exceeding this are rejected at startup.
+    /// Requirement: 8.5
+    const MAX_TTL_SECONDS: u64 = 315_360_000;
+
     /// Validate cache configuration values.
     ///
     /// Currently validates:
     /// - `compression_batch_size` must be between 64 KiB and 16 MiB inclusive
     ///   (Requirements: 5.1, 5.2, 5.3, 5.4)
+    /// - TTL fields must not exceed 315,360,000 seconds (10 years)
+    ///   (Requirement: 8.5)
     pub fn validate(&self) -> std::result::Result<(), String> {
         // Validate compression_batch_size (64 KiB to 16 MiB inclusive)
         const MIN_COMPRESSION_BATCH_SIZE: usize = 64 * 1024; // 64 KiB
@@ -1258,6 +1344,31 @@ impl CacheConfig {
             ));
         }
 
+        // Validate TTL fields do not exceed maximum (Requirement: 8.5)
+        self.validate_ttl_field("cache.get_ttl", &self.get_ttl)?;
+        self.validate_ttl_field("cache.put_ttl", &self.put_ttl)?;
+        self.validate_ttl_field("cache.head_ttl", &self.head_ttl)?;
+        self.validate_ttl_field("cache.incomplete_upload_ttl", &self.incomplete_upload_ttl)?;
+
+        Ok(())
+    }
+
+    /// Validate a single TTL field does not exceed the maximum.
+    /// Requirement: 8.5
+    fn validate_ttl_field(
+        &self,
+        field_name: &str,
+        value: &Duration,
+    ) -> std::result::Result<(), String> {
+        let secs = value.as_secs();
+        if secs > Self::MAX_TTL_SECONDS {
+            return Err(format!(
+                "configuration field '{}' value {} exceeds maximum {} seconds (10 years)",
+                field_name,
+                secs,
+                Self::MAX_TTL_SECONDS
+            ));
+        }
         Ok(())
     }
 }
@@ -1437,6 +1548,11 @@ impl Default for LoggingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConnectionPoolConfig {
+    /// DEPRECATED: This field is not read by any logic. Connection pooling is managed by
+    /// `max_idle_per_host` and `max_idle_per_ip` instead.
+    /// Retained for one release cycle for backward-compatible config parsing.
+    /// Will be removed in a future release.
+    #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub dns_refresh_interval: Duration,
@@ -1499,6 +1615,18 @@ pub struct ConnectionPoolConfig {
     /// Consecutive failures before excluding an IP from round-robin (default: 3)
     #[serde(default = "default_ip_failure_threshold")]
     pub ip_failure_threshold: u32,
+    /// Initial cooldown before an unhealthy IP becomes a probe candidate (default: 5s)
+    #[serde(
+        default = "default_health_probe_initial_cooldown",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub health_probe_initial_cooldown: Duration,
+    /// Maximum cooldown for unhealthy IP recovery probing (default: 300s / 5 min)
+    #[serde(
+        default = "default_health_probe_max_cooldown",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub health_probe_max_cooldown: Duration,
 }
 
 fn default_dns_servers() -> Vec<String> {
@@ -1549,6 +1677,14 @@ fn default_ip_failure_threshold() -> u32 {
     3
 }
 
+fn default_health_probe_initial_cooldown() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_health_probe_max_cooldown() -> Duration {
+    Duration::from_secs(300)
+}
+
 impl Default for ConnectionPoolConfig {
     fn default() -> Self {
         Self {
@@ -1569,6 +1705,8 @@ impl Default for ConnectionPoolConfig {
             keepalive_retries: default_keepalive_retries(),
             tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
             ip_failure_threshold: default_ip_failure_threshold(),
+            health_probe_initial_cooldown: default_health_probe_initial_cooldown(),
+            health_probe_max_cooldown: default_health_probe_max_cooldown(),
         }
     }
 }
@@ -1637,8 +1775,20 @@ pub struct MetricsConfig {
     pub port: u16,
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub collection_interval: Duration,
+    /// DEPRECATED: This field is not read by any logic. All cache stats are always included.
+    /// Retained for one release cycle for backward-compatible config parsing.
+    /// Will be removed in a future release.
+    #[serde(default = "default_true")]
     pub include_cache_stats: bool,
+    /// DEPRECATED: This field is not read by any logic. All compression stats are always included.
+    /// Retained for one release cycle for backward-compatible config parsing.
+    /// Will be removed in a future release.
+    #[serde(default = "default_true")]
     pub include_compression_stats: bool,
+    /// DEPRECATED: This field is not read by any logic. All connection stats are always included.
+    /// Retained for one release cycle for backward-compatible config parsing.
+    /// Will be removed in a future release.
+    #[serde(default = "default_true")]
     pub include_connection_stats: bool,
     pub otlp: OtlpConfig,
 }
@@ -1705,6 +1855,7 @@ impl Default for Config {
                 max_concurrent_requests: 200,
                 request_timeout: Duration::from_secs(30),
                 add_referer_header: true,
+                max_buffered_request_body_bytes: default_max_buffered_request_body_bytes(),
                 tls: None,
             },
             cache: CacheConfig {
@@ -1724,7 +1875,7 @@ impl Default for Config {
                 download_coordination: DownloadCoordinationConfig::default(), // Enabled by default
                 range_merge_gap_threshold: 1024 * 1024,         // 1MiB
                 eviction_buffer_percent: 5,                     // 5% buffer
-                ram_cache_flush_interval: Duration::from_secs(60), // 60 seconds
+                ram_cache_flush_interval: Duration::from_secs(10), // 10 seconds (Req 19)
                 ram_cache_flush_threshold: 100,                 // 100 pending updates
                 ram_cache_flush_on_eviction: false,             // Do not flush on eviction
                 ram_cache_verification_interval: Duration::from_secs(1), // 1 second
@@ -1772,6 +1923,8 @@ impl Default for Config {
                 keepalive_retries: default_keepalive_retries(),
                 tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
                 ip_failure_threshold: default_ip_failure_threshold(),
+                health_probe_initial_cooldown: default_health_probe_initial_cooldown(),
+                health_probe_max_cooldown: default_health_probe_max_cooldown(),
             },
             compression: CompressionConfig {
                 enabled: true,
@@ -1829,6 +1982,15 @@ impl Config {
         if let Err(e) = config.cache.shared_storage.validate() {
             return Err(ProxyError::ConfigError(format!(
                 "Invalid shared storage configuration: {}",
+                e
+            )));
+        }
+
+        // Validate cache configuration (compression_batch_size, TTL bounds)
+        // Requirement: 8.5
+        if let Err(e) = config.cache.validate() {
+            return Err(ProxyError::ConfigError(format!(
+                "Invalid cache configuration: {}",
                 e
             )));
         }
@@ -1940,12 +2102,11 @@ impl Config {
         // Log dashboard configuration
         if config.dashboard.enabled {
             info!(
-                "Dashboard enabled on {}:{} (cache_stats_refresh: {}s, logs_refresh: {}s, max_log_entries: {})",
+                "Dashboard enabled on {}:{} (cache_stats_refresh: {}s, logs_refresh: {}s)",
                 config.dashboard.bind_address,
                 config.dashboard.port,
                 config.dashboard.cache_stats_refresh_interval.as_secs(),
                 config.dashboard.logs_refresh_interval.as_secs(),
-                config.dashboard.max_log_entries
             );
         } else {
             info!("Dashboard disabled");
@@ -1980,7 +2141,55 @@ impl Config {
         info!("Configuration loaded successfully");
         debug!("Configuration: {:?}", config);
 
+        // Log deprecation warnings for dead config fields (Req 20.5)
+        config.log_deprecated_fields();
+
         Ok(config)
+    }
+
+    /// Log deprecation warnings for config fields that are no longer read by any logic.
+    /// These fields are retained for one release cycle for backward-compatible config parsing.
+    /// Requirement: 20.5
+    fn log_deprecated_fields(&self) {
+        if self.cache.eviction_buffer_percent != default_eviction_buffer_percent() {
+            warn!(
+                "Configuration field 'cache.eviction_buffer_percent' is deprecated and has no effect. \
+                 Eviction behavior is controlled by 'cache.eviction_trigger_percent' (default 95%) \
+                 and 'cache.eviction_target_percent' (default 80%). This field will be removed in a future release."
+            );
+        }
+        if !self.metrics.include_cache_stats {
+            warn!(
+                "Configuration field 'metrics.include_cache_stats' is deprecated and has no effect. \
+                 All cache stats are always included. This field will be removed in a future release."
+            );
+        }
+        if !self.metrics.include_compression_stats {
+            warn!(
+                "Configuration field 'metrics.include_compression_stats' is deprecated and has no effect. \
+                 All compression stats are always included. This field will be removed in a future release."
+            );
+        }
+        if !self.metrics.include_connection_stats {
+            warn!(
+                "Configuration field 'metrics.include_connection_stats' is deprecated and has no effect. \
+                 All connection stats are always included. This field will be removed in a future release."
+            );
+        }
+        if self.connection_pool.max_connections_per_ip != 10 {
+            warn!(
+                "Configuration field 'connection_pool.max_connections_per_ip' is deprecated and has no effect. \
+                 Connection pooling is managed by 'connection_pool.max_idle_per_host' and \
+                 'connection_pool.max_idle_per_ip'. This field will be removed in a future release."
+            );
+        }
+        if self.dashboard.max_log_entries != 100 {
+            warn!(
+                "Configuration field 'dashboard.max_log_entries' is deprecated and has no effect. \
+                 Log entries displayed on the dashboard are managed internally. \
+                 This field will be removed in a future release."
+            );
+        }
     }
 
     /// Build CLI argument parser
@@ -2113,7 +2322,7 @@ impl Config {
                 Arg::new("dashboard-bind-address")
                     .long("dashboard-bind-address")
                     .value_name("ADDRESS")
-                    .help("Dashboard server bind address (default: 0.0.0.0)"),
+                    .help("Dashboard server bind address (default: 127.0.0.1)"),
             )
             // Shared storage configuration CLI arguments
             .arg(
@@ -2184,7 +2393,7 @@ impl Config {
             ProxyError::ConfigError(format!("Failed to read config file {}: {}", path, e))
         })?;
 
-        let config: Self = serde_yaml::from_str(&content).map_err(|e| {
+        let config: Self = serde_yaml_ng::from_str(&content).map_err(|e| {
             ProxyError::ConfigError(format!("Failed to parse config file {}: {}", path, e))
         })?;
 
@@ -2629,10 +2838,10 @@ impl Config {
         let flush_interval_secs = self.cache.ram_cache_flush_interval.as_secs();
         if !(10..=600).contains(&flush_interval_secs) {
             warn!(
-                "Invalid ram_cache_flush_interval: {}s (must be 10-600s), using default 60s",
+                "Invalid ram_cache_flush_interval: {}s (must be 10-600s), using default 10s",
                 flush_interval_secs
             );
-            self.cache.ram_cache_flush_interval = Duration::from_secs(60);
+            self.cache.ram_cache_flush_interval = Duration::from_secs(10);
         }
 
         // Validate flush_threshold (10-10000)
@@ -2823,7 +3032,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
 
         assert_eq!(config.server.request_timeout, Duration::from_secs(30));
         assert_eq!(config.cache.put_ttl, Duration::from_secs(3600));
@@ -2902,7 +3111,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
 
         assert_eq!(config.server.request_timeout, Duration::from_secs(300)); // 5 minutes
         assert_eq!(config.cache.put_ttl, Duration::from_secs(3600)); // 1 hour
@@ -2979,7 +3188,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
 
         assert_eq!(config.server.request_timeout, Duration::from_millis(500));
         assert_eq!(config.cache.put_ttl, Duration::from_millis(1000));
@@ -3067,7 +3276,8 @@ metrics:
     headers: {}
 "#;
 
-        let result: std::result::Result<Config, serde_yaml::Error> = serde_yaml::from_str(yaml);
+        let result: std::result::Result<Config, serde_yaml_ng::Error> =
+            serde_yaml_ng::from_str(yaml);
         assert!(
             result.is_err(),
             "Should fail to parse invalid duration string"
@@ -3134,7 +3344,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
 
         // 1 day = 86400 seconds
         assert_eq!(config.cache.put_ttl, Duration::from_secs(86400));
@@ -3205,7 +3415,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert_eq!(config.cache.range_merge_gap_threshold, 524288); // 512KB
     }
 
@@ -3268,7 +3478,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         // Should use default value of 1MiB when not specified
         assert_eq!(config.cache.range_merge_gap_threshold, 1024 * 1024);
     }
@@ -3332,7 +3542,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         // Should use default values when not specified
         assert_eq!(config.cache.eviction_buffer_percent, 5);
         // shared_storage.lock_timeout defaults to 60s
@@ -3402,7 +3612,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         // Should use custom values when specified
         assert_eq!(config.cache.eviction_buffer_percent, 10);
         assert_eq!(config.cache.shared_storage.lock_timeout.as_secs(), 120);
@@ -3477,7 +3687,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(
             config.cache.write_cache_enabled,
             "write_cache_enabled should default to true when missing (write caching is complete)"
@@ -3497,7 +3707,7 @@ logging:
   app_log_dir: "./logs/app"
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("minimal config must parse");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
 
         // Spot-check fields that previously had no field-level serde default.
         assert_eq!(config.cache.write_cache_percent, 10.0);
@@ -3569,7 +3779,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(
             config.cache.write_cache_enabled,
             "write_cache_enabled should be true when explicitly set"
@@ -3636,7 +3846,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(
             !config.cache.write_cache_enabled,
             "write_cache_enabled should be false when explicitly set"
@@ -3700,7 +3910,7 @@ pool_check_interval: "20s"
 "#;
 
         let config: ConnectionPoolConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
 
         assert_eq!(config.max_connections_per_ip, 20);
         assert_eq!(config.dns_refresh_interval, Duration::from_secs(120));
@@ -3755,7 +3965,7 @@ pool_check_interval: "10s"
 "#;
 
         let config: ConnectionPoolConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
 
         assert_eq!(
             config.max_idle_per_host, 100,
@@ -3784,7 +3994,7 @@ max_idle_per_ip: 25
 "#;
 
         let config: ConnectionPoolConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
 
         assert!(config.ip_distribution_enabled);
         assert_eq!(config.max_idle_per_ip, 25);
@@ -3801,7 +4011,7 @@ idle_timeout: "30s"
 "#;
 
         let config: ConnectionPoolConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
 
         assert!(
             config.ip_distribution_enabled,
@@ -4108,7 +4318,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
 
         assert!(!config.cache.initialization.parallel_scan);
         assert_eq!(
@@ -4127,7 +4337,7 @@ metrics:
             .expect("Failed to read config/config.example.yaml");
 
         let config: Config =
-            serde_yaml::from_str(&yaml).expect("Failed to parse config/config.example.yaml");
+            serde_yaml_ng::from_str(&yaml).expect("Failed to parse config/config.example.yaml");
 
         // Verify initialization config has expected values from the example file
         assert!(config.cache.initialization.parallel_scan);
@@ -4212,7 +4422,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
 
         // Should use default values when initialization section is missing
         assert!(config.cache.initialization.parallel_scan);
@@ -4387,7 +4597,7 @@ dashboard:
 "#;
 
         // Parse the config (this should succeed)
-        let config: Config = serde_yaml::from_str(yaml).expect("Should parse YAML successfully");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Should parse YAML successfully");
 
         // But validation should fail because validation_threshold_warn (25.0) >= validation_threshold_error (20.0)
         let result = config.cache.shared_storage.validate();
@@ -4403,7 +4613,7 @@ dashboard:
 
         assert!(config.enabled);
         assert_eq!(config.port, 8081);
-        assert_eq!(config.bind_address, "0.0.0.0");
+        assert_eq!(config.bind_address, "127.0.0.1");
         assert_eq!(config.cache_stats_refresh_interval, Duration::from_secs(5));
         assert_eq!(config.logs_refresh_interval, Duration::from_secs(10));
         assert_eq!(config.max_log_entries, 100);
@@ -4503,7 +4713,7 @@ max_log_entries: 200
 "#;
 
         let config: DashboardConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse DashboardConfig");
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse DashboardConfig");
 
         assert!(!config.enabled);
         assert_eq!(config.port, 9090);
@@ -4520,7 +4730,7 @@ max_log_entries: 200
         // Verify dashboard is included with default values
         assert!(config.dashboard.enabled);
         assert_eq!(config.dashboard.port, 8081);
-        assert_eq!(config.dashboard.bind_address, "0.0.0.0");
+        assert_eq!(config.dashboard.bind_address, "127.0.0.1");
     }
 
     #[test]
@@ -4685,6 +4895,7 @@ max_log_entries: 200
         let config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 45,
+            max_waiter_resubscriptions: 3,
         };
         assert_eq!(config.wait_timeout(), Duration::from_secs(45));
     }
@@ -4695,6 +4906,7 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 2, // Below minimum of 5
+            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 5);
@@ -4706,6 +4918,7 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 200, // Above maximum of 120
+            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 120);
@@ -4717,6 +4930,7 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 60,
+            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 60);
@@ -4728,6 +4942,7 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 5,
+            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 5);
@@ -4739,6 +4954,7 @@ max_log_entries: 200
         let mut config = DownloadCoordinationConfig {
             enabled: true,
             wait_timeout_secs: 120,
+            max_waiter_resubscriptions: 3,
         };
         config.validate_and_clamp();
         assert_eq!(config.wait_timeout_secs, 120);
@@ -4764,7 +4980,7 @@ cache:
     wait_timeout_secs: 45
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(!config.cache.download_coordination.enabled);
         assert_eq!(config.cache.download_coordination.wait_timeout_secs, 45);
     }
@@ -4787,7 +5003,7 @@ cache:
   head_ttl: "3600s"
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(config.cache.download_coordination.enabled);
         assert_eq!(config.cache.download_coordination.wait_timeout_secs, 30);
     }
@@ -4856,7 +5072,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(config.server.add_referer_header);
     }
 
@@ -4919,7 +5135,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(config.server.add_referer_header);
     }
 
@@ -4982,7 +5198,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert!(!config.server.add_referer_header);
     }
 
@@ -4995,6 +5211,7 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: String::new(),
             key_path: "/path/to/key.pem".to_string(),
+            connect_allowlist: None,
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -5008,6 +5225,7 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: "/path/to/cert.pem".to_string(),
             key_path: String::new(),
+            connect_allowlist: None,
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -5021,6 +5239,7 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: "/path/to/cert.pem".to_string(),
             key_path: "/path/to/key.pem".to_string(),
+            connect_allowlist: None,
         };
         assert!(tls.validate().is_ok());
     }
@@ -5032,6 +5251,7 @@ metrics:
             tls_proxy_port: 8443,
             cert_path: String::new(),
             key_path: String::new(),
+            connect_allowlist: None,
         };
         assert!(tls.validate().is_ok());
     }
@@ -5043,6 +5263,7 @@ metrics:
             tls_proxy_port: 0,
             cert_path: String::new(),
             key_path: String::new(),
+            connect_allowlist: None,
         };
         let result = tls.validate();
         assert!(result.is_err());
@@ -5057,6 +5278,7 @@ metrics:
             tls_proxy_port: config.server.http_port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5072,6 +5294,7 @@ metrics:
             tls_proxy_port: config.server.https_port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5087,6 +5310,7 @@ metrics:
             tls_proxy_port: config.health.port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5104,6 +5328,7 @@ metrics:
             tls_proxy_port: 9090,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5119,6 +5344,7 @@ metrics:
             tls_proxy_port: config.dashboard.port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
         let result = config.validate_tls_config();
         assert!(result.is_err());
@@ -5134,6 +5360,7 @@ metrics:
             tls_proxy_port: 9999,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
         assert!(config.validate_tls_config().is_ok());
     }
@@ -5152,6 +5379,7 @@ metrics:
             tls_proxy_port: config.server.http_port, // conflicts, but TLS is disabled
             cert_path: String::new(),
             key_path: String::new(),
+            connect_allowlist: None,
         });
         // Port 0 check still applies
         // But http_port (80) is not 0, so this should pass since enabled=false skips conflict check
@@ -5164,19 +5392,19 @@ metrics:
     /// Validates: Requirements 1.1
     #[test]
     fn test_server_mode_deserialize_standard() {
-        let mode: ServerMode = serde_yaml::from_str("\"standard\"").unwrap();
+        let mode: ServerMode = serde_yaml_ng::from_str("\"standard\"").unwrap();
         assert_eq!(mode, ServerMode::Standard);
     }
 
     #[test]
     fn test_server_mode_deserialize_proxy_only() {
-        let mode: ServerMode = serde_yaml::from_str("\"proxy_only\"").unwrap();
+        let mode: ServerMode = serde_yaml_ng::from_str("\"proxy_only\"").unwrap();
         assert_eq!(mode, ServerMode::ProxyOnly);
     }
 
     #[test]
     fn test_server_mode_deserialize_invalid_value() {
-        let result: std::result::Result<ServerMode, _> = serde_yaml::from_str("\"invalid\"");
+        let result: std::result::Result<ServerMode, _> = serde_yaml_ng::from_str("\"invalid\"");
         assert!(result.is_err());
     }
 
@@ -5259,6 +5487,7 @@ metrics:
             tls_proxy_port: 3129,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
         let result = config.validate_proxy_only_mode();
         assert!(result.is_err());
@@ -5349,7 +5578,7 @@ metrics:
     compression: "none"
     headers: {}
 "#;
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert_eq!(config.server.mode, ServerMode::ProxyOnly);
         assert_eq!(config.server.proxy_port, 4000);
     }
@@ -5423,7 +5652,7 @@ metrics:
     headers: {}
 "#;
 
-        let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse config");
         assert_eq!(config.cache.compression_batch_size, 1_048_576);
     }
 
@@ -5455,6 +5684,109 @@ metrics:
             "error should mention the field name, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_ttl_validation_get_ttl_exceeds_max() {
+        // Requirement 8.5: TTL fields exceeding 315_360_000 seconds must be rejected.
+        let cfg = CacheConfig {
+            get_ttl: Duration::from_secs(999_999_999_999),
+            ..CacheConfig::default()
+        };
+        let err = cfg.validate().expect_err("get_ttl exceeding max must fail");
+        assert!(
+            err.contains("cache.get_ttl"),
+            "error should name the field, got: {}",
+            err
+        );
+        assert!(
+            err.contains("999999999999"),
+            "error should include the value, got: {}",
+            err
+        );
+        assert!(
+            err.contains("315360000"),
+            "error should include the maximum, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ttl_validation_put_ttl_exceeds_max() {
+        // Requirement 8.5: TTL fields exceeding 315_360_000 seconds must be rejected.
+        let cfg = CacheConfig {
+            put_ttl: Duration::from_secs(315_360_001),
+            ..CacheConfig::default()
+        };
+        let err = cfg.validate().expect_err("put_ttl exceeding max must fail");
+        assert!(
+            err.contains("cache.put_ttl"),
+            "error should name the field, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ttl_validation_head_ttl_exceeds_max() {
+        // Requirement 8.5: TTL fields exceeding 315_360_000 seconds must be rejected.
+        let cfg = CacheConfig {
+            head_ttl: Duration::from_secs(400_000_000),
+            ..CacheConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("head_ttl exceeding max must fail");
+        assert!(
+            err.contains("cache.head_ttl"),
+            "error should name the field, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ttl_validation_incomplete_upload_ttl_exceeds_max() {
+        // Requirement 8.5: TTL fields exceeding 315_360_000 seconds must be rejected.
+        let cfg = CacheConfig {
+            incomplete_upload_ttl: Duration::from_secs(315_360_001),
+            ..CacheConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("incomplete_upload_ttl exceeding max must fail");
+        assert!(
+            err.contains("cache.incomplete_upload_ttl"),
+            "error should name the field, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ttl_validation_at_boundary_accepted() {
+        // Requirement 8.5: TTL value exactly at 315_360_000 seconds should be accepted.
+        let cfg = CacheConfig {
+            get_ttl: Duration::from_secs(315_360_000),
+            put_ttl: Duration::from_secs(315_360_000),
+            head_ttl: Duration::from_secs(315_360_000),
+            incomplete_upload_ttl: Duration::from_secs(315_360_000),
+            ..CacheConfig::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "TTL at exactly the maximum should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_ttl_validation_zero_accepted() {
+        // TTL=0 is valid (means "do not cache / per-request auth").
+        let cfg = CacheConfig {
+            get_ttl: Duration::from_secs(0),
+            put_ttl: Duration::from_secs(0),
+            head_ttl: Duration::from_secs(0),
+            incomplete_upload_ttl: Duration::from_secs(0),
+            ..CacheConfig::default()
+        };
+        assert!(cfg.validate().is_ok(), "TTL=0 should be accepted");
     }
 }
 
@@ -5521,7 +5853,7 @@ mod dashboard_property_tests {
         // Verify specific default values per requirements
         let defaults_correct = default_config.enabled  // Enabled by default per requirements
             && default_config.port == 8081
-            && default_config.bind_address == "0.0.0.0"
+            && default_config.bind_address == "127.0.0.1"
             && default_config.cache_stats_refresh_interval == Duration::from_secs(5)
             && default_config.logs_refresh_interval == Duration::from_secs(10)
             && default_config.max_log_entries == 100;
@@ -5573,7 +5905,7 @@ log_level: "{}"
             access_dir_suffix, app_dir_suffix, enabled, access_log_mode, log_level,
         );
 
-        let config: LoggingConfig = match serde_yaml::from_str(&yaml) {
+        let config: LoggingConfig = match serde_yaml_ng::from_str(&yaml) {
             Ok(c) => c,
             Err(_) => return TestResult::discard(),
         };
@@ -5624,7 +5956,7 @@ access_log_file_rotation_interval: "{}s"
             access_retention, app_retention, cleanup_secs, rotation_secs,
         );
 
-        let config: LoggingConfig = match serde_yaml::from_str(&yaml) {
+        let config: LoggingConfig = match serde_yaml_ng::from_str(&yaml) {
             Ok(c) => c,
             Err(_) => return TestResult::discard(),
         };
@@ -5722,6 +6054,7 @@ mod tls_config_property_tests {
                 tls_proxy_port,
                 cert_path,
                 key_path,
+                connect_allowlist: None,
             }
         }
     }
@@ -5736,13 +6069,13 @@ mod tls_config_property_tests {
     #[quickcheck]
     fn prop_tls_config_round_trip_serialization(config: TlsConfig) -> TestResult {
         // Serialize to YAML
-        let yaml = match serde_yaml::to_string(&config) {
+        let yaml = match serde_yaml_ng::to_string(&config) {
             Ok(y) => y,
             Err(_) => return TestResult::discard(),
         };
 
         // Deserialize back
-        let deserialized: TlsConfig = match serde_yaml::from_str(&yaml) {
+        let deserialized: TlsConfig = match serde_yaml_ng::from_str(&yaml) {
             Ok(c) => c,
             Err(_) => return TestResult::failed(),
         };
@@ -5780,6 +6113,7 @@ mod tls_config_property_tests {
             tls_proxy_port: 8443,
             cert_path,
             key_path,
+            connect_allowlist: None,
         };
 
         let result = config.validate();
@@ -5855,6 +6189,7 @@ mod tls_config_property_tests {
             tls_proxy_port,
             cert_path: "/cert.pem".to_string(),
             key_path: "/key.pem".to_string(),
+            connect_allowlist: None,
         });
 
         let result = config.validate_tls_config();
@@ -5912,5 +6247,225 @@ mod rolling_validation_config_property_tests {
         let is_valid = (MIN_SECS..=MAX_SECS).contains(&duration_secs);
 
         TestResult::from_bool(result.is_ok() == is_valid)
+    }
+
+    /// Regression test for serde_yaml → serde_yaml_ng migration (Requirement 30.4).
+    /// Parses the full example config and asserts key fields from every major section
+    /// to ensure the YAML parser migration didn't break any config parsing behavior.
+    #[test]
+    fn test_serde_yaml_ng_migration_parses_example_config() {
+        let yaml = std::fs::read_to_string("config/config.example.yaml")
+            .expect("Failed to read config/config.example.yaml");
+
+        let config: Config =
+            serde_yaml_ng::from_str(&yaml).expect("serde_yaml_ng failed to parse example config");
+
+        // --- server section ---
+        assert_eq!(config.server.http_port, 80);
+        assert_eq!(config.server.https_port, 443);
+        assert_eq!(config.server.max_concurrent_requests, 200);
+        assert_eq!(config.server.request_timeout, Duration::from_secs(30));
+        assert!(config.server.add_referer_header);
+        assert_eq!(config.server.mode, ServerMode::Standard);
+        assert_eq!(config.server.proxy_port, 3128);
+
+        // TLS sub-section
+        let tls = config
+            .server
+            .tls
+            .as_ref()
+            .expect("tls section should be present");
+        assert!(!tls.enabled);
+        assert_eq!(tls.tls_proxy_port, 3129);
+        assert_eq!(tls.cert_path, "/etc/proxy/tls/cert.pem");
+        assert_eq!(tls.key_path, "/etc/proxy/tls/key.pem");
+
+        // --- cache section ---
+        assert_eq!(config.cache.cache_dir.to_str().unwrap(), "./tmp/cache");
+        assert_eq!(config.cache.max_cache_size, 524_288_000);
+        assert!(config.cache.ram_cache_enabled);
+        assert_eq!(config.cache.max_ram_cache_size, 104_857_600);
+        assert!(config.cache.write_cache_enabled);
+        assert_eq!(config.cache.write_cache_percent, 10.0);
+        assert_eq!(config.cache.write_cache_max_object_size, 268_435_456);
+        assert_eq!(config.cache.put_ttl, Duration::from_secs(86_400));
+        assert_eq!(config.cache.get_ttl, Duration::from_secs(315_360_000));
+        assert_eq!(config.cache.head_ttl, Duration::from_secs(60));
+        assert!(!config.cache.actively_remove_cached_data);
+        assert_eq!(
+            config.cache.ram_cache_flush_interval,
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.cache.ram_cache_flush_threshold, 100);
+        assert!(!config.cache.ram_cache_flush_on_eviction);
+        assert_eq!(
+            config.cache.ram_cache_verification_interval,
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            config.cache.incomplete_upload_ttl,
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(config.cache.range_merge_gap_threshold, 1_048_576);
+        assert_eq!(config.cache.eviction_trigger_percent, 95);
+        assert_eq!(config.cache.eviction_target_percent, 80);
+        assert!(config.cache.cache_bypass_headers_enabled);
+        assert_eq!(config.cache.full_object_check_threshold, 67_108_864);
+        assert!(config.cache.read_cache_enabled);
+        assert!(!config.cache.evaluate_conditions_from_cache);
+        assert_eq!(config.cache.disk_streaming_threshold, 1_048_576);
+        assert_eq!(config.cache.compression_batch_size, 1_048_576);
+
+        // shared_storage sub-section
+        assert_eq!(
+            config.cache.shared_storage.lock_timeout,
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            config.cache.shared_storage.lock_refresh_interval,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            config.cache.shared_storage.eviction_lock_timeout,
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.cache.shared_storage.recovery_max_concurrent, 4);
+        assert_eq!(
+            config.cache.shared_storage.consolidation_interval,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.cache.shared_storage.consolidation_size_threshold,
+            1_048_576
+        );
+        assert_eq!(config.cache.shared_storage.lock_max_retries, 5);
+        assert_eq!(
+            config.cache.shared_storage.validation_frequency,
+            Duration::from_secs(23 * 3600)
+        );
+        assert!(config.cache.shared_storage.orphan_recovery_enabled);
+        assert_eq!(
+            config.cache.shared_storage.orphan_recovery_interval,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            config.cache.shared_storage.orphan_scan_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(config.cache.shared_storage.orphan_max_per_cycle, 100);
+        assert_eq!(
+            config.cache.shared_storage.validation_max_duration,
+            Duration::from_secs(4 * 3600)
+        );
+        assert_eq!(
+            config.cache.shared_storage.consolidation_cycle_timeout,
+            Duration::from_secs(30)
+        );
+
+        // download_coordination sub-section
+        assert!(config.cache.download_coordination.enabled);
+        assert_eq!(config.cache.download_coordination.wait_timeout_secs, 30);
+
+        // initialization sub-section
+        assert!(config.cache.initialization.parallel_scan);
+        assert_eq!(
+            config.cache.initialization.scan_timeout,
+            Duration::from_secs(30)
+        );
+        assert!(config.cache.initialization.progress_logging);
+
+        // metadata_cache sub-section
+        assert!(config.cache.metadata_cache.enabled);
+        assert_eq!(
+            config.cache.metadata_cache.refresh_interval,
+            Duration::from_secs(5)
+        );
+        assert_eq!(config.cache.metadata_cache.max_entries, 100_000);
+        assert_eq!(config.cache.metadata_cache.stale_handle_max_retries, 3);
+
+        // --- logging section ---
+        assert_eq!(
+            config.logging.access_log_dir.to_str().unwrap(),
+            "./tmp/logs/access"
+        );
+        assert_eq!(
+            config.logging.app_log_dir.to_str().unwrap(),
+            "./tmp/logs/app"
+        );
+        assert!(config.logging.access_log_enabled);
+        assert_eq!(config.logging.log_level, "info");
+        assert_eq!(
+            config.logging.access_log_flush_interval,
+            Duration::from_secs(5)
+        );
+        assert_eq!(config.logging.access_log_buffer_size, 1000);
+        assert_eq!(config.logging.access_log_retention_days, 30);
+        assert_eq!(config.logging.app_log_retention_days, 30);
+
+        // --- connection_pool section ---
+        assert_eq!(
+            config.connection_pool.dns_refresh_interval,
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            config.connection_pool.connection_timeout,
+            Duration::from_secs(10)
+        );
+        assert_eq!(config.connection_pool.idle_timeout, Duration::from_secs(55));
+        assert!(config.connection_pool.keepalive_enabled);
+        assert_eq!(config.connection_pool.max_idle_per_host, 100);
+        assert_eq!(
+            config.connection_pool.max_lifetime,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            config.connection_pool.pool_check_interval,
+            Duration::from_secs(10)
+        );
+        assert!(config.connection_pool.ip_distribution_enabled);
+        assert_eq!(config.connection_pool.max_idle_per_ip, 10);
+        assert_eq!(config.connection_pool.keepalive_idle_secs, 15);
+        assert_eq!(config.connection_pool.keepalive_interval_secs, 5);
+        assert_eq!(config.connection_pool.keepalive_retries, 3);
+        assert_eq!(config.connection_pool.tcp_recv_buffer_size, Some(262_144));
+        assert_eq!(config.connection_pool.ip_failure_threshold, 3);
+
+        // --- compression section ---
+        assert!(config.compression.enabled);
+        assert_eq!(config.compression.threshold, 4096);
+        assert_eq!(
+            config.compression.preferred_algorithm,
+            CompressionAlgorithm::Lz4
+        );
+        assert!(config.compression.content_aware);
+
+        // --- health section ---
+        assert!(config.health.enabled);
+        assert_eq!(config.health.endpoint, "/health");
+        assert_eq!(config.health.port, 8080);
+        assert_eq!(config.health.check_interval, Duration::from_secs(30));
+
+        // --- metrics section ---
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.endpoint, "/metrics");
+        assert_eq!(config.metrics.port, 9090);
+        assert_eq!(config.metrics.collection_interval, Duration::from_secs(60));
+        assert!(!config.metrics.otlp.enabled);
+        assert_eq!(config.metrics.otlp.endpoint, "http://localhost:4318");
+        assert_eq!(config.metrics.otlp.export_interval, Duration::from_secs(60));
+        assert_eq!(config.metrics.otlp.timeout, Duration::from_secs(10));
+
+        // --- dashboard section ---
+        assert!(config.dashboard.enabled);
+        assert_eq!(config.dashboard.port, 8081);
+        assert_eq!(config.dashboard.bind_address, "0.0.0.0");
+        assert_eq!(
+            config.dashboard.cache_stats_refresh_interval,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.dashboard.logs_refresh_interval,
+            Duration::from_secs(10)
+        );
     }
 }

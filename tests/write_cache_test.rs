@@ -39,7 +39,8 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     )
 }
 
@@ -129,11 +130,19 @@ async fn test_write_cache_size_limits() -> Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let cache_manager = create_test_cache_manager(&temp_dir);
 
-    // Small size should be accommodated
-    assert!(cache_manager.can_write_cache_accommodate(1024));
+    // Small size should be accommodated (try_reserve returns Some)
+    let reservation = cache_manager.try_reserve_write_cache(1024).await;
+    assert!(reservation.is_some(), "Small size should be reservable");
+    drop(reservation); // Release reservation
 
-    // Very large size (512MB) should exceed default limit
-    assert!(!cache_manager.can_write_cache_accommodate(512 * 1024 * 1024));
+    // Very large size (512MB) should exceed default limit (try_reserve returns None)
+    let reservation = cache_manager
+        .try_reserve_write_cache(512 * 1024 * 1024)
+        .await;
+    assert!(
+        reservation.is_none(),
+        "Very large size should not be reservable"
+    );
 
     Ok(())
 }

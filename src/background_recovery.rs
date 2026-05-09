@@ -9,9 +9,10 @@ use crate::orphaned_range_recovery::{
 use crate::{ProxyError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio::time::{interval, sleep, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -22,8 +23,12 @@ pub struct BackgroundRecoverySystem {
     metrics: Arc<BackgroundRecoveryMetrics>,
     recovery_queue: Arc<RwLock<RecoveryQueue>>,
     operation_semaphore: Arc<Semaphore>,
-    shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Shutdown broadcast sender — used to signal the background task to stop.
+    /// When `stop()` is called, a message is sent on this channel.
+    shutdown_tx: Option<broadcast::Sender<()>>,
     is_running: Arc<Mutex<bool>>,
+    /// Cache directory root for orphan .bin cleanup
+    cache_dir: PathBuf,
 }
 
 /// Configuration for background recovery system
@@ -118,6 +123,7 @@ impl BackgroundRecoverySystem {
     pub fn new(
         orphaned_recovery: Arc<OrphanedRangeRecovery>,
         config: BackgroundRecoveryConfig,
+        cache_dir: PathBuf,
     ) -> Self {
         let operation_semaphore = Arc::new(Semaphore::new(config.max_concurrent_operations));
 
@@ -129,11 +135,16 @@ impl BackgroundRecoverySystem {
             operation_semaphore,
             shutdown_tx: None,
             is_running: Arc::new(Mutex::new(false)),
+            cache_dir,
         }
     }
 
     /// Start the background recovery system
-    pub async fn start(&mut self) -> Result<()> {
+    ///
+    /// Accepts a `broadcast::Receiver<()>` from the `ShutdownCoordinator` so that
+    /// the background task stops cleanly on SIGTERM/SIGINT without relying on a
+    /// private channel.
+    pub async fn start(&mut self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
         let mut is_running = self.is_running.lock().unwrap();
         if *is_running {
             return Err(ProxyError::CacheError(
@@ -143,8 +154,9 @@ impl BackgroundRecoverySystem {
         *is_running = true;
         drop(is_running);
 
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-        self.shutdown_tx = Some(shutdown_tx);
+        // Create a local broadcast for the stop() method (backward compat)
+        let (local_shutdown_tx, mut local_shutdown_rx) = broadcast::channel(1);
+        self.shutdown_tx = Some(local_shutdown_tx);
 
         // Clone necessary components for the background task
         let orphaned_recovery = self.orphaned_recovery.clone();
@@ -153,10 +165,22 @@ impl BackgroundRecoverySystem {
         let recovery_queue = self.recovery_queue.clone();
         let operation_semaphore = self.operation_semaphore.clone();
         let is_running = self.is_running.clone();
+        let cache_dir = self.cache_dir.clone();
 
         // Spawn the main background recovery task
         tokio::spawn(async move {
             info!("Starting background recovery system");
+
+            // Startup scan: clean up orphan .bin files without corresponding .meta
+            // This handles the case where a crash occurred between the .bin rename
+            // and the .meta rename in the atomic commit sequence (Requirement 4.4).
+            let orphan_bin_cleaned = Self::cleanup_orphan_bin_files(&cache_dir);
+            if orphan_bin_cleaned > 0 {
+                info!(
+                    "Startup scan: cleaned up {} orphan .bin files without .meta",
+                    orphan_bin_cleaned
+                );
+            }
 
             let mut scan_interval = interval(config.scan_interval);
             scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -176,11 +200,20 @@ impl BackgroundRecoverySystem {
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Background recovery system shutting down");
+                        info!("Background recovery received shutdown signal from ShutdownCoordinator");
+                        break;
+                    }
+                    _ = local_shutdown_rx.recv() => {
+                        info!("Background recovery received local stop signal");
                         break;
                     }
                 }
             }
+
+            // Any in-progress atomic writes (rename, fsync) spawned by
+            // process_recovery_queue are on independent tasks and will
+            // complete before the runtime shuts down. We just stop
+            // initiating new work here.
 
             let mut is_running = is_running.lock().unwrap();
             *is_running = false;
@@ -197,7 +230,7 @@ impl BackgroundRecoverySystem {
     /// Stop the background recovery system
     pub async fn stop(&mut self) -> Result<()> {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(()).await;
+            let _ = shutdown_tx.send(());
 
             // Wait for system to stop
             let mut attempts = 0;
@@ -237,6 +270,166 @@ impl BackgroundRecoverySystem {
             processing_count: queue.processing.len(),
         }
     }
+
+    /// Clean up orphan `.bin` files that lack a corresponding `.meta` file.
+    ///
+    /// An orphan `.bin` is one where:
+    /// - The file has a `.bin` extension in the ranges directory
+    /// - There is no corresponding `.meta` file in the metadata directory
+    ///   (same bucket/XX/YYY shard path, with the sanitized key prefix)
+    ///
+    /// This handles the case where a crash occurred between the `.bin` rename
+    /// and the `.meta` rename in the atomic commit sequence.
+    ///
+    /// Requirements: 4.4, 2.3
+    fn cleanup_orphan_bin_files(cache_dir: &Path) -> u64 {
+        let ranges_dir = cache_dir.join("ranges");
+        if !ranges_dir.exists() {
+            return 0;
+        }
+
+        let metadata_dir = cache_dir.join("metadata");
+        let mut cleaned_count: u64 = 0;
+
+        // Traverse ranges/bucket/XX/YYY/ structure
+        let bucket_entries = match std::fs::read_dir(&ranges_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    "Failed to read ranges directory for orphan .bin cleanup: {}",
+                    e
+                );
+                return 0;
+            }
+        };
+
+        for bucket_entry in bucket_entries.flatten() {
+            let bucket_path = bucket_entry.path();
+            if !bucket_path.is_dir() {
+                continue;
+            }
+
+            let bucket_name = match bucket_path.file_name() {
+                Some(name) => name.to_string_lossy().to_string(),
+                None => continue,
+            };
+
+            // Traverse level1 (XX) directories
+            let level1_entries = match std::fs::read_dir(&bucket_path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for level1_entry in level1_entries.flatten() {
+                let level1_path = level1_entry.path();
+                if !level1_path.is_dir() {
+                    continue;
+                }
+
+                let level1_name = match level1_path.file_name() {
+                    Some(name) => name.to_string_lossy().to_string(),
+                    None => continue,
+                };
+
+                // Traverse level2 (YYY) directories
+                let level2_entries = match std::fs::read_dir(&level1_path) {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+
+                for level2_entry in level2_entries.flatten() {
+                    let level2_path = level2_entry.path();
+                    if !level2_path.is_dir() {
+                        continue;
+                    }
+
+                    let level2_name = match level2_path.file_name() {
+                        Some(name) => name.to_string_lossy().to_string(),
+                        None => continue,
+                    };
+
+                    // Scan .bin files in this shard
+                    cleaned_count += Self::cleanup_orphan_bin_in_shard(
+                        &level2_path,
+                        &metadata_dir,
+                        &bucket_name,
+                        &level1_name,
+                        &level2_name,
+                    );
+                }
+            }
+        }
+
+        cleaned_count
+    }
+
+    /// Clean up orphan `.bin` files in a specific shard directory.
+    ///
+    /// A `.bin` file is orphaned if there is no corresponding `.meta` file
+    /// in the metadata directory at the same shard path. Range files use the
+    /// pattern `{sanitized_key}_{start}-{end}.bin`, and the corresponding
+    /// metadata file is `{sanitized_key}.meta`.
+    fn cleanup_orphan_bin_in_shard(
+        shard_dir: &Path,
+        metadata_dir: &Path,
+        bucket_name: &str,
+        level1_name: &str,
+        level2_name: &str,
+    ) -> u64 {
+        let mut cleaned = 0u64;
+
+        let entries = match std::fs::read_dir(shard_dir) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if !file_name_str.ends_with(".bin") {
+                continue;
+            }
+
+            // Extract the sanitized key from the filename.
+            // Range files: {sanitized_key}_{start}-{end}.bin
+            // The corresponding metadata is: metadata/bucket/XX/YYY/{sanitized_key}.meta
+            let sanitized_key = if let Some(underscore_pos) = file_name_str.rfind('_') {
+                &file_name_str[..underscore_pos]
+            } else {
+                // No underscore — not a standard range file pattern, but still
+                // check for a .meta with the same stem
+                file_name_str.strip_suffix(".bin").unwrap_or(&file_name_str)
+            };
+
+            // Construct the expected metadata path
+            let metadata_path = metadata_dir
+                .join(bucket_name)
+                .join(level1_name)
+                .join(level2_name)
+                .join(format!("{}.meta", sanitized_key));
+
+            if !metadata_path.exists() {
+                // Orphan .bin — no corresponding .meta
+                match std::fs::remove_file(&path) {
+                    Ok(_) => {
+                        cleaned += 1;
+                        info!(
+                            "Removed orphan .bin file (no corresponding .meta): {:?}",
+                            path
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to remove orphan .bin file {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+
+        cleaned
+    }
+
     /// Main recovery cycle implementation using sharded scanning for scalability
     async fn run_recovery_cycle(
         orphaned_recovery: &Arc<OrphanedRangeRecovery>,
@@ -682,6 +875,7 @@ mod tests {
     use crate::hybrid_metadata_writer::{ConsolidationTrigger, HybridMetadataWriter};
     use crate::journal_manager::JournalManager;
     use crate::metadata_lock_manager::MetadataLockManager;
+    use crate::shutdown::ShutdownCoordinator;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
@@ -720,7 +914,7 @@ mod tests {
             scan_timeout: Duration::from_millis(500),
         };
 
-        BackgroundRecoverySystem::new(orphaned_recovery, config)
+        BackgroundRecoverySystem::new(orphaned_recovery, config, temp_dir.path().to_path_buf())
     }
 
     #[test]
@@ -797,12 +991,13 @@ mod tests {
 
         assert!(!system.is_running());
 
-        // Start the system
-        system.start().await.unwrap();
+        // Start the system with a broadcast receiver (simulating ShutdownCoordinator)
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        system.start(shutdown_rx).await.unwrap();
         assert!(system.is_running());
 
-        // Stop the system
-        system.stop().await.unwrap();
+        // Send shutdown signal via the broadcast (simulates ShutdownCoordinator)
+        let _ = shutdown_tx.send(());
 
         // Give it a moment to fully stop
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -853,5 +1048,214 @@ mod tests {
 
         // Should be empty now
         assert!(BackgroundRecoverySystem::get_next_orphan_from_queue(&mut queue).is_none());
+    }
+
+    #[test]
+    fn test_cleanup_orphan_bin_files_removes_orphans() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        // Create ranges/bucket/ab/cde/ directory structure
+        let shard_dir = cache_dir
+            .join("ranges")
+            .join("test-bucket")
+            .join("ab")
+            .join("cde");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Create metadata/bucket/ab/cde/ directory structure
+        let meta_shard_dir = cache_dir
+            .join("metadata")
+            .join("test-bucket")
+            .join("ab")
+            .join("cde");
+        std::fs::create_dir_all(&meta_shard_dir).unwrap();
+
+        // Create a .bin file WITH a corresponding .meta (should NOT be removed)
+        let valid_bin = shard_dir.join("valid-object_0-1023.bin");
+        std::fs::write(&valid_bin, b"valid data").unwrap();
+        let valid_meta = meta_shard_dir.join("valid-object.meta");
+        std::fs::write(&valid_meta, b"{}").unwrap();
+
+        // Create a .bin file WITHOUT a corresponding .meta (should be removed)
+        let orphan_bin = shard_dir.join("orphan-object_0-2047.bin");
+        std::fs::write(&orphan_bin, b"orphan data").unwrap();
+
+        // Run cleanup
+        let cleaned = BackgroundRecoverySystem::cleanup_orphan_bin_files(&cache_dir);
+
+        // Verify: orphan removed, valid kept
+        assert_eq!(cleaned, 1);
+        assert!(!orphan_bin.exists(), "Orphan .bin should be removed");
+        assert!(valid_bin.exists(), "Valid .bin should be kept");
+        assert!(valid_meta.exists(), "Valid .meta should be kept");
+    }
+
+    #[test]
+    fn test_cleanup_orphan_bin_files_no_ranges_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        // No ranges directory exists
+        let cleaned = BackgroundRecoverySystem::cleanup_orphan_bin_files(&cache_dir);
+        assert_eq!(cleaned, 0);
+    }
+
+    #[test]
+    fn test_cleanup_orphan_bin_files_multiple_shards() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        // Create two shard directories
+        let shard1 = cache_dir
+            .join("ranges")
+            .join("bucket-a")
+            .join("01")
+            .join("abc");
+        let shard2 = cache_dir
+            .join("ranges")
+            .join("bucket-b")
+            .join("ff")
+            .join("xyz");
+        std::fs::create_dir_all(&shard1).unwrap();
+        std::fs::create_dir_all(&shard2).unwrap();
+
+        // Create metadata directories
+        let meta1 = cache_dir
+            .join("metadata")
+            .join("bucket-a")
+            .join("01")
+            .join("abc");
+        let meta2 = cache_dir
+            .join("metadata")
+            .join("bucket-b")
+            .join("ff")
+            .join("xyz");
+        std::fs::create_dir_all(&meta1).unwrap();
+        std::fs::create_dir_all(&meta2).unwrap();
+
+        // Orphan in shard1
+        let orphan1 = shard1.join("file1_0-99.bin");
+        std::fs::write(&orphan1, b"data1").unwrap();
+
+        // Valid file in shard2 (has .meta)
+        let valid_bin = shard2.join("file2_0-199.bin");
+        std::fs::write(&valid_bin, b"data2").unwrap();
+        std::fs::write(meta2.join("file2.meta"), b"{}").unwrap();
+
+        // Orphan in shard2
+        let orphan2 = shard2.join("file3_0-299.bin");
+        std::fs::write(&orphan2, b"data3").unwrap();
+
+        let cleaned = BackgroundRecoverySystem::cleanup_orphan_bin_files(&cache_dir);
+
+        assert_eq!(cleaned, 2);
+        assert!(!orphan1.exists());
+        assert!(valid_bin.exists());
+        assert!(!orphan2.exists());
+    }
+
+    /// Test that background recovery subscribes to ShutdownCoordinator and is
+    /// reflected in subscriber_count().
+    ///
+    /// Validates: Requirements 10.4, 10.5
+    #[tokio::test]
+    async fn test_background_recovery_registers_as_shutdown_subscriber() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut system = create_test_system(&temp_dir);
+
+        let coordinator = ShutdownCoordinator::new(Duration::from_secs(5));
+
+        // Before subscribing, no receivers exist
+        assert_eq!(coordinator.subscriber_count(), 0);
+
+        // Subscribe the background recovery task via the coordinator
+        let shutdown_rx = coordinator.subscribe();
+        assert_eq!(coordinator.subscriber_count(), 1);
+
+        // Start the background recovery system with the shutdown receiver
+        system.start(shutdown_rx).await.unwrap();
+        assert!(system.is_running());
+
+        // The subscriber is still counted (the spawned task holds the receiver)
+        assert_eq!(coordinator.subscriber_count(), 1);
+
+        // Clean up
+        system.stop().await.unwrap();
+    }
+
+    /// Test that multiple background tasks each register as separate subscribers
+    /// and subscriber_count() reflects the total.
+    ///
+    /// Validates: Requirements 10.4, 10.5
+    #[tokio::test]
+    async fn test_multiple_background_tasks_subscriber_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut system = create_test_system(&temp_dir);
+
+        let coordinator = ShutdownCoordinator::new(Duration::from_secs(5));
+
+        assert_eq!(coordinator.subscriber_count(), 0);
+
+        // Simulate subscribing multiple background tasks (as main.rs does)
+        let recovery_rx = coordinator.subscribe();
+        let _other_task_rx = coordinator.subscribe(); // e.g., orphaned range recovery
+        let _third_task_rx = coordinator.subscribe(); // e.g., cache initialization
+
+        assert_eq!(coordinator.subscriber_count(), 3);
+
+        // Start background recovery with its receiver
+        system.start(recovery_rx).await.unwrap();
+        assert!(system.is_running());
+
+        // All three subscribers still counted
+        assert_eq!(coordinator.subscriber_count(), 3);
+
+        // Clean up
+        system.stop().await.unwrap();
+    }
+
+    /// Test that sending a shutdown signal via ShutdownCoordinator causes the
+    /// background recovery task to stop.
+    ///
+    /// Validates: Requirements 10.4, 10.5
+    #[tokio::test]
+    async fn test_shutdown_signal_stops_background_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut system = create_test_system(&temp_dir);
+
+        let coordinator = ShutdownCoordinator::new(Duration::from_secs(5));
+        let shutdown_rx = coordinator.subscribe();
+
+        system.start(shutdown_rx).await.unwrap();
+        assert!(system.is_running());
+
+        // Send shutdown signal via the coordinator (simulates SIGTERM path)
+        coordinator.initiate_shutdown().await.ok();
+
+        // Wait for the background task to observe the signal and stop
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !system.is_running(),
+            "Background recovery should stop after shutdown signal"
+        );
+    }
+
+    /// Test that dropping a subscriber decrements subscriber_count().
+    ///
+    /// Validates: Requirement 10.5
+    #[test]
+    fn test_subscriber_count_decrements_on_drop() {
+        let coordinator = ShutdownCoordinator::new(Duration::from_secs(5));
+
+        let rx1 = coordinator.subscribe();
+        let rx2 = coordinator.subscribe();
+        assert_eq!(coordinator.subscriber_count(), 2);
+
+        drop(rx1);
+        assert_eq!(coordinator.subscriber_count(), 1);
+
+        drop(rx2);
+        assert_eq!(coordinator.subscriber_count(), 0);
     }
 }

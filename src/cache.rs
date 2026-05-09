@@ -4,6 +4,7 @@
 //! Supports both RAM and disk caching with compression, shared cache coordination,
 //! and write-through caching for PUT operations.
 
+use crate::cache_types::safe_expiry;
 use crate::cache_types::CacheMetadata;
 use crate::compression::{CompressionAlgorithm, CompressionHandler};
 use crate::ram_cache::RamCache;
@@ -17,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
 const OBJECT_CONCURRENCY_LIMIT: usize = 8;
@@ -285,8 +287,28 @@ impl GlobalEvictionLock {
 
     /// Get the expiration time for this lock
     pub fn expires_at(&self) -> SystemTime {
-        self.acquired_at + std::time::Duration::from_secs(self.timeout_seconds)
+        safe_expiry(
+            self.acquired_at,
+            std::time::Duration::from_secs(self.timeout_seconds),
+        )
     }
+}
+
+/// UUID-fenced eviction lock payload for distributed fencing (Requirement 5)
+///
+/// Written to the lockfile on acquisition and verified before each filesystem mutation
+/// during an eviction pass. If the UUID no longer matches, the eviction pass is aborted
+/// immediately to prevent a stale holder from corrupting the cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvictionLockPayload {
+    /// Unique fence token generated on each acquisition
+    pub uuid: String,
+
+    /// Wall-clock timestamp (milliseconds since epoch) when the lock was acquired
+    pub acquired_at_ms: u64,
+
+    /// Hostname of the machine holding the lock
+    pub hostname: String,
 }
 
 /// Tracks active S3 part fetches for per-instance request deduplication
@@ -577,6 +599,9 @@ pub struct CacheManager {
     >,
     // Eviction lock file handle (kept open while lock is held)
     eviction_lock_file: Arc<Mutex<Option<std::fs::File>>>,
+    // UUID fence token for the current eviction pass (Requirement 5)
+    // Set on lock acquisition, verified before each filesystem mutation
+    eviction_uuid: Arc<Mutex<Option<String>>>,
     // Size of the in-memory compression batch used by the incremental range writer.
     // Incoming body chunks are accumulated into a batch buffer and flushed as a
     // single LZ4 frame once the buffer reaches this size. Forwarded to
@@ -585,6 +610,9 @@ pub struct CacheManager {
     compression_batch_size: usize,
     // Bucket-level settings manager for per-bucket/prefix cache configuration
     bucket_settings_manager: Arc<crate::bucket_settings::BucketSettingsManager>,
+    // RAM cache flush interval for cross-instance access visibility (Req 19)
+    // Used by is_cache_entry_active to determine the journal scan window (2× this value)
+    ram_cache_flush_interval: std::time::Duration,
     // Use Arc<Mutex<>> for thread-safe interior mutability
     inner: Arc<Mutex<CacheManagerInner>>,
 }
@@ -697,7 +725,8 @@ impl CacheManager {
             true,                                          // Default read cache enabled
             std::time::Duration::from_secs(60),            // Default 60s bucket settings staleness
             1_048_576,                                     // Default 1 MiB compression batch size
-            false, // Default: don't evaluate conditions from cache
+            false,                              // Default: don't evaluate conditions from cache
+            std::time::Duration::from_secs(10), // Default 10s flush interval (Req 19)
         )
     }
 
@@ -726,6 +755,7 @@ impl CacheManager {
         bucket_settings_staleness_threshold: std::time::Duration,
         compression_batch_size: usize,
         evaluate_conditions_from_cache: bool,
+        ram_cache_flush_interval: std::time::Duration,
     ) -> Self {
         let ram_cache_manager = RamCacheManager {
             max_size: max_ram_cache_size,
@@ -807,7 +837,9 @@ impl CacheManager {
             )),
             bucket_settings_manager,
             eviction_lock_file: Arc::new(Mutex::new(None)),
+            eviction_uuid: Arc::new(Mutex::new(None)),
             compression_batch_size,
+            ram_cache_flush_interval,
             inner: Arc::new(Mutex::new(inner)),
         }
     }
@@ -1092,7 +1124,7 @@ impl CacheManager {
             download_coordination: crate::config::DownloadCoordinationConfig::default(),
             range_merge_gap_threshold: 1024 * 1024, // Default 1MB
             eviction_buffer_percent: 5,
-            ram_cache_flush_interval: std::time::Duration::from_secs(60),
+            ram_cache_flush_interval: self.ram_cache_flush_interval,
             ram_cache_flush_threshold: 100,
             ram_cache_flush_on_eviction: false,
             ram_cache_verification_interval: std::time::Duration::from_secs(1),
@@ -1601,6 +1633,8 @@ impl CacheManager {
 
             // Promote to RAM cache if enabled (cache hierarchy promotion)
             if self.ram_cache_enabled {
+                // RAM cache promotion is best-effort; failure only means the next read
+                // will serve from disk instead of RAM — no data loss or inconsistency.
                 let _ = self.promote_to_ram_cache(&cache_entry).await;
             }
 
@@ -1744,6 +1778,8 @@ impl CacheManager {
 
         // Store in RAM cache if enabled
         if self.ram_cache_enabled {
+            // RAM cache store is best-effort; failure only means the next read
+            // will serve from disk — no data loss or inconsistency.
             let _ = self.store_in_ram_cache(&cache_entry).await;
         }
 
@@ -1834,7 +1870,14 @@ impl CacheManager {
                                 .delete_specific_range(original_cache_key, idx, start, end)
                                 .await;
                             // Also invalidate HEAD cache entry if it exists (unified)
-                            let _ = self.invalidate_head_cache_entry_unified(cache_key).await;
+                            if let Err(e) =
+                                self.invalidate_head_cache_entry_unified(cache_key).await
+                            {
+                                warn!(
+                                    "Failed to invalidate HEAD cache entry: cache_key={}, error={}",
+                                    cache_key, e
+                                );
+                            }
                             return result;
                         }
                     }
@@ -1955,7 +1998,12 @@ impl CacheManager {
                     }
 
                     // Also invalidate HEAD cache entry if it exists (unified)
-                    let _ = self.invalidate_head_cache_entry_unified(cache_key).await;
+                    if let Err(e) = self.invalidate_head_cache_entry_unified(cache_key).await {
+                        warn!(
+                            "Failed to invalidate HEAD cache entry: cache_key={}, error={}",
+                            cache_key, e
+                        );
+                    }
 
                     return Ok(());
                 }
@@ -1963,7 +2011,12 @@ impl CacheManager {
         }
 
         // No metadata found - just invalidate HEAD cache if it exists
-        let _ = self.invalidate_head_cache_entry_unified(cache_key).await;
+        if let Err(e) = self.invalidate_head_cache_entry_unified(cache_key).await {
+            warn!(
+                "Failed to invalidate HEAD cache entry: cache_key={}, error={}",
+                cache_key, e
+            );
+        }
 
         info!("Cache invalidation completed for key: {}", cache_key);
         Ok(())
@@ -2089,6 +2142,8 @@ impl CacheManager {
         // Also remove lock file if it exists
         let lock_file_path = metadata_file_path.with_extension("meta.lock");
         if lock_file_path.exists() {
+            // Lock file removal is best-effort cleanup; if it fails, the lock will
+            // expire naturally and be cleaned up on next access.
             let _ = std::fs::remove_file(&lock_file_path);
         }
 
@@ -2449,6 +2504,7 @@ impl CacheManager {
 
             // Write to temporary file
             std::fs::write(&range_tmp_path, &compressed_data).map_err(|e| {
+                // Best-effort cleanup of temp file on write failure
                 let _ = std::fs::remove_file(&range_tmp_path);
                 ProxyError::CacheError(format!(
                     "Failed to write range tmp file for part {}: {}",
@@ -2458,6 +2514,7 @@ impl CacheManager {
 
             // Atomic rename
             std::fs::rename(&range_tmp_path, &range_file_path).map_err(|e| {
+                // Best-effort cleanup of temp file on rename failure
                 let _ = std::fs::remove_file(&range_tmp_path);
                 ProxyError::CacheError(format!(
                     "Failed to rename range file for part {}: {}",
@@ -2507,7 +2564,7 @@ impl CacheManager {
 
         // Requirement 7.5: Set expires_at using PUT_TTL
         let now = SystemTime::now();
-        metadata.expires_at = now + self.put_ttl;
+        metadata.expires_at = safe_expiry(now, self.put_ttl);
 
         // Update ranges in metadata
         metadata.ranges = range_specs;
@@ -2996,6 +3053,8 @@ impl CacheManager {
                     ..
                 } = *inner;
                 if let Some(ref mut cache) = ram_cache {
+                    // RAM cache put is best-effort; eviction from RAM only means
+                    // the entry will be served from disk on next access.
                     let _ = cache.put(ram_entry, compression_handler);
                 }
             }
@@ -3004,7 +3063,43 @@ impl CacheManager {
         Ok((range_data, false))
     }
 
-    /// Check if write cache can accommodate new entry
+    /// Atomically reserve write cache capacity using the new `try_reserve()` / `WriteReservation` pattern.
+    ///
+    /// Returns `Some(WriteReservation)` if capacity was successfully reserved, or `None` if
+    /// the entry exceeds limits or there is insufficient capacity. The reservation is
+    /// automatically released on drop (RAII).
+    ///
+    /// This replaces the old non-atomic `can_write_cache_accommodate` + manual release pattern.
+    ///
+    /// # Requirements
+    /// Implements Requirements 9.1, 9.2
+    pub async fn try_reserve_write_cache(
+        &self,
+        entry_size: u64,
+    ) -> Option<crate::write_cache_manager::WriteReservation> {
+        let wcm_guard = self.write_cache_manager.read().await;
+        if let Some(wcm_arc) = wcm_guard.as_ref() {
+            let wcm = wcm_arc.read().await;
+            wcm.try_reserve(entry_size).await
+        } else {
+            // WriteCacheManager not initialized — use legacy non-atomic check.
+            // This path only occurs during early initialization or in tests that
+            // don't call initialize(). We create a standalone WriteReservation
+            // backed by a no-op counter since there's no shared state to track.
+            if self.can_write_cache_accommodate(entry_size) {
+                // Return a zero-size reservation (no-op on drop) to signal "proceed"
+                Some(crate::write_cache_manager::WriteReservation::noop())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Check if write cache can accommodate new entry (non-atomic, legacy).
+    ///
+    /// **Deprecated**: Use `try_reserve_write_cache()` instead for atomic reservation.
+    /// This method only checks capacity without reserving it, which is racy under
+    /// concurrent uploads.
     pub fn can_write_cache_accommodate(&self, entry_size: u64) -> bool {
         let inner = self.inner.lock().unwrap();
 
@@ -3695,6 +3790,15 @@ impl CacheManager {
                 let cache_key = cache_key.clone();
                 let ranges = ranges.clone();
                 async move {
+                    // Requirement 5.3: Verify eviction fence before each batched filesystem mutation
+                    if let Err(e) = self.verify_eviction_fence() {
+                        warn!(
+                            "Eviction fence verification failed before batch eviction of {}: {}. Aborting eviction pass.",
+                            cache_key, e
+                        );
+                        return None;
+                    }
+
                     // Check if entry is actively being used by other instances
                     if self.is_cache_entry_active(&cache_key).await.unwrap_or(false) {
                         debug!(
@@ -3745,6 +3849,16 @@ impl CacheManager {
                 );
                 break;
             }
+
+            // Requirement 5.3: Verify fence is still valid before processing more results
+            if let Err(e) = self.verify_eviction_fence() {
+                warn!(
+                    "Eviction fence lost during result aggregation: {}. Aborting eviction pass with {} bytes freed so far.",
+                    e, total_bytes_freed
+                );
+                break;
+            }
+
             let (cache_key, ranges, bytes_freed, deleted_paths) = result;
             total_bytes_freed += bytes_freed;
             total_ranges_evicted += ranges.len() as u64;
@@ -4586,7 +4700,8 @@ impl CacheManager {
         {
             Ok(result) => result,
             Err(e) => {
-                // Release lock before returning error
+                // Release lock before returning error (best-effort; lock will expire
+                // naturally if release fails, and the primary error is already being propagated)
                 let _ = self.release_write_lock(cache_key).await;
                 // Requirement 7.4: Log errors with cache_key and failure reason
                 debug!(
@@ -5073,45 +5188,95 @@ impl CacheManager {
     }
 
     /// Check if cache entry is actively being used by other instances
+    ///
+    /// Checks both lock files and recent journal AccessUpdate entries (Req 19.2).
+    /// A recent cross-instance access within 2× ram_cache_flush_interval is treated
+    /// as evidence of activity, preventing premature eviction.
     pub async fn is_cache_entry_active(&self, cache_key: &str) -> Result<bool> {
         let lock_file_path = self.get_lock_file_path(cache_key);
 
-        // Check if lock file exists
-        if !lock_file_path.exists() {
-            return Ok(false);
-        }
-
-        // Read lock file to check if it's still valid
-        match std::fs::read_to_string(&lock_file_path) {
-            Ok(lock_content) => {
-                match serde_json::from_str::<CacheLock>(&lock_content) {
-                    Ok(lock_info) => {
-                        // Check if lock is expired
-                        if SystemTime::now() > lock_info.expires_at {
-                            // Lock is expired, clean it up
+        // Check if lock file exists and is still valid
+        if lock_file_path.exists() {
+            match std::fs::read_to_string(&lock_file_path) {
+                Ok(lock_content) => {
+                    match serde_json::from_str::<CacheLock>(&lock_content) {
+                        Ok(lock_info) => {
+                            if SystemTime::now() <= lock_info.expires_at {
+                                // Lock is still active
+                                debug!(
+                                    "Cache entry {} is actively locked by instance {}",
+                                    cache_key, lock_info.instance_id
+                                );
+                                return Ok(true);
+                            }
+                            // Lock is expired, clean it up (best-effort; expiry means
+                            // no other instance holds it, so removal failure is harmless)
                             let _ = std::fs::remove_file(&lock_file_path);
-                            Ok(false)
-                        } else {
-                            // Lock is still active
-                            debug!(
-                                "Cache entry {} is actively locked by instance {}",
-                                cache_key, lock_info.instance_id
-                            );
-                            Ok(true)
+                        }
+                        Err(_) => {
+                            // Corrupted lock file, remove it (best-effort; a corrupted lock
+                            // cannot represent valid ownership)
+                            let _ = std::fs::remove_file(&lock_file_path);
                         }
                     }
-                    Err(_) => {
-                        // Corrupted lock file, remove it
-                        let _ = std::fs::remove_file(&lock_file_path);
-                        Ok(false)
+                }
+                Err(_) => {
+                    // Can't read lock file, fall through to journal check
+                }
+            }
+        }
+
+        // Requirement 19.2: Scan journal for recent AccessUpdate entries from other instances
+        // within 2× ram_cache_flush_interval to detect cross-instance access activity
+        let journal_window = self.ram_cache_flush_interval * 2;
+        let cutoff = SystemTime::now()
+            .checked_sub(journal_window)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        let journals_dir = self.cache_dir.join("metadata").join("_journals");
+        if journals_dir.exists() {
+            if let Ok(dir_entries) = std::fs::read_dir(&journals_dir) {
+                for dir_entry in dir_entries.flatten() {
+                    let path = dir_entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                        if !file_name.ends_with(".journal") {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+
+                    // Read journal file and look for recent AccessUpdate entries for this key
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        for line in content.lines() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            if let Ok(journal_entry) =
+                                serde_json::from_str::<crate::journal_manager::JournalEntry>(line)
+                            {
+                                if journal_entry.cache_key == cache_key
+                                    && journal_entry.operation
+                                        == crate::journal_manager::JournalOperation::AccessUpdate
+                                    && journal_entry.timestamp >= cutoff
+                                {
+                                    debug!(
+                                        "Cache entry {} has recent cross-instance access (instance={}, age within {:?})",
+                                        cache_key, journal_entry.instance_id, journal_window
+                                    );
+                                    return Ok(true);
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Err(_) => {
-                // Can't read lock file, assume not active
-                Ok(false)
-            }
         }
+
+        Ok(false)
     }
     /// Release the global eviction lock
     ///
@@ -5125,12 +5290,88 @@ impl CacheManager {
     /// With flock-based locking, release is automatic when the file handle is dropped.
     /// This method explicitly drops the lock file handle.
     ///
-    /// - Requirement 5.6: Lock is released when eviction completes
+    /// Requirement 5.4: Only truncate lockfile if current UUID still matches
     pub async fn release_global_eviction_lock(&self) -> Result<()> {
+        let my_uuid = self.eviction_uuid.lock().unwrap().take();
+
+        // Requirement 5.4: Only truncate the lockfile if our UUID still matches
+        if let Some(uuid) = &my_uuid {
+            let lock_file_path = self.get_global_eviction_lock_path();
+            if let Ok(content) = std::fs::read_to_string(&lock_file_path) {
+                if let Ok(payload) = serde_json::from_str::<EvictionLockPayload>(&content) {
+                    if payload.uuid == *uuid {
+                        // Our UUID still matches — safe to truncate
+                        if let Ok(f) = std::fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(&lock_file_path)
+                        {
+                            // sync_all is best-effort here; the lock is being released
+                            // and the file is already truncated.
+                            let _ = f.sync_all();
+                        }
+                    } else {
+                        debug!(
+                            "Eviction lock UUID changed during release (expected={}, found={}), not truncating",
+                            uuid, payload.uuid
+                        );
+                    }
+                }
+            }
+        }
+
         // Drop the lock file handle, which automatically releases the flock
         *self.eviction_lock_file.lock().unwrap() = None;
         debug!("Released global eviction lock (flock)");
         Ok(())
+    }
+
+    /// Verify the eviction fence token before a filesystem mutation
+    ///
+    /// Re-reads the lockfile and checks that the UUID matches the one written at acquisition.
+    /// If the UUID has changed, another instance has taken over the lock and this eviction
+    /// pass must abort immediately.
+    ///
+    /// Requirement 5.3: Re-verify lockfile UUID before each batched filesystem mutation
+    pub fn verify_eviction_fence(&self) -> Result<()> {
+        let my_uuid = self.eviction_uuid.lock().unwrap().clone();
+        let my_uuid = match my_uuid {
+            Some(uuid) => uuid,
+            None => {
+                // No UUID set — we don't hold the eviction lock
+                return Err(ProxyError::EvictionFenceLost(
+                    "No eviction UUID set (lock not held)".to_string(),
+                ));
+            }
+        };
+
+        let lock_file_path = self.get_global_eviction_lock_path();
+        let content = std::fs::read_to_string(&lock_file_path).map_err(|e| {
+            ProxyError::EvictionFenceLost(format!(
+                "Failed to read eviction lock file for fence verification: {}",
+                e
+            ))
+        })?;
+
+        let payload: EvictionLockPayload = serde_json::from_str(&content).map_err(|e| {
+            ProxyError::EvictionFenceLost(format!(
+                "Failed to parse eviction lock payload for fence verification: {}",
+                e
+            ))
+        })?;
+
+        if payload.uuid != my_uuid {
+            warn!(
+                "Eviction fence lost: expected uuid={}, found uuid={} (holder={}). Aborting eviction pass.",
+                my_uuid, payload.uuid, payload.hostname
+            );
+            Err(ProxyError::EvictionFenceLost(format!(
+                "UUID mismatch: expected={}, found={}",
+                my_uuid, payload.uuid
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     /// Trigger eviction when 95% capacity reached
@@ -5483,7 +5724,7 @@ impl CacheManager {
                         lock_id: uuid::Uuid::new_v4().to_string(),
                         instance_id: self.get_instance_id(),
                         acquired_at: SystemTime::now(),
-                        expires_at: SystemTime::now() + timeout,
+                        expires_at: safe_expiry(SystemTime::now(), timeout),
                     };
 
                     let lock_json = serde_json::to_string(&lock_info).map_err(|e| {
@@ -5506,7 +5747,9 @@ impl CacheManager {
                     if let Ok(lock_content) = std::fs::read_to_string(&lock_file_path) {
                         if let Ok(lock_info) = serde_json::from_str::<CacheLock>(&lock_content) {
                             if SystemTime::now() > lock_info.expires_at {
-                                // Lock is expired, try to remove it
+                                // Lock is expired, try to remove it (best-effort; if removal
+                                // fails, the next iteration will retry or another instance
+                                // will clean it up)
                                 let _ = std::fs::remove_file(&lock_file_path);
                                 continue;
                             }
@@ -5608,7 +5851,7 @@ impl CacheManager {
             // Requirement 5.1: Parse max-age directive
             if let Some(max_age) = self.parse_cache_control_max_age(&cache_control_lower) {
                 debug!("Using Cache-Control max-age: {} seconds", max_age);
-                return now + std::time::Duration::from_secs(max_age);
+                return safe_expiry(now, std::time::Duration::from_secs(max_age));
             }
 
             // Parse s-maxage (takes precedence over max-age for shared caches)
@@ -5616,7 +5859,7 @@ impl CacheManager {
                 self.parse_cache_control_directive(&cache_control_lower, "s-maxage")
             {
                 debug!("Using Cache-Control s-maxage: {} seconds", s_maxage);
-                return now + std::time::Duration::from_secs(s_maxage);
+                return safe_expiry(now, std::time::Duration::from_secs(s_maxage));
             }
         }
 
@@ -5632,7 +5875,7 @@ impl CacheManager {
 
         // Requirement 5.4: Use configured default TTL when no cache headers are present
         debug!("Using default TTL: {:?}", get_ttl);
-        now + get_ttl
+        safe_expiry(now, get_ttl)
     }
 
     /// Parse Cache-Control max-age directive
@@ -6556,8 +6799,8 @@ impl CacheManager {
             ranges: Vec::new(),
             metadata: ram_entry.metadata,
             created_at: ram_entry.created_at,
-            expires_at: ram_entry.created_at + std::time::Duration::from_secs(3600), // Default 1 hour
-            metadata_expires_at: ram_entry.created_at + self.head_ttl,
+            expires_at: safe_expiry(ram_entry.created_at, std::time::Duration::from_secs(3600)), // Default 1 hour
+            metadata_expires_at: safe_expiry(ram_entry.created_at, self.head_ttl),
             compression_info,
             is_put_cached: false, // RAM cache entries are not PUT-cached
         })
@@ -7104,7 +7347,18 @@ impl CacheManager {
                 let temp_path = metadata_path.with_extension("meta.tmp");
                 if let Ok(json) = serde_json::to_string_pretty(&metadata) {
                     if std::fs::write(&temp_path, &json).is_ok() {
-                        let _ = std::fs::rename(&temp_path, &metadata_path);
+                        if let Err(e) = std::fs::rename(&temp_path, &metadata_path) {
+                            error!(
+                                "Failed to rename metadata temp file to final path: cache_key={}, temp={:?}, dest={:?}, error={}",
+                                cache_key, temp_path, metadata_path, e
+                            );
+                            // Attempt cleanup of temp file
+                            let _ = std::fs::remove_file(&temp_path); // best-effort cleanup
+                            return Err(ProxyError::CacheError(format!(
+                                "Failed to commit HEAD invalidation metadata for key {}: {}",
+                                cache_key, e
+                            )));
+                        }
                         debug!("Cleared HEAD fields in .meta file for key: {}", cache_key);
                     }
                 }
@@ -7134,13 +7388,15 @@ impl CacheManager {
             metadata: metadata.clone(),
             created_at: now,
             expires_at: self.calculate_expiration_time(&headers),
-            metadata_expires_at: now + self.head_ttl,
+            metadata_expires_at: safe_expiry(now, self.head_ttl),
             compression_info: CompressionInfo::default(),
             is_put_cached: false, // This is a GET response
         };
 
         // Store in RAM cache if enabled
         if self.ram_cache_enabled {
+            // RAM cache store is best-effort; failure only means the next read
+            // will serve from disk — no data loss or inconsistency.
             let _ = self.store_in_ram_cache(&cache_entry).await;
         }
 
@@ -7523,15 +7779,18 @@ impl CacheManager {
             cache_key
         );
 
-        // Check if write caching is enabled and entry can be accommodated
+        // Atomically reserve write cache capacity (Requirement 9.1, 9.2)
         let entry_size = response_body.len() as u64;
-        if !self.can_write_cache_accommodate(entry_size) {
-            debug!(
-                "Write cache cannot accommodate entry of size {} bytes for key: {}",
-                entry_size, cache_key
-            );
-            return Ok(());
-        }
+        let _reservation = match self.try_reserve_write_cache(entry_size).await {
+            Some(reservation) => reservation,
+            None => {
+                debug!(
+                    "Write cache cannot accommodate entry of size {} bytes for key: {}",
+                    entry_size, cache_key
+                );
+                return Ok(());
+            }
+        };
 
         // Requirement 8.1: Invalidate any existing cached data before storing new PUT
         // This handles conflicts where a new PUT overwrites existing cached data
@@ -7686,6 +7945,23 @@ impl CacheManager {
             cache_key, content_length, etag, effective_put_ttl
         );
 
+        // Atomically reserve write cache capacity (Requirement 9.1, 9.2)
+        // The reservation is held for the duration of this function and auto-releases on drop.
+        let _reservation = if content_length > 0 {
+            match self.try_reserve_write_cache(content_length).await {
+                Some(reservation) => Some(reservation),
+                None => {
+                    debug!(
+                        "Write cache cannot accommodate entry of size {} bytes for key: {}",
+                        content_length, cache_key
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            None // Empty objects don't need capacity reservation
+        };
+
         // Handle empty objects specially
         if content_length == 0 {
             info!("Storing empty write-cached object for key: {}", cache_key);
@@ -7798,6 +8074,7 @@ impl CacheManager {
 
         // Write to temporary file
         if let Err(e) = std::fs::write(&range_tmp_path, &compressed_data) {
+            // Best-effort cleanup of temp file and lock release
             let _ = std::fs::remove_file(&range_tmp_path);
             if lock_acquired {
                 let _ = self.release_write_lock(cache_key).await;
@@ -7810,6 +8087,7 @@ impl CacheManager {
 
         // Atomic rename
         if let Err(e) = std::fs::rename(&range_tmp_path, &range_file_path) {
+            // Best-effort cleanup of temp file and lock release
             let _ = std::fs::remove_file(&range_tmp_path);
             if lock_acquired {
                 let _ = self.release_write_lock(cache_key).await;
@@ -7825,6 +8103,7 @@ impl CacheManager {
         let range_file_relative_path = match range_file_path.strip_prefix(&ranges_dir) {
             Ok(path) => path.to_string_lossy().to_string(),
             Err(e) => {
+                // Best-effort cleanup of temp file and lock release
                 let _ = std::fs::remove_file(&range_tmp_path);
                 if lock_acquired {
                     let _ = self.release_write_lock(cache_key).await;
@@ -7942,7 +8221,7 @@ impl CacheManager {
                 object_metadata,
                 ranges: Vec::new(), // No ranges for empty object
                 created_at: now,
-                expires_at: now + self.put_ttl,
+                expires_at: safe_expiry(now, self.put_ttl),
                 compression_info: crate::cache_types::CompressionInfo::default(),
                 ..Default::default()
             };
@@ -8116,6 +8395,7 @@ impl CacheManager {
 
         // Write to temporary file
         if let Err(e) = std::fs::write(&range_tmp_path, &compressed_data) {
+            // Best-effort cleanup of temp file and lock release
             let _ = std::fs::remove_file(&range_tmp_path);
             // Release lock before returning error
             if lock_acquired {
@@ -8129,6 +8409,7 @@ impl CacheManager {
 
         // Atomic rename
         if let Err(e) = std::fs::rename(&range_tmp_path, &range_file_path) {
+            // Best-effort cleanup of temp file and lock release
             let _ = std::fs::remove_file(&range_tmp_path);
             // Release lock before returning error
             if lock_acquired {
@@ -8146,7 +8427,8 @@ impl CacheManager {
         let range_file_relative_path = range_file_path
             .strip_prefix(&ranges_dir)
             .map_err(|e| {
-                // Release lock before returning error
+                // Best-effort lock release before returning error; lock will expire
+                // naturally if release fails, and the primary error is being propagated.
                 if lock_acquired {
                     let _ = futures::executor::block_on(self.release_write_lock(cache_key));
                 }
@@ -8172,7 +8454,7 @@ impl CacheManager {
             object_metadata,
             ranges: vec![range_spec.clone()],
             created_at: now,
-            expires_at: now + self.put_ttl,
+            expires_at: safe_expiry(now, self.put_ttl),
             compression_info: crate::cache_types::CompressionInfo::default(),
             ..Default::default()
         };
@@ -8245,6 +8527,7 @@ impl CacheManager {
 
         // Atomic rename
         std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
+            // Best-effort cleanup of temp file on rename failure
             let _ = std::fs::remove_file(&metadata_tmp_path);
             ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
         })?;
@@ -8388,7 +8671,7 @@ impl CacheManager {
         metadata.object_metadata.write_cache_last_accessed = None;
 
         // Transition to GET_TTL
-        metadata.expires_at = now + self.get_effective_get_ttl(cache_key).await;
+        metadata.expires_at = safe_expiry(now, self.get_effective_get_ttl(cache_key).await);
 
         // Store updated metadata
         if let Err(e) = self.store_new_metadata(&metadata).await {
@@ -8560,7 +8843,7 @@ impl CacheManager {
         // First check RAM cache if enabled
         if self.ram_cache_enabled {
             if let Some(ram_entry) = self.get_from_ram_cache(cache_key).await? {
-                info!("Write cache hit (RAM) for key: {}", cache_key);
+                debug!("Write cache hit (RAM) for key: {}", cache_key);
                 self.record_write_cache_hit();
                 let write_entry = self.convert_ram_entry_to_write_entry(ram_entry)?;
                 return Ok(Some(write_entry));
@@ -8571,13 +8854,18 @@ impl CacheManager {
         let write_entry = self.get_write_entry_from_disk(cache_key).await?;
 
         if let Some(mut entry) = write_entry {
-            info!("Write cache hit (disk) for key: {}", cache_key);
+            debug!("Write cache hit (disk) for key: {}", cache_key);
             self.record_write_cache_hit();
 
             // Check TTL expiration
             if SystemTime::now() > entry.put_ttl_expires_at {
                 debug!("Write cache entry expired for key: {}", cache_key);
-                let _ = self.invalidate_write_cache_entry(cache_key).await;
+                if let Err(e) = self.invalidate_write_cache_entry(cache_key).await {
+                    warn!(
+                        "Failed to invalidate expired write cache entry: cache_key={}, error={}",
+                        cache_key, e
+                    );
+                }
                 return Ok(None);
             }
 
@@ -8586,6 +8874,8 @@ impl CacheManager {
 
             // Promote to RAM cache if enabled
             if self.ram_cache_enabled {
+                // RAM cache promotion is best-effort; failure only means the next read
+                // will serve from disk — no data loss or inconsistency.
                 let _ = self.promote_write_entry_to_ram(&entry).await;
             }
 
@@ -8645,7 +8935,7 @@ impl CacheManager {
         // Transition to GET_TTL
         if time_until_expiry <= self.put_ttl {
             let old_expires_at = metadata.expires_at;
-            metadata.expires_at = now + self.get_ttl;
+            metadata.expires_at = safe_expiry(now, self.get_ttl);
 
             // Store updated metadata
             self.store_new_metadata(&metadata).await?;
@@ -8935,7 +9225,7 @@ impl CacheManager {
             body: ram_entry.data,
             metadata: ram_entry.metadata,
             created_at: ram_entry.created_at,
-            put_ttl_expires_at: ram_entry.created_at + self.put_ttl,
+            put_ttl_expires_at: safe_expiry(ram_entry.created_at, self.put_ttl),
             last_accessed: ram_entry.last_accessed,
             compression_info,
             is_put_cached: true, // Write cache entries are PUT-cached
@@ -9617,16 +9907,9 @@ impl CacheManager {
         self.cache_dir.join("locks").join("global_eviction.lock")
     }
 
-    /// Get eviction lock timeout in seconds
-    /// Returns configured eviction lock timeout in seconds
-    /// Requirement: 2.4, 6.1, 6.2
-    fn get_eviction_lock_timeout_seconds(&self) -> u64 {
-        self.shared_storage.eviction_lock_timeout.as_secs()
-    }
-
-    /// Try to acquire the global eviction lock using flock
+    /// Try to acquire the global eviction lock using flock with UUID fencing
     /// Returns Ok(true) if lock acquired, Ok(false) if held by another instance
-    /// Requirements: 1.1, 1.2, 1.3, 1.5, 2.1, 2.2, 2.3, 2.5, 8.1, 8.2, 8.4, 8.5
+    /// Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
     pub async fn try_acquire_global_eviction_lock(&self) -> Result<bool> {
         // Perform the synchronous lock acquisition in a block to ensure guard is dropped
         // before any async operations
@@ -9655,9 +9938,41 @@ impl CacheManager {
                 }
             }
 
+            // Check if existing lock is stale (for takeover)
+            // Requirement 5.5: treat lockfile whose acquired_at exceeds eviction_lock_timeout as stale
+            let eviction_lock_timeout = self.shared_storage.eviction_lock_timeout;
+            if lock_file_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&lock_file_path) {
+                    if let Ok(existing_payload) =
+                        serde_json::from_str::<EvictionLockPayload>(&content)
+                    {
+                        let now_ms = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let age_ms = now_ms.saturating_sub(existing_payload.acquired_at_ms);
+                        let timeout_ms = eviction_lock_timeout.as_millis() as u64;
+
+                        if age_ms <= timeout_ms {
+                            // Lock is not stale — another instance holds it legitimately
+                            debug!(
+                                "Eviction lock held by {} (age={}ms, timeout={}ms), not stale",
+                                existing_payload.hostname, age_ms, timeout_ms
+                            );
+                        } else {
+                            debug!(
+                                "Eviction lock is stale (age={}ms > timeout={}ms), eligible for takeover",
+                                age_ms, timeout_ms
+                            );
+                        }
+                    }
+                }
+            }
+
             // Try to acquire lock using flock (non-blocking)
             let lock_file = match std::fs::OpenOptions::new()
                 .create(true)
+                .read(true)
                 .write(true)
                 .truncate(false)
                 .open(&lock_file_path)
@@ -9676,34 +9991,211 @@ impl CacheManager {
             };
 
             // Try to acquire exclusive lock (non-blocking)
-            use fs2::FileExt;
             match lock_file.try_lock_exclusive() {
                 Ok(()) => {
                     debug!("Acquired global eviction lock using flock");
 
-                    // Write lock metadata for debugging
-                    let lock_data = GlobalEvictionLock {
-                        instance_id: self.get_instance_id(),
-                        process_id: std::process::id(),
-                        hostname: hostname::get()
-                            .unwrap_or_else(|_| "unknown".into())
-                            .to_string_lossy()
-                            .to_string(),
-                        acquired_at: SystemTime::now(),
-                        timeout_seconds: self.get_eviction_lock_timeout_seconds(),
+                    // Generate a fresh UUID fence token
+                    let my_uuid = Uuid::new_v4().to_string();
+                    let now_ms = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let my_hostname = hostname::get()
+                        .unwrap_or_else(|_| "unknown".into())
+                        .to_string_lossy()
+                        .to_string();
+
+                    // Requirement 5.1: Write UUID + acquired_at_ms + hostname, then fsync
+                    let payload = EvictionLockPayload {
+                        uuid: my_uuid.clone(),
+                        acquired_at_ms: now_ms,
+                        hostname: my_hostname,
                     };
 
-                    if let Ok(lock_json) = serde_json::to_string_pretty(&lock_data) {
-                        let _ = std::io::Write::write_all(&mut &lock_file, lock_json.as_bytes());
+                    let payload_json = serde_json::to_string(&payload).map_err(|e| {
+                        ProxyError::CacheError(format!(
+                            "Failed to serialize eviction lock payload: {}",
+                            e
+                        ))
+                    })?;
+
+                    // Truncate and write the payload
+                    use std::io::Write;
+                    lock_file.set_len(0).map_err(|e| {
+                        ProxyError::CacheError(format!(
+                            "Failed to truncate eviction lock file: {}",
+                            e
+                        ))
+                    })?;
+                    use std::io::Seek;
+                    (&lock_file)
+                        .seek(std::io::SeekFrom::Start(0))
+                        .map_err(|e| {
+                            ProxyError::CacheError(format!(
+                                "Failed to seek eviction lock file: {}",
+                                e
+                            ))
+                        })?;
+                    (&lock_file)
+                        .write_all(payload_json.as_bytes())
+                        .map_err(|e| {
+                            ProxyError::CacheError(format!(
+                                "Failed to write eviction lock payload: {}",
+                                e
+                            ))
+                        })?;
+                    (&lock_file).flush().map_err(|e| {
+                        ProxyError::CacheError(format!("Failed to flush eviction lock file: {}", e))
+                    })?;
+                    lock_file.sync_all().map_err(|e| {
+                        ProxyError::CacheError(format!("Failed to fsync eviction lock file: {}", e))
+                    })?;
+
+                    // Requirement 5.2: Read back the file content and verify UUID matches.
+                    // We keep the flock held on the original file handle to prevent races.
+                    // Reading via the path (not the fd) defeats NFS attribute caching.
+                    let readback = std::fs::read_to_string(&lock_file_path).map_err(|e| {
+                        ProxyError::CacheError(format!(
+                            "Failed to read back eviction lock file: {}",
+                            e
+                        ))
+                    })?;
+
+                    let readback_payload: EvictionLockPayload = serde_json::from_str(&readback)
+                        .map_err(|e| {
+                            ProxyError::CacheError(format!(
+                                "Failed to parse eviction lock readback: {}",
+                                e
+                            ))
+                        })?;
+
+                    if readback_payload.uuid != my_uuid {
+                        warn!(
+                            "Eviction lock UUID mismatch after acquisition: expected={}, found={}. Another instance took over.",
+                            my_uuid, readback_payload.uuid
+                        );
+                        // Release the flock and abort (best-effort; if unlock fails,
+                        // the OS releases the flock when the file handle is dropped)
+                        let _ = lock_file.unlock();
+                        return Ok(false);
                     }
 
-                    // Store the lock file so it stays open (and locked) until dropped
+                    // Store the UUID and the verified lock file handle
+                    *self.eviction_uuid.lock().unwrap() = Some(my_uuid.clone());
                     *guard = Some(lock_file);
 
-                    // Return success - guard will be dropped at end of block
+                    debug!(
+                        "Eviction lock acquired and verified: uuid={}, acquired_at_ms={}",
+                        my_uuid, now_ms
+                    );
+
                     Ok(true)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Lock is held by another process — check if it's stale for takeover
+                    // Requirement 5.5: stale takeover via eviction_lock_timeout
+                    if let Ok(content) = std::fs::read_to_string(&lock_file_path) {
+                        if let Ok(existing_payload) =
+                            serde_json::from_str::<EvictionLockPayload>(&content)
+                        {
+                            let now_ms = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let age_ms = now_ms.saturating_sub(existing_payload.acquired_at_ms);
+                            let timeout_ms = eviction_lock_timeout.as_millis() as u64;
+
+                            if age_ms > timeout_ms {
+                                info!(
+                                    "Eviction lock is stale (age={}ms > timeout={}ms, holder={}), attempting takeover",
+                                    age_ms, timeout_ms, existing_payload.hostname
+                                );
+                                // Attempt blocking lock acquisition for stale takeover
+                                // Use a short timeout to avoid indefinite blocking
+                                let lock_file_for_takeover = match std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .read(true)
+                                    .write(true)
+                                    .truncate(false)
+                                    .open(&lock_file_path)
+                                {
+                                    Ok(f) => f,
+                                    Err(_) => return Ok(false),
+                                };
+
+                                // Try blocking lock — if the stale holder crashed, this succeeds
+                                match lock_file_for_takeover.try_lock_exclusive() {
+                                    Ok(()) => {
+                                        // Stale takeover succeeded — write our UUID
+                                        let my_uuid = Uuid::new_v4().to_string();
+                                        let my_hostname = hostname::get()
+                                            .unwrap_or_else(|_| "unknown".into())
+                                            .to_string_lossy()
+                                            .to_string();
+
+                                        let payload = EvictionLockPayload {
+                                            uuid: my_uuid.clone(),
+                                            acquired_at_ms: now_ms,
+                                            hostname: my_hostname,
+                                        };
+
+                                        let payload_json =
+                                            serde_json::to_string(&payload).unwrap_or_default();
+
+                                        use std::io::Write;
+                                        // set_len and seek are part of the atomic takeover sequence;
+                                        // if they fail, the subsequent write_all will also fail and
+                                        // we fall through to the "Takeover write/verify failed" path.
+                                        let _ = lock_file_for_takeover.set_len(0);
+                                        use std::io::Seek;
+                                        let _ = (&lock_file_for_takeover)
+                                            .seek(std::io::SeekFrom::Start(0));
+                                        if (&lock_file_for_takeover)
+                                            .write_all(payload_json.as_bytes())
+                                            .is_ok()
+                                        {
+                                            // sync_all is best-effort; the readback verification
+                                            // below is the true correctness gate.
+                                            let _ = lock_file_for_takeover.sync_all();
+
+                                            // Verify readback
+                                            if let Ok(readback) =
+                                                std::fs::read_to_string(&lock_file_path)
+                                            {
+                                                if let Ok(rb_payload) =
+                                                    serde_json::from_str::<EvictionLockPayload>(
+                                                        &readback,
+                                                    )
+                                                {
+                                                    if rb_payload.uuid == my_uuid {
+                                                        info!(
+                                                            "Stale eviction lock takeover succeeded: uuid={}",
+                                                            my_uuid
+                                                        );
+                                                        *self.eviction_uuid.lock().unwrap() =
+                                                            Some(my_uuid);
+                                                        *guard = Some(lock_file_for_takeover);
+                                                        return Ok(true);
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Takeover write/verify failed (best-effort unlock;
+                                        // OS releases flock on handle drop regardless)
+                                        let _ = lock_file_for_takeover.unlock();
+                                        return Ok(false);
+                                    }
+                                    Err(_) => {
+                                        debug!("Stale lock takeover failed — lock still held");
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     debug!("Global eviction lock held by another instance");
                     Ok(false)
                 }
@@ -9909,18 +10401,21 @@ impl CacheManager {
 
         // Serialize metadata to JSON
         let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
+            // Best-effort unlock; OS releases flock on file handle drop regardless
             let _ = lock_file.unlock();
             ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
         })?;
 
         // Write to temporary file
         std::fs::write(&metadata_tmp_path, &metadata_json).map_err(|e| {
+            // Best-effort unlock; OS releases flock on file handle drop regardless
             let _ = lock_file.unlock();
             ProxyError::CacheError(format!("Failed to write metadata tmp file: {}", e))
         })?;
 
         // Atomically rename to final file
         std::fs::rename(&metadata_tmp_path, &metadata_file_path).map_err(|e| {
+            // Best-effort unlock and cleanup; OS releases flock on handle drop
             let _ = lock_file.unlock();
             let _ = std::fs::remove_file(&metadata_tmp_path);
             ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))

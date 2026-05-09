@@ -41,7 +41,8 @@ async fn test_cache_manager_multipart_integration() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     ));
 
     let path = "/test-bucket/test-object";
@@ -119,7 +120,8 @@ async fn test_regular_put_with_conflict_invalidation() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     ));
 
     let path = "/test-bucket/test-object";

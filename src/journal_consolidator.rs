@@ -3414,11 +3414,29 @@ impl JournalConsolidator {
                     }
                 } else {
                     // Truncate primary journal (keep file for future appends)
-                    match tokio::fs::write(&journal_path, "").await {
-                        Ok(_) => {
+                    // Atomic: write empty to .tmp, sync_all, rename over original
+                    let tmp_path = journal_path.with_extension("journal.tmp");
+                    let truncate_result: std::result::Result<(), String> = async {
+                        let f = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+                            format!("Failed to create tmp file for truncation: {}", e)
+                        })?;
+                        f.sync_all().await.map_err(|e| {
+                            format!("Failed to sync_all tmp file for truncation: {}", e)
+                        })?;
+                        tokio::fs::rename(&tmp_path, &journal_path)
+                            .await
+                            .map_err(|e| {
+                                format!("Failed to rename tmp file for truncation: {}", e)
+                            })?;
+                        Ok(())
+                    }
+                    .await;
+
+                    match truncate_result {
+                        Ok(()) => {
                             files_truncated += 1;
                             debug!(
-                                "Truncated fully-consolidated primary journal: path={:?}, removed={}",
+                                "Truncated fully-consolidated primary journal (atomic): path={:?}, removed={}",
                                 journal_path, removed_count
                             );
                         }
@@ -3427,11 +3445,18 @@ impl JournalConsolidator {
                                 "Failed to truncate journal file: path={:?}, error={}",
                                 journal_path, e
                             );
+                            // Attempt to remove .tmp file, but don't fail if removal fails
+                            if let Err(cleanup_err) = tokio::fs::remove_file(&tmp_path).await {
+                                warn!(
+                                    "Failed to remove tmp file after truncation failure: path={:?}, error={}",
+                                    tmp_path, cleanup_err
+                                );
+                            }
                         }
                     }
                 }
             } else {
-                // Partial consolidation — rewrite with remaining entries
+                // Partial consolidation — rewrite with remaining entries (atomic)
                 let mut new_content = String::new();
                 for entry in &remaining_entries {
                     match serde_json::to_string(entry) {
@@ -3448,11 +3473,31 @@ impl JournalConsolidator {
                     }
                 }
 
-                match tokio::fs::write(&journal_path, new_content).await {
-                    Ok(_) => {
+                // Atomic: write to .tmp, sync_all, rename over original
+                let tmp_path = journal_path.with_extension("journal.tmp");
+                let rewrite_result: std::result::Result<(), String> = async {
+                    use tokio::io::AsyncWriteExt;
+                    let mut f = tokio::fs::File::create(&tmp_path)
+                        .await
+                        .map_err(|e| format!("Failed to create tmp file for rewrite: {}", e))?;
+                    f.write_all(new_content.as_bytes())
+                        .await
+                        .map_err(|e| format!("Failed to write tmp file for rewrite: {}", e))?;
+                    f.sync_all()
+                        .await
+                        .map_err(|e| format!("Failed to sync_all tmp file for rewrite: {}", e))?;
+                    tokio::fs::rename(&tmp_path, &journal_path)
+                        .await
+                        .map_err(|e| format!("Failed to rename tmp file for rewrite: {}", e))?;
+                    Ok(())
+                }
+                .await;
+
+                match rewrite_result {
+                    Ok(()) => {
                         files_rewritten += 1;
                         debug!(
-                            "Rewritten journal file: path={:?}, removed={}, remaining={}",
+                            "Rewritten journal file (atomic): path={:?}, removed={}, remaining={}",
                             journal_path,
                             removed_count,
                             remaining_entries.len()
@@ -3463,6 +3508,13 @@ impl JournalConsolidator {
                             "Failed to write updated journal file: path={:?}, error={}",
                             journal_path, e
                         );
+                        // Attempt to remove .tmp file, but don't fail if removal fails
+                        if let Err(cleanup_err) = tokio::fs::remove_file(&tmp_path).await {
+                            warn!(
+                                "Failed to remove tmp file after rewrite failure: path={:?}, error={}",
+                                tmp_path, cleanup_err
+                            );
+                        }
                     }
                 }
             }

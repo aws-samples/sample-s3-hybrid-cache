@@ -114,6 +114,28 @@ impl InFlightTracker {
         }
     }
 
+    /// Attempts to re-subscribe to an existing in-flight fetch for the given flight key.
+    ///
+    /// This is used by waiters that have timed out but want to continue waiting
+    /// rather than launching a duplicate S3 fetch. The lookup and subscribe happen
+    /// atomically under the same DashMap shard lock to prevent a race with the
+    /// fetcher completing between the check and the subscribe.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(receiver)` if the flight key is still present (FetchGuard exists)
+    /// - `None` if the flight key is absent (fetcher completed or was dropped)
+    ///
+    /// # Requirements
+    ///
+    /// - 7.1: Re-subscribe waiter when FetchGuard still present
+    /// - 7.2: Return None when FetchGuard absent so waiter becomes new fetcher
+    pub fn try_resubscribe(&self, flight_key: &str) -> Option<broadcast::Receiver<FetchResult>> {
+        // The DashMap ref guard holds the shard lock, ensuring the sender
+        // cannot be removed between the lookup and the subscribe() call.
+        self.pending.get(flight_key).map(|entry| entry.subscribe())
+    }
+
     /// Returns the number of in-flight fetches currently being tracked.
     pub fn in_flight_count(&self) -> usize {
         self.pending.len()
@@ -516,6 +538,287 @@ mod tests {
         };
 
         assert_eq!(tracker.in_flight_count(), 2);
+    }
+
+    // =========================================================================
+    // Re-subscription unit tests (Requirements 7.1, 7.2, 7.3, 7.4, 7.5)
+    // =========================================================================
+
+    /// Requirement 7.1: Waiter re-subscribes when FetchGuard is still present.
+    /// When try_resubscribe is called and the flight key is in the registry,
+    /// it returns Some(receiver) so the waiter can continue waiting.
+    #[test]
+    fn test_try_resubscribe_returns_receiver_when_fetch_guard_present() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/resubscribe-test.txt";
+
+        // Register a fetcher — FetchGuard is now present
+        let _guard = match tracker.try_register(flight_key) {
+            FetchRole::Fetcher(guard) => guard,
+            FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+        };
+
+        // try_resubscribe should return Some since FetchGuard is present
+        let result = tracker.try_resubscribe(flight_key);
+        assert!(
+            result.is_some(),
+            "Expected Some(receiver) when FetchGuard is present"
+        );
+    }
+
+    /// Requirement 7.2: Waiter becomes new fetcher when FetchGuard is absent.
+    /// When try_resubscribe is called and the flight key is NOT in the registry,
+    /// it returns None so the waiter knows to become the new fetcher.
+    #[test]
+    fn test_try_resubscribe_returns_none_when_fetch_guard_absent() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/absent-key.txt";
+
+        // No registration — flight key is not in the registry
+        let result = tracker.try_resubscribe(flight_key);
+        assert!(
+            result.is_none(),
+            "Expected None when flight key is not in registry"
+        );
+    }
+
+    /// Requirement 7.2: After FetchGuard is dropped (fetcher completed or panicked),
+    /// try_resubscribe returns None so the waiter becomes the new fetcher.
+    #[test]
+    fn test_try_resubscribe_returns_none_after_guard_dropped() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/guard-dropped.txt";
+
+        // Register and immediately drop the guard (simulates fetcher panic/cancel)
+        {
+            let _guard = match tracker.try_register(flight_key) {
+                FetchRole::Fetcher(guard) => guard,
+                FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+            };
+            // guard dropped here
+        }
+
+        // FetchGuard is gone — try_resubscribe should return None
+        let result = tracker.try_resubscribe(flight_key);
+        assert!(
+            result.is_none(),
+            "Expected None after FetchGuard was dropped"
+        );
+    }
+
+    /// Requirement 7.2: After fetcher completes successfully, try_resubscribe
+    /// returns None since the flight key is removed from the registry.
+    #[test]
+    fn test_try_resubscribe_returns_none_after_complete_success() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/completed.txt";
+
+        let guard = match tracker.try_register(flight_key) {
+            FetchRole::Fetcher(guard) => guard,
+            FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+        };
+
+        guard.complete_success();
+
+        let result = tracker.try_resubscribe(flight_key);
+        assert!(
+            result.is_none(),
+            "Expected None after fetcher completed successfully"
+        );
+    }
+
+    /// Requirement 7.4: Re-subscribed waiter receives the fetcher's result.
+    /// When a waiter re-subscribes and the fetcher later completes, the new
+    /// receiver gets the success notification.
+    #[tokio::test]
+    async fn test_resubscribed_waiter_receives_success_notification() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/resubscribe-notify.txt";
+
+        let guard = match tracker.try_register(flight_key) {
+            FetchRole::Fetcher(guard) => guard,
+            FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+        };
+
+        // Simulate a waiter that re-subscribes (e.g., after a timeout)
+        let mut rx = tracker
+            .try_resubscribe(flight_key)
+            .expect("FetchGuard is present, should get receiver");
+
+        // Fetcher completes
+        guard.complete_success();
+
+        // Re-subscribed waiter should receive the success notification
+        let result = rx.recv().await;
+        assert!(result.is_ok(), "Should receive broadcast message");
+        assert!(
+            result.unwrap().is_ok(),
+            "Should receive Ok(()) success result"
+        );
+    }
+
+    /// Requirement 7.4: Re-subscribed waiter receives the fetcher's error.
+    #[tokio::test]
+    async fn test_resubscribed_waiter_receives_error_notification() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/resubscribe-error.txt";
+
+        let guard = match tracker.try_register(flight_key) {
+            FetchRole::Fetcher(guard) => guard,
+            FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+        };
+
+        // Simulate a waiter that re-subscribes
+        let mut rx = tracker
+            .try_resubscribe(flight_key)
+            .expect("FetchGuard is present, should get receiver");
+
+        // Fetcher completes with error
+        guard.complete_error("upstream timeout".to_string());
+
+        // Re-subscribed waiter should receive the error notification
+        let result = rx.recv().await;
+        assert!(result.is_ok(), "Should receive broadcast message");
+        let fetch_result = result.unwrap();
+        assert!(fetch_result.is_err(), "Should receive error result");
+        assert_eq!(fetch_result.unwrap_err(), "upstream timeout");
+    }
+
+    /// Requirement 7.5: Simulates the re-subscription loop exhausting max retries.
+    /// After max_resubscriptions timeouts, the waiter should stop re-subscribing.
+    /// This tests the loop logic at the unit level using try_resubscribe directly.
+    #[tokio::test]
+    async fn test_resubscription_loop_exhausts_max_retries() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/max-retries.txt";
+        let max_resubscriptions: u32 = 3;
+
+        // Register a fetcher that will never complete (simulates slow upstream)
+        let _guard = match tracker.try_register(flight_key) {
+            FetchRole::Fetcher(guard) => guard,
+            FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+        };
+
+        // Simulate the re-subscription loop with short timeouts
+        let wait_timeout = std::time::Duration::from_millis(10);
+        let mut re_subscribe_count: u32 = 0;
+
+        // Get initial receiver as a waiter would
+        let mut rx = match tracker.try_register(flight_key) {
+            FetchRole::Waiter(rx) => rx,
+            FetchRole::Fetcher(_) => panic!("Expected Waiter"),
+        };
+
+        let final_status: &str = loop {
+            match tokio::time::timeout(wait_timeout, rx.recv()).await {
+                Ok(Ok(result)) => {
+                    // Fetcher completed — not expected in this test
+                    panic!("Unexpected fetch completion: {:?}", result);
+                }
+                Ok(Err(_)) => {
+                    // Channel closed — become fetcher
+                    break "channel_closed";
+                }
+                Err(_timeout) => {
+                    re_subscribe_count += 1;
+
+                    if re_subscribe_count > max_resubscriptions {
+                        // Requirement 7.5: gateway timeout
+                        break "gateway_timeout";
+                    }
+
+                    // Re-subscribe
+                    if let Some(new_rx) = tracker.try_resubscribe(flight_key) {
+                        rx = new_rx;
+                        continue;
+                    } else {
+                        break "become_fetcher";
+                    }
+                }
+            }
+        };
+
+        assert_eq!(
+            final_status, "gateway_timeout",
+            "Should hit gateway timeout after max re-subscriptions"
+        );
+        assert_eq!(
+            re_subscribe_count,
+            max_resubscriptions + 1,
+            "Should have attempted max+1 re-subscriptions before giving up"
+        );
+    }
+
+    /// Requirement 7.1, 7.4: Normal case — waiter receives result before timeout.
+    /// The waiter subscribes, the fetcher completes quickly, and the waiter
+    /// gets the result without needing to re-subscribe.
+    #[tokio::test]
+    async fn test_waiter_receives_result_before_timeout() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/fast-fetch.txt";
+
+        let guard = match tracker.try_register(flight_key) {
+            FetchRole::Fetcher(guard) => guard,
+            FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+        };
+
+        let mut rx = match tracker.try_register(flight_key) {
+            FetchRole::Waiter(rx) => rx,
+            FetchRole::Fetcher(_) => panic!("Expected Waiter"),
+        };
+
+        // Fetcher completes quickly
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            guard.complete_success();
+        });
+
+        // Waiter should receive result well before a typical timeout
+        let wait_timeout = std::time::Duration::from_secs(5);
+        let result = tokio::time::timeout(wait_timeout, rx.recv()).await;
+
+        assert!(result.is_ok(), "Should receive result before timeout");
+        let recv_result = result.unwrap();
+        assert!(recv_result.is_ok(), "Channel should not be closed");
+        assert!(
+            recv_result.unwrap().is_ok(),
+            "Fetch result should be success"
+        );
+    }
+
+    /// Requirement 7.1: Multiple re-subscriptions succeed while FetchGuard is present.
+    /// Each call to try_resubscribe returns a fresh receiver.
+    #[tokio::test]
+    async fn test_multiple_resubscriptions_all_receive_result() {
+        let tracker = InFlightTracker::new();
+        let flight_key = "bucket/multi-resub.txt";
+
+        let guard = match tracker.try_register(flight_key) {
+            FetchRole::Fetcher(guard) => guard,
+            FetchRole::Waiter(_) => panic!("Expected Fetcher"),
+        };
+
+        // Simulate 3 re-subscriptions (as if timeout fired 3 times)
+        let mut receivers = Vec::new();
+        for _ in 0..3 {
+            let rx = tracker
+                .try_resubscribe(flight_key)
+                .expect("FetchGuard present, should get receiver");
+            receivers.push(rx);
+        }
+
+        // Fetcher completes
+        guard.complete_success();
+
+        // All re-subscribed receivers should get the notification
+        for mut rx in receivers {
+            let result = rx.recv().await;
+            assert!(
+                result.is_ok(),
+                "Each re-subscribed receiver should get result"
+            );
+            assert!(result.unwrap().is_ok(), "Result should be success");
+        }
     }
 }
 

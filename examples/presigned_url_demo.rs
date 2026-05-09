@@ -27,7 +27,7 @@ fn main() {
     query_params.insert("X-Amz-SignedHeaders".to_string(), "host".to_string());
     query_params.insert("X-Amz-Signature".to_string(), "abc123def456...".to_string());
 
-    if let Some(info) = parse_presigned_url(&query_params) {
+    if let Ok(Some(info)) = parse_presigned_url(&query_params) {
         print_presigned_url_info(&info);
     } else {
         println!("Failed to parse presigned URL");
@@ -46,7 +46,7 @@ fn main() {
     query_params.insert("X-Amz-Expires".to_string(), "3600".to_string()); // 1 hour
     query_params.insert("X-Amz-Signature".to_string(), "xyz789...".to_string());
 
-    if let Some(info) = parse_presigned_url(&query_params) {
+    if let Ok(Some(info)) = parse_presigned_url(&query_params) {
         print_presigned_url_info(&info);
     } else {
         println!("Failed to parse presigned URL");
@@ -60,7 +60,7 @@ fn main() {
     query_params.insert("versionId".to_string(), "abc123".to_string());
     query_params.insert("partNumber".to_string(), "1".to_string());
 
-    if let Some(info) = parse_presigned_url(&query_params) {
+    if let Ok(Some(info)) = parse_presigned_url(&query_params) {
         print_presigned_url_info(&info);
     } else {
         println!("Not a presigned URL (missing X-Amz-Algorithm)");
@@ -78,7 +78,7 @@ fn main() {
     query_params.insert("X-Amz-Date".to_string(), "20260115T120000Z".to_string());
     query_params.insert("X-Amz-Expires".to_string(), "7200".to_string()); // 2 hours
 
-    if let Some(info) = parse_presigned_url(&query_params) {
+    if let Ok(Some(info)) = parse_presigned_url(&query_params) {
         println!(
             "Presigned URL expires in: {} seconds",
             info.expires_in_seconds

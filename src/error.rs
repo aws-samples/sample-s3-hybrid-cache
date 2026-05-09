@@ -63,6 +63,15 @@ pub enum ProxyError {
 
     #[error("Retry after {0} seconds")]
     RetryAfter(u64),
+
+    #[error("Eviction fence lost: {0}")]
+    EvictionFenceLost(String),
+
+    #[error("Request body too large: content_length={content_length:?}, max_bytes={max_bytes}")]
+    RequestBodyTooLarge {
+        content_length: Option<u64>,
+        max_bytes: u64,
+    },
 }
 
 impl From<std::io::Error> for ProxyError {
@@ -83,8 +92,8 @@ impl From<serde_json::Error> for ProxyError {
     }
 }
 
-impl From<serde_yaml::Error> for ProxyError {
-    fn from(err: serde_yaml::Error) -> Self {
+impl From<serde_yaml_ng::Error> for ProxyError {
+    fn from(err: serde_yaml_ng::Error) -> Self {
         ProxyError::SerializationError(err.to_string())
     }
 }

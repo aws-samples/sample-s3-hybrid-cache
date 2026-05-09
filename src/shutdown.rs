@@ -68,6 +68,15 @@ impl ShutdownCoordinator {
         self.shutdown_sender.subscribe()
     }
 
+    /// Returns the number of active shutdown signal subscribers.
+    ///
+    /// This allows tests to verify that all expected background tasks have
+    /// subscribed to the shutdown signal. The count reflects the number of
+    /// active `broadcast::Receiver` instances created via `subscribe()`.
+    pub fn subscriber_count(&self) -> usize {
+        self.shutdown_sender.receiver_count()
+    }
+
     /// Start listening for shutdown signals
     pub async fn listen_for_shutdown(&self) -> Result<()> {
         info!("Starting shutdown signal listener");

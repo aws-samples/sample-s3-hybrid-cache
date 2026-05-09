@@ -214,46 +214,72 @@ pub fn try_acquire_exclusive_lock(lock_path: &Path) -> Result<File> {
     Ok(lock_file)
 }
 
-/// Lock file content structure for enhanced metadata locking
+/// Lock file content structure for cross-host metadata locking.
+///
+/// Written atomically as JSON when a lock is acquired. Contains enough
+/// information for any host to determine whether the lock is stale:
+/// - Same host: PID check (fast, authoritative)
+/// - Different host: wall-clock timeout only (no remote PID visibility)
+///
+/// Requirements: 3.1, 3.2, 3.3, 3.5
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockFileContent {
-    /// Process ID of the lock holder
-    pub process_id: u32,
-    /// Instance ID (hostname:pid) for unique identification
+    /// Unique identifier: "hostname:pid"
     pub instance_id: String,
-    /// When the lock was acquired
-    pub acquired_at: SystemTime,
-    /// Operation being performed under this lock
-    pub operation: String,
-    /// Cache key being locked
-    pub cache_key: String,
+    /// Hostname of the lock holder (used for same-host vs cross-host decision)
+    pub hostname: String,
+    /// Process ID of the lock holder
+    pub pid: u32,
+    /// Acquisition timestamp in milliseconds since UNIX epoch
+    pub acquired_at_ms: u64,
+    /// Monotonic fence epoch — incremented on each takeover to detect races
+    pub fence_epoch: u64,
 }
 
 impl LockFileContent {
-    /// Create new lock file content
-    pub fn new(operation: String, cache_key: String) -> Self {
+    /// Create new lock file content for the current process
+    pub fn new(fence_epoch: u64) -> Self {
+        let hostname = hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let pid = std::process::id();
+        let instance_id = format!("{}:{}", hostname, pid);
+        let acquired_at_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         Self {
-            process_id: std::process::id(),
-            instance_id: get_instance_id(),
-            acquired_at: SystemTime::now(),
-            operation,
-            cache_key,
+            instance_id,
+            hostname,
+            pid,
+            acquired_at_ms,
+            fence_epoch,
         }
     }
 
-    /// Check if this lock is stale based on timeout and process existence
-    pub fn is_stale(&self, timeout: Duration) -> bool {
-        // Check if lock has exceeded timeout
-        let age = SystemTime::now()
-            .duration_since(self.acquired_at)
-            .unwrap_or_default();
+    /// Create a LockFileContent with a specific hostname (for testing)
+    #[cfg(test)]
+    pub fn with_hostname(hostname: String, pid: u32, fence_epoch: u64) -> Self {
+        let instance_id = format!("{}:{}", hostname, pid);
+        let acquired_at_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
-        if age <= timeout {
-            return false; // Not old enough to be stale
+        Self {
+            instance_id,
+            hostname,
+            pid,
+            acquired_at_ms,
+            fence_epoch,
         }
+    }
 
-        // Check if process still exists
-        !is_process_alive(self.process_id)
+    /// Get the hostname component of the lock owner
+    pub fn hostname_component(&self) -> &str {
+        &self.hostname
     }
 
     /// Serialize to JSON for storage
@@ -280,16 +306,19 @@ pub struct MetadataLock {
     cache_key: String,
     /// When the lock was acquired
     acquired_at: SystemTime,
+    /// Fence epoch written at acquisition time (for verification)
+    fence_epoch: u64,
 }
 
 impl MetadataLock {
     /// Create a new metadata lock
-    fn new(lock_file_path: PathBuf, lock_file: File, cache_key: String) -> Self {
+    fn new(lock_file_path: PathBuf, lock_file: File, cache_key: String, fence_epoch: u64) -> Self {
         Self {
             lock_file_path,
             _lock_file: lock_file,
             cache_key,
             acquired_at: SystemTime::now(),
+            fence_epoch,
         }
     }
 
@@ -306,6 +335,80 @@ impl MetadataLock {
     /// Get when the lock was acquired
     pub fn acquired_at(&self) -> SystemTime {
         self.acquired_at
+    }
+
+    /// Get the fence epoch for this lock
+    pub fn fence_epoch(&self) -> u64 {
+        self.fence_epoch
+    }
+
+    /// Refresh the heartbeat by updating `acquired_at_ms` in the lockfile.
+    ///
+    /// Call this periodically during long operations (every `metadata_lock_timeout_ms / 2`)
+    /// to prevent other hosts from treating this lock as stale and attempting takeover.
+    ///
+    /// Requirements: 3.4, 3.5
+    pub fn refresh_heartbeat(&self) -> Result<()> {
+        use std::io::Write;
+
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Read current content to preserve fields
+        let content = std::fs::read_to_string(&self.lock_file_path).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to read lock file for heartbeat refresh: path={:?}, error={}",
+                self.lock_file_path, e
+            ))
+        })?;
+
+        let mut lock_info = LockFileContent::from_json(&content)?;
+
+        // Verify our epoch is still current before refreshing
+        if lock_info.fence_epoch != self.fence_epoch {
+            return Err(ProxyError::CacheError(format!(
+                "Fence epoch mismatch during heartbeat refresh: path={:?}, expected={}, found={}",
+                self.lock_file_path, self.fence_epoch, lock_info.fence_epoch
+            )));
+        }
+
+        // Update the timestamp
+        lock_info.acquired_at_ms = now_ms;
+
+        // Write back with fsync
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.lock_file_path)
+            .map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to open lock file for heartbeat refresh: path={:?}, error={}",
+                    self.lock_file_path, e
+                ))
+            })?;
+
+        let json = lock_info.to_json()?;
+        file.write_all(json.as_bytes()).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to write heartbeat refresh: path={:?}, error={}",
+                self.lock_file_path, e
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to fsync heartbeat refresh: path={:?}, error={}",
+                self.lock_file_path, e
+            ))
+        })?;
+
+        debug!(
+            "Refreshed lock heartbeat: cache_key={}, path={:?}, acquired_at_ms={}",
+            self.cache_key, self.lock_file_path, now_ms
+        );
+
+        Ok(())
     }
 }
 
@@ -338,7 +441,9 @@ impl Drop for MetadataLock {
 pub struct MetadataLockManager {
     /// Cache directory path
     cache_dir: PathBuf,
-    /// Lock timeout duration
+    /// Lock timeout duration (used for lock acquisition retries)
+    /// Retained for API compatibility; cross-host staleness uses metadata_lock_timeout_ms.
+    #[allow(dead_code)]
     lock_timeout: Duration,
     /// Maximum retry attempts
     max_retries: u32,
@@ -346,17 +451,49 @@ pub struct MetadataLockManager {
     base_backoff: Duration,
     /// Maximum backoff duration
     max_backoff: Duration,
+    /// Hostname of this instance (cached at construction for cross-host comparison)
+    hostname: String,
+    /// Cross-host metadata lock timeout in milliseconds (Req 3.3)
+    metadata_lock_timeout_ms: u64,
 }
 
 impl MetadataLockManager {
     /// Create a new metadata lock manager
     pub fn new(cache_dir: PathBuf, lock_timeout: Duration, max_retries: u32) -> Self {
+        let hostname = hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         Self {
             cache_dir,
             lock_timeout,
             max_retries,
             base_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
+            hostname,
+            metadata_lock_timeout_ms: 30_000, // default 30s
+        }
+    }
+
+    /// Create a new metadata lock manager with explicit cross-host timeout
+    pub fn with_metadata_lock_timeout(
+        cache_dir: PathBuf,
+        lock_timeout: Duration,
+        max_retries: u32,
+        metadata_lock_timeout_ms: u64,
+    ) -> Self {
+        let hostname = hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        Self {
+            cache_dir,
+            lock_timeout,
+            max_retries,
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+            hostname,
+            metadata_lock_timeout_ms,
         }
     }
     /// Acquire an exclusive metadata lock with stale lock detection and exponential backoff
@@ -452,33 +589,22 @@ impl MetadataLockManager {
         // Try to acquire exclusive lock (non-blocking)
         match lock_file.try_lock_exclusive() {
             Ok(()) => {
-                // Successfully acquired lock - write lock content
-                let lock_content =
-                    LockFileContent::new("metadata_update".to_string(), cache_key.to_string());
+                // Successfully acquired lock — write content, fsync, verify epoch
+                let lock_content = LockFileContent::new(0);
+                let epoch = lock_content.fence_epoch;
 
-                // Write lock content to file with error handling
-                if let Err(e) = std::fs::write(lock_file_path, lock_content.to_json()?) {
-                    error!(
-                        "Failed to write lock content: cache_key={}, path={:?}, error={}",
-                        cache_key, lock_file_path, e
-                    );
-                    // Try to clean up the lock file on write failure
-                    let _ = std::fs::remove_file(lock_file_path);
-                    return Err(ProxyError::CacheError(format!(
-                        "Failed to write lock content: path={:?}, error={}",
-                        lock_file_path, e
-                    )));
-                }
+                self.write_and_verify_lock_content(lock_file_path, &lock_content, cache_key)?;
 
                 debug!(
-                    "Acquired fresh metadata lock: cache_key={}, path={:?}",
-                    cache_key, lock_file_path
+                    "Acquired fresh metadata lock: cache_key={}, path={:?}, epoch={}",
+                    cache_key, lock_file_path, epoch
                 );
 
                 Ok(MetadataLock::new(
                     lock_file_path.to_path_buf(),
                     lock_file,
                     cache_key.to_string(),
+                    epoch,
                 ))
             }
             Err(_lock_err) => {
@@ -517,6 +643,14 @@ impl MetadataLockManager {
                             }
                         }
 
+                        // Read the epoch that break_stale_lock wrote (for cross-host takeover)
+                        // or default to 0 if the file was deleted (same-host stale)
+                        let takeover_epoch = std::fs::read_to_string(lock_file_path)
+                            .ok()
+                            .and_then(|c| LockFileContent::from_json(&c).ok())
+                            .map(|info| info.fence_epoch)
+                            .unwrap_or(0);
+
                         // Try to acquire lock again after breaking stale lock
                         let new_lock_file = OpenOptions::new()
                             .create(true)
@@ -545,34 +679,26 @@ impl MetadataLockManager {
                             ))
                         })?;
 
-                        // Write new lock content
-                        let lock_content = LockFileContent::new(
-                            "metadata_update".to_string(),
-                            cache_key.to_string(),
-                        );
+                        // Write new lock content with the takeover epoch, fsync, verify
+                        let lock_content = LockFileContent::new(takeover_epoch);
+                        let epoch = lock_content.fence_epoch;
 
-                        if let Err(e) = std::fs::write(lock_file_path, lock_content.to_json()?) {
-                            error!(
-                                "Failed to write lock content after breaking stale lock: cache_key={}, path={:?}, error={}",
-                                cache_key, lock_file_path, e
-                            );
-                            // Clean up on failure
-                            let _ = std::fs::remove_file(lock_file_path);
-                            return Err(ProxyError::CacheError(format!(
-                                "Failed to write lock content after breaking stale lock: path={:?}, error={}",
-                                lock_file_path, e
-                            )));
-                        }
+                        self.write_and_verify_lock_content(
+                            lock_file_path,
+                            &lock_content,
+                            cache_key,
+                        )?;
 
                         info!(
-                            "Acquired metadata lock after breaking stale lock: cache_key={}, path={:?}",
-                            cache_key, lock_file_path
+                            "Acquired metadata lock after breaking stale lock: cache_key={}, path={:?}, epoch={}",
+                            cache_key, lock_file_path, epoch
                         );
 
                         Ok(MetadataLock::new(
                             lock_file_path.to_path_buf(),
                             new_lock_file,
                             cache_key.to_string(),
+                            epoch,
                         ))
                     }
                     Ok(false) => {
@@ -598,15 +724,102 @@ impl MetadataLockManager {
         }
     }
 
-    /// Check if a lock file represents a stale lock
+    /// Write lock content to the lockfile, fsync, and re-read to verify the fence epoch.
+    ///
+    /// This ensures durability and detects races where another host overwrites the
+    /// lockfile between our write and our verification read.
+    ///
+    /// Requirements: 3.4, 3.5
+    fn write_and_verify_lock_content(
+        &self,
+        lock_file_path: &Path,
+        lock_content: &LockFileContent,
+        cache_key: &str,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let json = lock_content.to_json()?;
+
+        // Write lock content with truncate + write + fsync
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(lock_file_path)
+            .map_err(|e| {
+                error!(
+                    "Failed to open lock file for write: cache_key={}, path={:?}, error={}",
+                    cache_key, lock_file_path, e
+                );
+                ProxyError::CacheError(format!(
+                    "Failed to open lock file for write: path={:?}, error={}",
+                    lock_file_path, e
+                ))
+            })?;
+
+        file.write_all(json.as_bytes()).map_err(|e| {
+            error!(
+                "Failed to write lock content: cache_key={}, path={:?}, error={}",
+                cache_key, lock_file_path, e
+            );
+            let _ = std::fs::remove_file(lock_file_path);
+            ProxyError::CacheError(format!(
+                "Failed to write lock content: path={:?}, error={}",
+                lock_file_path, e
+            ))
+        })?;
+
+        file.sync_all().map_err(|e| {
+            error!(
+                "Failed to fsync lock file: cache_key={}, path={:?}, error={}",
+                cache_key, lock_file_path, e
+            );
+            let _ = std::fs::remove_file(lock_file_path);
+            ProxyError::CacheError(format!(
+                "Failed to fsync lock file: path={:?}, error={}",
+                lock_file_path, e
+            ))
+        })?;
+
+        drop(file);
+
+        // Re-read and verify the fence epoch matches what we wrote
+        let verify_content = std::fs::read_to_string(lock_file_path).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to re-read lock file for epoch verification: path={:?}, error={}",
+                lock_file_path, e
+            ))
+        })?;
+
+        let verified = LockFileContent::from_json(&verify_content)?;
+        if verified.fence_epoch != lock_content.fence_epoch {
+            warn!(
+                "Fence epoch mismatch after lock acquisition: cache_key={}, path={:?}, expected={}, got={}",
+                cache_key, lock_file_path, lock_content.fence_epoch, verified.fence_epoch
+            );
+            return Err(ProxyError::CacheError(format!(
+                "Fence epoch mismatch: expected={}, got={} — another host overwrote the lock",
+                lock_content.fence_epoch, verified.fence_epoch
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Check if a lock file represents a stale lock.
+    ///
+    /// Cross-host staleness logic (Requirements 3.1, 3.2, 3.3):
+    /// - Same host: use PID check (authoritative, fast)
+    /// - Different host: wall-clock timeout only (no remote PID visibility)
+    /// - Unparseable/empty lockfiles: treated as remote-owned, use wall-clock timeout
     fn is_lock_stale(&self, lock_file_path: &Path) -> Result<bool> {
         // Read lock file content
         let content = match std::fs::read_to_string(lock_file_path) {
             Ok(content) => content,
             Err(_) => {
-                // Empty or unreadable lock file is considered stale
+                // Unreadable lock file — treat as stale (cannot determine owner)
                 debug!(
-                    "Lock file is empty or unreadable, considering stale: path={:?}",
+                    "Lock file is unreadable, considering stale: path={:?}",
                     lock_file_path
                 );
                 return Ok(true);
@@ -622,85 +835,175 @@ impl MetadataLockManager {
             return Ok(true);
         }
 
-        // Parse lock content
-        let lock_content = match LockFileContent::from_json(&content) {
-            Ok(content) => content,
+        // Parse lock content — unparseable files are treated as remote-owned
+        // and use wall-clock timeout (Req 3.3: never assume local ownership)
+        let lock_info = match LockFileContent::from_json(&content) {
+            Ok(info) => info,
             Err(_) => {
-                // Corrupted lock file is considered stale
+                // Corrupted/unparseable: treat as remote-owned, use wall-clock timeout.
+                // We use the file's mtime as a proxy for acquired_at_ms since we can't
+                // parse the content.
                 debug!(
-                    "Lock file is corrupted, considering stale: path={:?}",
+                    "Lock file is unparseable, using wall-clock timeout: path={:?}",
                     lock_file_path
                 );
-                return Ok(true);
+                let file_age_ms = match std::fs::metadata(lock_file_path) {
+                    Ok(meta) => meta
+                        .modified()
+                        .ok()
+                        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(u64::MAX),
+                    Err(_) => u64::MAX, // Can't stat → assume very old → stale
+                };
+                return Ok(file_age_ms > self.metadata_lock_timeout_ms);
             }
         };
 
-        // Check if lock is stale
-        let is_stale = lock_content.is_stale(self.lock_timeout);
+        let my_hostname = self.hostname.as_str();
+        let lock_hostname = lock_info.hostname_component();
 
-        if is_stale {
-            debug!(
-                "Lock is stale: path={:?}, process_id={}, instance_id={}, age={:.2}s",
-                lock_file_path,
-                lock_content.process_id,
-                lock_content.instance_id,
-                SystemTime::now()
-                    .duration_since(lock_content.acquired_at)
-                    .unwrap_or_default()
-                    .as_secs_f64()
-            );
+        if lock_hostname == my_hostname {
+            // Same host: use PID check (Req 3.2)
+            let stale = !is_process_alive(lock_info.pid);
+            if stale {
+                debug!(
+                    "Lock is stale (same-host, PID dead): path={:?}, pid={}, hostname={}",
+                    lock_file_path, lock_info.pid, lock_hostname
+                );
+            } else {
+                debug!(
+                    "Lock is active (same-host, PID alive): path={:?}, pid={}, hostname={}",
+                    lock_file_path, lock_info.pid, lock_hostname
+                );
+            }
+            Ok(stale)
         } else {
-            debug!(
-                "Lock is active: path={:?}, process_id={}, instance_id={}, age={:.2}s",
-                lock_file_path,
-                lock_content.process_id,
-                lock_content.instance_id,
-                SystemTime::now()
-                    .duration_since(lock_content.acquired_at)
-                    .unwrap_or_default()
-                    .as_secs_f64()
-            );
-        }
+            // Different host: wall-clock timeout only (Req 3.3)
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let age_ms = now_ms.saturating_sub(lock_info.acquired_at_ms);
+            let stale = age_ms > self.metadata_lock_timeout_ms;
 
-        Ok(is_stale)
+            if stale {
+                debug!(
+                    "Lock is stale (cross-host, timeout): path={:?}, lock_hostname={}, age_ms={}, timeout_ms={}",
+                    lock_file_path, lock_hostname, age_ms, self.metadata_lock_timeout_ms
+                );
+            } else {
+                debug!(
+                    "Lock is active (cross-host, within timeout): path={:?}, lock_hostname={}, age_ms={}, timeout_ms={}",
+                    lock_file_path, lock_hostname, age_ms, self.metadata_lock_timeout_ms
+                );
+            }
+            Ok(stale)
+        }
     }
 
-    /// Break a stale lock with consistency validation
+    /// Break a stale lock with cross-host ownership awareness.
+    ///
+    /// Requirement 3.1: Never delete/recreate a lockfile owned by another host.
+    /// - Same-host stale lock (dead PID): delete and recreate as before.
+    /// - Different-host stale lock (timeout): overwrite content in-place with new
+    ///   fence epoch, fsync, then re-read to verify epoch matches.
     pub async fn break_stale_lock(&self, lock_file_path: &Path) -> Result<bool> {
         debug!("Breaking stale lock: path={:?}", lock_file_path);
 
-        // Read lock content before breaking (for logging)
+        // Read lock content to determine ownership
         let lock_info = match std::fs::read_to_string(lock_file_path) {
-            Ok(content) => match LockFileContent::from_json(&content) {
-                Ok(lock_content) => Some(format!(
-                    "process_id={}, instance_id={}, operation={}",
-                    lock_content.process_id, lock_content.instance_id, lock_content.operation
-                )),
-                Err(_) => Some("corrupted".to_string()),
-            },
+            Ok(content) => LockFileContent::from_json(&content).ok(),
             Err(_) => None,
         };
 
-        // Remove the stale lock file
-        match std::fs::remove_file(lock_file_path) {
-            Ok(()) => {
-                info!(
-                    "Successfully broke stale lock: path={:?}, lock_info={:?}",
-                    lock_file_path, lock_info
-                );
+        let is_same_host = lock_info
+            .as_ref()
+            .map(|info| info.hostname_component() == self.hostname.as_str())
+            .unwrap_or(true); // If we can't parse, treat as local (safe to delete)
 
-                Ok(true)
+        if is_same_host {
+            // Same-host stale lock (dead PID): safe to delete and recreate
+            match std::fs::remove_file(lock_file_path) {
+                Ok(()) => {
+                    info!(
+                        "Broke stale same-host lock (deleted): path={:?}, lock_info={:?}",
+                        lock_file_path,
+                        lock_info
+                            .as_ref()
+                            .map(|i| format!("instance_id={}, pid={}", i.instance_id, i.pid))
+                    );
+                    Ok(true)
+                }
+                Err(e) => {
+                    info!(
+                        "Failed to break stale same-host lock (likely already removed): path={:?}, error={}",
+                        lock_file_path, e
+                    );
+                    Err(ProxyError::CacheError(format!(
+                        "Failed to remove stale lock file: {}",
+                        e
+                    )))
+                }
             }
-            Err(e) => {
-                info!(
-                    "Failed to break stale lock (likely already removed): path={:?}, lock_info={:?}, error={}",
-                    lock_file_path, lock_info, e
+        } else {
+            // Different-host stale lock (Req 3.1): do NOT delete/recreate.
+            // Instead, overwrite content in-place with a new fence epoch.
+            let prev_epoch = lock_info.as_ref().map(|i| i.fence_epoch).unwrap_or(0);
+            let new_epoch = prev_epoch + 1;
+            let new_content = LockFileContent::new(new_epoch);
+
+            // Overwrite the lockfile content (atomic write via truncate+write+fsync)
+            use std::io::Write;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(lock_file_path)
+                .map_err(|e| {
+                    ProxyError::CacheError(format!(
+                        "Failed to open cross-host lock for overwrite: path={:?}, error={}",
+                        lock_file_path, e
+                    ))
+                })?;
+
+            let json = new_content.to_json()?;
+            file.write_all(json.as_bytes()).map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to write new epoch to cross-host lock: path={:?}, error={}",
+                    lock_file_path, e
+                ))
+            })?;
+            file.sync_all().map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to fsync cross-host lock: path={:?}, error={}",
+                    lock_file_path, e
+                ))
+            })?;
+            drop(file);
+
+            // Re-read to verify the epoch matches (fence verification)
+            let verify_content = std::fs::read_to_string(lock_file_path).map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to re-read cross-host lock for verification: path={:?}, error={}",
+                    lock_file_path, e
+                ))
+            })?;
+            let verified = LockFileContent::from_json(&verify_content)?;
+            if verified.fence_epoch != new_epoch {
+                warn!(
+                    "Fence epoch mismatch after cross-host lock takeover: path={:?}, expected={}, got={}",
+                    lock_file_path, new_epoch, verified.fence_epoch
                 );
-                Err(ProxyError::CacheError(format!(
-                    "Failed to remove stale lock file: {}",
-                    e
-                )))
+                return Ok(false);
             }
+
+            info!(
+                "Broke stale cross-host lock (overwritten with new epoch): path={:?}, prev_host={}, new_epoch={}",
+                lock_file_path,
+                lock_info.as_ref().map(|i| i.hostname.as_str()).unwrap_or("unknown"),
+                new_epoch
+            );
+            Ok(true)
         }
     }
     /// Get lock file path for a cache key
@@ -739,13 +1042,12 @@ impl MetadataLockManager {
     }
 }
 
-/// Get unique instance ID for this process
-fn get_instance_id() -> String {
-    format!(
-        "{}:{}",
-        hostname::get().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    )
+/// Get the current time in milliseconds since UNIX epoch
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Check if a process is alive (cross-platform)
@@ -792,50 +1094,68 @@ mod tests {
 
     #[test]
     fn test_lock_file_content_creation() {
-        let content = LockFileContent::new(
-            "test_operation".to_string(),
-            "test-bucket/test-object".to_string(),
-        );
+        let content = LockFileContent::new(0);
 
-        assert_eq!(content.process_id, std::process::id());
-        assert_eq!(content.operation, "test_operation");
-        assert_eq!(content.cache_key, "test-bucket/test-object");
+        assert_eq!(content.pid, std::process::id());
         assert!(!content.instance_id.is_empty());
+        assert!(!content.hostname.is_empty());
+        assert_eq!(content.fence_epoch, 0);
+        assert!(content.acquired_at_ms > 0);
     }
 
     #[test]
     fn test_lock_file_content_serialization() {
-        let content = LockFileContent::new(
-            "test_operation".to_string(),
-            "test-bucket/test-object".to_string(),
-        );
+        let content = LockFileContent::new(42);
 
         let json = content.to_json().unwrap();
         let deserialized = LockFileContent::from_json(&json).unwrap();
 
-        assert_eq!(deserialized.process_id, content.process_id);
-        assert_eq!(deserialized.operation, content.operation);
-        assert_eq!(deserialized.cache_key, content.cache_key);
+        assert_eq!(deserialized.pid, content.pid);
         assert_eq!(deserialized.instance_id, content.instance_id);
+        assert_eq!(deserialized.hostname, content.hostname);
+        assert_eq!(deserialized.acquired_at_ms, content.acquired_at_ms);
+        assert_eq!(deserialized.fence_epoch, content.fence_epoch);
     }
 
     #[test]
-    fn test_lock_file_content_stale_detection() {
-        let mut content = LockFileContent::new(
-            "test_operation".to_string(),
-            "test-bucket/test-object".to_string(),
-        );
+    fn test_lock_file_content_stale_detection_same_host() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
 
-        // Fresh lock should not be stale
-        assert!(!content.is_stale(Duration::from_secs(60)));
+        let lock_path = temp_dir.path().join("test.lock");
 
-        // Old lock with current process should not be stale (process is alive)
-        content.acquired_at = SystemTime::now() - Duration::from_secs(120);
-        assert!(!content.is_stale(Duration::from_secs(60)));
+        // Write a lock owned by current host with current PID — should NOT be stale
+        let content = LockFileContent::new(0);
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(!manager.is_lock_stale(&lock_path).unwrap());
 
-        // Old lock with non-existent process should be stale
-        content.process_id = 999999; // Unlikely to exist
-        assert!(content.is_stale(Duration::from_secs(60)));
+        // Write a lock owned by current host with non-existent PID — should be stale
+        let mut content = LockFileContent::new(0);
+        content.pid = 999999; // Unlikely to exist
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(manager.is_lock_stale(&lock_path).unwrap());
+    }
+
+    #[test]
+    fn test_lock_file_content_stale_detection_cross_host() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let lock_path = temp_dir.path().join("test.lock");
+
+        // Write a lock owned by a different host, recently acquired — should NOT be stale
+        let mut content = LockFileContent::with_hostname("other-host".to_string(), 12345, 0);
+        content.acquired_at_ms = now_ms(); // just acquired
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(!manager.is_lock_stale(&lock_path).unwrap());
+
+        // Write a lock owned by a different host, acquired long ago — should be stale
+        let mut content = LockFileContent::with_hostname("other-host".to_string(), 12345, 0);
+        content.acquired_at_ms = now_ms().saturating_sub(60_000); // 60s ago, timeout is 30s
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(manager.is_lock_stale(&lock_path).unwrap());
     }
 
     #[test]
@@ -861,11 +1181,13 @@ mod tests {
         assert_eq!(lock.cache_key(), cache_key);
         assert!(lock.lock_file_path().exists());
 
-        // Lock file should contain valid JSON
+        // Lock file should contain valid JSON with new format
         let content = std::fs::read_to_string(lock.lock_file_path()).unwrap();
         let lock_content = LockFileContent::from_json(&content).unwrap();
-        assert_eq!(lock_content.cache_key, cache_key);
-        assert_eq!(lock_content.process_id, std::process::id());
+        assert_eq!(lock_content.pid, std::process::id());
+        assert!(!lock_content.hostname.is_empty());
+        assert!(!lock_content.instance_id.is_empty());
+        assert!(lock_content.acquired_at_ms > 0);
     }
 
     #[tokio::test]
@@ -1254,5 +1576,472 @@ mod tests {
             result.is_err(),
             "Malformed cache key must return Err, got Ok"
         );
+    }
+
+    // =========================================================================
+    // Cross-host metadata lock behavior tests (Task 4.5)
+    // Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5
+    // =========================================================================
+
+    /// Requirement 3.2: Same-host staleness uses PID check — dead PID = stale
+    #[test]
+    fn test_same_host_staleness_uses_pid_check() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let lock_path = temp_dir.path().join("same_host.lock");
+
+        // Current PID is alive — lock should NOT be stale
+        let content = LockFileContent::new(0);
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(
+            !manager.is_lock_stale(&lock_path).unwrap(),
+            "Lock with current PID should not be stale"
+        );
+
+        // Non-existent PID on same host — lock SHOULD be stale
+        let hostname = hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let dead_pid = 4_000_000; // PID unlikely to exist
+        let content = LockFileContent::with_hostname(hostname, dead_pid, 5);
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(
+            manager.is_lock_stale(&lock_path).unwrap(),
+            "Lock with dead PID on same host should be stale"
+        );
+    }
+
+    /// Requirement 3.3: Different-host staleness uses wall-clock timeout only
+    #[test]
+    fn test_cross_host_staleness_uses_wall_clock_timeout_only() {
+        let temp_dir = TempDir::new().unwrap();
+        // Use a short timeout (1 second) for testing
+        let manager = MetadataLockManager::with_metadata_lock_timeout(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+            1_000, // 1 second timeout
+        );
+
+        let lock_path = temp_dir.path().join("cross_host.lock");
+
+        // Lock from another host, acquired just now — should NOT be stale
+        // (even though the PID doesn't exist locally, we don't check PID for remote hosts)
+        let mut content = LockFileContent::with_hostname("remote-host-alpha".to_string(), 99999, 0);
+        content.acquired_at_ms = now_ms();
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(
+            !manager.is_lock_stale(&lock_path).unwrap(),
+            "Recent cross-host lock should not be stale regardless of PID"
+        );
+
+        // Lock from another host, acquired 5 seconds ago (exceeds 1s timeout) — SHOULD be stale
+        let mut content = LockFileContent::with_hostname("remote-host-beta".to_string(), 12345, 0);
+        content.acquired_at_ms = now_ms().saturating_sub(5_000);
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(
+            manager.is_lock_stale(&lock_path).unwrap(),
+            "Cross-host lock exceeding timeout should be stale"
+        );
+    }
+
+    /// Requirement 3.3: Cross-host staleness does NOT consult local PID
+    /// Even if the PID happens to be alive locally, a cross-host lock's staleness
+    /// is determined solely by wall-clock age.
+    #[test]
+    fn test_cross_host_ignores_local_pid_existence() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = MetadataLockManager::with_metadata_lock_timeout(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+            1_000, // 1 second timeout
+        );
+
+        let lock_path = temp_dir.path().join("cross_host_pid.lock");
+
+        // Use current process PID but from a different hostname.
+        // Even though this PID is alive locally, the lock is from another host
+        // so staleness should be determined by wall-clock only.
+        let current_pid = std::process::id();
+        let mut content =
+            LockFileContent::with_hostname("different-host".to_string(), current_pid, 0);
+        content.acquired_at_ms = now_ms().saturating_sub(5_000); // 5s ago, exceeds 1s timeout
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(
+            manager.is_lock_stale(&lock_path).unwrap(),
+            "Cross-host lock should be stale based on timeout even if PID is alive locally"
+        );
+
+        // Same scenario but within timeout — should NOT be stale
+        let mut content =
+            LockFileContent::with_hostname("different-host".to_string(), current_pid, 0);
+        content.acquired_at_ms = now_ms(); // just now
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+        assert!(
+            !manager.is_lock_stale(&lock_path).unwrap(),
+            "Cross-host lock within timeout should not be stale even if PID is alive locally"
+        );
+    }
+
+    /// Requirement 3.1: Never delete/recreate lockfile owned by another host.
+    /// break_stale_lock overwrites in-place for cross-host locks.
+    #[tokio::test]
+    async fn test_break_stale_lock_overwrites_cross_host_instead_of_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = MetadataLockManager::with_metadata_lock_timeout(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+            1_000,
+        );
+
+        let lock_path = temp_dir.path().join("cross_host_break.lock");
+
+        // Create a lock from a different host with epoch 5
+        let mut content = LockFileContent::with_hostname("remote-host-gamma".to_string(), 54321, 5);
+        content.acquired_at_ms = now_ms().saturating_sub(60_000); // stale
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+
+        // Break the stale lock — should overwrite, NOT delete
+        let result = manager.break_stale_lock(&lock_path).await.unwrap();
+        assert!(result, "break_stale_lock should succeed");
+
+        // File should still exist (overwritten, not deleted)
+        assert!(
+            lock_path.exists(),
+            "Cross-host lock file should still exist after break (overwritten, not deleted)"
+        );
+
+        // Content should have incremented epoch
+        let new_content = std::fs::read_to_string(&lock_path).unwrap();
+        let new_info = LockFileContent::from_json(&new_content).unwrap();
+        assert_eq!(
+            new_info.fence_epoch, 6,
+            "Epoch should be incremented from 5 to 6 on cross-host takeover"
+        );
+    }
+
+    /// Requirement 3.1: Same-host stale lock (dead PID) IS deleted
+    #[tokio::test]
+    async fn test_break_stale_lock_deletes_same_host() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let lock_path = temp_dir.path().join("same_host_break.lock");
+
+        // Create a lock from the current host with a dead PID
+        let hostname = hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let content = LockFileContent::with_hostname(hostname, 4_000_000, 3);
+        std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+
+        // Break the stale lock — should delete for same-host
+        let result = manager.break_stale_lock(&lock_path).await.unwrap();
+        assert!(result, "break_stale_lock should succeed for same-host");
+
+        // File should be deleted
+        assert!(
+            !lock_path.exists(),
+            "Same-host stale lock file should be deleted"
+        );
+    }
+
+    /// Requirement 3.4: Fence-epoch verification — acquisition rejected on epoch mismatch.
+    /// Tests that the fence-epoch mechanism detects when another host has modified the
+    /// lockfile. The heartbeat refresh path checks epoch before updating, and rejects
+    /// if the epoch has changed (indicating another host took over).
+    #[tokio::test]
+    async fn test_fence_epoch_verification_rejects_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let cache_key = "test-bucket/epoch-mismatch-object";
+        let lock = manager.acquire_lock(cache_key).await.unwrap();
+
+        // Read the lock's epoch
+        let original_epoch = lock.fence_epoch();
+
+        // Simulate another host taking over by writing a different epoch to the lockfile
+        let hijacker =
+            LockFileContent::with_hostname("hijacker-host".to_string(), 7777, original_epoch + 5);
+        std::fs::write(lock.lock_file_path(), hijacker.to_json().unwrap()).unwrap();
+
+        // Now any operation that verifies the epoch should fail
+        let result = lock.refresh_heartbeat();
+        assert!(
+            result.is_err(),
+            "Operations should be rejected when fence epoch has been changed by another host"
+        );
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Fence epoch mismatch"),
+            "Error should mention fence epoch mismatch, got: {}",
+            err_msg
+        );
+    }
+
+    /// Requirement 3.4: Fence-epoch verification succeeds when epoch matches
+    #[test]
+    fn test_fence_epoch_verification_succeeds_on_match() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let lock_path = temp_dir.path().join("epoch_ok.lock");
+
+        let content = LockFileContent::with_hostname("host-a".to_string(), 1000, 42);
+
+        // write_and_verify should succeed when no race occurs
+        let result = manager.write_and_verify_lock_content(&lock_path, &content, "test/key");
+        assert!(
+            result.is_ok(),
+            "write_and_verify should succeed when epoch matches: {:?}",
+            result.err()
+        );
+
+        // Verify the file contains the expected epoch
+        let stored = std::fs::read_to_string(&lock_path).unwrap();
+        let stored_info = LockFileContent::from_json(&stored).unwrap();
+        assert_eq!(stored_info.fence_epoch, 42);
+    }
+
+    /// Requirement 3.5: LockFileContent serialization/deserialization round-trip
+    #[test]
+    fn test_lock_file_content_round_trip() {
+        let content = LockFileContent::with_hostname("test-host-xyz".to_string(), 12345, 99);
+
+        let json = content.to_json().unwrap();
+        let deserialized = LockFileContent::from_json(&json).unwrap();
+
+        assert_eq!(deserialized.instance_id, "test-host-xyz:12345");
+        assert_eq!(deserialized.hostname, "test-host-xyz");
+        assert_eq!(deserialized.pid, 12345);
+        assert_eq!(deserialized.fence_epoch, 99);
+        assert_eq!(deserialized.acquired_at_ms, content.acquired_at_ms);
+    }
+
+    /// Requirement 3.5: LockFileContent round-trip with various hostnames
+    #[test]
+    fn test_lock_file_content_round_trip_various_hostnames() {
+        let test_cases = vec![
+            ("simple-host", 1, 0),
+            ("host.with.dots.example.com", 65535, u64::MAX),
+            ("UPPERCASE-HOST", 1, 1),
+            ("host-with-dashes-123", 99999, 42),
+        ];
+
+        for (hostname, pid, epoch) in test_cases {
+            let content = LockFileContent::with_hostname(hostname.to_string(), pid, epoch);
+            let json = content.to_json().unwrap();
+            let deserialized = LockFileContent::from_json(&json).unwrap();
+
+            assert_eq!(deserialized.hostname, hostname);
+            assert_eq!(deserialized.pid, pid);
+            assert_eq!(deserialized.fence_epoch, epoch);
+            assert_eq!(
+                deserialized.hostname_component(),
+                hostname,
+                "hostname_component() should return the hostname"
+            );
+        }
+    }
+
+    /// Requirement 3.5: Heartbeat refresh updates acquired_at_ms without changing epoch
+    #[tokio::test]
+    async fn test_heartbeat_refresh_updates_timestamp_preserves_epoch() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let cache_key = "test-bucket/heartbeat-test-object";
+        let lock = manager.acquire_lock(cache_key).await.unwrap();
+
+        // Read initial state
+        let initial_content = std::fs::read_to_string(lock.lock_file_path()).unwrap();
+        let initial_info = LockFileContent::from_json(&initial_content).unwrap();
+        let initial_epoch = initial_info.fence_epoch;
+        let initial_timestamp = initial_info.acquired_at_ms;
+
+        // Small sleep to ensure timestamp advances
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Refresh heartbeat
+        lock.refresh_heartbeat().unwrap();
+
+        // Read updated state
+        let updated_content = std::fs::read_to_string(lock.lock_file_path()).unwrap();
+        let updated_info = LockFileContent::from_json(&updated_content).unwrap();
+
+        // Epoch should be unchanged
+        assert_eq!(
+            updated_info.fence_epoch, initial_epoch,
+            "Heartbeat refresh must not change fence_epoch"
+        );
+
+        // Timestamp should be updated (>= initial)
+        assert!(
+            updated_info.acquired_at_ms >= initial_timestamp,
+            "Heartbeat refresh should update acquired_at_ms: initial={}, updated={}",
+            initial_timestamp,
+            updated_info.acquired_at_ms
+        );
+
+        // Other fields should be preserved
+        assert_eq!(updated_info.pid, initial_info.pid);
+        assert_eq!(updated_info.hostname, initial_info.hostname);
+        assert_eq!(updated_info.instance_id, initial_info.instance_id);
+    }
+
+    /// Requirement 3.4: Heartbeat refresh fails on epoch mismatch (another host took over)
+    #[tokio::test]
+    async fn test_heartbeat_refresh_fails_on_epoch_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let cache_key = "test-bucket/heartbeat-mismatch-object";
+        let lock = manager.acquire_lock(cache_key).await.unwrap();
+
+        // Simulate another host overwriting the lock file with a different epoch
+        let hijacked_content =
+            LockFileContent::with_hostname("hijacker-host".to_string(), 9999, 999);
+        std::fs::write(lock.lock_file_path(), hijacked_content.to_json().unwrap()).unwrap();
+
+        // Heartbeat refresh should fail because epoch doesn't match
+        let result = lock.refresh_heartbeat();
+        assert!(
+            result.is_err(),
+            "Heartbeat refresh should fail when epoch has been changed by another host"
+        );
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Fence epoch mismatch"),
+            "Error should mention fence epoch mismatch, got: {}",
+            err_msg
+        );
+    }
+
+    /// Requirement 3.1, 3.3: Multi-host contention simulation
+    /// Simulates two hosts with different instance_ids contending for the same lock.
+    #[test]
+    fn test_multi_host_contention_staleness_decisions() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create two managers simulating different hosts
+        // Manager A: represents the local host
+        let manager_a =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        // Manager B: we simulate by checking how manager_a evaluates locks from "host-b"
+        let lock_path = temp_dir.path().join("contention.lock");
+
+        // Scenario 1: host-b holds a fresh lock — manager_a should see it as NOT stale
+        let mut content_b = LockFileContent::with_hostname("host-b".to_string(), 5000, 1);
+        content_b.acquired_at_ms = now_ms();
+        std::fs::write(&lock_path, content_b.to_json().unwrap()).unwrap();
+        assert!(
+            !manager_a.is_lock_stale(&lock_path).unwrap(),
+            "Fresh cross-host lock should not be stale"
+        );
+
+        // Scenario 2: host-b's lock has timed out — manager_a should see it as stale
+        let mut content_b = LockFileContent::with_hostname("host-b".to_string(), 5000, 1);
+        content_b.acquired_at_ms = now_ms().saturating_sub(60_000); // 60s ago, default timeout 30s
+        std::fs::write(&lock_path, content_b.to_json().unwrap()).unwrap();
+        assert!(
+            manager_a.is_lock_stale(&lock_path).unwrap(),
+            "Timed-out cross-host lock should be stale"
+        );
+
+        // Scenario 3: host-b's lock is just barely within timeout — should NOT be stale
+        let mut content_b = LockFileContent::with_hostname("host-b".to_string(), 5000, 1);
+        content_b.acquired_at_ms = now_ms().saturating_sub(29_000); // 29s ago, timeout is 30s
+        std::fs::write(&lock_path, content_b.to_json().unwrap()).unwrap();
+        assert!(
+            !manager_a.is_lock_stale(&lock_path).unwrap(),
+            "Lock within timeout should not be stale"
+        );
+    }
+
+    /// Requirement 3.5: Unparseable lock file content treated as remote-owned
+    #[test]
+    fn test_unparseable_lock_treated_as_remote_with_wall_clock() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = MetadataLockManager::with_metadata_lock_timeout(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+            1_000, // 1 second timeout
+        );
+
+        let lock_path = temp_dir.path().join("corrupt.lock");
+
+        // Write garbage content — should be treated as remote-owned
+        // and use file mtime for wall-clock check
+        std::fs::write(&lock_path, "this is not valid json {{{").unwrap();
+
+        // File was just written so mtime is recent — should NOT be stale
+        // (within 1 second timeout)
+        assert!(
+            !manager.is_lock_stale(&lock_path).unwrap(),
+            "Recently-written unparseable lock should not be stale"
+        );
+    }
+
+    /// Requirement 3.5: Empty lock file is always stale
+    #[test]
+    fn test_empty_lock_file_is_stale() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let lock_path = temp_dir.path().join("empty.lock");
+        std::fs::write(&lock_path, "").unwrap();
+
+        assert!(
+            manager.is_lock_stale(&lock_path).unwrap(),
+            "Empty lock file should always be stale"
+        );
+    }
+
+    /// Requirement 3.4: Cross-host break_stale_lock increments fence epoch correctly
+    #[tokio::test]
+    async fn test_cross_host_break_increments_epoch_from_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let lock_path = temp_dir.path().join("epoch_increment.lock");
+
+        // Test epoch increment from various starting values
+        for start_epoch in [0u64, 1, 42, 100, u64::MAX - 1] {
+            let mut content =
+                LockFileContent::with_hostname("remote-host".to_string(), 11111, start_epoch);
+            content.acquired_at_ms = now_ms().saturating_sub(60_000); // stale
+            std::fs::write(&lock_path, content.to_json().unwrap()).unwrap();
+
+            let result = manager.break_stale_lock(&lock_path).await.unwrap();
+            assert!(result);
+
+            let new_content = std::fs::read_to_string(&lock_path).unwrap();
+            let new_info = LockFileContent::from_json(&new_content).unwrap();
+            assert_eq!(
+                new_info.fence_epoch,
+                start_epoch + 1,
+                "Epoch should increment from {} to {}",
+                start_epoch,
+                start_epoch + 1
+            );
+        }
     }
 }

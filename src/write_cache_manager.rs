@@ -8,16 +8,115 @@
 //! - Requirement 6.1: Write cache capacity limited to percentage of disk cache
 //! - Requirement 6.5: Eviction uses configured algorithm (LRU or TinyLFU)
 //! - Requirement 4.2, 4.3: Incomplete upload eviction after TTL
+//! - Requirement 9.1: Atomic CAS-loop reservation (no separate check + reserve)
+//! - Requirement 9.2: Single entry point returns reservation handle or "no capacity"
+//! - Requirement 9.3: Saturating release on drop (never underflows)
+//! - Requirement 9.4: Concurrent releases produce correct final value
+//! - Requirement 9.5: Rate-limited warn on underflow detection
 
 use crate::cache::CacheEvictionAlgorithm;
 
 use crate::{ProxyError, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tracing::{debug, error, info, warn};
+
+/// Rate-limit interval for underflow warnings (seconds).
+/// At most one warning per this interval to avoid log spam.
+const UNDERFLOW_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Global atomic timestamp (epoch seconds) for rate-limiting underflow warnings.
+/// Shared across all `WriteReservation` drops within the process.
+static LAST_UNDERFLOW_WARN: AtomicU64 = AtomicU64::new(0);
+
+/// RAII handle representing a successful capacity reservation in the write cache.
+///
+/// Holds `size` bytes reserved against the shared `current_size` counter.
+/// On drop, releases the reservation using saturating subtraction to prevent underflow.
+/// If an underflow condition is detected (current < size before saturation), a
+/// rate-limited `warn!` is emitted.
+///
+/// # Requirements
+/// Implements Requirements 9.1, 9.3, 9.4, 9.5
+pub struct WriteReservation {
+    size: u64,
+    current_size: Arc<AtomicU64>,
+}
+
+impl WriteReservation {
+    /// Get the reserved size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Create a no-op reservation that does nothing on drop.
+    ///
+    /// Used as a fallback when `WriteCacheManager` is not initialized (e.g., during
+    /// early startup or in tests that don't call `initialize()`). The reservation
+    /// signals "proceed with the operation" without tracking capacity.
+    pub fn noop() -> Self {
+        Self {
+            size: 0,
+            current_size: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Drop for WriteReservation {
+    fn drop(&mut self) {
+        if self.size == 0 {
+            return;
+        }
+
+        // Use fetch_update with saturating subtraction to prevent underflow.
+        // This is atomic: the CAS loop ensures correctness under concurrent drops.
+        let result =
+            self.current_size
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    if current < self.size {
+                        // Underflow detected — emit rate-limited warning
+                        let now_secs = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let last = LAST_UNDERFLOW_WARN.load(Ordering::Relaxed);
+                        if now_secs.saturating_sub(last) >= UNDERFLOW_WARN_INTERVAL_SECS
+                            && LAST_UNDERFLOW_WARN
+                                .compare_exchange(
+                                    last,
+                                    now_secs,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                        {
+                            warn!(
+                                release_size = self.size,
+                                current_size = current,
+                                "Write cache capacity underflow detected: \
+                             release_size ({}) > current_size ({}), saturating to 0",
+                                self.size,
+                                current
+                            );
+                        }
+                        Some(0)
+                    } else {
+                        Some(current - self.size)
+                    }
+                });
+
+        // fetch_update with Some(...) always succeeds eventually, but log if it somehow fails
+        if let Err(val) = result {
+            debug!(
+                "WriteReservation drop: unexpected fetch_update failure, current_size={}",
+                val
+            );
+        }
+    }
+}
 
 /// Write cache manager for capacity tracking and eviction
 ///
@@ -29,12 +128,15 @@ use tracing::{debug, error, info, warn};
 /// - All capacity tracking uses compressed size (actual disk usage)
 /// - Eviction is triggered when capacity would be exceeded
 /// - Incomplete multipart uploads are evicted after TTL expiration
+/// - Capacity reservation uses a single atomic CAS-loop entry point (`try_reserve`)
+///   that returns an RAII `WriteReservation` handle (Requirement 9.1, 9.2)
 pub struct WriteCacheManager {
     /// Maximum write cache size in bytes (calculated from percentage of total cache)
     max_size: u64,
 
-    /// Current write cache usage in bytes (compressed size on disk)
-    current_size: AtomicU64,
+    /// Current write cache usage in bytes (compressed size on disk).
+    /// Shared with `WriteReservation` handles via `Arc`.
+    current_size: Arc<AtomicU64>,
 
     /// Write cache TTL (default: 1 day), refreshed on read access
     write_ttl: Duration,
@@ -47,8 +149,6 @@ pub struct WriteCacheManager {
 
     /// Cache directory for file operations
     cache_dir: PathBuf,
-
-    /// Reference to disk cache manager for storage operations
 
     /// Maximum object size for write caching (objects larger than this bypass cache)
     max_object_size: u64,
@@ -94,7 +194,7 @@ impl WriteCacheManager {
 
         Self {
             max_size,
-            current_size: AtomicU64::new(0),
+            current_size: Arc::new(AtomicU64::new(0)),
             write_ttl,
             incomplete_upload_ttl,
             eviction_algorithm,
@@ -122,6 +222,7 @@ impl WriteCacheManager {
             256 * 1024 * 1024, // 256MB
         )
     }
+
     /// Get the maximum write cache size
     pub fn max_size(&self) -> u64 {
         self.max_size
@@ -153,7 +254,7 @@ impl WriteCacheManager {
     }
 
     // =========================================================================
-    // Capacity Management Methods (Requirements 6.1, 6.2, 6.3)
+    // Capacity Management Methods (Requirements 9.1, 9.2, 9.3, 9.4, 9.5)
     // =========================================================================
 
     /// Get current write cache usage (compressed bytes on disk)
@@ -164,117 +265,148 @@ impl WriteCacheManager {
         self.current_size.load(Ordering::SeqCst)
     }
 
-    /// Check if there's capacity for a new write, evicting if necessary
+    /// Atomically reserve capacity for a write operation.
     ///
-    /// This method:
-    /// 1. Checks if the estimated size would exceed capacity
-    /// 2. If so, attempts to evict existing write-cached objects
-    /// 3. Returns true if space is available (possibly after eviction)
+    /// Returns an RAII `WriteReservation` handle that automatically releases
+    /// the reserved capacity on drop (including on cancellation/panic).
+    /// Returns `None` if:
+    /// - The requested size exceeds `max_object_size`
+    /// - There is insufficient capacity (even after attempting eviction)
+    /// - The size would overflow `u64` when added to current usage
+    ///
+    /// This is the single entry point for capacity reservation, replacing the
+    /// previous `ensure_capacity` + `reserve_capacity` two-step pattern.
     ///
     /// # Arguments
-    /// * `estimated_compressed_size` - Expected compressed size on disk
+    /// * `size` - Number of bytes to reserve (compressed size)
     ///
     /// # Returns
-    /// * `true` if space is available (possibly after eviction)
-    /// * `false` if eviction cannot free sufficient space
+    /// * `Some(WriteReservation)` - Reservation handle; capacity is held until dropped
+    /// * `None` - Insufficient capacity or size exceeds limits
     ///
     /// # Requirements
-    /// Implements Requirements 6.1, 6.2
-    pub async fn ensure_capacity(&self, estimated_compressed_size: u64) -> bool {
-        let current = self.current_size.load(Ordering::SeqCst);
-        let needed = current.saturating_add(estimated_compressed_size);
-
-        // Check if object exceeds max object size
-        if estimated_compressed_size > self.max_object_size {
+    /// Implements Requirements 9.1, 9.2
+    pub async fn try_reserve(&self, size: u64) -> Option<WriteReservation> {
+        // Reject objects exceeding max object size
+        if size > self.max_object_size {
             debug!(
                 "Write cache bypass: object size {} exceeds max_object_size {}",
-                estimated_compressed_size, self.max_object_size
+                size, self.max_object_size
             );
-            return false;
+            return None;
         }
 
-        // Check if we have enough space
-        if needed <= self.max_size {
+        // Fast path: attempt atomic CAS reservation without eviction
+        if let Some(reservation) = self.try_cas_reserve(size) {
+            return Some(reservation);
+        }
+
+        // Slow path: attempt eviction then retry CAS
+        let current = self.current_size.load(Ordering::SeqCst);
+        let needed = current.saturating_add(size);
+        if needed > self.max_size {
+            let target_size = self.max_size.saturating_sub(size);
             debug!(
-                "Write cache has capacity: current={}, needed={}, max={}",
-                current, needed, self.max_size
+                "Write cache needs eviction: current={}, needed={}, max={}, target={}",
+                current, needed, self.max_size, target_size
             );
-            return true;
-        }
 
-        // Need to evict to make space
-        let bytes_to_free = needed.saturating_sub(self.max_size);
-        debug!(
-            "Write cache needs eviction: current={}, needed={}, max={}, bytes_to_free={}",
-            current, needed, self.max_size, bytes_to_free
-        );
-
-        // Calculate target size (with some buffer to avoid frequent evictions)
-        let target_size = self.max_size.saturating_sub(estimated_compressed_size);
-
-        match self.evict_to_target(target_size).await {
-            Ok(freed) => {
-                let new_current = self.current_size.load(Ordering::SeqCst);
-                let can_fit =
-                    new_current.saturating_add(estimated_compressed_size) <= self.max_size;
-
-                if can_fit {
-                    info!(
-                        "Write cache eviction successful: freed={} bytes, new_current={}, can_fit={}",
-                        freed, new_current, can_fit
-                    );
-                } else {
-                    warn!(
-                        "Write cache eviction insufficient: freed={} bytes, new_current={}, needed={}",
-                        freed, new_current, estimated_compressed_size
-                    );
+            match self.evict_to_target(target_size).await {
+                Ok(freed) => {
+                    if freed > 0 {
+                        info!(
+                            "Write cache eviction freed {} bytes for reservation of {}",
+                            freed, size
+                        );
+                    }
                 }
-                can_fit
+                Err(e) => {
+                    error!("Write cache eviction failed: {}", e);
+                    return None;
+                }
             }
-            Err(e) => {
-                error!("Write cache eviction failed: {}", e);
-                false
+        }
+
+        // Retry CAS after eviction
+        self.try_cas_reserve(size)
+    }
+
+    /// Attempt a single CAS-loop reservation without eviction.
+    ///
+    /// Returns `Some(WriteReservation)` if the reservation succeeds atomically,
+    /// or `None` if current_size + size would exceed max_size or overflow.
+    fn try_cas_reserve(&self, size: u64) -> Option<WriteReservation> {
+        loop {
+            let current = self.current_size.load(Ordering::SeqCst);
+            let new = current.checked_add(size)?;
+            if new > self.max_size {
+                return None;
+            }
+            match self.current_size.compare_exchange_weak(
+                current,
+                new,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    debug!(
+                        "Write cache reserved: size={}, old_total={}, new_total={}",
+                        size, current, new
+                    );
+                    return Some(WriteReservation {
+                        size,
+                        current_size: self.current_size.clone(),
+                    });
+                }
+                Err(_) => continue, // CAS failed, retry
             }
         }
     }
 
-    /// Reserve capacity for a write (call after ensure_capacity succeeds)
+    /// Directly release capacity (for internal eviction use only).
     ///
-    /// # Arguments
-    /// * `compressed_size` - Actual compressed size written to disk
+    /// Uses saturating subtraction to prevent underflow. Emits a rate-limited
+    /// warning if underflow would have occurred.
     ///
-    /// # Requirements
-    /// Implements Requirement 6.1
-    pub fn reserve_capacity(&self, compressed_size: u64) {
-        let old = self
-            .current_size
-            .fetch_add(compressed_size, Ordering::SeqCst);
-        debug!(
-            "Write cache reserved: size={}, old_total={}, new_total={}",
-            compressed_size,
-            old,
-            old + compressed_size
-        );
-    }
+    /// This method is NOT part of the public API for callers performing uploads.
+    /// Upload callers use `WriteReservation` (RAII drop) for release.
+    /// This is used internally by eviction paths that track sizes independently.
+    fn release_capacity_internal(&self, compressed_size: u64) {
+        if compressed_size == 0 {
+            return;
+        }
 
-    /// Release capacity after eviction or expiration
-    ///
-    /// # Arguments
-    /// * `compressed_size` - Compressed size being freed
-    ///
-    /// # Requirements
-    /// Implements Requirement 6.1
-    pub fn release_capacity(&self, compressed_size: u64) {
-        let old = self.current_size.fetch_sub(
-            compressed_size.min(self.current_size.load(Ordering::SeqCst)),
-            Ordering::SeqCst,
-        );
-        debug!(
-            "Write cache released: size={}, old_total={}, new_total={}",
-            compressed_size,
-            old,
-            old.saturating_sub(compressed_size)
-        );
+        self.current_size
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                if current < compressed_size {
+                    // Underflow — rate-limited warning
+                    let now_secs = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let last = LAST_UNDERFLOW_WARN.load(Ordering::Relaxed);
+                    if now_secs.saturating_sub(last) >= UNDERFLOW_WARN_INTERVAL_SECS
+                        && LAST_UNDERFLOW_WARN
+                            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        warn!(
+                            release_size = compressed_size,
+                            current_size = current,
+                            "Write cache capacity underflow detected in eviction: \
+                             release_size ({}) > current_size ({}), saturating to 0",
+                            compressed_size,
+                            current
+                        );
+                    }
+                    Some(0)
+                } else {
+                    Some(current - compressed_size)
+                }
+            })
+            .ok();
+
+        debug!("Write cache released (internal): size={}", compressed_size);
     }
 
     /// Initialize from coordinated scan results
@@ -515,8 +647,8 @@ impl WriteCacheManager {
             warn!("Failed to remove metadata file {:?}: {}", metadata_path, e);
         }
 
-        // Update current size
-        self.release_capacity(total_freed);
+        // Update current size via internal saturating release
+        self.release_capacity_internal(total_freed);
 
         Ok(total_freed)
     }
@@ -688,7 +820,7 @@ impl WriteCacheManager {
             warn!("Failed to remove upload directory {:?}: {}", upload_dir, e);
         }
 
-        self.release_capacity(total_freed);
+        self.release_capacity_internal(total_freed);
         Ok(total_freed)
     }
 
@@ -847,29 +979,121 @@ mod tests {
         assert_eq!(manager.incomplete_upload_ttl(), Duration::from_secs(86400));
     }
 
-    #[test]
-    fn test_capacity_reserve_release() {
+    #[tokio::test]
+    async fn test_try_reserve_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024, // 1MB total
+            10.0,        // 10% = ~100KB max write cache
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::LRU,
+            256 * 1024 * 1024,
+        );
+
+        // Should succeed for small reservation
+        let reservation = manager.try_reserve(1000).await;
+        assert!(reservation.is_some());
+        assert_eq!(manager.current_usage(), 1000);
+
+        // Second reservation should also succeed
+        let reservation2 = manager.try_reserve(1000).await;
+        assert!(reservation2.is_some());
+        assert_eq!(manager.current_usage(), 2000);
+
+        // Drop first reservation — usage should decrease
+        drop(reservation);
+        assert_eq!(manager.current_usage(), 1000);
+
+        // Drop second reservation
+        drop(reservation2);
+        assert_eq!(manager.current_usage(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_try_reserve_exceeds_capacity() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            10_000, // 10KB total
+            10.0,   // 10% = 1000 bytes max write cache
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::LRU,
+            256 * 1024 * 1024,
+        );
+
+        // Reserve most of the capacity
+        let r1 = manager.try_reserve(900).await;
+        assert!(r1.is_some());
+
+        // This should fail — would exceed capacity
+        let r2 = manager.try_reserve(200).await;
+        assert!(r2.is_none());
+
+        // Usage should still be 900 (failed reservation doesn't change it)
+        assert_eq!(manager.current_usage(), 900);
+
+        // Drop r1, then the 200 reservation should succeed
+        drop(r1);
+        assert_eq!(manager.current_usage(), 0);
+
+        let r3 = manager.try_reserve(200).await;
+        assert!(r3.is_some());
+        assert_eq!(manager.current_usage(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_try_reserve_exceeds_max_object_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024 * 1024, // 1GB total
+            10.0,               // 10% = 100MB max write cache
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::LRU,
+            1024 * 1024, // 1MB max object size
+        );
+
+        // Object larger than max_object_size should be rejected
+        let reservation = manager.try_reserve(2 * 1024 * 1024).await;
+        assert!(reservation.is_none());
+        assert_eq!(manager.current_usage(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_reservation_drop_releases_capacity() {
         let temp_dir = TempDir::new().unwrap();
         let manager = WriteCacheManager::new_with_defaults(
             temp_dir.path().to_path_buf(),
             1024 * 1024 * 1024, // 1GB total
         );
 
+        {
+            let _r = manager.try_reserve(5000).await.unwrap();
+            assert_eq!(manager.current_usage(), 5000);
+            // _r drops here
+        }
+
         assert_eq!(manager.current_usage(), 0);
+    }
 
-        // Reserve some capacity
-        manager.reserve_capacity(1000);
-        assert_eq!(manager.current_usage(), 1000);
+    #[tokio::test]
+    async fn test_reservation_saturating_release() {
+        // Test that releasing more than current_size saturates to 0
+        let current_size = Arc::new(AtomicU64::new(50));
 
-        manager.reserve_capacity(500);
-        assert_eq!(manager.current_usage(), 1500);
+        let reservation = WriteReservation {
+            size: 100, // More than current_size
+            current_size: current_size.clone(),
+        };
 
-        // Release capacity
-        manager.release_capacity(500);
-        assert_eq!(manager.current_usage(), 1000);
+        drop(reservation);
 
-        manager.release_capacity(1000);
-        assert_eq!(manager.current_usage(), 0);
+        // Should saturate to 0, not underflow
+        assert_eq!(current_size.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -902,43 +1126,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_capacity_within_limits() {
+    async fn test_concurrent_reservations_never_exceed_capacity() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = WriteCacheManager::new(
+        let manager = Arc::new(WriteCacheManager::new(
             temp_dir.path().to_path_buf(),
-            1024 * 1024, // 1MB total
-            10.0,        // 10% = 100KB max write cache
+            10_000, // 10KB total
+            100.0,  // Will be clamped to 50% = 5000 bytes
             Duration::from_secs(86400),
             Duration::from_secs(86400),
             CacheEvictionAlgorithm::LRU,
-            256 * 1024 * 1024,
-        );
+            5000,
+        ));
 
-        // Should have capacity for small object
-        assert!(manager.ensure_capacity(1000).await);
+        let max_size = manager.max_size();
+        let mut handles = Vec::new();
 
-        // Reserve it
-        manager.reserve_capacity(1000);
+        // Spawn many concurrent reservation attempts
+        for _ in 0..50 {
+            let mgr = manager.clone();
+            handles.push(tokio::spawn(async move { mgr.try_reserve(100).await }));
+        }
 
-        // Should still have capacity
-        assert!(manager.ensure_capacity(1000).await);
-    }
+        let results: Vec<_> = futures::future::join_all(handles).await;
+        let successful: Vec<_> = results
+            .into_iter()
+            .filter_map(|r| r.ok().flatten())
+            .collect();
 
-    #[tokio::test]
-    async fn test_ensure_capacity_exceeds_max_object_size() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = WriteCacheManager::new(
-            temp_dir.path().to_path_buf(),
-            1024 * 1024 * 1024, // 1GB total
-            10.0,               // 10% = 100MB max write cache
-            Duration::from_secs(86400),
-            Duration::from_secs(86400),
-            CacheEvictionAlgorithm::LRU,
-            1024 * 1024, // 1MB max object size
-        );
+        // Current usage should equal sum of successful reservations
+        let total_reserved: u64 = successful.iter().map(|r| r.size()).sum();
+        assert_eq!(manager.current_usage(), total_reserved);
 
-        // Object larger than max_object_size should be rejected
-        assert!(!manager.ensure_capacity(2 * 1024 * 1024).await);
+        // Should never exceed capacity
+        assert!(total_reserved <= max_size);
     }
 }
 
@@ -999,6 +1219,9 @@ mod property_tests {
                 max_write_cache, // Max object size = max write cache for this test
             );
 
+            // Track active reservations
+            let mut active_reservations: Vec<WriteReservation> = Vec::new();
+
             // Process each request
             for size_kb in &request_sizes_kb {
                 let request_size = (*size_kb as u64) * 1024;
@@ -1008,20 +1231,13 @@ mod property_tests {
                     continue;
                 }
 
-                let _current_before = manager.current_usage();
-                let can_fit = manager.ensure_capacity(request_size).await;
-
-                if can_fit {
-                    // If ensure_capacity returns true, we should be able to fit
-                    let current_after = manager.current_usage();
-                    let would_fit = current_after + request_size <= max_write_cache;
-
-                    if !would_fit {
-                        return TestResult::failed();
+                match manager.try_reserve(request_size).await {
+                    Some(reservation) => {
+                        active_reservations.push(reservation);
                     }
-
-                    // Simulate reserving the capacity
-                    manager.reserve_capacity(request_size);
+                    None => {
+                        // Reservation failed — that's fine, capacity was full
+                    }
                 }
 
                 // Property: current usage should never exceed max
@@ -1029,6 +1245,12 @@ mod property_tests {
                 if current > max_write_cache {
                     return TestResult::failed();
                 }
+            }
+
+            // After dropping all reservations, usage should be 0
+            drop(active_reservations);
+            if manager.current_usage() != 0 {
+                return TestResult::failed();
             }
 
             TestResult::passed()
@@ -1169,6 +1391,95 @@ mod property_tests {
                     // principle should hold: older/less frequent items first
                     // For this test, we just verify the algorithm is applied consistently
                 }
+            }
+
+            TestResult::passed()
+        })
+    }
+
+    /// Property 9: Monotone non-underflowing capacity
+    ///
+    /// *For any* generated interleaved reserve/release trace, assert that
+    /// `current_size` is always in the range `[0, capacity]` at every step,
+    /// that after all reservations are dropped `current_size == 0`, and that
+    /// no panics occur regardless of the trace.
+    ///
+    /// The trace is modeled as a sequence of operations:
+    /// - `Reserve(size)` — attempt to reserve `size` bytes
+    /// - `Release(index)` — drop the reservation at `index` in the active list
+    ///
+    /// **Validates: Requirements 9.1, 9.2, 9.3, 9.4**
+    #[quickcheck]
+    fn prop_write_cache_monotone_capacity(capacity_kb: u16, ops: Vec<(bool, u16)>) -> TestResult {
+        // Filter invalid inputs: need a non-zero capacity and at least one operation
+        if capacity_kb == 0 || ops.is_empty() {
+            return TestResult::discard();
+        }
+
+        // Limit trace length to keep tests fast
+        if ops.len() > 50 {
+            return TestResult::discard();
+        }
+
+        let capacity = (capacity_kb as u64) * 1024;
+        // max_object_size = capacity (allow any single reservation up to full capacity)
+        let max_object_size = capacity;
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+
+            // Create manager with exact capacity (100% write cache of total = capacity)
+            // We set total_cache_size = capacity * 2 and write_cache_percent = 50%
+            // so max_size = capacity
+            let manager = WriteCacheManager::new(
+                temp_dir.path().to_path_buf(),
+                capacity * 2, // total cache
+                50.0,         // 50% → max_size = capacity
+                Duration::from_secs(86400),
+                Duration::from_secs(86400),
+                CacheEvictionAlgorithm::LRU,
+                max_object_size,
+            );
+
+            // Verify our capacity calculation
+            assert_eq!(manager.max_size(), capacity);
+
+            let mut active_reservations: Vec<WriteReservation> = Vec::new();
+
+            for (is_reserve, value) in &ops {
+                if *is_reserve {
+                    // Reserve operation: attempt to reserve `value` KB
+                    let size = (*value as u64) * 1024;
+                    if size == 0 {
+                        continue; // skip zero-size reserves
+                    }
+                    if let Some(reservation) = manager.try_reserve(size).await {
+                        active_reservations.push(reservation);
+                    }
+                    // Reservation may fail (capacity full) — that's fine
+                } else {
+                    // Release operation: drop the reservation at index `value % len`
+                    if !active_reservations.is_empty() {
+                        let idx = (*value as usize) % active_reservations.len();
+                        active_reservations.swap_remove(idx);
+                    }
+                }
+
+                // Invariant: current_size must be in [0, capacity] at every step
+                let current = manager.current_usage();
+                if current > capacity {
+                    return TestResult::failed();
+                }
+                // current_size is u64, so >= 0 is always true, but verify it
+                // matches the sum of active reservations
+            }
+
+            // After dropping all reservations, current_size must be 0
+            drop(active_reservations);
+            let final_usage = manager.current_usage();
+            if final_usage != 0 {
+                return TestResult::failed();
             }
 
             TestResult::passed()

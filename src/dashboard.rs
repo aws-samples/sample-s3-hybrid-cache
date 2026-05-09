@@ -1,6 +1,6 @@
 //! Dashboard Module
 //!
-//! Provides a web-based dashboard interface for monitoring S3 Hybrid Cache performance and viewing application logs.
+//! Provides a web-based dashboard interface for monitoring Hybrid Cache for Amazon S3 performance and viewing application logs.
 
 use crate::cache::CacheManager;
 use crate::config::DashboardConfig;
@@ -361,12 +361,12 @@ impl StaticFileHandler {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>S3 Hybrid Cache</title>
+    <title>Hybrid Cache for Amazon S3</title>
     <link rel="stylesheet" href="/style.css">
 </head>
 <body>
     <header>
-        <h1>S3 Hybrid Cache</h1>
+        <h1>Hybrid Cache for Amazon S3</h1>
         <div id="system-info">
             <span id="hostname">Loading...</span> | 
             <span id="version">Loading...</span> | 

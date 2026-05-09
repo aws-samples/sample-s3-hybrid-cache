@@ -5,11 +5,13 @@
 //! preserving end-to-end TLS encryption and certificate validation.
 
 use crate::connection_pool::EndpointOverrides;
+use crate::destination_policy::DestinationPolicy;
 use crate::{ProxyError, Result};
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
@@ -20,11 +22,17 @@ pub struct TcpProxy {
     resolver: TokioResolver,
     /// Parsed endpoint overrides (exact + suffix) for PrivateLink etc.
     overrides: EndpointOverrides,
+    /// Destination policy for CONNECT/SNI restriction
+    destination_policy: Arc<DestinationPolicy>,
 }
 
 impl TcpProxy {
     /// Create a new TCP proxy instance with external DNS resolver
-    pub fn new(listen_addr: SocketAddr, overrides: EndpointOverrides) -> Self {
+    pub fn new(
+        listen_addr: SocketAddr,
+        overrides: EndpointOverrides,
+        destination_policy: Arc<DestinationPolicy>,
+    ) -> Self {
         use hickory_resolver::config::{ResolveHosts, CLOUDFLARE, GOOGLE};
         // Use external DNS servers to bypass /etc/hosts (same as connection pool)
         let mut config = ResolverConfig::default();
@@ -55,6 +63,7 @@ impl TcpProxy {
             listen_addr,
             resolver,
             overrides,
+            destination_policy,
         }
     }
 
@@ -79,9 +88,10 @@ impl TcpProxy {
 
                             let resolver = self.resolver.clone();
                             let overrides = self.overrides.clone();
+                            let policy = self.destination_policy.clone();
                             tokio::spawn(async move {
                                 if let Err(e) =
-                                    Self::handle_connection(client_stream, client_addr, resolver, overrides).await
+                                    Self::handle_connection(client_stream, client_addr, resolver, overrides, policy).await
                                 {
                                     // Check if this is a client-initiated cancellation or connection error
                                     let err_str = e.to_string();
@@ -118,6 +128,7 @@ impl TcpProxy {
         client_addr: SocketAddr,
         resolver: TokioResolver,
         overrides: EndpointOverrides,
+        policy: Arc<DestinationPolicy>,
     ) -> Result<()> {
         // Set up connection cleanup on error
         let cleanup_connection = || {
@@ -185,6 +196,7 @@ impl TcpProxy {
             &target_host,
             resolver,
             overrides,
+            policy,
         )
         .await
         {
@@ -332,16 +344,36 @@ impl TcpProxy {
 
     /// Establish TCP tunnel to target endpoint
     async fn establish_tcp_tunnel(
-        client_stream: TcpStream,
+        mut client_stream: TcpStream,
         client_addr: SocketAddr,
         target_host: &str,
         resolver: TokioResolver,
         overrides: EndpointOverrides,
+        policy: Arc<DestinationPolicy>,
     ) -> Result<()> {
         debug!(
             "Resolving {} using external DNS (bypassing /etc/hosts)",
             target_host
         );
+
+        // Destination policy check: reject prohibited destinations
+        let target_port = 443u16;
+        match policy.check(target_host, target_port, &resolver).await {
+            Ok(_allowed_ips) => {
+                // Policy allows this destination — proceed with connection
+            }
+            Err(reason) => {
+                warn!(
+                    hostname = %target_host,
+                    port = target_port,
+                    reason = %reason,
+                    "SNI passthrough destination rejected by policy"
+                );
+                // Shutdown client stream silently on rejection
+                let _ = client_stream.shutdown().await;
+                return Ok(());
+            }
+        }
 
         // Check endpoint overrides first (exact then suffix, for PrivateLink etc.)
         let ip_addresses: Vec<IpAddr> = if let Some(ips) = overrides.resolve(target_host) {

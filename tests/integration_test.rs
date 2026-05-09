@@ -4,10 +4,13 @@
 
 use s3_proxy::{
     cache::CacheManager, compression::CompressionHandler, config::Config,
-    connection_pool::ConnectionPoolManager, http_proxy::HttpProxy, tcp_proxy::TcpProxy,
+    connection_pool::ConnectionPoolManager, destination_policy::DestinationPolicy,
+    http_proxy::HttpProxy, tcp_proxy::TcpProxy,
 };
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[test]
 fn test_basic_module_instantiation() {
@@ -31,6 +34,7 @@ fn test_basic_module_instantiation() {
     let _tcp_proxy = TcpProxy::new(
         tcp_addr,
         s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+        Arc::new(DestinationPolicy::new(443, None, HashSet::new())),
     );
 
     // Cache Manager
@@ -90,12 +94,14 @@ fn test_tcp_proxy_creation() {
     let _tcp_proxy1 = TcpProxy::new(
         tcp_addr1,
         s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+        Arc::new(DestinationPolicy::new(443, None, HashSet::new())),
     );
 
     let tcp_addr2 = SocketAddr::from(([0, 0, 0, 0], 8443));
     let _tcp_proxy2 = TcpProxy::new(
         tcp_addr2,
         s3_proxy::connection_pool::EndpointOverrides::from_config(&std::collections::HashMap::new()),
+        Arc::new(DestinationPolicy::new(443, None, HashSet::new())),
     );
 
     // Verify that the proxy can be created without errors

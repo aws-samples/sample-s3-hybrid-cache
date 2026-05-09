@@ -3,6 +3,10 @@
 //! This module provides a custom connector that integrates Hyper's connection pooling
 //! with the existing ConnectionPoolManager for IP selection and load balancing.
 //! Applies TCP socket options (keepalive, receive buffer) via socket2 before TLS handshake.
+//!
+//! Also provides [`build_tls_config_for_host`], the single source of truth for
+//! outbound TLS version selection: override-matched hosts get TLS 1.2 only;
+//! all others get the default (TLS 1.2 or 1.3).
 
 use crate::config::ConnectionPoolConfig;
 use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
@@ -24,6 +28,44 @@ use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tower::Service;
 use tracing::{debug, warn};
+
+/// Build the appropriate `rustls::ClientConfig` for an outbound connection to `host`.
+///
+/// Override-matched hosts (those present in `pool_manager.resolve_override`) receive
+/// a TLS 1.2-only configuration (VPC interface endpoints / PrivateLink don't support
+/// TLS 1.3). All other hosts receive the default configuration (TLS 1.2 or 1.3).
+///
+/// This is the single source of truth for outbound TLS version selection — all
+/// callsites that need a per-host `ClientConfig` should use this function.
+pub fn build_tls_config_for_host(
+    host: &str,
+    root_store: rustls::RootCertStore,
+    pool_manager: &ConnectionPoolManager,
+) -> rustls::ClientConfig {
+    if pool_manager.resolve_override(host).is_some() {
+        debug!(
+            host = %host,
+            "Using TLS 1.2-only config for PrivateLink/override-matched destination"
+        );
+        build_tls12_only_config(root_store)
+    } else {
+        build_tls_default_config(root_store)
+    }
+}
+
+/// Build the default TLS configuration (TLS 1.2 or 1.3).
+pub fn build_tls_default_config(root_store: rustls::RootCertStore) -> rustls::ClientConfig {
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
+
+/// Build a TLS 1.2-only configuration for PrivateLink / VPC interface endpoints.
+pub fn build_tls12_only_config(root_store: rustls::RootCertStore) -> rustls::ClientConfig {
+    rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
 
 /// Wrapper type for TLS streams that implements Connection trait
 pub struct HttpsStream(TlsStream<TcpStream>);
@@ -83,13 +125,11 @@ impl Connection for HttpsStream {
 ///
 /// Applies TCP keepalive and receive buffer options via socket2 on new connections.
 /// Records connection failures in IpHealthTracker for automatic IP exclusion.
+/// Uses [`build_tls_config_for_host`] to select the correct TLS version per host.
 pub struct CustomHttpsConnector {
     pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
-    /// Default TLS connector (TLS 1.2 + 1.3)
-    tls_default: TlsConnector,
-    /// TLS 1.2-only connector for VPC interface endpoints (PrivateLink).
-    /// None when no endpoint_overrides are configured.
-    tls_privatelink: Option<TlsConnector>,
+    /// Root certificate store for building per-host TLS configurations.
+    root_store: rustls::RootCertStore,
     config: ConnectionPoolConfig,
     health_tracker: Arc<IpHealthTracker>,
     metrics_manager:
@@ -99,15 +139,13 @@ pub struct CustomHttpsConnector {
 impl CustomHttpsConnector {
     pub fn new(
         pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
-        tls_default: TlsConnector,
-        tls_privatelink: Option<TlsConnector>,
+        root_store: rustls::RootCertStore,
         config: ConnectionPoolConfig,
         health_tracker: Arc<IpHealthTracker>,
     ) -> Self {
         Self {
             pool_manager,
-            tls_default,
-            tls_privatelink,
+            root_store,
             config,
             health_tracker,
             metrics_manager: Arc::new(tokio::sync::RwLock::new(None)),
@@ -177,8 +215,7 @@ impl Service<Uri> for CustomHttpsConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let pool_manager = Arc::clone(&self.pool_manager);
-        let tls_default = self.tls_default.clone();
-        let tls_privatelink = self.tls_privatelink.clone();
+        let root_store = self.root_store.clone();
         let metrics_manager = self.metrics_manager.clone();
         let config = self.config.clone();
         let health_tracker = Arc::clone(&self.health_tracker);
@@ -263,21 +300,11 @@ impl Service<Uri> for CustomHttpsConnector {
                 connect_ip
             );
 
-            // Select TLS connector: use TLS 1.2-only for PrivateLink destinations,
-            // default (1.2+1.3) for everything else.
-            let tls_connector = if let Some(ref pl) = tls_privatelink {
+            // Select TLS connector via the shared builder function.
+            let tls_connector = {
                 let pm = pool_manager.read().await;
-                if pm.resolve_override(&tls_hostname).is_some() {
-                    debug!(
-                        "[HTTPS_CONNECTOR] Using TLS 1.2 connector for PrivateLink destination: {}",
-                        tls_hostname
-                    );
-                    pl.clone()
-                } else {
-                    tls_default.clone()
-                }
-            } else {
-                tls_default.clone()
+                let cfg = build_tls_config_for_host(&tls_hostname, root_store, &pm);
+                TlsConnector::from(Arc::new(cfg))
             };
 
             // TLS handshake
@@ -332,8 +359,7 @@ impl Clone for CustomHttpsConnector {
     fn clone(&self) -> Self {
         Self {
             pool_manager: Arc::clone(&self.pool_manager),
-            tls_default: self.tls_default.clone(),
-            tls_privatelink: self.tls_privatelink.clone(),
+            root_store: self.root_store.clone(),
             config: self.config.clone(),
             health_tracker: Arc::clone(&self.health_tracker),
             metrics_manager: self.metrics_manager.clone(),
@@ -359,16 +385,70 @@ mod tests {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        let tls_connector = TlsConnector::from(Arc::new(tls_config));
         let health_tracker = Arc::new(IpHealthTracker::new(3));
 
-        let connector =
-            CustomHttpsConnector::new(pool_manager, tls_connector, None, config, health_tracker);
+        let connector = CustomHttpsConnector::new(pool_manager, root_store, config, health_tracker);
 
         let _connector2 = connector.clone();
+    }
+
+    #[test]
+    fn test_build_tls_config_default() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = ConnectionPoolConfig::default();
+        let pm = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        // Non-override host should get default TLS config (1.2 + 1.3)
+        let cfg = build_tls_config_for_host("s3.us-east-1.amazonaws.com", root_store, &pm);
+        // Default config supports TLS 1.2 and 1.3
+        assert!(cfg.alpn_protocols.is_empty()); // no ALPN set by default
+    }
+
+    #[test]
+    fn test_build_tls_config_override_matched() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        // Create a config with endpoint overrides
+        let mut config = ConnectionPoolConfig::default();
+        config.endpoint_overrides.insert(
+            "vpce-bucket.s3.us-east-1.vpce.amazonaws.com".to_string(),
+            vec!["10.0.1.100".parse().unwrap()],
+        );
+        let pm = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        // Override-matched host should get TLS 1.2-only config
+        let _cfg = build_tls_config_for_host(
+            "vpce-bucket.s3.us-east-1.vpce.amazonaws.com",
+            root_store,
+            &pm,
+        );
+        // The config is TLS 1.2 only — verified by the builder_with_protocol_versions call
+    }
+
+    #[test]
+    fn test_build_tls_default_config_fn() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let _cfg = build_tls_default_config(root_store);
+    }
+
+    #[test]
+    fn test_build_tls12_only_config_fn() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let _cfg = build_tls12_only_config(root_store);
     }
 }

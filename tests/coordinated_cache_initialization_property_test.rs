@@ -339,9 +339,9 @@ fn prop_cross_validation_threshold_behavior(manager_size: u32, tracker_size: u32
             config.write_cache_max_object_size,
         );
 
-        // Reserve capacity to set the manager size
+        // Set the manager size via initialization (replaces removed reserve_capacity)
         if manager_size > 0 {
-            write_cache_manager.reserve_capacity(manager_size);
+            write_cache_manager.initialize_from_scan_results(manager_size, 1);
         }
 
         // Create size tracker with JournalConsolidator

@@ -46,12 +46,13 @@ fn create_test_cache_manager(
         false,                      // write_cache_enabled
         Duration::from_secs(86400), // incomplete_upload_ttl
         MetadataCacheConfig::default(),
-        95,                      // eviction_trigger_percent
-        80,                      // eviction_target_percent
-        true,                    // read_cache_enabled
-        Duration::from_secs(60), // bucket_settings_staleness_threshold
-        1_048_576,               // compression_batch_size
-        false,                   // evaluate_conditions_from_cache
+        95,                                 // eviction_trigger_percent
+        80,                                 // eviction_target_percent
+        true,                               // read_cache_enabled
+        Duration::from_secs(60),            // bucket_settings_staleness_threshold
+        1_048_576,                          // compression_batch_size
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     )
 }
 

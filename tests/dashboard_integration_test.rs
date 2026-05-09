@@ -277,7 +277,7 @@ async fn simulate_static_file_request(
     // In a real implementation, this would make an HTTP request to /
     // For testing, we'll simulate the response
 
-    let mock_html = r#"<!DOCTYPE html><html><head><title>S3 Hybrid Cache</title></head><body><h1>Dashboard</h1></body></html>"#;
+    let mock_html = r#"<!DOCTYPE html><html><head><title>Hybrid Cache for Amazon S3</title></head><body><h1>Dashboard</h1></body></html>"#;
 
     Ok(mock_html.to_string())
 }

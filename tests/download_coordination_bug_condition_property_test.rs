@@ -182,6 +182,7 @@ async fn make_cache_infra(
         config.cache.bucket_settings_staleness_threshold,
         config.cache.compression_batch_size,
         config.cache.evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     ));
 
     // Build the journal-backed DiskCacheManager *before* initializing the

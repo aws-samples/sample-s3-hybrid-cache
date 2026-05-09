@@ -115,8 +115,29 @@ async fn start_metrics_server(
     Ok(())
 }
 
+/// Set process umask to 0o077 so all files are created with owner-only permissions (Req 14).
+/// On non-Unix platforms, logs a warning since umask is not available.
+#[cfg(unix)]
+fn set_process_umask() {
+    // SAFETY: libc::umask is a simple syscall that sets the process file creation mask.
+    // It has no unsafe memory implications and always succeeds on Unix.
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_process_umask() {
+    // Cannot set umask on non-Unix platforms; warn at startup.
+    // Note: tracing is not yet initialized at this point, so use eprintln as a fallback.
+    eprintln!("WARN: umask not available on this platform; cache files may have permissive modes");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Set restrictive umask before any file creation (Req 14)
+    set_process_umask();
+
     // Load configuration
     let config = Config::load()?;
 
@@ -154,7 +175,7 @@ async fn main() -> Result<()> {
     logger.initialize()?;
 
     info!(
-        "Starting S3 Hybrid Cache server v{} (built: {})",
+        "Starting Hybrid Cache for Amazon S3 server v{} (built: {})",
         env!("CARGO_PKG_VERSION"),
         env!("BUILD_TIMESTAMP")
     );
@@ -507,11 +528,15 @@ async fn main() -> Result<()> {
             let recovery_config =
                 BackgroundRecoveryConfig::from_shared_storage_config(&config.cache.shared_storage);
 
-            let mut background_recovery =
-                BackgroundRecoverySystem::new(orphaned_recovery, recovery_config);
+            let mut background_recovery = BackgroundRecoverySystem::new(
+                orphaned_recovery,
+                recovery_config,
+                config.cache.cache_dir.clone(),
+            );
 
-            // Start the background recovery system
-            if let Err(e) = background_recovery.start().await {
+            // Start the background recovery system with shutdown coordinator subscription
+            let recovery_shutdown_rx = shutdown_coordinator.subscribe();
+            if let Err(e) = background_recovery.start(recovery_shutdown_rx).await {
                 error!("Failed to start background orphan recovery system: {}", e);
             } else {
                 info!("Background orphan recovery system started successfully");
@@ -695,6 +720,6 @@ async fn main() -> Result<()> {
     // Give server tasks a moment to finish after receiving their shutdown signals
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    info!("S3 Hybrid Cache shutdown complete");
+    info!("Hybrid Cache for Amazon S3 shutdown complete");
     Ok(())
 }

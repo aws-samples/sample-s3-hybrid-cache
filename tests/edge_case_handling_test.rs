@@ -159,7 +159,8 @@ async fn test_bin_file_deletion_on_eviction() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     );
 
     // Create a range with .bin file
@@ -251,7 +252,8 @@ async fn test_meta_file_deletion_on_last_range_eviction() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     );
 
     // Create a range with .bin file
@@ -343,7 +345,8 @@ async fn test_stale_eviction_lock_handling() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     );
 
     // Create a stale eviction lock
@@ -351,15 +354,17 @@ async fn test_stale_eviction_lock_handling() {
     std::fs::create_dir_all(&lock_dir).unwrap();
     let lock_path = lock_dir.join("global_eviction.lock");
 
-    let stale_lock = s3_proxy::cache::GlobalEvictionLock {
-        instance_id: "stale-instance".to_string(),
-        process_id: 12345,
+    let stale_lock = s3_proxy::cache::EvictionLockPayload {
+        uuid: "stale-uuid-12345".to_string(),
+        acquired_at_ms: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 61_000, // 61 seconds ago
         hostname: "stale-host".to_string(),
-        acquired_at: SystemTime::now() - Duration::from_secs(61), // 61 seconds ago
-        timeout_seconds: 60,
     };
 
-    let lock_json = serde_json::to_string_pretty(&stale_lock).unwrap();
+    let lock_json = serde_json::to_string(&stale_lock).unwrap();
     std::fs::write(&lock_path, lock_json).unwrap();
 
     // Try to acquire lock - should break stale lock and succeed
@@ -414,7 +419,8 @@ async fn test_multiple_range_eviction_meta_deletion() {
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     );
 
     // Create multiple ranges

@@ -7,6 +7,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+/// Maximum TTL duration: 10 years in seconds.
+const MAX_TTL_SECS: u64 = 315_360_000;
+
+/// Compute expiry without panicking. Clamps to 10 years from base on overflow.
+///
+/// This function replaces direct `SystemTime + Duration` arithmetic in TTL paths
+/// to prevent panics when a large or overflowing duration is supplied.
+///
+/// Only call this when TTL > 0. TTL=0 means "do not cache / per-request auth"
+/// and should bypass expiry computation entirely.
+pub fn safe_expiry(base: SystemTime, ttl: Duration) -> SystemTime {
+    const MAX_TTL: Duration = Duration::from_secs(MAX_TTL_SECS);
+    let clamped_ttl = if ttl > MAX_TTL { MAX_TTL } else { ttl };
+    base.checked_add(clamped_ttl)
+        .unwrap_or_else(|| base.checked_add(MAX_TTL).unwrap_or(base))
+}
+
 /// Result of checking object-level cache expiration.
 /// Used by `check_object_expiration` to indicate whether cached data is fresh
 /// or needs revalidation against S3.
@@ -583,7 +600,7 @@ impl NewCacheMetadata {
 
     /// Refresh the object-level TTL by setting `expires_at = now + ttl`.
     pub fn refresh_object_ttl(&mut self, ttl: Duration) {
-        self.expires_at = SystemTime::now() + ttl;
+        self.expires_at = safe_expiry(SystemTime::now(), ttl);
     }
 }
 
@@ -1705,6 +1722,7 @@ mod tests {
                 0,
                 10 * 1024 * 1024, // 10MB capacity
                 None,
+                128 * 1024 * 1024, // 128 MiB body cap
             );
 
             let cache_key = "test-bucket/test-object";
@@ -1877,5 +1895,43 @@ mod tests {
 
             TestResult::passed()
         })
+    }
+
+    /// Property 8: No-panic TTL arithmetic — for every generated (SystemTime, Duration) pair
+    /// across the full u64 range, assert no panic and valid result.
+    ///
+    /// The property verifies:
+    /// 1. safe_expiry never panics (implicit — if it panics, the test fails)
+    /// 2. The result is >= base (expiry is never before the base time)
+    /// 3. The result is <= base + 10 years (the clamp works)
+    ///
+    /// **Validates: Requirements 8.1, 8.2, 8.3, 8.4**
+    #[quickcheck]
+    fn prop_safe_expiry_no_panic(base_secs: u64, ttl_secs: u64) -> TestResult {
+        // Construct a SystemTime from the base timestamp (seconds since UNIX_EPOCH)
+        // Cap base_secs to avoid SystemTime construction overflow on platforms where
+        // SystemTime cannot represent the full u64 range of seconds.
+        let base = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(base_secs))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        let ttl = Duration::from_secs(ttl_secs);
+
+        // Call safe_expiry — if it panics, the test fails automatically
+        let result = safe_expiry(base, ttl);
+
+        // Assert: result >= base (expiry is never before the base time)
+        if result < base {
+            return TestResult::failed();
+        }
+
+        // Assert: result <= base + 10 years (the clamp works)
+        let max_ttl = Duration::from_secs(MAX_TTL_SECS);
+        let max_expiry = base.checked_add(max_ttl).unwrap_or(base);
+        if result > max_expiry {
+            return TestResult::failed();
+        }
+
+        TestResult::passed()
     }
 }

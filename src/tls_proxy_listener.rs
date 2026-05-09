@@ -6,11 +6,15 @@
 //! traffic while maintaining full caching capability.
 
 use crate::{
-    cache::CacheManager, config::Config, http_proxy::HttpProxy, inflight_tracker::InFlightTracker,
-    logging::LoggerManager, range_handler::RangeHandler, s3_client::S3ClientApi,
-    shutdown::ShutdownSignal, ProxyError, Result,
+    cache::CacheManager, config::Config, destination_policy::DestinationPolicy,
+    http_proxy::HttpProxy, inflight_tracker::InFlightTracker, logging::LoggerManager,
+    range_handler::RangeHandler, s3_client::S3ClientApi, shutdown::ShutdownSignal, ProxyError,
+    Result,
 };
 use bytes::Bytes;
+use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts, CLOUDFLARE, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -19,7 +23,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +51,8 @@ pub struct TlsProxyListener {
     logger_manager: Option<Arc<Mutex<LoggerManager>>>,
     inflight_tracker: Arc<InFlightTracker>,
     proxy_referer: Option<String>,
+    destination_policy: Arc<DestinationPolicy>,
+    resolver: Arc<TokioResolver>,
 }
 
 impl TlsProxyListener {
@@ -72,6 +79,46 @@ impl TlsProxyListener {
         let server_config = load_tls_config(cert_path, key_path)?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
+        // Build DNS resolver (bypass /etc/hosts, same as TcpProxy and ConnectionPoolManager)
+        let mut resolver_config = ResolverConfig::default();
+        for ns in GOOGLE.udp_and_tcp() {
+            resolver_config.add_name_server(ns);
+        }
+        for ns in CLOUDFLARE.udp_and_tcp() {
+            resolver_config.add_name_server(ns);
+        }
+        let mut opts = ResolverOpts::default();
+        opts.use_hosts_file = ResolveHosts::Never;
+        let resolver = Arc::new(
+            TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+                .with_options(opts)
+                .build()
+                .expect("Failed to build DNS resolver for TLS proxy listener"),
+        );
+
+        // Build DestinationPolicy from config
+        let connect_allowlist = config
+            .server
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.connect_allowlist.clone());
+
+        // Extract IPs from endpoint_overrides for the carve-out
+        let mut endpoint_override_ips: HashSet<IpAddr> = HashSet::new();
+        for ips in config.connection_pool.endpoint_overrides.values() {
+            for ip_str in ips {
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    endpoint_override_ips.insert(ip);
+                }
+            }
+        }
+
+        let destination_policy = Arc::new(DestinationPolicy::new(
+            443,
+            connect_allowlist,
+            endpoint_override_ips,
+        ));
+
         Ok(Self {
             listen_addr,
             tls_acceptor,
@@ -85,6 +132,8 @@ impl TlsProxyListener {
             logger_manager,
             inflight_tracker,
             proxy_referer,
+            destination_policy,
+            resolver,
         })
     }
 
@@ -121,6 +170,8 @@ impl TlsProxyListener {
                             let logger_manager = self.logger_manager.clone();
                             let inflight_tracker = Arc::clone(&self.inflight_tracker);
                             let proxy_referer = self.proxy_referer.clone();
+                            let destination_policy = Arc::clone(&self.destination_policy);
+                            let resolver = Arc::clone(&self.resolver);
 
                             tokio::spawn(async move {
                                 // Perform TLS handshake
@@ -147,12 +198,20 @@ impl TlsProxyListener {
                                     let logger_manager = logger_manager.clone();
                                     let inflight_tracker = Arc::clone(&inflight_tracker);
                                     let proxy_referer = proxy_referer.clone();
+                                    let destination_policy = Arc::clone(&destination_policy);
+                                    let resolver = Arc::clone(&resolver);
 
                                     async move {
                                         // Intercept CONNECT requests for TCP passthrough
                                         // (e.g., when HTTPS_PROXY is set instead of HTTP_PROXY)
                                         if req.method() == Method::CONNECT {
-                                            return handle_connect(req, addr).await;
+                                            return handle_connect(
+                                                req,
+                                                addr,
+                                                &destination_policy,
+                                                &resolver,
+                                            )
+                                            .await;
                                         }
 
                                         HttpProxy::handle_request(
@@ -244,11 +303,16 @@ impl TlsProxyListener {
 /// traffic inside the tunnel (it's opaque bytes), but we handle it gracefully
 /// as a passthrough — the same behavior as the HTTPS listener on port 443.
 ///
-/// Returns a `200 Connection Established` response. Hyper's upgrade mechanism
-/// then hands us the raw stream for bidirectional forwarding.
+/// Before connecting, the destination policy is checked to reject prohibited
+/// destinations (wrong port, private/loopback/link-local IPs, allowlist miss).
+///
+/// Returns a `200 Connection Established` response on success, or `403 Forbidden`
+/// if the destination policy rejects the target.
 async fn handle_connect(
     req: Request<Incoming>,
     client_addr: SocketAddr,
+    policy: &DestinationPolicy,
+    resolver: &TokioResolver,
 ) -> std::result::Result<
     Response<http_body_util::combinators::BoxBody<Bytes, hyper::Error>>,
     std::convert::Infallible,
@@ -275,31 +339,63 @@ async fn handle_connect(
         return Ok(resp);
     }
 
+    // Parse host and port from target
+    let (host, port) = if let Some(colon) = target.rfind(':') {
+        let h = &target[..colon];
+        let p = target[colon + 1..].parse::<u16>().unwrap_or(443);
+        (h.to_string(), p)
+    } else {
+        (target.clone(), 443u16)
+    };
+
+    // Check destination policy before connecting
+    let allowed_ips = match policy.check(&host, port, resolver).await {
+        Ok(ips) => ips,
+        Err(reason) => {
+            // Determine the resolved IP string for logging
+            let resolved_ip_str = match &reason {
+                crate::destination_policy::RejectionReason::IpRangeBlocked { ips, .. } => {
+                    format!("{:?}", ips)
+                }
+                _ => "N/A".to_string(),
+            };
+
+            warn!(
+                hostname = %host,
+                resolved_ip = %resolved_ip_str,
+                port = port,
+                reason = %reason,
+                "CONNECT destination rejected by policy"
+            );
+
+            let resp = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(
+                    Full::new(Bytes::from("Forbidden\n"))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap();
+            return Ok(resp);
+        }
+    };
+
     info!(
-        "CONNECT tunnel request from {} to {} (HTTPS_PROXY passthrough, no caching)",
-        client_addr, target
+        "CONNECT tunnel request from {} to {}:{} (HTTPS_PROXY passthrough, no caching)",
+        client_addr, host, port
     );
 
     // Spawn the tunnel task that runs after the upgrade completes
-    let target_clone = target.clone();
+    let target_addr = format!("{}:{}", host, port);
     tokio::spawn(async move {
         // Wait for hyper to hand us the upgraded (raw) connection
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let mut client_io = TokioIo::new(upgraded);
 
-                // Parse host and port from target
-                let (host, port) = if let Some(colon) = target_clone.rfind(':') {
-                    let h = &target_clone[..colon];
-                    let p = target_clone[colon + 1..].parse::<u16>().unwrap_or(443);
-                    (h.to_string(), p)
-                } else {
-                    (target_clone.clone(), 443u16)
-                };
-
-                // Connect to the target
-                let target_addr = format!("{}:{}", host, port);
-                match TcpStream::connect(&target_addr).await {
+                // Connect to one of the policy-approved IPs
+                let connect_addr = SocketAddr::new(allowed_ips[0], port);
+                match TcpStream::connect(connect_addr).await {
                     Ok(mut server_stream) => {
                         debug!(
                             "CONNECT tunnel established: {} <-> {}",

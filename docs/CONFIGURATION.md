@@ -719,48 +719,33 @@ cache:
 
 ## Eviction Configuration
 
-### Eviction Buffer
+### Eviction Thresholds
 
 ```yaml
 cache:
-  eviction_buffer_percent: 5  # Default: 5%
+  eviction_trigger_percent: 95  # Default: 95% — eviction starts when cache exceeds this
+  eviction_target_percent: 80   # Default: 80% — eviction reduces cache to this level
 ```
 
-**Purpose**: Create buffer to minimize eviction frequency
+**Purpose**: Control when eviction starts and how much space it reclaims.
 
 **How it works**:
-- Eviction triggers at 95% capacity (100% - 5%)
-- Eviction target is 90% capacity (100% - 5% - 5%)
-- Frees 5% buffer before next eviction needed
+- Eviction triggers when cache size exceeds `eviction_trigger_percent` of `max_cache_size`
+- Eviction removes entries until cache size drops to `eviction_target_percent` of `max_cache_size`
+- The gap between trigger and target creates a buffer to minimize eviction frequency
 
-**Example** (10GB cache, 5% buffer):
+**Example** (10GB cache, defaults):
 - Eviction triggers at 9.5GB (95%)
-- Eviction target is 9GB (90%)
-- Frees 500MB buffer
+- Eviction target is 8GB (80%)
+- Frees 1.5GB buffer before next eviction needed
 
 **Tuning guide**:
-- **Smaller buffer** (2-3%): Less wasted space, more frequent evictions
-- **Larger buffer** (10-15%): More wasted space, fewer evictions
-- **Default 5%**: Good balance for most workloads
+- **Higher target** (85-90%): Less wasted space, more frequent evictions
+- **Lower target** (70-75%): More wasted space, fewer evictions
+- **Default 80%**: Good balance for most workloads
 
-### Metadata Lock Timeout
-
-```yaml
-cache:
-  metadata_lock_timeout_seconds: 60  # Default: 60 seconds
-```
-
-**Purpose**: Prevent deadlocks from crashed processes holding locks
-
-**Tuning guide**:
-- **Shorter timeout** (30s): Faster crash recovery, risk of breaking active locks
-- **Longer timeout** (120s): More protection against false breaks, slower recovery
-- **Default 60s**: Good balance for most workloads
-
-**Considerations**:
-- Normal metadata operations complete in milliseconds
-- Only crashes or hung processes should trigger timeout
-- Monitor `metadata_lock_timeouts` metric to tune
+> **Note**: The `eviction_buffer_percent` field is deprecated and has no effect. Use
+> `eviction_trigger_percent` and `eviction_target_percent` instead.
 
 ## Multi-Instance Coordination
 
@@ -1558,7 +1543,8 @@ cache:
   ram_cache_enabled: true
   max_ram_cache_size: 10737418240   # 10GB
   eviction_algorithm: "tinylfu"
-  eviction_buffer_percent: 10
+  eviction_trigger_percent: 95
+  eviction_target_percent: 80
 
 connection_pool:
   keepalive_enabled: true

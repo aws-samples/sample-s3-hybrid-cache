@@ -17,15 +17,29 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
-/// Check whether an Authorization header value uses an AWS SigV4-family algorithm.
+/// Check whether an Authorization header value uses an AWS SigV4-family algorithm
+/// with proper structural validation.
 ///
 /// Recognizes both classic SigV4 (`AWS4-HMAC-SHA256`) and SigV4A
 /// (`AWS4-ECDSA-P256-SHA256`), which the AWS CLI uses by default for
 /// Multi-Region Access Point (MRAP) requests. Both share the same
 /// `Credential=.../SignedHeaders=.../Signature=...` wire format, so every
 /// downstream parser that treats them identically is correct.
+///
+/// Validates that the header:
+/// 1. Starts with the algorithm identifier followed by a space
+/// 2. Contains `Credential=`, `SignedHeaders=`, and `Signature=` components
+///
+/// This prevents a random string containing the substring "AWS4-HMAC-SHA256"
+/// from being misclassified as a SigV4-signed request.
 pub fn is_sigv4_algorithm(auth: &str) -> bool {
-    auth.contains("AWS4-HMAC-SHA256") || auth.contains("AWS4-ECDSA-P256-SHA256")
+    let has_algorithm_prefix =
+        auth.starts_with("AWS4-HMAC-SHA256 ") || auth.starts_with("AWS4-ECDSA-P256-SHA256 ");
+
+    has_algorithm_prefix
+        && auth.contains("Credential=")
+        && auth.contains("SignedHeaders=")
+        && auth.contains("Signature=")
 }
 
 /// Check if a request is signed with AWS Signature Version 4 (or SigV4A)
@@ -109,8 +123,8 @@ pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
 ///
 /// # Arguments
 ///
-/// * `response_headers` - Headers from the S3 response
-/// * `request_headers` - Headers from the original client request
+/// * `response_headers` - Headers from the S3 response (source of ETag, Last-Modified, Content-Type)
+/// * `request_headers` - Headers from the original client request (retained for API compatibility)
 /// * `content_length` - Content length of the object
 ///
 /// # Returns
@@ -122,7 +136,7 @@ pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
 ///
 /// - Requirement 3.1: Extract ETag from response headers
 /// - Requirement 3.2: Extract Last-Modified from response headers
-/// - Requirement 3.3: Extract Content-Type from request headers
+/// - Requirement 3.3: Extract Content-Type from response headers (fallback: application/octet-stream)
 /// - Requirement 3.4: Store metadata alongside cached object
 /// - Requirement 3.5: Handle missing headers gracefully
 ///
@@ -132,15 +146,14 @@ pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
 /// let response_headers = HashMap::from([
 ///     ("etag".to_string(), "\"abc123\"".to_string()),
 ///     ("last-modified".to_string(), "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
-/// ]);
-/// let request_headers = HashMap::from([
 ///     ("content-type".to_string(), "application/octet-stream".to_string()),
 /// ]);
+/// let request_headers = HashMap::new();
 /// let metadata = extract_metadata(&response_headers, &request_headers, 1024);
 /// ```
 pub fn extract_metadata(
     response_headers: &HashMap<String, String>,
-    request_headers: &HashMap<String, String>,
+    _request_headers: &HashMap<String, String>,
     content_length: u64,
 ) -> ObjectMetadata {
     // Extract ETag from response headers (Requirement 3.1)
@@ -165,16 +178,17 @@ pub fn extract_metadata(
             String::new()
         });
 
-    // Extract Content-Type from request headers (Requirement 3.3)
-    // Try both lowercase and capitalized versions for case-insensitive matching
-    let content_type = request_headers
+    // Extract Content-Type from response headers (Requirement 16 / 3.3)
+    // Use S3 response Content-Type to avoid cache poisoning from incorrect client request headers.
+    // Fallback to application/octet-stream if absent.
+    let content_type = response_headers
         .get("content-type")
-        .or_else(|| request_headers.get("Content-Type"))
-        .cloned();
-
-    if content_type.is_none() {
-        debug!("Content-Type not found in request headers");
-    }
+        .or_else(|| response_headers.get("Content-Type"))
+        .cloned()
+        .or_else(|| {
+            debug!("Content-Type not found in S3 response headers, using application/octet-stream");
+            Some("application/octet-stream".to_string())
+        });
 
     // Log extracted metadata
     info!(
@@ -201,6 +215,34 @@ pub async fn forward_signed_request(
     tls_connector: &TlsConnector,
     proxy_referer: Option<&str>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+    forward_signed_request_bounded(
+        req,
+        target_host,
+        target_ip,
+        tls_connector,
+        proxy_referer,
+        default_max_buffered_request_body_bytes(),
+    )
+    .await
+}
+
+/// Default maximum buffered request body size: 128 MiB
+fn default_max_buffered_request_body_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+/// Forward a signed request with a configurable body size cap.
+///
+/// Same as `forward_signed_request` but accepts a `max_body_bytes` parameter
+/// for the bounded body read (Requirement 11.1, 11.4).
+pub async fn forward_signed_request_bounded(
+    req: Request<hyper::body::Incoming>,
+    target_host: &str,
+    target_ip: IpAddr,
+    tls_connector: &TlsConnector,
+    proxy_referer: Option<&str>,
+    max_body_bytes: u64,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     debug!(
         "Forwarding signed request to {} ({})",
         target_host, target_ip
@@ -212,8 +254,8 @@ pub async fn forward_signed_request(
     let headers = req.headers().clone();
     let version = req.version();
 
-    // Read request body
-    let body_bytes = read_request_body(req).await?;
+    // Read request body with bounded size (Requirement 11.4)
+    let body_bytes = read_request_body_bounded(req, max_body_bytes).await?;
 
     // Determine if we should inject Referer header
     let should_inject_referer = if let Some(_referer_value) = proxy_referer {
@@ -443,17 +485,76 @@ pub async fn forward_signed_request_with_body(
     parse_http_response(&response_bytes, &method, path_and_query)
 }
 
-/// Read request body from incoming request
-async fn read_request_body(req: Request<hyper::body::Incoming>) -> Result<Bytes> {
+/// Read request body from incoming request with a configurable size cap.
+///
+/// Reads the body frame-by-frame, accumulating bytes up to `max_bytes`.
+/// Returns an error that callers translate to HTTP 413 if the body exceeds the cap.
+///
+/// # Arguments
+/// * `req` - The incoming HTTP request
+/// * `max_bytes` - Maximum number of bytes to buffer
+///
+/// # Requirements
+/// - Requirement 11.1: Configurable cap on request body buffering
+/// - Requirement 11.2: Return HTTP 413 on exceed
+/// - Requirement 11.4: Apply cap at every body.collect() callsite
+pub async fn read_request_body_bounded(
+    req: Request<hyper::body::Incoming>,
+    max_bytes: u64,
+) -> Result<Bytes> {
     use http_body_util::BodyExt;
 
-    let body = req.into_body();
-    let collected = body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?;
+    let content_length_hint = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
 
-    Ok(collected.to_bytes())
+    // Fast reject if Content-Length already exceeds cap
+    if let Some(cl) = content_length_hint {
+        if cl > max_bytes {
+            warn!(
+                content_length = cl,
+                max_bytes = max_bytes,
+                "Request body exceeds max_buffered_request_body_bytes (Content-Length)"
+            );
+            return Err(ProxyError::RequestBodyTooLarge {
+                content_length: Some(cl),
+                max_bytes,
+            });
+        }
+    }
+
+    let mut body = req.into_body();
+    let mut accumulated = Vec::with_capacity(
+        content_length_hint
+            .unwrap_or(8192)
+            .min(max_bytes)
+            .min(8 * 1024 * 1024) as usize,
+    );
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?;
+        if let Ok(data) = frame.into_data() {
+            if accumulated.len() as u64 + data.len() as u64 > max_bytes {
+                warn!(
+                    accumulated_bytes = accumulated.len(),
+                    chunk_bytes = data.len(),
+                    max_bytes = max_bytes,
+                    content_length = ?content_length_hint,
+                    "Request body exceeds max_buffered_request_body_bytes"
+                );
+                return Err(ProxyError::RequestBodyTooLarge {
+                    content_length: content_length_hint,
+                    max_bytes,
+                });
+            }
+            accumulated.extend_from_slice(&data);
+        }
+    }
+
+    Ok(Bytes::from(accumulated))
 }
 
 /// Connect to target IP address
@@ -546,8 +647,12 @@ pub async fn establish_tls_with_retry(
                 );
                 last_error = Some(e);
                 if attempt < max_retries - 1 {
-                    // Exponential backoff (Requirement 2.4)
-                    let delay_ms = 100 * (1 << attempt);
+                    // Exponential backoff with overflow protection (Requirement 2.4, 29.2, 29.3, 29.4)
+                    // Clamp attempt to prevent shift overflow, use checked_shl/saturating_mul, cap at 60s
+                    let clamped_attempt = attempt.min(20) as u32;
+                    let delay_ms = 100u64
+                        .saturating_mul(1u64.checked_shl(clamped_attempt).unwrap_or(u64::MAX))
+                        .min(60_000);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
@@ -587,8 +692,12 @@ pub async fn establish_tls_with_retry(
                 );
                 last_error = Some(e);
                 if attempt < max_retries - 1 {
-                    // Exponential backoff (Requirement 2.4)
-                    let delay_ms = 100 * (1 << attempt);
+                    // Exponential backoff with overflow protection (Requirement 2.4, 29.2, 29.3, 29.4)
+                    // Clamp attempt to prevent shift overflow, use checked_shl/saturating_mul, cap at 60s
+                    let clamped_attempt = attempt.min(20) as u32;
+                    let delay_ms = 100u64
+                        .saturating_mul(1u64.checked_shl(clamped_attempt).unwrap_or(u64::MAX))
+                        .min(60_000);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
@@ -907,19 +1016,105 @@ fn parse_status_code(status_line: &str) -> Result<StatusCode> {
         .map_err(|e| ProxyError::HttpError(format!("Invalid status code {}: {}", code, e)))
 }
 
-/// Decode chunked HTTP response body
+/// Configuration for chunked transfer decoding bounds.
+///
+/// Enforces per-chunk and total-body size limits to prevent silent truncation
+/// or unbounded memory consumption from malformed chunked responses.
+#[derive(Debug, Clone)]
+pub struct ChunkedDecodeConfig {
+    /// Maximum allowed size for a single chunk (default: 16 MiB)
+    pub max_chunk_size: usize,
+    /// Maximum total decoded body size (default: 100 MiB)
+    pub max_total_decoded: usize,
+}
+
+impl Default for ChunkedDecodeConfig {
+    fn default() -> Self {
+        Self {
+            max_chunk_size: 16 * 1024 * 1024,     // 16 MiB
+            max_total_decoded: 100 * 1024 * 1024, // 100 MiB
+        }
+    }
+}
+
+/// Structured error type for chunked transfer decoding failures.
+///
+/// Callers that receive a `ChunkedDecodeError` must NOT commit the partial body
+/// to the cache and must NOT return it to the client as a 200 response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkedDecodeError {
+    /// A single chunk declared a size exceeding the configured maximum.
+    ChunkTooLarge { declared: usize, max: usize },
+    /// The accumulated decoded body exceeded the configured maximum.
+    BodyTooLarge { accumulated: usize, max: usize },
+    /// The read cap was reached before the zero-size terminator chunk.
+    TruncatedBeforeTerminator,
+    /// The chunk size line could not be parsed as a valid hex number.
+    MalformedChunkSize(String),
+}
+
+impl std::fmt::Display for ChunkedDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChunkTooLarge { declared, max } => {
+                write!(
+                    f,
+                    "Chunk too large: declared {} bytes, max {} bytes",
+                    declared, max
+                )
+            }
+            Self::BodyTooLarge { accumulated, max } => {
+                write!(
+                    f,
+                    "Body too large: accumulated {} bytes, max {} bytes",
+                    accumulated, max
+                )
+            }
+            Self::TruncatedBeforeTerminator => {
+                write!(
+                    f,
+                    "Truncated before terminator: read cap reached before zero-size chunk"
+                )
+            }
+            Self::MalformedChunkSize(s) => {
+                write!(f, "Malformed chunk size: '{}'", s)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChunkedDecodeError {}
+
+impl From<ChunkedDecodeError> for ProxyError {
+    fn from(err: ChunkedDecodeError) -> Self {
+        ProxyError::HttpError(format!("Chunked decode error: {}", err))
+    }
+}
+
+/// Decode chunked HTTP response body with bounds checking.
 ///
 /// Parses chunked encoding format:
 /// - Each chunk starts with hex size followed by \r\n
 /// - Chunk data follows, terminated by \r\n
 /// - Final chunk has size 0 followed by \r\n\r\n
 ///
+/// Returns a structured `ChunkedDecodeError` if:
+/// - A chunk declares a size exceeding `config.max_chunk_size`
+/// - The accumulated decoded body exceeds `config.max_total_decoded`
+/// - The data is truncated before the zero-size terminator chunk
+/// - A chunk size line cannot be parsed as hex
+///
 /// # Arguments
 /// * `chunked_data` - Raw chunked response body
+/// * `config` - Bounds configuration for decoding
 ///
 /// # Returns
-/// * Decoded body bytes without chunk markers
-fn decode_chunked_body(chunked_data: &[u8]) -> Result<Bytes> {
+/// * `Ok(Bytes)` - Decoded body bytes without chunk markers
+/// * `Err(ChunkedDecodeError)` - Structured error describing the failure
+fn decode_chunked_body_bounded(
+    chunked_data: &[u8],
+    config: &ChunkedDecodeConfig,
+) -> std::result::Result<Bytes, ChunkedDecodeError> {
     let mut decoded = Vec::new();
     let mut pos = 0;
 
@@ -927,17 +1122,19 @@ fn decode_chunked_body(chunked_data: &[u8]) -> Result<Bytes> {
 
     while pos < chunked_data.len() {
         // Find the end of the chunk size line (look for \r\n)
-        let size_line_end = find_crlf(&chunked_data[pos..]).ok_or_else(|| {
-            ProxyError::HttpError("Invalid chunked encoding: no CRLF after chunk size".to_string())
-        })?;
-
-        let size_line_end = pos + size_line_end;
+        let size_line_end = match find_crlf(&chunked_data[pos..]) {
+            Some(offset) => pos + offset,
+            None => {
+                // No CRLF found — data is truncated before we could read a complete chunk header
+                return Err(ChunkedDecodeError::TruncatedBeforeTerminator);
+            }
+        };
 
         // Parse chunk size (hex)
         let size_str = String::from_utf8_lossy(&chunked_data[pos..size_line_end]);
-        let chunk_size = usize::from_str_radix(size_str.trim(), 16).map_err(|e| {
-            ProxyError::HttpError(format!("Invalid chunk size '{}': {}", size_str, e))
-        })?;
+        let trimmed = size_str.trim();
+        let chunk_size = usize::from_str_radix(trimmed, 16)
+            .map_err(|_| ChunkedDecodeError::MalformedChunkSize(trimmed.to_string()))?;
 
         debug!("Chunk size: {} bytes", chunk_size);
 
@@ -950,13 +1147,25 @@ fn decode_chunked_body(chunked_data: &[u8]) -> Result<Bytes> {
             break;
         }
 
-        // Check if we have enough data for the chunk
+        // Check per-chunk size limit
+        if chunk_size > config.max_chunk_size {
+            return Err(ChunkedDecodeError::ChunkTooLarge {
+                declared: chunk_size,
+                max: config.max_chunk_size,
+            });
+        }
+
+        // Check total decoded body limit
+        if decoded.len() + chunk_size > config.max_total_decoded {
+            return Err(ChunkedDecodeError::BodyTooLarge {
+                accumulated: decoded.len() + chunk_size,
+                max: config.max_total_decoded,
+            });
+        }
+
+        // Check if we have enough data for the chunk (truncation detection)
         if pos + chunk_size > chunked_data.len() {
-            return Err(ProxyError::HttpError(format!(
-                "Incomplete chunk: expected {} bytes but only {} available",
-                chunk_size,
-                chunked_data.len() - pos
-            )));
+            return Err(ChunkedDecodeError::TruncatedBeforeTerminator);
         }
 
         // Extract chunk data
@@ -967,14 +1176,29 @@ fn decode_chunked_body(chunked_data: &[u8]) -> Result<Bytes> {
         if pos + 2 <= chunked_data.len() && &chunked_data[pos..pos + 2] == b"\r\n" {
             pos += 2;
         } else {
-            return Err(ProxyError::HttpError(
-                "Invalid chunked encoding: missing CRLF after chunk data".to_string(),
-            ));
+            // Missing CRLF after chunk data means truncation
+            return Err(ChunkedDecodeError::TruncatedBeforeTerminator);
         }
     }
 
     debug!("Decoded chunked body: {} bytes total", decoded.len());
     Ok(Bytes::from(decoded))
+}
+
+/// Decode chunked HTTP response body with default bounds.
+///
+/// Convenience wrapper around `decode_chunked_body_bounded` using `ChunkedDecodeConfig::default()`.
+/// Returns a `ProxyError` on failure with structured logging.
+fn decode_chunked_body(chunked_data: &[u8]) -> Result<Bytes> {
+    let config = ChunkedDecodeConfig::default();
+    decode_chunked_body_bounded(chunked_data, &config).map_err(|e| {
+        warn!(
+            error = %e,
+            accumulated_bytes = chunked_data.len(),
+            "Chunked transfer decode failed"
+        );
+        ProxyError::from(e)
+    })
 }
 
 /// Find the position of \r\n in a byte slice
@@ -1106,10 +1330,10 @@ mod tests {
     fn test_is_aws_sigv4_signed() {
         let mut headers = HashMap::new();
 
-        // Test with AWS4-HMAC-SHA256 signature
+        // Test with full valid AWS4-HMAC-SHA256 signature
         headers.insert(
             "authorization".to_string(),
-            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request" // #gitleaks:allow
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123" // #gitleaks:allow
                 .to_string(),
         );
         assert!(is_aws_sigv4_signed(&headers));
@@ -1118,7 +1342,7 @@ mod tests {
         headers.clear();
         headers.insert(
             "Authorization".to_string(),
-            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request" // #gitleaks:allow
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123" // #gitleaks:allow
                 .to_string(),
         );
         assert!(is_aws_sigv4_signed(&headers));
@@ -1129,6 +1353,24 @@ mod tests {
 
         // Test with different auth type
         headers.insert("authorization".to_string(), "Bearer token123".to_string());
+        assert!(!is_aws_sigv4_signed(&headers));
+
+        // Test with algorithm substring but missing components (Req 12.3)
+        headers.clear();
+        headers.insert(
+            "authorization".to_string(),
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request" // #gitleaks:allow
+                .to_string(),
+        );
+        assert!(!is_aws_sigv4_signed(&headers));
+
+        // Test with algorithm substring embedded in random text (Req 12.1)
+        headers.clear();
+        headers.insert(
+            "authorization".to_string(),
+            "something AWS4-HMAC-SHA256 Credential=x, SignedHeaders=host, Signature=abc"
+                .to_string(),
+        );
         assert!(!is_aws_sigv4_signed(&headers));
     }
 
@@ -1177,12 +1419,38 @@ mod tests {
 
     #[test]
     fn test_is_sigv4_algorithm_helper() {
-        assert!(is_sigv4_algorithm("AWS4-HMAC-SHA256 Credential=..."));
-        assert!(is_sigv4_algorithm("AWS4-ECDSA-P256-SHA256 Credential=..."));
+        // Full valid SigV4 header
+        assert!(is_sigv4_algorithm(
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123" // #gitleaks:allow
+        ));
+        // Full valid SigV4A header
+        assert!(is_sigv4_algorithm(
+            "AWS4-ECDSA-P256-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123" // #gitleaks:allow
+        ));
+        // Not SigV4 at all
         assert!(!is_sigv4_algorithm("Bearer token"));
         assert!(!is_sigv4_algorithm(""));
         // Guard against partial/misspelled algorithms
         assert!(!is_sigv4_algorithm("AWS4-ECDSA Credential=..."));
+        // Algorithm present but not at start (substring match should fail)
+        assert!(!is_sigv4_algorithm(
+            "Basic AWS4-HMAC-SHA256 Credential=x, SignedHeaders=host, Signature=abc"
+        ));
+        // Algorithm at start but missing required components
+        assert!(!is_sigv4_algorithm("AWS4-HMAC-SHA256 Credential=x"));
+        assert!(!is_sigv4_algorithm(
+            "AWS4-HMAC-SHA256 Credential=x, SignedHeaders=host"
+        ));
+        assert!(!is_sigv4_algorithm(
+            "AWS4-HMAC-SHA256 Credential=x, Signature=abc"
+        ));
+        assert!(!is_sigv4_algorithm(
+            "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc"
+        ));
+        // Algorithm without trailing space (should fail)
+        assert!(!is_sigv4_algorithm(
+            "AWS4-HMAC-SHA256Credential=x, SignedHeaders=host, Signature=abc"
+        ));
     }
 
     #[test]
@@ -1244,6 +1512,83 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_chunked_body_bounded_chunk_too_large() {
+        let config = ChunkedDecodeConfig {
+            max_chunk_size: 10,
+            max_total_decoded: 100,
+        };
+        // Declare a chunk of 20 bytes (exceeds max_chunk_size of 10)
+        let chunked_data = b"14\r\n01234567890123456789\r\n0\r\n\r\n";
+        let result = decode_chunked_body_bounded(chunked_data, &config);
+        assert_eq!(
+            result,
+            Err(ChunkedDecodeError::ChunkTooLarge {
+                declared: 20,
+                max: 10
+            })
+        );
+    }
+
+    #[test]
+    fn test_decode_chunked_body_bounded_body_too_large() {
+        let config = ChunkedDecodeConfig {
+            max_chunk_size: 100,
+            max_total_decoded: 15,
+        };
+        // Two chunks of 10 bytes each = 20 total, exceeds max_total_decoded of 15
+        let chunked_data = b"a\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n";
+        let result = decode_chunked_body_bounded(chunked_data, &config);
+        assert_eq!(
+            result,
+            Err(ChunkedDecodeError::BodyTooLarge {
+                accumulated: 20,
+                max: 15
+            })
+        );
+    }
+
+    #[test]
+    fn test_decode_chunked_body_bounded_truncated_before_terminator() {
+        let config = ChunkedDecodeConfig::default();
+        // Data ends without a zero-size terminator chunk
+        let chunked_data = b"5\r\nHello\r\n6\r\n World";
+        let result = decode_chunked_body_bounded(chunked_data, &config);
+        assert_eq!(result, Err(ChunkedDecodeError::TruncatedBeforeTerminator));
+    }
+
+    #[test]
+    fn test_decode_chunked_body_bounded_malformed_chunk_size() {
+        let config = ChunkedDecodeConfig::default();
+        // "ZZ" is not valid hex
+        let chunked_data = b"ZZ\r\nHello\r\n0\r\n\r\n";
+        let result = decode_chunked_body_bounded(chunked_data, &config);
+        assert_eq!(
+            result,
+            Err(ChunkedDecodeError::MalformedChunkSize("ZZ".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_decode_chunked_body_bounded_success_within_limits() {
+        let config = ChunkedDecodeConfig {
+            max_chunk_size: 100,
+            max_total_decoded: 100,
+        };
+        let chunked_data = b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
+        let result = decode_chunked_body_bounded(chunked_data, &config).unwrap();
+        assert_eq!(result, Bytes::from("Hello World"));
+    }
+
+    #[test]
+    fn test_decode_chunked_body_bounded_missing_crlf_after_data() {
+        let config = ChunkedDecodeConfig::default();
+        // Chunk data not followed by \r\n
+        let chunked_data = b"5\r\nHello5\r\nWorld\r\n0\r\n\r\n";
+        let result = decode_chunked_body_bounded(chunked_data, &config);
+        assert_eq!(result, Err(ChunkedDecodeError::TruncatedBeforeTerminator));
+    }
+
+    #[test]
     fn test_find_crlf() {
         assert_eq!(find_crlf(b"Hello\r\nWorld"), Some(5));
         assert_eq!(find_crlf(b"\r\n"), Some(0));
@@ -1259,12 +1604,12 @@ mod tests {
             "last-modified".to_string(),
             "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
         );
-
-        let mut request_headers = HashMap::new();
-        request_headers.insert(
+        response_headers.insert(
             "content-type".to_string(),
             "application/octet-stream".to_string(),
         );
+
+        let request_headers = HashMap::new();
 
         let metadata = extract_metadata(&response_headers, &request_headers, 1024);
 
@@ -1286,9 +1631,9 @@ mod tests {
             "Last-Modified".to_string(),
             "Thu, 22 Oct 2015 08:30:00 GMT".to_string(),
         );
+        response_headers.insert("Content-Type".to_string(), "text/plain".to_string());
 
-        let mut request_headers = HashMap::new();
-        request_headers.insert("Content-Type".to_string(), "text/plain".to_string());
+        let request_headers = HashMap::new();
 
         let metadata = extract_metadata(&response_headers, &request_headers, 2048);
 
@@ -1301,6 +1646,7 @@ mod tests {
     #[test]
     fn test_extract_metadata_missing_headers() {
         // Test with all headers missing (Requirement 3.5)
+        // Content-Type should fallback to application/octet-stream per Req 16.3
         let response_headers = HashMap::new();
         let request_headers = HashMap::new();
 
@@ -1309,7 +1655,10 @@ mod tests {
         // Should handle missing headers gracefully
         assert_eq!(metadata.etag, "");
         assert_eq!(metadata.last_modified, "");
-        assert_eq!(metadata.content_type, None);
+        assert_eq!(
+            metadata.content_type,
+            Some("application/octet-stream".to_string())
+        );
         assert_eq!(metadata.content_length, 512);
     }
 
@@ -1319,15 +1668,18 @@ mod tests {
         let mut response_headers = HashMap::new();
         response_headers.insert("etag".to_string(), "\"partial123\"".to_string());
         // last-modified missing
+        // content-type missing — should fallback to application/octet-stream
 
         let request_headers = HashMap::new();
-        // content-type missing
 
         let metadata = extract_metadata(&response_headers, &request_headers, 4096);
 
         assert_eq!(metadata.etag, "\"partial123\"");
         assert_eq!(metadata.last_modified, ""); // Missing, should be empty
-        assert_eq!(metadata.content_type, None); // Missing, should be None
+        assert_eq!(
+            metadata.content_type,
+            Some("application/octet-stream".to_string())
+        ); // Missing from response, fallback to default
         assert_eq!(metadata.content_length, 4096);
     }
 
@@ -1359,9 +1711,9 @@ mod tests {
             "last-modified".to_string(),
             "Sat, 24 Oct 2015 10:00:00 GMT".to_string(),
         );
+        response_headers.insert("content-type".to_string(), "video/mp4".to_string());
 
-        let mut request_headers = HashMap::new();
-        request_headers.insert("content-type".to_string(), "video/mp4".to_string());
+        let request_headers = HashMap::new();
 
         let large_size = 5_000_000_000u64; // 5GB
         let metadata = extract_metadata(&response_headers, &request_headers, large_size);
@@ -1379,7 +1731,7 @@ mod tests {
             "Sun, 25 Oct 2015 11:00:00 GMT".to_string(),
         );
 
-        // Test various content types
+        // Test various content types from S3 response
         let content_types = vec![
             "application/json",
             "text/html; charset=utf-8",
@@ -1388,12 +1740,50 @@ mod tests {
         ];
 
         for ct in content_types {
-            let mut request_headers = HashMap::new();
-            request_headers.insert("content-type".to_string(), ct.to_string());
+            let mut resp_headers = response_headers.clone();
+            resp_headers.insert("content-type".to_string(), ct.to_string());
 
-            let metadata = extract_metadata(&response_headers, &request_headers, 1024);
+            let request_headers = HashMap::new();
+
+            let metadata = extract_metadata(&resp_headers, &request_headers, 1024);
             assert_eq!(metadata.content_type, Some(ct.to_string()));
         }
+    }
+
+    #[test]
+    fn test_extract_metadata_content_type_from_response_not_request() {
+        // Req 16: Content-Type must come from S3 response, not client request.
+        // A client sending a wrong Content-Type on PUT should not poison the cache.
+        let mut response_headers = HashMap::new();
+        response_headers.insert("etag".to_string(), "\"resp-etag\"".to_string());
+        response_headers.insert("content-type".to_string(), "image/png".to_string());
+
+        let mut request_headers = HashMap::new();
+        request_headers.insert("content-type".to_string(), "text/plain".to_string());
+
+        let metadata = extract_metadata(&response_headers, &request_headers, 2048);
+
+        // Should use response Content-Type, not request Content-Type
+        assert_eq!(metadata.content_type, Some("image/png".to_string()));
+    }
+
+    #[test]
+    fn test_extract_metadata_content_type_fallback_when_absent() {
+        // Req 16.3: Fallback to application/octet-stream if S3 response has no Content-Type
+        let mut response_headers = HashMap::new();
+        response_headers.insert("etag".to_string(), "\"no-ct\"".to_string());
+        // No content-type in response
+
+        let mut request_headers = HashMap::new();
+        request_headers.insert("content-type".to_string(), "text/html".to_string());
+
+        let metadata = extract_metadata(&response_headers, &request_headers, 512);
+
+        // Should fallback to application/octet-stream, NOT use request's text/html
+        assert_eq!(
+            metadata.content_type,
+            Some("application/octet-stream".to_string())
+        );
     }
 }
 

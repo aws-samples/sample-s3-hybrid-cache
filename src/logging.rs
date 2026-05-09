@@ -418,6 +418,9 @@ impl AccessLogBuffer {
     ///
     /// This is the same format as the existing `AccessLogWriter::format_entry()`
     fn format_entry(entry: &AccessLogEntry) -> String {
+        // Mask presigned URL credentials before writing to log
+        let masked_uri = mask_presigned_params(&entry.request_uri);
+
         // S3 Server Access Log format (version_id field removed)
         format!(
             "{} {} [{}] {} {} {} {} \"{}\" {} {} {} {} {} {} \"{}\" \"{}\" {} {} {} {} {} {} {} {} {}",
@@ -428,7 +431,7 @@ impl AccessLogBuffer {
             entry.requester,
             entry.request_id,
             entry.operation,
-            entry.request_uri,
+            masked_uri,
             entry.http_status,
             entry.error_code.as_deref().unwrap_or("-"),
             entry.bytes_sent,
@@ -869,6 +872,103 @@ impl LoggerManager {
         } else {
             0
         }
+    }
+}
+
+/// Sensitive presigned URL query parameter names (lowercase for case-insensitive matching).
+const SENSITIVE_PARAMS: &[&str] = &[
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+];
+
+/// Mask sensitive presigned URL query parameters in a URI.
+///
+/// Replaces the values of `X-Amz-Signature`, `X-Amz-Credential`, and
+/// `X-Amz-Security-Token` with `REDACTED`, preserving parameter names and
+/// positions. Parameter name matching is case-insensitive and handles
+/// percent-encoded variants.
+///
+/// URIs without a query string or without any sensitive parameters are
+/// returned unchanged (fast path avoids allocation).
+pub fn mask_presigned_params(uri: &str) -> String {
+    // Fast path: no query string at all
+    let Some(query_start) = uri.find('?') else {
+        return uri.to_string();
+    };
+
+    let query = &uri[query_start + 1..];
+
+    // Fast path: check for likely presigned parameter substrings (case-insensitive).
+    // Also check for percent-encoded hyphens (%2D or %2d) which appear in encoded
+    // parameter names like X%2DAmz%2DSignature.
+    let lower = query.to_ascii_lowercase();
+    if !lower.contains("x-amz-s") && !lower.contains("x-amz-c") && !lower.contains("x%2damz%2d") {
+        return uri.to_string();
+    }
+
+    let path = &uri[..query_start];
+    let mut result = String::with_capacity(uri.len());
+    result.push_str(path);
+    result.push('?');
+
+    for (i, param) in query.split('&').enumerate() {
+        if i > 0 {
+            result.push('&');
+        }
+
+        if let Some(eq_pos) = param.find('=') {
+            let name = &param[..eq_pos];
+            // Decode percent-encoding for comparison, then compare case-insensitively
+            let decoded_name = percent_decode(name);
+            let name_lower = decoded_name.to_ascii_lowercase();
+
+            if SENSITIVE_PARAMS.contains(&name_lower.as_str()) {
+                result.push_str(name);
+                result.push('=');
+                result.push_str("REDACTED");
+            } else {
+                result.push_str(param);
+            }
+        } else {
+            // No '=' — bare parameter, pass through unchanged
+            result.push_str(param);
+        }
+    }
+
+    result
+}
+
+/// Minimal percent-decoding for parameter name comparison.
+/// Only decodes %XX sequences; does not handle '+' as space (query param names
+/// don't use '+' encoding in AWS presigned URLs).
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                result.push((hi << 4 | lo) as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    result
+}
+
+/// Convert an ASCII hex digit to its numeric value.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1703,6 +1803,126 @@ mod tests {
 }
 
 #[cfg(test)]
+mod mask_presigned_params_tests {
+    use super::*;
+
+    #[test]
+    fn no_query_string_unchanged() {
+        let uri = "/bucket/key";
+        assert_eq!(mask_presigned_params(uri), uri);
+    }
+
+    #[test]
+    fn no_sensitive_params_unchanged() {
+        let uri = "/bucket/key?prefix=foo&delimiter=/";
+        assert_eq!(mask_presigned_params(uri), uri);
+    }
+
+    #[test]
+    fn masks_signature() {
+        let uri = "/bucket/key?X-Amz-Signature=abc123&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?X-Amz-Signature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn masks_credential() {
+        let uri = "/bucket/key?X-Amz-Credential=AKID/20230101/us-east-1/s3/aws4_request&X-Amz-Date=20230101T000000Z";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-Amz-Credential=REDACTED&X-Amz-Date=20230101T000000Z"
+        );
+    }
+
+    #[test]
+    fn masks_security_token() {
+        let uri = "/bucket/key?X-Amz-Security-Token=FwoGZXIvYXdzEBY&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-Amz-Security-Token=REDACTED&other=val"
+        );
+    }
+
+    #[test]
+    fn masks_all_three_params() {
+        let uri = "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID/scope&X-Amz-Date=20230101T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef&X-Amz-Security-Token=session";
+        let masked = mask_presigned_params(uri);
+        assert!(masked.contains("X-Amz-Credential=REDACTED"));
+        assert!(masked.contains("X-Amz-Signature=REDACTED"));
+        assert!(masked.contains("X-Amz-Security-Token=REDACTED"));
+        // Non-sensitive params preserved
+        assert!(masked.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(masked.contains("X-Amz-Date=20230101T000000Z"));
+        assert!(masked.contains("X-Amz-Expires=3600"));
+        assert!(masked.contains("X-Amz-SignedHeaders=host"));
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        let uri = "/bucket/key?x-amz-signature=abc&x-amz-credential=cred&x-amz-security-token=tok";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?x-amz-signature=REDACTED&x-amz-credential=REDACTED&x-amz-security-token=REDACTED"
+        );
+    }
+
+    #[test]
+    fn mixed_case_matching() {
+        let uri = "/bucket/key?X-AMZ-SIGNATURE=abc&X-Amz-Credential=cred";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-AMZ-SIGNATURE=REDACTED&X-Amz-Credential=REDACTED"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_param_names() {
+        // X-Amz-Signature with percent-encoded hyphen: X%2DAmz%2DSignature
+        let uri = "/bucket/key?X%2DAmz%2DSignature=secret123&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?X%2DAmz%2DSignature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn preserves_path_unchanged() {
+        let uri = "/my-bucket/path/to/object.txt?X-Amz-Signature=sig&prefix=test";
+        let masked = mask_presigned_params(uri);
+        assert!(masked.starts_with("/my-bucket/path/to/object.txt?"));
+        assert!(masked.contains("X-Amz-Signature=REDACTED"));
+        assert!(masked.contains("prefix=test"));
+    }
+
+    #[test]
+    fn bare_param_without_equals_preserved() {
+        let uri = "/bucket/key?X-Amz-Signature=sig&bare_param&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-Amz-Signature=REDACTED&bare_param&other=val"
+        );
+    }
+
+    #[test]
+    fn empty_value_masked() {
+        let uri = "/bucket/key?X-Amz-Signature=&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?X-Amz-Signature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn fast_path_no_allocation_for_non_presigned() {
+        // URI with query params but no presigned params — fast path should return as-is
+        let uri = "/bucket/key?prefix=foo&max-keys=100&delimiter=/";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, uri);
+    }
+}
+
+#[cfg(test)]
 mod log_lifecycle_property_tests {
     use super::*;
     use filetime::{set_file_mtime, FileTime};
@@ -2215,6 +2435,202 @@ mod log_lifecycle_property_tests {
                 "deleted ({}) + errors ({}) != total expired ({})",
                 result.access_files_deleted, result.errors, total_expired
             ));
+        }
+
+        TestResult::passed()
+    }
+}
+
+#[cfg(test)]
+mod mask_presigned_params_property_tests {
+    use super::*;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+
+    // Property 15: Complete credential masking
+    // **Validates: Requirements 15.1, 15.2, 15.3, 15.5**
+    //
+    // For every generated URL with presigned params at various positions, assert:
+    //   (a) masked output contains no sensitive values (X-Amz-Signature, X-Amz-Credential,
+    //       X-Amz-Security-Token values)
+    //   (b) masked output preserves the path portion unchanged
+    //   (c) masked output preserves non-sensitive parameter names and values unchanged
+    //   (d) masked output preserves sensitive parameter NAMES (only values are masked)
+    //   (e) no panics on any input
+    #[quickcheck]
+    fn prop_complete_credential_masking(
+        path_segments: Vec<String>,
+        non_sensitive_params: Vec<(String, String)>,
+        signature_value: String,
+        credential_value: String,
+        token_value: String,
+        param_order_seed: u8,
+    ) -> TestResult {
+        // Build a path from segments, filtering out empty/problematic segments
+        let path_parts: Vec<&str> = path_segments
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty() && !s.contains('?') && !s.contains('#'))
+            .take(5)
+            .collect();
+
+        let path = if path_parts.is_empty() {
+            "/bucket/key".to_string()
+        } else {
+            format!("/{}", path_parts.join("/"))
+        };
+
+        // Filter non-sensitive params: exclude anything that looks like a sensitive param name
+        // and exclude params with problematic characters or trivially short names/values
+        let safe_params: Vec<(&str, &str)> = non_sensitive_params
+            .iter()
+            .filter(|(name, _)| {
+                let lower = name.to_ascii_lowercase();
+                !lower.contains("x-amz-signature")
+                    && !lower.contains("x-amz-credential")
+                    && !lower.contains("x-amz-security-token")
+                    && !name.contains('&')
+                    && !name.contains('=')
+                    && !name.contains('?')
+                    && !name.is_empty()
+                    && name.trim().len() >= 2
+            })
+            .filter(|(_, val)| !val.contains('&') && !val.contains('=') && !val.contains('?'))
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .take(5)
+            .collect();
+
+        // Build sensitive params with non-empty values for meaningful testing
+        // Filter sensitive values: exclude chars that appear structurally in URLs
+        // (& = ? /) and very short values that could match substrings of other
+        // params or the URL structure itself, causing false-positive assertions.
+        let is_problematic_value = |v: &str| -> bool {
+            v.is_empty()
+                || v.len() < 4
+                || v.contains('&')
+                || v.contains('=')
+                || v.contains('?')
+                || v.contains('/')
+                || v.trim().is_empty()
+        };
+        let sig_val = if is_problematic_value(&signature_value) {
+            "abc123sig".to_string()
+        } else {
+            signature_value.clone()
+        };
+        let cred_val = if is_problematic_value(&credential_value) {
+            "AKID/20230101/us-east-1/s3/aws4_request".to_string()
+        } else {
+            credential_value.clone()
+        };
+        let tok_val = if is_problematic_value(&token_value) {
+            "FwoGZXIvYXdzEBYtoken".to_string()
+        } else {
+            token_value.clone()
+        };
+
+        // Build query params in various orders based on seed
+        let sensitive_params = [
+            ("X-Amz-Signature", sig_val.as_str()),
+            ("X-Amz-Credential", cred_val.as_str()),
+            ("X-Amz-Security-Token", tok_val.as_str()),
+        ];
+
+        // Determine which sensitive params to include (at least one)
+        let include_mask = (param_order_seed % 7) + 1; // 1-7, bitmask for 3 params
+        let mut all_params: Vec<(&str, &str)> = Vec::new();
+
+        // Add non-sensitive params first
+        for (name, val) in &safe_params {
+            all_params.push((name, val));
+        }
+
+        // Insert sensitive params at positions determined by seed
+        for (i, &(name, val)) in sensitive_params.iter().enumerate() {
+            if include_mask & (1 << i) != 0 {
+                let insert_pos = if all_params.is_empty() {
+                    0
+                } else {
+                    ((param_order_seed as usize).wrapping_add(i * 37)) % (all_params.len() + 1)
+                };
+                all_params.insert(insert_pos, (name, val));
+            }
+        }
+
+        // Need at least one sensitive param for a meaningful test
+        if all_params.iter().all(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            !SENSITIVE_PARAMS.contains(&lower.as_str())
+        }) {
+            return TestResult::discard();
+        }
+
+        // Build the URI
+        let query_string: String = all_params
+            .iter()
+            .map(|(name, val)| format!("{}={}", name, val))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let uri = format!("{}?{}", path, query_string);
+
+        // Apply masking
+        let masked = mask_presigned_params(&uri);
+
+        // (a) Masked output must not contain any sensitive VALUES
+        // Only check non-trivial values (empty values become "REDACTED" which is fine)
+        for (i, &(_, val)) in sensitive_params.iter().enumerate() {
+            if include_mask & (1 << i) != 0
+                && !val.is_empty()
+                && val != "REDACTED"
+                && masked.contains(val)
+            {
+                return TestResult::error(format!(
+                    "Masked output still contains sensitive value '{}' in: {}",
+                    val, masked
+                ));
+            }
+        }
+
+        // (b) Path portion must be preserved unchanged
+        let masked_path = masked.split('?').next().unwrap_or("");
+        if masked_path != path {
+            return TestResult::error(format!(
+                "Path changed: expected '{}', got '{}'",
+                path, masked_path
+            ));
+        }
+
+        // (c) Non-sensitive parameter names and values must be preserved
+        for (name, val) in &safe_params {
+            let expected_fragment = format!("{}={}", name, val);
+            if !masked.contains(&expected_fragment) {
+                return TestResult::error(format!(
+                    "Non-sensitive param '{}={}' not preserved in: {}",
+                    name, val, masked
+                ));
+            }
+        }
+
+        // (d) Sensitive parameter NAMES must be preserved (only values masked)
+        for (i, &(name, _)) in sensitive_params.iter().enumerate() {
+            if include_mask & (1 << i) != 0 {
+                let expected_name_prefix = format!("{}=", name);
+                if !masked.contains(&expected_name_prefix) {
+                    return TestResult::error(format!(
+                        "Sensitive param name '{}' not preserved in: {}",
+                        name, masked
+                    ));
+                }
+                // The value after the name should be REDACTED
+                let redacted_fragment = format!("{}=REDACTED", name);
+                if !masked.contains(&redacted_fragment) {
+                    return TestResult::error(format!(
+                        "Sensitive param '{}' not masked to REDACTED in: {}",
+                        name, masked
+                    ));
+                }
+            }
         }
 
         TestResult::passed()

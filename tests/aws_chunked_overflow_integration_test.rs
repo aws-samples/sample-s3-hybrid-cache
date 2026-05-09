@@ -63,7 +63,7 @@ fn test_decoder_survives_and_serves_subsequent_legitimate_request() {
     let decoded = decode_aws_chunked(legitimate)
         .expect("Legitimate aws-chunked body must still decode after a rejected one");
     assert_eq!(
-        decoded, b"hello",
+        decoded.data, b"hello",
         "Decoder must round-trip a well-formed body after rejecting a crafted one"
     );
 }

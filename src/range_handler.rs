@@ -452,8 +452,8 @@ impl RangeHandler {
         let mut current = sorted_ranges[0].clone();
 
         for range in sorted_ranges.iter().skip(1) {
-            // Check if ranges overlap or are adjacent
-            if current.end + 1 >= range.start {
+            // Check if ranges overlap or are adjacent (saturating to avoid overflow on u64::MAX)
+            if current.end.saturating_add(1) >= range.start {
                 // Merge ranges
                 current.end = std::cmp::max(current.end, range.end);
             } else {

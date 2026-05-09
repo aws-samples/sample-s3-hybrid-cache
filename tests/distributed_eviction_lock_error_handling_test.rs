@@ -14,7 +14,7 @@
 //! lightweight directory setup instead of full cache_manager.initialize() to avoid
 //! pulling in the consolidator dependency.
 
-use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager, GlobalEvictionLock};
+use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager, EvictionLockPayload};
 use s3_proxy::config::SharedStorageConfig;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
@@ -52,7 +52,8 @@ fn create_shared_storage_cache_manager(cache_dir: std::path::PathBuf) -> CacheMa
         true,                               // read_cache_enabled
         std::time::Duration::from_secs(60), // bucket_settings_staleness_threshold
         1_048_576,                          // compression_batch_size
-        false,                              // evaluate_conditions_from_cache
+        false,                              // evaluate_conditions_from_cache,
+        std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
     )
 }
 
@@ -160,10 +161,12 @@ async fn test_corrupted_json_lock_file_treated_as_stale() {
 
     // Verify lock file was replaced with valid JSON
     let lock_json = std::fs::read_to_string(&lock_file_path).expect("Failed to read lock file");
-    let lock: GlobalEvictionLock =
+    let lock: EvictionLockPayload =
         serde_json::from_str(&lock_json).expect("Lock file should now contain valid JSON");
 
-    assert!(!lock.instance_id.is_empty(), "Instance ID should be set");
+    assert!(!lock.uuid.is_empty(), "UUID should be set");
+    assert!(!lock.hostname.is_empty(), "Hostname should be set");
+    assert!(lock.acquired_at_ms > 0, "acquired_at_ms should be set");
 
     // Clean up
     cache_manager
@@ -377,14 +380,15 @@ async fn test_no_panic_on_release_with_various_states() {
     );
 
     // Test 3: Release with lock owned by another instance
-    let other_lock = GlobalEvictionLock {
-        instance_id: "other-instance:99999".to_string(),
-        process_id: 99999,
+    let other_lock = EvictionLockPayload {
+        uuid: "other-instance-uuid".to_string(),
+        acquired_at_ms: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
         hostname: "other-host".to_string(),
-        acquired_at: SystemTime::now(),
-        timeout_seconds: 300,
     };
-    let lock_json = serde_json::to_string_pretty(&other_lock).expect("Failed to serialize lock");
+    let lock_json = serde_json::to_string(&other_lock).expect("Failed to serialize lock");
     std::fs::write(&lock_file_path, lock_json).expect("Failed to write other lock");
     let result3 = cache_manager.release_global_eviction_lock().await;
     assert!(
@@ -476,18 +480,19 @@ async fn test_stale_lock_acquisition_handles_gracefully() {
 
     // Create a stale lock file
     let lock_file_path = cache_dir.join("locks").join("global_eviction.lock");
-    let stale_time = SystemTime::now() - Duration::from_secs(400); // Well past timeout
+    let stale_time_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 400_000; // 400 seconds ago, well past timeout
 
-    let stale_lock = GlobalEvictionLock {
-        instance_id: "stale-instance:12345".to_string(),
-        process_id: 12345,
+    let stale_lock = EvictionLockPayload {
+        uuid: "stale-uuid-12345".to_string(),
+        acquired_at_ms: stale_time_ms,
         hostname: "stale-host".to_string(),
-        acquired_at: stale_time,
-        timeout_seconds: 60, // 60 second timeout, but 400 seconds have passed
     };
 
-    let lock_json =
-        serde_json::to_string_pretty(&stale_lock).expect("Failed to serialize stale lock");
+    let lock_json = serde_json::to_string(&stale_lock).expect("Failed to serialize stale lock");
     std::fs::write(&lock_file_path, lock_json).expect("Failed to write stale lock file");
 
     // Acquire lock - should succeed by forcibly acquiring stale lock
@@ -499,15 +504,16 @@ async fn test_stale_lock_acquisition_handles_gracefully() {
 
     assert!(acquired, "Should acquire stale lock");
 
-    // Verify lock was updated
+    // Verify lock was updated with new UUID
     let lock_json = std::fs::read_to_string(&lock_file_path).expect("Failed to read lock file");
-    let lock: GlobalEvictionLock =
+    let lock: EvictionLockPayload =
         serde_json::from_str(&lock_json).expect("Lock should be valid JSON");
 
     assert_ne!(
-        lock.instance_id, "stale-instance:12345",
-        "Lock should be owned by new instance"
+        lock.uuid, "stale-uuid-12345",
+        "Lock should be owned by new instance with a new UUID"
     );
+    assert!(!lock.uuid.is_empty(), "New UUID should be set");
 
     // Clean up
     cache_manager
