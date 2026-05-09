@@ -136,7 +136,7 @@ The `--endpoint-url http://...` is required so the SDK signs the request against
             │                         │                          │
             ▼                         ▼                          ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                    Hybrid Cache for Amazon S3 (1..N)                        │
+│                    Hybrid Cache for Amazon S3 (1..N)                       │
 │                                                                            │
 │  ┌────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐  │
 │  │ HTTP (Port 80)     │ │ TLS Proxy (Port 3129)│ │ HTTPS (Port 443)     │  │
