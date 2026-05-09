@@ -113,7 +113,7 @@ aws s3 cp s3://your-bucket/key ./local \
   --region us-east-1
 ```
 
-The `--endpoint-url http://...` is required so the SDK signs the request against the real S3 hostname while connecting through the proxy — SigV4 authentication is built into the HTTP request itself, so the client→proxy leg can use plain HTTP without compromising security — TLS is only needed if the proxy is on a different host (where traffic crosses a real network).
+The `--endpoint-url http://...` is required so the SDK signs the request against the real S3 hostname while connecting through the proxy — SigV4 authentication is built into the HTTP request itself, so the client→proxy leg can use plain HTTP without compromising security — TLS is only needed if the proxy is on a different host (where traffic crosses an untrusted network).
 
 **Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to avoid passing `--endpoint-url` on every command (works for buckets in that region).
 
