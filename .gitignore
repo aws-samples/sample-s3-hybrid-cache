@@ -26,3 +26,4 @@ coverage/
 # Cache / runtime data
 cache/
 tmp/
+ProbeScanExport-*
