@@ -50,8 +50,10 @@ Quick start guide for installing, configuring, and running Hybrid Cache for Amaz
 
 ## Prerequisites
 
-- **Rust 1.89+** toolchain (earlier versions fail to compile: `std::fs::File::unlock` was stabilized in 1.89 and collides with the `fs2` crate's `FileExt::unlock`)
-- **sudo access** (required for ports 80/443)
+- **Rust 1.89+** toolchain — earlier versions fail to compile: `std::fs::File::unlock` was stabilized in 1.89 and collides with the `fs2` crate's `FileExt::unlock`
+- **OS**: Linux or macOS for building and running; production deployments typically run on Linux (systemd service, binary portability via glibc)
+- **sudo access** — required to bind ports 80/443; not needed for proxy-only mode on port 3128
+- **git** — to clone the repository
 
 ## Installation
 
