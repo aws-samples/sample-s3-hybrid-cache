@@ -64,7 +64,7 @@ impl EndpointOverrides {
                 exact.insert(hostname.clone(), ips);
             }
         }
-        suffixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        suffixes.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
 
         Self { exact, suffixes }
     }

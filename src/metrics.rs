@@ -848,11 +848,10 @@ impl MetricsManager {
     async fn collect_request_metrics(&self) -> RequestMetrics {
         let stats = self.request_stats.read().await;
 
-        let average_response_time_ms = if stats.total_requests > 0 {
-            stats.total_response_time_ms / stats.total_requests
-        } else {
-            0
-        };
+        let average_response_time_ms = stats
+            .total_response_time_ms
+            .checked_div(stats.total_requests)
+            .unwrap_or(0);
 
         let elapsed_seconds = stats
             .last_reset
@@ -1782,11 +1781,10 @@ impl MetricsManager {
         debug!(
             "Recorded coalesce wait duration: {}ms (avg: {}ms)",
             duration_ms,
-            if stats.wait_duration_count > 0 {
-                stats.wait_duration_sum_ms / stats.wait_duration_count
-            } else {
-                0
-            }
+            stats
+                .wait_duration_sum_ms
+                .checked_div(stats.wait_duration_count)
+                .unwrap_or(0)
         );
     }
 

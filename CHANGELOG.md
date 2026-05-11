@@ -5,6 +5,11 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.2] - 2026-05-11
+
+### Fixed
+- **Clippy lint fixes (Rust 1.95)**: Resolved 13 `clippy::unnecessary_sort_by` and `clippy::manual_checked_ops` warnings promoted to errors by `-D warnings`. Replaced `sort_by(|a, b| ...)` with `sort_by_key` in `background_recovery.rs`, `cache_validator.rs`, `connection_pool.rs`, `dashboard.rs`, `journal_consolidator.rs`, and `journal_manager.rs`. Replaced manual guard-then-divide patterns with `checked_div().unwrap_or(0)` in `cache_initialization_coordinator.rs`, `cache_validator.rs`, and `metrics.rs`.
+
 ## [1.16.1] - 2026-05-11
 
 ### Security

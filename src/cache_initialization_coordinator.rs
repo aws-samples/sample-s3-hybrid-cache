@@ -2706,11 +2706,7 @@ impl ObjectsScanResults {
 
     /// Get average object size
     pub fn average_object_size(&self) -> u64 {
-        if self.total_objects == 0 {
-            0
-        } else {
-            self.total_size / self.total_objects
-        }
+        self.total_size.checked_div(self.total_objects).unwrap_or(0)
     }
 
     /// Format average object size in human-readable format

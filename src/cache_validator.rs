@@ -945,7 +945,7 @@ impl CacheValidator {
         count: usize,
     ) -> Vec<&'a CacheFileResult> {
         let mut sorted_results: Vec<&CacheFileResult> = results.iter().collect();
-        sorted_results.sort_by(|a, b| b.compressed_size.cmp(&a.compressed_size));
+        sorted_results.sort_by_key(|b| std::cmp::Reverse(b.compressed_size));
         sorted_results.into_iter().take(count).collect()
     }
 
@@ -995,11 +995,11 @@ impl CacheValidator {
 
         // Count files in each bucket
         for result in results {
-            let bucket_index = if bucket_size > 0 {
-                ((result.compressed_size / bucket_size) as usize).min(bucket_count - 1)
-            } else {
-                0
-            };
+            let bucket_index = result
+                .compressed_size
+                .checked_div(bucket_size)
+                .map(|i| (i as usize).min(bucket_count - 1))
+                .unwrap_or(0);
             buckets[bucket_index].count += 1;
         }
 

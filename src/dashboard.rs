@@ -2159,7 +2159,7 @@ impl LogReader {
         }
 
         // Sort by timestamp (most recent first) and limit
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
         entries.truncate(limit);
 
         Ok(entries)

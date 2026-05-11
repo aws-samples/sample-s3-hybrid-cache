@@ -831,7 +831,7 @@ impl JournalManager {
             }
         }
 
-        all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        all_entries.sort_by_key(|a| a.timestamp);
 
         debug!(
             "Retrieved {} journal entries for cache_key={} from {} journal files (indexed)",
@@ -885,7 +885,7 @@ impl JournalManager {
         }
 
         // Sort entries by timestamp for proper ordering
-        all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        all_entries.sort_by_key(|a| a.timestamp);
 
         debug!(
             "Retrieved {} journal entries for cache_key={} from {} journal files",

@@ -620,13 +620,13 @@ impl BackgroundRecoverySystem {
         if config.enable_priority_recovery {
             queue
                 .high_priority
-                .sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
+                .sort_by_key(|b| std::cmp::Reverse(b.priority_score));
             queue
                 .medium_priority
-                .sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
+                .sort_by_key(|b| std::cmp::Reverse(b.priority_score));
             queue
                 .low_priority
-                .sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
+                .sort_by_key(|b| std::cmp::Reverse(b.priority_score));
         }
 
         let total_queued =
