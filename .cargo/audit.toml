@@ -1,0 +1,11 @@
+# cargo-audit configuration
+#
+# https://docs.rs/cargo-audit/latest/cargo_audit/#configuration
+#
+# This file tells `cargo audit` which advisories we have explicitly reviewed
+# and decided to defer. Every entry MUST have a comment naming the tracking
+# spec or changelog entry and the expected resolution path. Entries that are
+# no longer relevant MUST be removed — this file is not a permanent waiver.
+
+[advisories]
+ignore = []

@@ -116,29 +116,28 @@ impl OtlpExporter {
             .build()
             .map_err(|e| ProxyError::SystemError(format!("OTLP build failed: {}", e)))?;
 
-        let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+        let reader = PeriodicReader::builder(exporter)
             .with_interval(self.config.export_interval)
             .build();
 
         let hostname = gethostname::gethostname().to_string_lossy().to_string();
         let provider = SdkMeterProvider::builder()
             .with_reader(reader)
-            .with_resource(Resource::new(vec![
-                KeyValue::new(
-                    opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-                    "s3-proxy",
-                ),
-                KeyValue::new(
-                    opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
-                    env!("CARGO_PKG_VERSION"),
-                ),
-                KeyValue::new(
-                    // "host.name" — not in the stable attribute set for 0.27;
-                    // use the raw string which is what the constant expands to.
-                    "host.name",
-                    hostname,
-                ),
-            ]))
+            .with_resource(
+                Resource::builder_empty()
+                    .with_attributes(vec![
+                        KeyValue::new(
+                            opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                            "s3-proxy",
+                        ),
+                        KeyValue::new(
+                            opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                        KeyValue::new("host.name", hostname),
+                    ])
+                    .build(),
+            )
             .build();
 
         let m = provider.meter("s3-proxy");

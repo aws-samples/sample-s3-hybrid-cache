@@ -5,6 +5,11 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.1] - 2026-05-11
+
+### Security
+- **RUSTSEC-2026-0097 fully resolved — OTel stack upgraded to 0.29**: Bumped `opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` / `opentelemetry-semantic-conventions` from `0.27` to `0.29`. `opentelemetry_sdk 0.29` depends on `rand 0.9`, eliminating the last runtime reach path for the unsound `rand 0.8` advisory. The `tonic 0.12` transitive path (via `opentelemetry-otlp 0.27`) is also gone — `opentelemetry-otlp 0.29` no longer pulls in `tonic`. The only remaining `rand 0.8.5` in the lock file is `quickcheck 1.0.3` (dev-dependency, test-only; no runtime exposure). `cargo audit` now exits 0 with an empty `ignore` list in `.cargo/audit.toml`. API changes in `src/otlp.rs`: `PeriodicReader::builder()` no longer accepts a runtime argument (removed); `Resource::new(vec![...])` replaced with `Resource::builder_empty().with_attributes(vec![...]).build()` (the `new` constructor was made private in 0.29).
+
 ## [1.16.0] - 2026-05-09
 
 Comprehensive security, correctness, and hardening release addressing 34 findings from a code review. Minor version bump because the `max_waiter_resubscriptions` config addition and the public API changes to `WriteCacheManager`, `metadata_lock_manager`, and `aws_chunked_decoder` are net-new surface (all defaulted; existing configs parse unchanged).
