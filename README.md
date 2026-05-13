@@ -25,7 +25,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 
 - **Shared File Storage**: Multiple cache servers share cached data via existing on-premises file storage (e.g., NFS), eliminating redundant S3 pulls. Users allocate capacity from gigabytes to petabytes using existing hardware.
 
-- **Stateless Proxies**: Simplifies high availability by mimicking [S3's multi-value answer DNS resolution](https://aws.amazon.com/about-aws/whats-new/2023/08/amazon-s3-multivalue-answer-response-dns-queries/). S3 clients using the AWS Common Runtime (CRT)—available as a transfer client in AWS CLI v2 and modern SDKs—automatically distribute requests across all resolved IPs and retry against alternate IPs on connection failure. No load balancer or client-side configuration required.
+- **Stateless Proxies**: Simplifies high availability by mimicking S3's [multi-value answer DNS resolution](https://docs.aws.amazon.com/general/latest/gr/s3.html#multivalue-answer-dns-routing). S3 clients using the AWS Common Runtime (CRT)—available as a transfer client in AWS CLI v2 and modern SDKs—automatically distribute requests across all resolved IPs and retry against alternate IPs on connection failure. No load balancer or client-side configuration required.
 
 ## Benefits
 

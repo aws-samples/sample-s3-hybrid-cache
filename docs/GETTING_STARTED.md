@@ -485,7 +485,7 @@ The MRAP zone (`dns-mrap.json`) follows the same pattern — apex A records plus
 | Wildcard CNAME chain | Routes all subdomains (buckets, access points) to proxy IPs via the primary zone |
 | Short TTL (60s) | Enables quick failover if a proxy becomes unavailable |
 
-This approach mirrors how [S3 itself uses multi-value answer routing for DNS queries](https://aws.amazon.com/about-aws/whats-new/2023/08/amazon-s3-multivalue-answer-response-dns-queries/). The AWS Common Runtime (CRT), available as a transfer client in AWS CLI v2 and modern SDKs, resolves all IPs from DNS, distributes requests across them, and retries against alternate IPs on connection failure — providing load balancing and failover without an external load balancer.
+This approach mirrors how S3 itself uses multi-value answer (MVA) routing for DNS queries ([launch announcement](https://aws.amazon.com/about-aws/whats-new/2023/08/amazon-s3-multivalue-answer-response-dns-queries/); see also [Multivalue answer DNS routing](https://docs.aws.amazon.com/general/latest/gr/s3.html#multivalue-answer-dns-routing) in the AWS General Reference). The AWS Common Runtime (CRT), available as a transfer client in AWS CLI v2 and modern SDKs, resolves all IPs from DNS, distributes requests across them, and retries against alternate IPs on connection failure — providing load balancing and failover without an external load balancer. Clients without MVA support fall back to using the first IP in the response.
 
 **Multi-Instance Shared Storage**: When running multiple proxy instances with shared NFS storage, the volume MUST be mounted with `lookupcache=pos` for reliable cache coordination. See [Configuration Guide - Multi-Instance Coordination](CONFIGURATION.md#multi-instance-coordination) for details.
 
