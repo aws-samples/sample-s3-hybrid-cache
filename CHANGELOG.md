@@ -5,6 +5,18 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.3] - 2026-06-01
+
+Test coverage release. No production code changes — `src/` runtime logic is unchanged, so the upgrade contract is unaffected (`cargo build --release` → copy binary → `systemctl restart`, no config edits).
+
+### Added
+- **Inline unit tests for `tcp_proxy.rs`** (13 tests): TLS ClientHello SNI extraction (valid hostnames, non-handshake records, truncated input, non-ClientHello handshake type, non-hostname SNI extension type) plus `format_bytes` unit boundaries and `format_addr` IPv4-mapped-IPv6 simplification. Previously this 773-line module had no inline coverage and was only exercised indirectly via TLS passthrough integration tests.
+- **Inline unit tests for `shutdown.rs`** (12 tests): broadcast subscriber accounting (`subscriber_count`, subscribe/drop), `initiate_shutdown`/`force_shutdown` with no components registered (minimal-config case), signal broadcast delivery, and `ShutdownSignal` state transitions including the closed-channel path that must unblock rather than hang.
+- **Inline unit tests for `health.rs`** (8 tests): `determine_overall_status` precedence (Unhealthy > Degraded > Healthy, empty = Healthy), `check_health` with no subsystems registered, result caching, and `SystemHealth`/`HealthStatus` JSON serialization (including the `skip_serializing_if` on `ip_distribution`).
+
+### Changed
+- **`docs/DEVELOPER.md` testing section**: Replaced the stale "Coverage: 236 tests passing" figure with a description of the suite structure (inline `#[cfg(test)]` modules in 40+ `src/` modules plus 130+ files under `tests/`) and grep-able commands to get current counts, so the number cannot go stale again. Added a Coverage subsection documenting local `cargo-llvm-cov` usage.
+
 ## [1.16.2] - 2026-05-11
 
 ### Fixed

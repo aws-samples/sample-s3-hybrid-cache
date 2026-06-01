@@ -302,3 +302,111 @@ impl HealthManager {
             .map_err(|e| ProxyError::HttpError(format!("Failed to build health response: {}", e)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn component(status: HealthStatus) -> ComponentHealth {
+        ComponentHealth {
+            name: "test".to_string(),
+            status,
+            message: None,
+            last_check: SystemTime::now(),
+            response_time_ms: Some(0),
+        }
+    }
+
+    #[test]
+    fn test_determine_overall_status_empty_is_healthy() {
+        let mgr = HealthManager::new();
+        assert_eq!(mgr.determine_overall_status(&[]), HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_determine_overall_status_all_healthy() {
+        let mgr = HealthManager::new();
+        let components = [
+            component(HealthStatus::Healthy),
+            component(HealthStatus::Healthy),
+        ];
+        assert_eq!(
+            mgr.determine_overall_status(&components),
+            HealthStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn test_determine_overall_status_degraded_takes_precedence_over_healthy() {
+        let mgr = HealthManager::new();
+        let components = [
+            component(HealthStatus::Healthy),
+            component(HealthStatus::Degraded),
+        ];
+        assert_eq!(
+            mgr.determine_overall_status(&components),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn test_determine_overall_status_unhealthy_takes_precedence_over_degraded() {
+        let mgr = HealthManager::new();
+        let components = [
+            component(HealthStatus::Degraded),
+            component(HealthStatus::Unhealthy),
+            component(HealthStatus::Healthy),
+        ];
+        assert_eq!(
+            mgr.determine_overall_status(&components),
+            HealthStatus::Unhealthy
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_health_no_components_is_healthy() {
+        // A manager with no subsystems registered should report Healthy with
+        // an empty component list (startup / minimal-config case).
+        let mgr = HealthManager::new();
+        let health = mgr.check_health().await;
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert!(health.components.is_empty());
+        assert!(health.ip_distribution.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_health_result_is_cached() {
+        let mgr = HealthManager::new();
+        let _ = mgr.check_health().await;
+        let cached = mgr.last_health_check.read().await;
+        assert!(cached.is_some());
+    }
+
+    #[test]
+    fn test_system_health_serializes_to_json() {
+        let health = SystemHealth {
+            status: HealthStatus::Healthy,
+            timestamp: SystemTime::now(),
+            components: vec![component(HealthStatus::Healthy)],
+            uptime_seconds: 42,
+            ip_distribution: None,
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        // ip_distribution is skipped when None
+        assert!(!json.contains("ip_distribution"));
+        assert!(json.contains("uptime_seconds"));
+    }
+
+    #[test]
+    fn test_health_status_roundtrip() {
+        for status in [
+            HealthStatus::Healthy,
+            HealthStatus::Degraded,
+            HealthStatus::Unhealthy,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: HealthStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, back);
+        }
+    }
+}

@@ -771,3 +771,159 @@ impl TcpProxy {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal but well-formed TLS ClientHello record carrying a
+    /// single SNI hostname extension. Used to exercise the SNI parser without
+    /// a real TLS stack.
+    fn build_client_hello_with_sni(hostname: &str) -> Vec<u8> {
+        let host_bytes = hostname.as_bytes();
+
+        // SNI extension body: server name list len (2) + type (1) + name len (2) + name
+        let mut sni_ext_body = Vec::new();
+        let list_len = 1 + 2 + host_bytes.len();
+        sni_ext_body.extend_from_slice(&(list_len as u16).to_be_bytes());
+        sni_ext_body.push(0x00); // hostname type
+        sni_ext_body.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        sni_ext_body.extend_from_slice(host_bytes);
+
+        // Extension: type 0x0000 (server_name) + length (2) + body
+        let mut extension = Vec::new();
+        extension.extend_from_slice(&0x0000u16.to_be_bytes());
+        extension.extend_from_slice(&(sni_ext_body.len() as u16).to_be_bytes());
+        extension.extend_from_slice(&sni_ext_body);
+
+        // Extensions block: total length (2) + extensions
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&(extension.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&extension);
+
+        // ClientHello body
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version TLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session id length = 0
+        body.extend_from_slice(&0x0002u16.to_be_bytes()); // cipher suites length
+        body.extend_from_slice(&[0x00, 0x2f]); // one cipher suite
+        body.push(0x01); // compression methods length
+        body.push(0x00); // null compression
+        body.extend_from_slice(&extensions);
+
+        // Handshake message: type (1) + length (3) + body
+        let mut handshake = Vec::new();
+        handshake.push(0x01); // ClientHello
+        let body_len = body.len();
+        handshake.push(((body_len >> 16) & 0xff) as u8);
+        handshake.push(((body_len >> 8) & 0xff) as u8);
+        handshake.push((body_len & 0xff) as u8);
+        handshake.extend_from_slice(&body);
+
+        // TLS record: type (1) + version (2) + length (2) + handshake
+        let mut record = Vec::new();
+        record.push(0x16); // handshake content type
+        record.extend_from_slice(&[0x03, 0x01]); // record version
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        record
+    }
+
+    #[test]
+    fn test_extract_sni_valid_client_hello() {
+        let record = build_client_hello_with_sni("my-bucket.s3.us-west-2.amazonaws.com");
+        let sni = TcpProxy::extract_sni_from_tls_handshake(&record);
+        assert_eq!(sni.as_deref(), Some("my-bucket.s3.us-west-2.amazonaws.com"));
+    }
+
+    #[test]
+    fn test_extract_sni_short_hostname() {
+        let record = build_client_hello_with_sni("s3.amazonaws.com");
+        let sni = TcpProxy::extract_sni_from_tls_handshake(&record);
+        assert_eq!(sni.as_deref(), Some("s3.amazonaws.com"));
+    }
+
+    #[test]
+    fn test_extract_sni_rejects_non_handshake_record() {
+        // Content type 0x17 = application_data, not handshake (0x16)
+        let data = [0x17u8, 0x03, 0x03, 0x00, 0x05, 1, 2, 3, 4, 5];
+        assert_eq!(TcpProxy::extract_sni_from_tls_handshake(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_rejects_too_short() {
+        assert_eq!(
+            TcpProxy::extract_sni_from_tls_handshake(&[0x16, 0x03]),
+            None
+        );
+        assert_eq!(TcpProxy::extract_sni_from_tls_handshake(&[]), None);
+    }
+
+    #[test]
+    fn test_extract_sni_rejects_non_client_hello() {
+        // Valid TLS record header but handshake type 0x02 (ServerHello)
+        let mut data = vec![0x16, 0x03, 0x01, 0x00, 0x04];
+        data.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // ServerHello, len 0
+        assert_eq!(TcpProxy::extract_sni_from_tls_handshake(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_truncated_handshake_body() {
+        // Well-formed header claiming a ClientHello, but the body is truncated
+        // before the random/extensions, so parsing must bail out with None.
+        let mut data = vec![0x16, 0x03, 0x01, 0x00, 0x06];
+        data.extend_from_slice(&[0x01, 0x00, 0x00, 0x02, 0x03, 0x03]); // ClientHello, 2-byte body
+        assert_eq!(TcpProxy::extract_sni_from_tls_handshake(&data), None);
+    }
+
+    #[test]
+    fn test_parse_sni_extension_rejects_non_hostname_type() {
+        // list_len covers type+len+name; name type 0x01 is not hostname (0x00)
+        let body = [0x00, 0x04, 0x01, 0x00, 0x01, b'x'];
+        assert_eq!(TcpProxy::parse_sni_extension(&body), None);
+    }
+
+    #[test]
+    fn test_parse_sni_extension_rejects_truncated() {
+        assert_eq!(TcpProxy::parse_sni_extension(&[0x00, 0x04]), None);
+    }
+
+    #[test]
+    fn test_format_bytes_units() {
+        assert_eq!(TcpProxy::format_bytes(0), "0B");
+        assert_eq!(TcpProxy::format_bytes(512), "512B");
+        assert_eq!(TcpProxy::format_bytes(1024), "1.0KB");
+        assert_eq!(TcpProxy::format_bytes(1536), "1.5KB");
+        assert_eq!(TcpProxy::format_bytes(1024 * 1024), "1.00MB");
+        assert_eq!(TcpProxy::format_bytes(1024 * 1024 * 1024), "1.00GB");
+    }
+
+    #[test]
+    fn test_format_bytes_boundary() {
+        // Just below 1 KB stays in bytes
+        assert_eq!(TcpProxy::format_bytes(1023), "1023B");
+        // Just below 1 MB stays in KB
+        assert_eq!(TcpProxy::format_bytes(1024 * 1024 - 1), "1024.0KB");
+    }
+
+    #[test]
+    fn test_format_addr_ipv4() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(TcpProxy::format_addr(addr), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_format_addr_ipv4_mapped_ipv6() {
+        // ::ffff:127.0.0.1 should be simplified to the IPv4 form
+        let addr: SocketAddr = "[::ffff:127.0.0.1]:443".parse().unwrap();
+        assert_eq!(TcpProxy::format_addr(addr), "127.0.0.1:443");
+    }
+
+    #[test]
+    fn test_format_addr_native_ipv6() {
+        let addr: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        assert_eq!(TcpProxy::format_addr(addr), "[2606:4700:4700::1111]:443");
+    }
+}

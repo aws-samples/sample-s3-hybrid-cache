@@ -1418,7 +1418,14 @@ pub async fn get_or_load<F, Fut>(&self, cache_key: &str, loader: F) -> Result<Ne
 
 ### Unit Tests
 
-**Coverage**: 236 tests passing
+The suite spans inline `#[cfg(test)]` modules in 40+ of the `src/` modules plus
+130+ integration and property-test files under `tests/`. Get the current counts
+directly from the tree:
+
+```bash
+cargo test --release 2>&1 | grep "test result"   # per-binary pass/fail totals
+ls tests/*.rs | wc -l                             # integration/property test files
+```
 
 **Key Test Suites**:
 - Cache operations (get, put, evict)
@@ -1427,11 +1434,39 @@ pub async fn get_or_load<F, Fut>(&self, cache_key: &str, loader: F) -> Result<Ne
 - TTL expiration
 - Multipart uploads
 - Error handling
+- TCP passthrough SNI parsing (`tcp_proxy`)
+- Graceful shutdown signalling (`shutdown`)
+- Health status aggregation (`health`)
 
 **Property-Based Tests** (quickcheck):
 - Cache consistency
 - Range merging correctness
 - Compression round-trip
+
+### Coverage
+
+Coverage is measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+(LLVM source-based instrumentation). The CI `coverage` job builds an instrumented
+binary, runs the full suite, and publishes a Cobertura report that GitLab renders
+as line-by-line annotations in the merge request diff; the MR-widget percentage is
+scraped from the job's text summary via the `coverage:` regex in `.gitlab-ci.yml`.
+
+Run it locally:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --release --workspace            # text summary in the terminal
+cargo llvm-cov --release --workspace --html     # browsable report under target/llvm-cov/html
+```
+
+Notes:
+- Coverage uses a distinct instrumented build profile, so it does not reuse the
+  `target/` artifacts from a normal `build`/`test` run.
+- The CI job is `allow_failure: true` until the `coverage:` regex is confirmed
+  against a real job log (the `llvm-cov` `TOTAL` line has several percentage
+  columns). Remove `allow_failure` once stable, and optionally gate with
+  `cargo llvm-cov --fail-under-lines <pct>`.
 
 ### Integration Tests
 
