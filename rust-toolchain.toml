@@ -1,0 +1,12 @@
+# Pin the build toolchain so local builds and CI use the same Rust version.
+#
+# This is the *build* version, distinct from the MSRV floor in Cargo.toml
+# (`rust-version = "1.89"`). Pinning prevents the recurring clippy breakage
+# where `rust:latest` in CI ships new lints that fire on existing code while
+# a developer's local stable lags behind (see CHANGELOG 1.16.2 / 1.16.4).
+#
+# Keep this in sync with the `image: rust:<version>` tag in .gitlab-ci.yml.
+# Bump both together, deliberately, and run the full pre-push checklist when you do.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]

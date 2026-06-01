@@ -4221,13 +4221,11 @@ impl HttpProxy {
                                         let header_map: HeaderMap = client_headers
                                             .iter()
                                             .filter_map(|(k, v)| {
-                                                k.parse::<hyper::header::HeaderName>()
-                                                    .ok()
-                                                    .and_then(|name| {
-                                                        v.parse::<hyper::header::HeaderValue>()
-                                                            .ok()
-                                                            .map(|val| (name, val))
-                                                    })
+                                                let name =
+                                                    k.parse::<hyper::header::HeaderName>().ok();
+                                                let val =
+                                                    v.parse::<hyper::header::HeaderValue>().ok();
+                                                name.zip(val)
                                             })
                                             .collect();
                                         return Self::serve_range_from_cache(
@@ -4462,13 +4460,13 @@ impl HttpProxy {
                                                 let header_map: HeaderMap = client_headers
                                                     .iter()
                                                     .filter_map(|(k, v)| {
-                                                        k.parse::<hyper::header::HeaderName>()
-                                                        .ok()
-                                                        .and_then(|name| {
-                                                            v.parse::<hyper::header::HeaderValue>()
-                                                                .ok()
-                                                                .map(|val| (name, val))
-                                                        })
+                                                        let name = k
+                                                            .parse::<hyper::header::HeaderName>()
+                                                            .ok();
+                                                        let val = v
+                                                            .parse::<hyper::header::HeaderValue>()
+                                                            .ok();
+                                                        name.zip(val)
                                                     })
                                                     .collect();
                                                 return Self::serve_range_from_cache(
@@ -4711,13 +4709,9 @@ impl HttpProxy {
                             let header_map: HeaderMap = client_headers
                                 .iter()
                                 .filter_map(|(k, v)| {
-                                    k.parse::<hyper::header::HeaderName>()
-                                        .ok()
-                                        .and_then(|name| {
-                                            v.parse::<hyper::header::HeaderValue>()
-                                                .ok()
-                                                .map(|val| (name, val))
-                                        })
+                                    let name = k.parse::<hyper::header::HeaderName>().ok();
+                                    let val = v.parse::<hyper::header::HeaderValue>().ok();
+                                    name.zip(val)
                                 })
                                 .collect();
                             return Self::serve_range_from_cache(
@@ -9292,13 +9286,9 @@ impl HttpProxy {
             let header_map: HeaderMap = headers
                 .iter()
                 .filter_map(|(k, v)| {
-                    k.parse::<hyper::header::HeaderName>()
-                        .ok()
-                        .and_then(|name| {
-                            v.parse::<hyper::header::HeaderValue>()
-                                .ok()
-                                .map(|val| (name, val))
-                        })
+                    let name = k.parse::<hyper::header::HeaderName>().ok();
+                    let val = v.parse::<hyper::header::HeaderValue>().ok();
+                    name.zip(val)
                 })
                 .collect();
             return Self::serve_range_from_cache(

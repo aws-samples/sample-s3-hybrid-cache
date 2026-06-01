@@ -120,8 +120,8 @@ async fn test_multi_instance_validation_coordination() {
     );
 
     // The one that got the lock should be able to release it
-    if lock1_result.is_ok() {
-        drop(lock1_result.unwrap());
+    if let Ok(lock1) = lock1_result {
+        drop(lock1);
         // Now the other should be able to acquire it
         let lock2_retry = tracker2.try_acquire_validation_lock().await;
         assert!(
@@ -129,7 +129,7 @@ async fn test_multi_instance_validation_coordination() {
             "Second instance should acquire lock after first releases"
         );
     } else {
-        drop(lock2_result.unwrap());
+        drop(lock2_result.expect("one of the two locks must have been acquired"));
         let lock1_retry = tracker1.try_acquire_validation_lock().await;
         assert!(
             lock1_retry.is_ok(),

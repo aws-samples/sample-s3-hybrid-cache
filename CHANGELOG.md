@@ -5,6 +5,16 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.4] - 2026-06-01
+
+Build-toolchain pin and clippy fixes for Rust 1.96. No production code changes — `src/` runtime behavior is unchanged (all fixes are style-level lints and test code), so the upgrade contract is unaffected.
+
+### Fixed
+- **Clippy lint fixes (Rust 1.96)**: Resolved 6 lints promoted to errors by `-D warnings` under the newer toolchain in CI's `rust:latest` image. Four `clippy::manual_option_zip` sites in `src/http_proxy.rs` (header-map construction) rewritten to use `Option::zip`. One `clippy::filter_next_back` in a `src/cache.rs` property test rewritten to `Iterator::rfind`. One `clippy::unnecessary_unwrap` (unwrap-after-`is_ok`) in `tests/cache_size_tracking_integration_test.rs` rewritten to `if let Ok`. These were pre-existing — the code predated the lints; CI surfaced them when `rust:latest` advanced to 1.96.
+
+### Changed
+- **Pinned the build toolchain to Rust 1.96**: Added `rust-toolchain.toml` (channel `1.96`, with `rustfmt`/`clippy`) and changed the CI base image from `rust:latest` to `rust:1.96` in `.gitlab-ci.yml`. Local builds and CI now use the same compiler, so new clippy lints no longer appear unannounced on a `rust:latest` bump (this is the third such recurrence — see 1.16.2 for Rust 1.95). The toolchain pin is the *build* version and is distinct from the MSRV floor (`rust-version = "1.89"` in `Cargo.toml`); bump the pin and the CI image together, deliberately, running the full pre-push checklist each time.
+
 ## [1.16.3] - 2026-06-01
 
 Test coverage release. No production code changes — `src/` runtime logic is unchanged, so the upgrade contract is unaffected (`cargo build --release` → copy binary → `systemctl restart`, no config edits).

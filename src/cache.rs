@@ -11311,8 +11311,7 @@ mod cache_key_sanitization_tests {
             // Find the expected value (last entry for this part number due to HashMap insert behavior)
             let expected = valid_entries
                 .iter()
-                .filter(|(pn, _, _)| *pn == lookup_part_number)
-                .next_back();
+                .rfind(|(pn, _, _)| *pn == lookup_part_number);
 
             match expected {
                 Some((_, exp_start, exp_end)) => {
