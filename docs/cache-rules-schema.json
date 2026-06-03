@@ -1,0 +1,122 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/aws-samples/sample-s3-hybrid-cache/cache-rules-schema.json",
+  "title": "Hybrid Cache for Amazon S3 Cache Rules",
+  "description": "Ordered list of cache rules for Hybrid Cache for Amazon S3. Place this file at cache_dir/cache_rules.json. Each rule matches a glob pattern against the full cache key {bucket}/{object_key} and supplies an optional subset of cache settings. Resolution is first-match-per-field over the ordered rule list: for each field independently, the value is taken from the earliest rule whose pattern matches and which sets that field, falling through to the global YAML cache: defaults. The file is optional and hot-reloadable; when absent or when rules is empty, every field resolves to the global defaults.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional JSON Schema reference for IDE validation support."
+    },
+    "rules": {
+      "type": "array",
+      "description": "Ordered list of cache rules. Order is significant: resolution is first-match-per-field, so place specific rules above broad ones. Defaults to an empty list, which makes every field resolve to the global cache: defaults.",
+      "items": {
+        "$ref": "#/definitions/cache_rule"
+      }
+    }
+  },
+  "definitions": {
+    "cache_rule": {
+      "type": "object",
+      "description": "One cache rule: a required glob pattern plus an optional subset of cache settings to apply when the pattern matches.",
+      "required": [
+        "pattern"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Glob pattern matched against the full cache key in the form {bucket}/{object_key} (no leading slash). Glob syntax: '*' matches any run of characters except '/' (one path segment), '**' matches any run including '/' (crosses segments), '?' matches exactly one character except '/', and every other character is a literal (regex metacharacters are escaped, so '.' matches only a literal '.'). Patterns are anchored to the whole key (they match only if they match the entire string) and matching is case-sensitive. A leading literal bucket name (e.g. \"mybucket/temp/**\") scopes a rule to one bucket; a leading wildcard (e.g. \"**/logs/**\") matches across all buckets; a wildcard before a literal segment (e.g. \"**/credit-cards/**\") matches that segment anywhere. Must be non-empty. Note: for access points, MRAPs, and S3-compatible hosts the cache key uses a different leading segment ({name}-{account}-s3alias, {alias}.mrap, or the bare normalized path) - see docs/CACHING.md.",
+          "examples": [
+            "**",
+            "**/logs/**",
+            "**/credit-cards/**",
+            "prod-*/static/**",
+            "mybucket/temp/**"
+          ]
+        },
+        "get_ttl": {
+          "type": "string",
+          "description": "TTL for cached GET responses. Human-readable duration: e.g. \"0s\", \"30s\", \"5m\", \"1h\", \"7d\". Set to \"0s\" to cache on disk but revalidate with S3 on every request (conditional GET with If-Modified-Since / If-None-Match). When \"0s\", range data is excluded from RAM cache (ram_cache_eligible is forced false).",
+          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "examples": [
+            "0s",
+            "30s",
+            "5m",
+            "1h",
+            "7d"
+          ]
+        },
+        "head_ttl": {
+          "type": "string",
+          "description": "TTL for cached HEAD responses. Same duration format as get_ttl. Set to \"0s\" to revalidate HEAD responses with S3 on every request.",
+          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "examples": [
+            "0s",
+            "30s",
+            "5m",
+            "1h"
+          ]
+        },
+        "put_ttl": {
+          "type": "string",
+          "description": "TTL for write-cached PUT responses. Controls how long PUT data is retained on disk for subsequent GET requests.",
+          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "examples": [
+            "30s",
+            "5m",
+            "1h",
+            "7d"
+          ]
+        },
+        "read_cache_enabled": {
+          "type": "boolean",
+          "description": "Enable or disable read caching for GET responses. When false, GET responses are streamed directly from S3 without caching to disk or RAM, and ram_cache_eligible is forced false. Write caching (PUT) is independent. Default: true (from global config)."
+        },
+        "write_cache_enabled": {
+          "type": "boolean",
+          "description": "Enable or disable write-through caching for PUT operations. When false, PUT requests are forwarded to S3 but not cached locally. Default: from global config."
+        },
+        "compression_enabled": {
+          "type": "boolean",
+          "description": "Enable or disable LZ4 compression for cached data. Disable for keys containing already-compressed data (images, videos, archives). Default: from global config."
+        },
+        "ram_cache_eligible": {
+          "type": "boolean",
+          "description": "Whether range data for matching keys can be stored in RAM cache. Set to false to reserve RAM cache for higher-priority keys. Automatically forced to false when get_ttl is \"0s\" or read_cache_enabled is false. Default: true."
+        },
+        "evaluate_conditions_from_cache": {
+          "type": "boolean",
+          "description": "Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since) against cached metadata instead of forwarding to S3. When true, the proxy returns 304/412/200 locally from unexpired cache; when false (default), all conditional requests are forwarded to S3 for strict RFC 7232 semantics. Falls back to forward when cache metadata is expired or missing validators."
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "rules": [
+        {
+          "pattern": "**/credit-cards/**",
+          "read_cache_enabled": false
+        },
+        {
+          "pattern": "**/logs/**",
+          "get_ttl": "0s"
+        },
+        {
+          "pattern": "prod-*/static/**",
+          "get_ttl": "7d",
+          "compression_enabled": true
+        },
+        {
+          "pattern": "**",
+          "get_ttl": "5m"
+        }
+      ]
+    }
+  ]
+}

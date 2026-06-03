@@ -1,13 +1,28 @@
-//! Bucket-Level Cache Settings
+//! Cache Match Rules
 //!
-//! Per-bucket and per-prefix cache configuration loaded from `_settings.json` files
-//! stored at `cache_dir/metadata/{bucket}/_settings.json`. Supports a settings cascade
-//! (Prefix → Bucket → Global) for fine-grained cache control.
+//! Glob-based cache rules loaded from a single hot-reloadable file at
+//! `cache_dir/cache_rules.json`. Each rule is a glob `pattern` plus an optional
+//! subset of cache settings. Patterns are matched against the full cache key
+//! (`{bucket}/{object_key}`, or the access-point / MRAP / S3-compatible cache-key
+//! form). Resolution is first-match-per-field over the ordered rule list, falling
+//! through to the global config scalar defaults.
+//!
+//! Glob syntax (user-facing):
+//! - `*`  matches any run of characters except `/` (one path segment)
+//! - `**` matches any run of characters including `/` (crosses segments)
+//! - `?`  matches exactly one character except `/`
+//! - every other character is a literal (regex metacharacters are escaped)
+//!
+//! Internally each glob is translated to an anchored regex and all rules are
+//! compiled into one `regex::RegexSet` at load time (never per request).
+//!
+//! This replaces the former per-bucket `_settings.json` mechanism. That is a
+//! breaking change with no automatic migration.
 
+use regex::RegexSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
@@ -15,7 +30,11 @@ use tracing::{debug, info, warn};
 
 use crate::config::duration_serde;
 
-/// Custom deserializer for optional Duration fields in bucket settings JSON.
+/// Default maximum number of rules. A generous safety guardrail; the real cost
+/// driver is match fan-out per key, not total rule count. Confirmed by benchmark.
+pub const DEFAULT_MAX_RULES: usize = 1024;
+
+/// Custom deserializer for optional Duration fields in rule JSON.
 /// Handles both string values ("30s", "5m") and null/missing fields.
 fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
 where
@@ -78,101 +97,138 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
-/// Per-bucket settings loaded from `_settings.json`.
-/// All fields are optional — omitted fields fall back to global config.
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
-pub struct BucketSettings {
-    /// Optional JSON schema reference for IDE validation
+/// Translate a user glob pattern into an anchored regex string.
+///
+/// Returns an error for empty/whitespace-only patterns. The output is always
+/// anchored (`^…$`) so a pattern matches only the entire cache key. Matching is
+/// case-sensitive (the regex default), mirroring S3 key semantics.
+pub fn glob_to_regex(pattern: &str) -> Result<String, String> {
+    if pattern.trim().is_empty() {
+        return Err("pattern is empty".to_string());
+    }
+
+    let mut out = String::with_capacity(pattern.len() * 2 + 2);
+    out.push('^');
+
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '*' => {
+                // `**` crosses `/`; `*` stays within a path segment.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    out.push_str(".*");
+                    i += 2;
+                } else {
+                    out.push_str("[^/]*");
+                    i += 1;
+                }
+            }
+            '?' => {
+                out.push_str("[^/]");
+                i += 1;
+            }
+            other => {
+                // Escape any regex metacharacter; pass through normal chars.
+                // `regex::escape` handles multi-byte chars correctly via the &str slice.
+                let ch_str = &pattern[i..i + other.len_utf8()];
+                out.push_str(&regex::escape(ch_str));
+                i += other.len_utf8();
+            }
+        }
+    }
+
+    out.push('$');
+    Ok(out)
+}
+
+/// The optional settings fields a rule (or resolution layer) may set.
+/// All optional; omitted fields fall through to the next layer.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+pub struct CacheRule {
+    /// Glob pattern matched against the full cache key.
+    pub pattern: String,
+
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub get_ttl: Option<Duration>,
+
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub head_ttl: Option<Duration>,
+
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub put_ttl: Option<Duration>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_cache_eligible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluate_conditions_from_cache: Option<bool>,
+}
+
+/// The on-disk `cache_rules.json` shape.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct CacheRules {
+    /// Optional JSON schema reference for IDE validation.
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
 
-    /// GET response TTL override (e.g., "0s", "30s", "5m", "1h", "7d")
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_duration",
-        serialize_with = "serialize_optional_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub get_ttl: Option<Duration>,
-
-    /// HEAD response TTL override
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_duration",
-        serialize_with = "serialize_optional_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub head_ttl: Option<Duration>,
-
-    /// PUT write-cache TTL override
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_duration",
-        serialize_with = "serialize_optional_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub put_ttl: Option<Duration>,
-
-    /// Enable/disable read caching for GET responses
-    pub read_cache_enabled: Option<bool>,
-
-    /// Enable/disable write-through caching for PUT operations
-    pub write_cache_enabled: Option<bool>,
-
-    /// Enable/disable LZ4 compression for cached data
-    pub compression_enabled: Option<bool>,
-
-    /// Whether range data from this bucket can be stored in RAM cache
-    pub ram_cache_eligible: Option<bool>,
-
-    /// Evaluate client conditional headers against cached metadata instead of forwarding
-    /// to S3. See `CacheConfig::evaluate_conditions_from_cache` for full semantics.
-    pub evaluate_conditions_from_cache: Option<bool>,
-
-    /// Per-prefix overrides within this bucket
+    /// Ordered list of rules. Order is significant (first-match-per-field).
     #[serde(default)]
-    pub prefix_overrides: Vec<PrefixOverride>,
+    pub rules: Vec<CacheRule>,
 }
 
-/// Per-prefix settings override within a bucket.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
-pub struct PrefixOverride {
-    /// Prefix path (e.g., "/temp/", "/static/assets/")
-    pub prefix: String,
+impl CacheRules {
+    /// Validate the rule set. Returns a list of human-readable errors; empty = valid.
+    /// Checks: non-empty patterns, compilable globs, and the rule-count cap.
+    pub fn validate(&self, max_rules: usize) -> Vec<String> {
+        let mut errors = Vec::new();
 
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_duration",
-        serialize_with = "serialize_optional_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub get_ttl: Option<Duration>,
+        if self.rules.len() > max_rules {
+            errors.push(format!(
+                "rule count {} exceeds maximum {}",
+                self.rules.len(),
+                max_rules
+            ));
+        }
 
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_duration",
-        serialize_with = "serialize_optional_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub head_ttl: Option<Duration>,
+        for (i, rule) in self.rules.iter().enumerate() {
+            match glob_to_regex(&rule.pattern) {
+                Ok(re) => {
+                    if regex::Regex::new(&re).is_err() {
+                        errors.push(format!("rules[{}]: pattern failed to compile", i));
+                    }
+                }
+                Err(e) => errors.push(format!("rules[{}]: {}", i, e)),
+            }
+        }
 
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_duration",
-        serialize_with = "serialize_optional_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub put_ttl: Option<Duration>,
-
-    pub read_cache_enabled: Option<bool>,
-    pub write_cache_enabled: Option<bool>,
-    pub compression_enabled: Option<bool>,
-    pub ram_cache_eligible: Option<bool>,
-    pub evaluate_conditions_from_cache: Option<bool>,
+        errors
+    }
 }
 
-/// Fully resolved settings for a specific bucket+path combination.
-/// Every field has a concrete value (no Options) after cascade resolution.
+/// Fully resolved settings for a specific cache key.
+/// Every field has a concrete value (no Options) after resolution.
 #[derive(Debug, Clone)]
 pub struct ResolvedSettings {
     pub get_ttl: Duration,
@@ -183,19 +239,42 @@ pub struct ResolvedSettings {
     pub compression_enabled: bool,
     pub ram_cache_eligible: bool,
     pub evaluate_conditions_from_cache: bool,
-    /// Tracks which level provided the settings
+    /// Tracks which layer provided the dominant settings.
     pub source: SettingsSource,
 }
 
-/// Indicates which level of the settings cascade provided the resolved values.
-#[derive(Debug, Clone)]
+/// Indicates which layer of resolution provided the resolved values.
+#[derive(Debug, Clone, PartialEq)]
 pub enum SettingsSource {
+    /// No rule matched; all fields from global config defaults.
     Global,
-    Bucket(String),
-    Prefix(String, String), // (bucket, prefix)
+    /// At least one rule matched; carries the index and pattern of the first match.
+    Rule(usize, String),
 }
 
-/// Global config defaults extracted from CacheConfig at startup.
+impl Default for ResolvedSettings {
+    /// Permissive defaults used as a neutral fallback (and by tests that drive
+    /// the request-path entry points directly). Mirrors a no-rules resolution
+    /// against typical global defaults: caching enabled, compression off, RAM
+    /// eligible, 1h TTLs, `source = Global`. Production resolves settings once
+    /// per request via [`crate::cache::CacheManager::resolve_settings`] and
+    /// threads that value in; it never relies on this default.
+    fn default() -> Self {
+        Self {
+            get_ttl: Duration::from_secs(3600),
+            head_ttl: Duration::from_secs(3600),
+            put_ttl: Duration::from_secs(3600),
+            read_cache_enabled: true,
+            write_cache_enabled: true,
+            compression_enabled: false,
+            ram_cache_eligible: true,
+            evaluate_conditions_from_cache: false,
+            source: SettingsSource::Global,
+        }
+    }
+}
+
+/// Global config scalar defaults extracted from CacheConfig at startup.
 #[derive(Debug, Clone)]
 pub struct GlobalDefaults {
     pub get_ttl: Duration,
@@ -208,29 +287,147 @@ pub struct GlobalDefaults {
     pub evaluate_conditions_from_cache: bool,
 }
 
-/// Cached bucket settings entry with load timestamp and fallback.
-struct CachedBucketSettings {
-    settings: BucketSettings,
-    loaded_at: Instant,
-    /// Previous valid settings, kept as fallback if reload produces invalid JSON.
-    previous_valid: Option<BucketSettings>,
-    /// Whether a `_settings.json` file exists on disk for this bucket.
-    /// Used to determine if per-bucket metrics should be emitted.
-    has_settings_file: bool,
+/// A rule plus its compiled regex index. The regex itself lives in the shared
+/// `RegexSet`; this keeps the original pattern and values for resolution/display.
+#[derive(Debug, Clone)]
+struct CompiledRule {
+    rule: CacheRule,
 }
 
-/// Thread-safe manager for loading, caching, and resolving bucket settings.
-/// Lazily loads settings from disk on first access, then caches with staleness threshold.
+/// Parsed, validated, compiled rule set held in memory.
+#[derive(Debug, Clone)]
+struct RuleSet {
+    rules: Vec<CompiledRule>,
+    /// One automaton over all anchored pattern translations.
+    /// `regex_set` index i corresponds to `rules[i]`.
+    regex_set: RegexSet,
+}
+
+impl RuleSet {
+    /// Build a compiled rule set from parsed rules. Caller must have validated first.
+    fn build(rules: Vec<CacheRule>) -> Result<Self, String> {
+        let patterns: Result<Vec<String>, String> =
+            rules.iter().map(|r| glob_to_regex(&r.pattern)).collect();
+        let patterns = patterns?;
+        let regex_set = RegexSet::new(&patterns).map_err(|e| e.to_string())?;
+        let compiled = rules
+            .into_iter()
+            .map(|rule| CompiledRule { rule })
+            .collect();
+        Ok(Self {
+            rules: compiled,
+            regex_set,
+        })
+    }
+
+    /// An empty rule set: matches nothing, so resolution always yields globals.
+    fn empty() -> Self {
+        Self {
+            rules: Vec::new(),
+            // RegexSet::empty() never matches.
+            regex_set: RegexSet::empty(),
+        }
+    }
+
+    /// Resolve a full cache key to concrete settings using first-match-per-field.
+    fn resolve(&self, full_key: &str, g: &GlobalDefaults) -> ResolvedSettings {
+        // Matched indices in ascending (list) order.
+        let matched: Vec<usize> = self.regex_set.matches(full_key).into_iter().collect();
+
+        // Record the source as the first matching rule (if any).
+        let source = match matched.first() {
+            Some(&idx) => SettingsSource::Rule(idx, self.rules[idx].rule.pattern.clone()),
+            None => SettingsSource::Global,
+        };
+
+        // For each field, the first matched rule that sets it wins; else global.
+        let first = |pick: &dyn Fn(&CacheRule) -> Option<bool>| -> Option<bool> {
+            matched.iter().find_map(|&i| pick(&self.rules[i].rule))
+        };
+        let first_dur = |pick: &dyn Fn(&CacheRule) -> Option<Duration>| -> Option<Duration> {
+            matched.iter().find_map(|&i| pick(&self.rules[i].rule))
+        };
+
+        let get_ttl = first_dur(&|r| r.get_ttl).unwrap_or(g.get_ttl);
+        let head_ttl = first_dur(&|r| r.head_ttl).unwrap_or(g.head_ttl);
+        let put_ttl = first_dur(&|r| r.put_ttl).unwrap_or(g.put_ttl);
+        let read_cache_enabled = first(&|r| r.read_cache_enabled).unwrap_or(g.read_cache_enabled);
+        let write_cache_enabled =
+            first(&|r| r.write_cache_enabled).unwrap_or(g.write_cache_enabled);
+        let compression_enabled =
+            first(&|r| r.compression_enabled).unwrap_or(g.compression_enabled);
+        let mut ram_cache_eligible =
+            first(&|r| r.ram_cache_eligible).unwrap_or(g.ram_cache_enabled);
+        let evaluate_conditions_from_cache = first(&|r| r.evaluate_conditions_from_cache)
+            .unwrap_or(g.evaluate_conditions_from_cache);
+
+        // Post-resolution invariants (unchanged from prior behaviour):
+        // - Zero get_ttl → RAM range cache ineligible (RAM cache bypasses revalidation)
+        // - Read cache disabled → RAM range cache ineligible
+        if get_ttl == Duration::ZERO {
+            ram_cache_eligible = false;
+        }
+        if !read_cache_enabled {
+            ram_cache_eligible = false;
+        }
+
+        ResolvedSettings {
+            get_ttl,
+            head_ttl,
+            put_ttl,
+            read_cache_enabled,
+            write_cache_enabled,
+            compression_enabled,
+            ram_cache_eligible,
+            evaluate_conditions_from_cache,
+            source,
+        }
+    }
+}
+
+/// Cached rule set with load timestamp and last-known-good fallback.
+struct CachedRules {
+    ruleset: RuleSet,
+    loaded_at: Instant,
+    /// The rules as parsed (for the dashboard).
+    rules: Vec<CacheRule>,
+    /// Previous valid rule set, kept as fallback if a reload produces invalid content.
+    previous_valid: Option<(RuleSet, Vec<CacheRule>)>,
+    /// Whether a `cache_rules.json` file exists on disk.
+    has_rules_file: bool,
+}
+
+/// Thread-safe manager for loading, caching, and resolving cache rules.
+/// Lazily loads the rules file on first access, then caches with a staleness threshold.
 pub struct BucketSettingsManager {
     cache_dir: PathBuf,
-    /// Cached settings per bucket: bucket_name -> CachedBucketSettings
-    cache: RwLock<HashMap<String, CachedBucketSettings>>,
-    /// Staleness threshold — settings older than this trigger a re-read from disk
+    /// Cached rule set (single global file).
+    cache: RwLock<Option<CachedRules>>,
+    /// Staleness threshold — a loaded rule set older than this triggers a re-read.
     staleness_threshold: Duration,
-    /// Global config values used as fallback
+    /// Global config scalar defaults used as the lowest-precedence fallback.
     global_config: GlobalDefaults,
-    /// Single-flight coordination: only one task reloads a bucket's settings at a time
-    pending_loads: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Maximum number of rules permitted.
+    max_rules: usize,
+    /// Single-flight coordination: only one task reloads the rules file at a time.
+    pending_load: Mutex<()>,
+    /// Count of calls to [`resolve`](Self::resolve), incremented once per call.
+    /// Used by the resolve-once regression test (Requirement 8.2) to assert that
+    /// a multi-range request resolves settings exactly once rather than once per
+    /// spawned per-range cache-write task. A single relaxed atomic increment is
+    /// off the latency-sensitive matching work and adds no measurable cost.
+    resolve_calls: AtomicUsize,
+    // -- Reload health counters (item 3) --
+    /// Total successful rule-file loads since startup.
+    reloads_total: AtomicU64,
+    /// Total rule-file load failures (parse, validation, compile) since startup.
+    reload_failures_total: AtomicU64,
+    /// Whether the running ruleset is a stale fallback (last load failed).
+    on_fallback: AtomicBool,
+    /// Number of rules currently loaded.
+    rules_loaded: AtomicUsize,
+    /// Unix timestamp (seconds) of the last successful load.
+    last_load_unix: AtomicU64,
 }
 
 impl BucketSettingsManager {
@@ -242,16 +439,24 @@ impl BucketSettingsManager {
     ) -> Self {
         Self {
             cache_dir,
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(None),
             staleness_threshold,
             global_config,
-            pending_loads: Mutex::new(HashMap::new()),
+            max_rules: DEFAULT_MAX_RULES,
+            pending_load: Mutex::new(()),
+            resolve_calls: AtomicUsize::new(0),
+            reloads_total: AtomicU64::new(0),
+            reload_failures_total: AtomicU64::new(0),
+            on_fallback: AtomicBool::new(false),
+            rules_loaded: AtomicUsize::new(0),
+            last_load_unix: AtomicU64::new(0),
         }
     }
 
     /// Extract bucket name from a cache key or request path.
     /// Cache keys have the form "/{bucket}/{key}" or "{bucket}/{key}".
     /// Returns `None` for empty paths or paths that are just "/".
+    /// Retained for per-bucket metrics attribution.
     pub fn extract_bucket(path: &str) -> Option<&str> {
         let trimmed = path.strip_prefix('/').unwrap_or(path);
         let bucket = match trimmed.find('/') {
@@ -265,360 +470,264 @@ impl BucketSettingsManager {
         }
     }
 
-    /// Resolve settings for a given bucket and object path.
-    /// Handles the full cascade: Prefix → Bucket → Global.
-    /// Lazily loads/reloads settings from disk as needed.
-    pub async fn resolve(&self, bucket: &str, path: &str) -> ResolvedSettings {
-        // Step 1: Check if cached settings exist and are fresh
+    /// Path to the rules file: `{cache_dir}/cache_rules.json`.
+    fn rules_path(&self) -> PathBuf {
+        self.cache_dir.join("cache_rules.json")
+    }
+
+    /// Resolve settings for a full cache key. Handles lazy load/reload.
+    pub async fn resolve(&self, full_key: &str) -> ResolvedSettings {
+        // Count every resolution call. The resolve-once-per-request optimization
+        // (Requirement 8.2) threads a single `ResolvedSettings` through all
+        // per-range cache-write tasks instead of re-resolving per range; this
+        // counter lets the regression test assert that a multi-range request
+        // resolves exactly once. Relaxed ordering is sufficient — the test reads
+        // the count after all spawned work it cares about has completed.
+        self.resolve_calls.fetch_add(1, Ordering::Relaxed);
+
         let needs_reload = {
             let cache = self.cache.read().await;
-            match cache.get(bucket) {
+            match cache.as_ref() {
                 Some(cached) => cached.loaded_at.elapsed() >= self.staleness_threshold,
                 None => true,
             }
         };
 
-        // Step 2: If stale or missing, use single-flight pattern to reload from disk
         if needs_reload {
-            self.load_settings(bucket).await;
+            self.load_rules().await;
         }
 
-        // Step 3: Read cached settings and apply cascade
         let cache = self.cache.read().await;
-        let settings = cache.get(bucket).map(|c| &c.settings);
-
-        self.cascade(bucket, path, settings)
+        match cache.as_ref() {
+            Some(cached) => cached.ruleset.resolve(full_key, &self.global_config),
+            None => RuleSet::empty().resolve(full_key, &self.global_config),
+        }
     }
 
-    /// Check if a bucket has a `_settings.json` file on disk.
-    /// Returns `false` if the bucket hasn't been loaded yet or has no settings file.
-    /// Used to determine whether per-bucket metrics should be emitted.
-    pub async fn has_custom_settings(&self, bucket: &str) -> bool {
-        let cache = self.cache.read().await;
-        cache.get(bucket).is_some_and(|c| c.has_settings_file)
+    /// Number of times [`resolve`](Self::resolve) has been called since
+    /// construction. Public test-observability hook for the resolve-once
+    /// regression test (Requirement 8.2): it asserts that a multi-range request
+    /// resolves settings exactly once (reusing one `ResolvedSettings` across all
+    /// spawned per-range cache-write tasks) rather than once per range. Reached
+    /// in the test through `CacheManager::get_bucket_settings_manager`.
+    pub fn resolve_call_count(&self) -> usize {
+        self.resolve_calls.load(Ordering::Relaxed)
     }
 
-    /// Return the list of bucket names that have a `_settings.json` file.
-    /// Used by the dashboard and metrics collection.
-    pub async fn buckets_with_settings(&self) -> Vec<String> {
-        let cache = self.cache.read().await;
-        cache
-            .iter()
-            .filter(|(_, v)| v.has_settings_file)
-            .map(|(k, _)| k.clone())
-            .collect()
-    }
-
-    /// Return the number of prefix overrides for a bucket.
-    /// Returns 0 if the bucket has no custom settings.
-    pub async fn prefix_override_count(&self, bucket: &str) -> usize {
-        let cache = self.cache.read().await;
-        cache
-            .get(bucket)
-            .map_or(0, |c| c.settings.prefix_overrides.len())
-    }
-
-    /// Return the prefix overrides for a bucket.
-    /// Returns an empty vec if the bucket has no custom settings.
-    pub async fn get_prefix_overrides(&self, bucket: &str) -> Vec<PrefixOverride> {
-        let cache = self.cache.read().await;
-        cache
-            .get(bucket)
-            .map_or_else(Vec::new, |c| c.settings.prefix_overrides.clone())
-    }
-
-    /// Single-flight load of settings from disk for a bucket.
-    /// Only one task reads from disk per bucket; others wait.
-    async fn load_settings(&self, bucket: &str) {
-        // Get or create per-bucket lock
-        let lock = {
-            let mut pending = self.pending_loads.lock().await;
-            pending
-                .entry(bucket.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-
-        // Only one task proceeds past this point per bucket
-        let _guard = lock.lock().await;
-
-        // Re-check cache — another task may have loaded while we waited
+    /// Return the parsed rules (for the dashboard). Triggers a lazy load if needed.
+    pub async fn rules(&self) -> Vec<CacheRule> {
         {
             let cache = self.cache.read().await;
-            if let Some(cached) = cache.get(bucket) {
+            if let Some(cached) = cache.as_ref() {
+                if cached.loaded_at.elapsed() < self.staleness_threshold {
+                    return cached.rules.clone();
+                }
+            }
+        }
+        self.load_rules().await;
+        let cache = self.cache.read().await;
+        cache.as_ref().map_or_else(Vec::new, |c| c.rules.clone())
+    }
+
+    /// Whether a `cache_rules.json` file exists on disk (triggers a lazy load).
+    pub async fn has_rules_file(&self) -> bool {
+        {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.as_ref() {
+                if cached.loaded_at.elapsed() < self.staleness_threshold {
+                    return cached.has_rules_file;
+                }
+            }
+        }
+        self.load_rules().await;
+        let cache = self.cache.read().await;
+        cache.as_ref().is_some_and(|c| c.has_rules_file)
+    }
+
+    /// Return a snapshot of cache-rules reload health counters.
+    /// Cheap (all atomics, no async lock).
+    pub fn rules_health(&self) -> crate::metrics::CacheRulesMetrics {
+        crate::metrics::CacheRulesMetrics {
+            reloads_total: self.reloads_total.load(Ordering::Relaxed),
+            reload_failures_total: self.reload_failures_total.load(Ordering::Relaxed),
+            on_fallback: self.on_fallback.load(Ordering::Relaxed),
+            rules_loaded: self.rules_loaded.load(Ordering::Relaxed) as u64,
+            last_load_unix: self.last_load_unix.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Single-flight load of the rules file from disk.
+    async fn load_rules(&self) {
+        let _guard = self.pending_load.lock().await;
+
+        // Re-check — another task may have loaded while we waited.
+        {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.as_ref() {
                 if cached.loaded_at.elapsed() < self.staleness_threshold {
                     return;
                 }
             }
         }
 
-        // Build settings file path: {cache_dir}/metadata/{bucket}/_settings.json
-        let settings_path = self
-            .cache_dir
-            .join("metadata")
-            .join(bucket)
-            .join("_settings.json");
-
-        match tokio::fs::read_to_string(&settings_path).await {
-            Ok(contents) => {
-                match serde_json::from_str::<BucketSettings>(&contents) {
-                    Ok(new_settings) => {
-                        let errors = new_settings.validate();
-                        if errors.is_empty() {
-                            info!(bucket = bucket, "Bucket settings reloaded from disk");
-                            let mut cache = self.cache.write().await;
-                            let previous_valid = cache.get(bucket).and_then(|c| {
-                                // Keep the current settings as previous_valid
-                                // (only if they were themselves valid)
-                                if c.settings != BucketSettings::default()
-                                    || c.previous_valid.is_some()
-                                {
-                                    Some(c.settings.clone())
-                                } else {
-                                    c.previous_valid.clone()
-                                }
-                            });
-                            cache.insert(
-                                bucket.to_string(),
-                                CachedBucketSettings {
-                                    settings: new_settings,
-                                    loaded_at: Instant::now(),
-                                    previous_valid,
-                                    has_settings_file: true,
-                                },
-                            );
-                        } else {
-                            // Valid JSON but invalid field values
-                            warn!(
-                                bucket = bucket,
-                                errors = ?errors,
-                                "Bucket settings validation failed, using fallback"
-                            );
-                            self.use_fallback_settings(bucket).await;
+        let path = self.rules_path();
+        match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => match serde_json::from_str::<CacheRules>(&contents) {
+                Ok(parsed) => {
+                    let errors = parsed.validate(self.max_rules);
+                    if errors.is_empty() {
+                        match RuleSet::build(parsed.rules.clone()) {
+                            Ok(ruleset) => {
+                                info!(
+                                    rule_count = parsed.rules.len(),
+                                    "Cache rules loaded from disk"
+                                );
+                                self.store_valid(ruleset, parsed.rules, true).await;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Cache rules failed to compile, using fallback");
+                                self.use_fallback(true).await;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        // Invalid JSON
-                        warn!(
-                            bucket = bucket,
-                            error = %e,
-                            "Failed to parse bucket settings JSON, using fallback"
-                        );
-                        self.use_fallback_settings(bucket).await;
+                    } else {
+                        warn!(errors = ?errors, "Cache rules validation failed, using fallback");
+                        self.use_fallback(true).await;
                     }
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, "Failed to parse cache_rules.json, using fallback");
+                    self.use_fallback(true).await;
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // File not found — cache a default "no settings" marker
-                let mut cache = self.cache.write().await;
-                cache.insert(
-                    bucket.to_string(),
-                    CachedBucketSettings {
-                        settings: BucketSettings::default(),
-                        loaded_at: Instant::now(),
-                        previous_valid: None,
-                        has_settings_file: false,
-                    },
-                );
+                // No rules file → empty rule set (global defaults for every key).
+                self.store_valid(RuleSet::empty(), Vec::new(), false).await;
             }
             Err(e) => {
-                // Disk I/O error
-                warn!(
-                    bucket = bucket,
-                    error = %e,
-                    "Failed to read bucket settings file, using fallback"
-                );
-                self.use_fallback_settings(bucket).await;
+                warn!(error = %e, "Failed to read cache_rules.json, using fallback");
+                self.use_fallback(false).await;
             }
         }
     }
 
-    /// On error, keep previous valid settings or cache a default with updated timestamp.
-    ///
-    /// Fallback priority:
-    /// 1. Current `settings` in cache (the last successfully loaded valid settings)
-    /// 2. `previous_valid` (the settings before the current ones)
-    /// 3. Global defaults (empty BucketSettings — cascade will use GlobalDefaults)
-    async fn use_fallback_settings(&self, bucket: &str) {
+    /// Store a freshly loaded valid rule set, preserving the prior one as fallback.
+    async fn store_valid(&self, ruleset: RuleSet, rules: Vec<CacheRule>, has_file: bool) {
+        let rule_count = rules.len();
         let mut cache = self.cache.write().await;
-        if let Some(existing) = cache.get(bucket) {
-            // The current `settings` is the last valid load. Use it as fallback
-            // unless it's a default marker (from a previous file-not-found),
-            // in which case try `previous_valid`.
-            let is_current_meaningful =
-                existing.settings != BucketSettings::default() || existing.previous_valid.is_none();
-            let (fallback_settings, previous_valid) = if is_current_meaningful {
-                // Current settings are valid — keep using them
-                (existing.settings.clone(), existing.previous_valid.clone())
-            } else if let Some(prev) = &existing.previous_valid {
-                // Current settings are a default marker, but we have a previous valid
-                (prev.clone(), None)
+        let previous_valid = cache.as_ref().and_then(|c| {
+            if !c.rules.is_empty() {
+                Some((c.ruleset.clone(), c.rules.clone()))
             } else {
-                // Both are empty/default — use global defaults
-                (BucketSettings::default(), None)
-            };
-            let has_settings_file = existing.has_settings_file;
-            cache.insert(
-                bucket.to_string(),
-                CachedBucketSettings {
-                    settings: fallback_settings,
-                    loaded_at: Instant::now(),
-                    previous_valid,
-                    has_settings_file,
-                },
-            );
-        } else {
-            // No previous settings at all — use global defaults (empty BucketSettings)
-            cache.insert(
-                bucket.to_string(),
-                CachedBucketSettings {
-                    settings: BucketSettings::default(),
-                    loaded_at: Instant::now(),
-                    previous_valid: None,
-                    has_settings_file: false,
-                },
-            );
-        }
-    }
-
-    /// Apply the settings cascade: Prefix → Bucket → Global.
-    /// For each field independently, use the most specific level that defines it.
-    fn cascade(
-        &self,
-        bucket: &str,
-        path: &str,
-        settings: Option<&BucketSettings>,
-    ) -> ResolvedSettings {
-        let g = &self.global_config;
-
-        // Find the longest matching prefix override
-        let prefix_match = settings.and_then(|s| {
-            s.prefix_overrides
-                .iter()
-                .filter(|po| path.starts_with(&po.prefix))
-                .max_by_key(|po| po.prefix.len())
+                c.previous_valid.clone()
+            }
         });
-
-        // Determine source for debug logging
-        let source = match &prefix_match {
-            Some(po) => SettingsSource::Prefix(bucket.to_string(), po.prefix.clone()),
-            None => match settings {
-                Some(s) if self.has_any_field(s) => SettingsSource::Bucket(bucket.to_string()),
-                _ => SettingsSource::Global,
-            },
-        };
-
-        // Cascade each field: prefix → bucket → global
-        let get_ttl = prefix_match
-            .and_then(|po| po.get_ttl)
-            .or(settings.and_then(|s| s.get_ttl))
-            .unwrap_or(g.get_ttl);
-
-        let head_ttl = prefix_match
-            .and_then(|po| po.head_ttl)
-            .or(settings.and_then(|s| s.head_ttl))
-            .unwrap_or(g.head_ttl);
-
-        let put_ttl = prefix_match
-            .and_then(|po| po.put_ttl)
-            .or(settings.and_then(|s| s.put_ttl))
-            .unwrap_or(g.put_ttl);
-
-        let read_cache_enabled = prefix_match
-            .and_then(|po| po.read_cache_enabled)
-            .or(settings.and_then(|s| s.read_cache_enabled))
-            .unwrap_or(g.read_cache_enabled);
-
-        let write_cache_enabled = prefix_match
-            .and_then(|po| po.write_cache_enabled)
-            .or(settings.and_then(|s| s.write_cache_enabled))
-            .unwrap_or(g.write_cache_enabled);
-
-        let compression_enabled = prefix_match
-            .and_then(|po| po.compression_enabled)
-            .or(settings.and_then(|s| s.compression_enabled))
-            .unwrap_or(g.compression_enabled);
-
-        let mut ram_cache_eligible = prefix_match
-            .and_then(|po| po.ram_cache_eligible)
-            .or(settings.and_then(|s| s.ram_cache_eligible))
-            .unwrap_or(g.ram_cache_enabled);
-
-        let evaluate_conditions_from_cache = prefix_match
-            .and_then(|po| po.evaluate_conditions_from_cache)
-            .or(settings.and_then(|s| s.evaluate_conditions_from_cache))
-            .unwrap_or(g.evaluate_conditions_from_cache);
-
-        // Enforce invariants after cascade:
-        // - Zero get_ttl → RAM range cache ineligible (RAM cache bypasses revalidation)
-        // - Read cache disabled → RAM range cache ineligible
-        // Note: These invariants only affect ram_cache_eligible (RAM range cache).
-        // The metadata cache is NOT affected — it stores entries for zero-TTL objects
-        // because it has its own refresh interval and is used for revalidation. (Requirement 6.6)
-        if get_ttl == Duration::ZERO {
-            ram_cache_eligible = false;
-        }
-        if !read_cache_enabled {
-            ram_cache_eligible = false;
-        }
-
-        let resolved = ResolvedSettings {
-            get_ttl,
-            head_ttl,
-            put_ttl,
-            read_cache_enabled,
-            write_cache_enabled,
-            compression_enabled,
-            ram_cache_eligible,
-            evaluate_conditions_from_cache,
-            source: source.clone(),
-        };
-
-        debug!(
-            bucket = bucket,
-            path = path,
-            source = ?source,
-            get_ttl = ?resolved.get_ttl,
-            ram_cache_eligible = resolved.ram_cache_eligible,
-            read_cache_enabled = resolved.read_cache_enabled,
-            "Resolved bucket settings"
+        *cache = Some(CachedRules {
+            ruleset,
+            loaded_at: Instant::now(),
+            rules,
+            previous_valid,
+            has_rules_file: has_file,
+        });
+        // Update health counters.
+        self.reloads_total.fetch_add(1, Ordering::Relaxed);
+        self.on_fallback.store(false, Ordering::Relaxed);
+        self.rules_loaded.store(rule_count, Ordering::Relaxed);
+        self.last_load_unix.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::Relaxed,
         );
-
-        resolved
     }
 
-    /// Check if a BucketSettings has any field set (not all defaults/None).
-    fn has_any_field(&self, s: &BucketSettings) -> bool {
-        s.get_ttl.is_some()
-            || s.head_ttl.is_some()
-            || s.put_ttl.is_some()
-            || s.read_cache_enabled.is_some()
-            || s.write_cache_enabled.is_some()
-            || s.compression_enabled.is_some()
-            || s.ram_cache_eligible.is_some()
-            || s.evaluate_conditions_from_cache.is_some()
-            || !s.prefix_overrides.is_empty()
+    /// On error, keep the last-known-good rule set (or empty if none), refreshing
+    /// the timestamp so we don't hot-loop on a broken file.
+    async fn use_fallback(&self, has_file: bool) {
+        self.reload_failures_total.fetch_add(1, Ordering::Relaxed);
+        self.on_fallback.store(true, Ordering::Relaxed);
+        let mut cache = self.cache.write().await;
+        let (ruleset, rules, previous_valid) = match cache.as_ref() {
+            Some(c) if !c.rules.is_empty() => {
+                (c.ruleset.clone(), c.rules.clone(), c.previous_valid.clone())
+            }
+            Some(c) => match &c.previous_valid {
+                Some((rs, rules)) => (rs.clone(), rules.clone(), None),
+                None => (RuleSet::empty(), Vec::new(), None),
+            },
+            None => (RuleSet::empty(), Vec::new(), None),
+        };
+        *cache = Some(CachedRules {
+            ruleset,
+            loaded_at: Instant::now(),
+            rules,
+            previous_valid,
+            has_rules_file: has_file,
+        });
     }
 }
 
-impl BucketSettings {
-    /// Validate a BucketSettings struct. Returns a list of human-readable validation errors.
-    /// An empty list means the settings are valid.
-    ///
-    /// Validation rules:
-    /// - TTL values must be >= 0 (Duration is unsigned, so this is always true post-parse,
-    ///   but we validate explicitly for completeness)
-    /// - prefix_overrides entries must have non-empty prefixes starting with "/"
-    pub fn validate(&self) -> Vec<String> {
-        let mut errors = Vec::new();
+/// Scan `{cache_dir}/metadata/` for legacy per-bucket `_settings.json` files.
+///
+/// These historically lived at `cache_dir/metadata/{bucket}/_settings.json`. The
+/// per-bucket settings mechanism has been removed (Requirement 7.1): such files
+/// are NO LONGER read or honoured. This scan is purely informational — it never
+/// reads, parses, or loads the files, and a scan failure is logged at debug and
+/// treated as "none found" so it can never crash or block startup.
+///
+/// The scan is intentionally bounded: it checks only the immediate child
+/// directories of `metadata/` (the exact historical layout), so its cost scales
+/// with the number of buckets, not the full sharded metadata tree.
+fn find_legacy_settings_files(cache_dir: &Path) -> Vec<PathBuf> {
+    let metadata_dir = cache_dir.join("metadata");
+    let entries = match std::fs::read_dir(&metadata_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No metadata directory → nothing to warn about (common case).
+            return Vec::new();
+        }
+        Err(e) => {
+            debug!(
+                path = %metadata_dir.display(),
+                error = %e,
+                "Could not scan metadata directory for legacy _settings.json files"
+            );
+            return Vec::new();
+        }
+    };
 
-        for (i, po) in self.prefix_overrides.iter().enumerate() {
-            if po.prefix.is_empty() {
-                errors.push(format!("prefix_overrides[{}]: prefix is empty", i));
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let candidate = path.join("_settings.json");
+            if candidate.is_file() {
+                found.push(candidate);
             }
         }
+    }
+    found
+}
 
-        errors
+/// Log a single aggregate warning at startup if any legacy per-bucket
+/// `_settings.json` files are present under `cache_dir/metadata/`.
+///
+/// Call this exactly once during startup. The files are NOT read or honoured;
+/// the warning only points operators at the migration note. Requirements 7.1, 7.4.
+pub fn warn_if_legacy_settings_present(cache_dir: &Path) {
+    let found = find_legacy_settings_files(cache_dir);
+    if let Some(example) = found.first() {
+        warn!(
+            count = found.len(),
+            example = %example.display(),
+            "Detected {} legacy per-bucket _settings.json file(s) under {}/metadata/. \
+             These are NO LONGER read or honoured — the per-bucket settings mechanism has been \
+             replaced by a single cache_rules.json rules file. Migrate your settings to \
+             cache_dir/cache_rules.json (see the BREAKING CHANGE entry in CHANGELOG.md and \
+             docs/CACHING.md). These files can be deleted once migrated.",
+            found.len(),
+            cache_dir.display()
+        );
     }
 }
 
@@ -626,198 +735,6 @@ impl BucketSettings {
 mod tests {
     use super::*;
 
-    #[test]
-    fn validate_empty_settings_is_valid() {
-        let settings = BucketSettings::default();
-        assert!(settings.validate().is_empty());
-    }
-
-    #[test]
-    fn validate_valid_prefix_overrides() {
-        let settings = BucketSettings {
-            prefix_overrides: vec![
-                PrefixOverride {
-                    prefix: "/temp/".to_string(),
-                    get_ttl: Some(Duration::from_secs(0)),
-                    head_ttl: None,
-                    put_ttl: None,
-                    read_cache_enabled: None,
-                    write_cache_enabled: None,
-                    compression_enabled: None,
-                    ram_cache_eligible: None,
-                    evaluate_conditions_from_cache: None,
-                },
-                PrefixOverride {
-                    prefix: "/static/assets/".to_string(),
-                    get_ttl: None,
-                    head_ttl: None,
-                    put_ttl: None,
-                    read_cache_enabled: None,
-                    write_cache_enabled: None,
-                    compression_enabled: None,
-                    ram_cache_eligible: None,
-                    evaluate_conditions_from_cache: None,
-                },
-            ],
-            ..Default::default()
-        };
-        assert!(settings.validate().is_empty());
-    }
-
-    #[test]
-    fn validate_rejects_empty_prefix() {
-        let settings = BucketSettings {
-            prefix_overrides: vec![PrefixOverride {
-                prefix: "".to_string(),
-                get_ttl: None,
-                head_ttl: None,
-                put_ttl: None,
-                read_cache_enabled: None,
-                write_cache_enabled: None,
-                compression_enabled: None,
-                ram_cache_eligible: None,
-                evaluate_conditions_from_cache: None,
-            }],
-            ..Default::default()
-        };
-        let errors = settings.validate();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("prefix is empty"));
-        assert!(errors[0].contains("prefix_overrides[0]"));
-    }
-
-    #[test]
-    fn validate_accepts_prefix_without_leading_slash() {
-        let settings = BucketSettings {
-            prefix_overrides: vec![PrefixOverride {
-                prefix: "temp/".to_string(),
-                get_ttl: None,
-                head_ttl: None,
-                put_ttl: None,
-                read_cache_enabled: None,
-                write_cache_enabled: None,
-                compression_enabled: None,
-                ram_cache_eligible: None,
-                evaluate_conditions_from_cache: None,
-            }],
-            ..Default::default()
-        };
-        // Prefixes without leading slash are valid — object keys don't have leading slashes
-        assert!(settings.validate().is_empty());
-    }
-
-    #[test]
-    fn validate_reports_multiple_invalid_prefixes() {
-        let settings = BucketSettings {
-            prefix_overrides: vec![
-                PrefixOverride {
-                    prefix: "".to_string(),
-                    get_ttl: None,
-                    head_ttl: None,
-                    put_ttl: None,
-                    read_cache_enabled: None,
-                    write_cache_enabled: None,
-                    compression_enabled: None,
-                    ram_cache_eligible: None,
-                    evaluate_conditions_from_cache: None,
-                },
-                PrefixOverride {
-                    prefix: "/valid/".to_string(),
-                    get_ttl: None,
-                    head_ttl: None,
-                    put_ttl: None,
-                    read_cache_enabled: None,
-                    write_cache_enabled: None,
-                    compression_enabled: None,
-                    ram_cache_eligible: None,
-                    evaluate_conditions_from_cache: None,
-                },
-                PrefixOverride {
-                    prefix: "no-slash".to_string(),
-                    get_ttl: None,
-                    head_ttl: None,
-                    put_ttl: None,
-                    read_cache_enabled: None,
-                    write_cache_enabled: None,
-                    compression_enabled: None,
-                    ram_cache_eligible: None,
-                    evaluate_conditions_from_cache: None,
-                },
-            ],
-            ..Default::default()
-        };
-        let errors = settings.validate();
-        // Only empty prefix is invalid; no-slash and /valid/ are both acceptable
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("prefix_overrides[0]"));
-        assert!(errors[0].contains("prefix is empty"));
-    }
-
-    #[test]
-    fn validate_settings_with_ttls_and_valid_prefixes() {
-        let settings = BucketSettings {
-            get_ttl: Some(Duration::from_secs(300)),
-            head_ttl: Some(Duration::from_secs(30)),
-            put_ttl: Some(Duration::from_secs(3600)),
-            prefix_overrides: vec![PrefixOverride {
-                prefix: "/data/".to_string(),
-                get_ttl: Some(Duration::from_secs(0)),
-                head_ttl: None,
-                put_ttl: None,
-                read_cache_enabled: Some(false),
-                write_cache_enabled: None,
-                compression_enabled: None,
-                ram_cache_eligible: None,
-                evaluate_conditions_from_cache: None,
-            }],
-            ..Default::default()
-        };
-        assert!(settings.validate().is_empty());
-    }
-
-    #[test]
-    fn extract_bucket_with_leading_slash_and_key() {
-        assert_eq!(
-            BucketSettingsManager::extract_bucket("/my-bucket/some/key"),
-            Some("my-bucket")
-        );
-    }
-
-    #[test]
-    fn extract_bucket_without_leading_slash() {
-        assert_eq!(
-            BucketSettingsManager::extract_bucket("my-bucket/some/key"),
-            Some("my-bucket")
-        );
-    }
-
-    #[test]
-    fn extract_bucket_with_trailing_slash_only() {
-        assert_eq!(
-            BucketSettingsManager::extract_bucket("/my-bucket/"),
-            Some("my-bucket")
-        );
-    }
-
-    #[test]
-    fn extract_bucket_name_only() {
-        assert_eq!(
-            BucketSettingsManager::extract_bucket("my-bucket"),
-            Some("my-bucket")
-        );
-    }
-
-    #[test]
-    fn extract_bucket_just_slash() {
-        assert_eq!(BucketSettingsManager::extract_bucket("/"), None);
-    }
-
-    #[test]
-    fn extract_bucket_empty_string() {
-        assert_eq!(BucketSettingsManager::extract_bucket(""), None);
-    }
-
-    // Helper to create a GlobalDefaults with known values
     fn test_global_defaults() -> GlobalDefaults {
         GlobalDefaults {
             get_ttl: Duration::from_secs(300),
@@ -839,459 +756,440 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn resolve_no_settings_file_returns_global_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mgr = test_manager(tmp.path());
-
-        let resolved = mgr.resolve("my-bucket", "/some/key").await;
-
-        assert_eq!(resolved.get_ttl, Duration::from_secs(300));
-        assert_eq!(resolved.head_ttl, Duration::from_secs(60));
-        assert_eq!(resolved.put_ttl, Duration::from_secs(3600));
-        assert!(resolved.read_cache_enabled);
-        assert!(resolved.write_cache_enabled);
-        assert!(resolved.compression_enabled);
-        assert!(resolved.ram_cache_eligible);
-        assert!(matches!(resolved.source, SettingsSource::Global));
-    }
-
-    #[tokio::test]
-    async fn resolve_bucket_settings_override_ttls() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{"get_ttl": "10s", "head_ttl": "5s"}"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/some/key").await;
-
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10));
-        assert_eq!(resolved.head_ttl, Duration::from_secs(5));
-        assert_eq!(resolved.put_ttl, Duration::from_secs(3600)); // global fallback
-        assert!(matches!(resolved.source, SettingsSource::Bucket(_)));
-    }
-
-    #[tokio::test]
-    async fn resolve_prefix_override_takes_precedence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{
-                "get_ttl": "10s",
-                "prefix_overrides": [
-                    {"prefix": "/temp/", "get_ttl": "0s"},
-                    {"prefix": "/static/", "get_ttl": "7d"}
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-
-        // Path matching /temp/ prefix
-        let resolved = mgr.resolve("my-bucket", "/temp/file.txt").await;
-        assert_eq!(resolved.get_ttl, Duration::ZERO);
-        assert!(matches!(resolved.source, SettingsSource::Prefix(_, _)));
-
-        // Path matching /static/ prefix
-        let resolved = mgr.resolve("my-bucket", "/static/image.png").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(7 * 86400));
-
-        // Path matching no prefix — falls back to bucket-level
-        let resolved = mgr.resolve("my-bucket", "/other/file.txt").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10));
-    }
-
-    #[tokio::test]
-    async fn resolve_longest_prefix_wins() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{
-                "prefix_overrides": [
-                    {"prefix": "/data/", "get_ttl": "30s"},
-                    {"prefix": "/data/archive/", "get_ttl": "7d"}
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-
-        let resolved = mgr.resolve("my-bucket", "/data/archive/old.bin").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(7 * 86400));
-
-        let resolved = mgr.resolve("my-bucket", "/data/recent.bin").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(30));
-    }
-
-    #[tokio::test]
-    async fn resolve_zero_ttl_forces_ram_cache_ineligible() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{"get_ttl": "0s", "ram_cache_eligible": true}"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        assert_eq!(resolved.get_ttl, Duration::ZERO);
-        assert!(!resolved.ram_cache_eligible); // forced false despite explicit true
-    }
-
-    #[tokio::test]
-    async fn resolve_read_cache_disabled_forces_ram_cache_ineligible() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{"read_cache_enabled": false, "ram_cache_eligible": true}"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        assert!(!resolved.read_cache_enabled);
-        assert!(!resolved.ram_cache_eligible); // forced false despite explicit true
-    }
-
-    #[tokio::test]
-    async fn resolve_prefix_zero_ttl_forces_ram_ineligible() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{
-                "ram_cache_eligible": true,
-                "prefix_overrides": [
-                    {"prefix": "/volatile/", "get_ttl": "0s", "ram_cache_eligible": true}
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/volatile/data.json").await;
-
-        assert_eq!(resolved.get_ttl, Duration::ZERO);
-        assert!(!resolved.ram_cache_eligible); // zero TTL overrides explicit true
-    }
-
-    #[tokio::test]
-    async fn resolve_cascade_each_field_independently() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        // Bucket sets get_ttl and compression_enabled
-        // Prefix sets only head_ttl
-        // Other fields fall through to global
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{
-                "get_ttl": "10s",
-                "compression_enabled": false,
-                "prefix_overrides": [
-                    {"prefix": "/special/", "head_ttl": "1s"}
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/special/file").await;
-
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10)); // bucket
-        assert_eq!(resolved.head_ttl, Duration::from_secs(1)); // prefix
-        assert_eq!(resolved.put_ttl, Duration::from_secs(3600)); // global
-        assert!(!resolved.compression_enabled); // bucket
-        assert!(resolved.write_cache_enabled); // global
-    }
-
-    #[tokio::test]
-    async fn resolve_empty_json_uses_global_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(bucket_dir.join("_settings.json"), "{}").unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        assert_eq!(resolved.get_ttl, Duration::from_secs(300));
-        assert_eq!(resolved.head_ttl, Duration::from_secs(60));
-        assert!(resolved.ram_cache_eligible);
-        assert!(matches!(resolved.source, SettingsSource::Global));
-    }
-
-    #[tokio::test]
-    async fn resolve_caches_settings_across_calls() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(bucket_dir.join("_settings.json"), r#"{"get_ttl": "10s"}"#).unwrap();
-
-        let mgr = test_manager(tmp.path());
-
-        // First call loads from disk
-        let r1 = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(r1.get_ttl, Duration::from_secs(10));
-
-        // Modify file on disk — should NOT be picked up (within staleness threshold)
-        std::fs::write(bucket_dir.join("_settings.json"), r#"{"get_ttl": "99s"}"#).unwrap();
-
-        let r2 = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(r2.get_ttl, Duration::from_secs(10)); // still cached
-    }
-
-    #[tokio::test]
-    async fn resolve_schema_field_ignored_in_resolution() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{"$schema": "https://example.com/schema.json", "get_ttl": "15s"}"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        assert_eq!(resolved.get_ttl, Duration::from_secs(15));
-    }
-
-    #[tokio::test]
-    async fn resolve_write_cache_independent_of_read_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        std::fs::write(
-            bucket_dir.join("_settings.json"),
-            r#"{"read_cache_enabled": false, "write_cache_enabled": true}"#,
-        )
-        .unwrap();
-
-        let mgr = test_manager(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        assert!(!resolved.read_cache_enabled);
-        assert!(resolved.write_cache_enabled); // independent of read cache
-    }
-
-    /// Helper: create a manager with zero staleness threshold so every resolve() triggers reload.
     fn test_manager_always_reload(cache_dir: &std::path::Path) -> BucketSettingsManager {
         BucketSettingsManager::new(
             cache_dir.to_path_buf(),
             test_global_defaults(),
-            Duration::ZERO, // force reload on every call
+            Duration::ZERO,
         )
     }
 
-    // ========================================================================
-    // Error recovery tests (Task 2.3)
-    // Requirements: 1.3, 1.4, 9.6, 10.5
-    // ========================================================================
+    // ---- glob_to_regex translator (Property 3, Property 4) ----
+
+    fn matches(pattern: &str, key: &str) -> bool {
+        let re = regex::Regex::new(&glob_to_regex(pattern).unwrap()).unwrap();
+        re.is_match(key)
+    }
+
+    #[test]
+    fn glob_single_star_stays_within_segment() {
+        assert!(matches("a/*/b", "a/x/b"));
+        assert!(!matches("a/*/b", "a/x/y/b")); // * does not cross /
+        assert!(matches("*/b", "a/b"));
+        assert!(!matches("*/b", "a/x/b"));
+    }
+
+    #[test]
+    fn glob_double_star_crosses_segments() {
+        assert!(matches("**/credit-cards/**", "cust1/credit-cards/card.cc"));
+        assert!(matches(
+            "**/credit-cards/**",
+            "cust1/sub/credit-cards/deep/card.cc"
+        ));
+        assert!(matches("a/**", "a/b/c/d"));
+        assert!(!matches("a/**/z", "a/b/c")); // must end in z
+        assert!(matches("a/**/z", "a/b/c/z"));
+    }
+
+    #[test]
+    fn glob_question_matches_one_non_slash() {
+        assert!(matches("a/?", "a/x"));
+        assert!(!matches("a/?", "a/")); // needs exactly one char
+        assert!(!matches("a/?", "a/xy"));
+        assert!(!matches("a?b", "a/b")); // ? does not match /
+    }
+
+    #[test]
+    fn glob_anchored_whole_string() {
+        assert!(matches("bucket/temp", "bucket/temp"));
+        assert!(!matches("bucket/temp", "bucket/temp/x")); // anchored, not prefix
+        assert!(matches("bucket/temp/**", "bucket/temp/x"));
+    }
+
+    #[test]
+    fn glob_escapes_metacharacters() {
+        // A dot in a bucket name must match a literal dot only.
+        assert!(matches("my.logs/**", "my.logs/x"));
+        assert!(!matches("my.logs/**", "myXlogs/x"));
+        // Other metacharacters are literals.
+        assert!(matches("a+b/(c)/**", "a+b/(c)/file"));
+        assert!(!matches("a+b/(c)/**", "aab/c/file"));
+    }
+
+    #[test]
+    fn glob_case_sensitive() {
+        assert!(matches("Bucket/**", "Bucket/x"));
+        assert!(!matches("Bucket/**", "bucket/x"));
+    }
+
+    #[test]
+    fn glob_empty_pattern_rejected() {
+        assert!(glob_to_regex("").is_err());
+        assert!(glob_to_regex("   ").is_err());
+    }
+
+    // ---- validation (Requirement 5) ----
+
+    #[test]
+    fn validate_empty_pattern_is_error() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "".to_string(),
+                ..Default::default()
+            }],
+        };
+        assert!(!rules.validate(DEFAULT_MAX_RULES).is_empty());
+    }
+
+    #[test]
+    fn validate_rule_cap_enforced() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![
+                CacheRule {
+                    pattern: "**".to_string(),
+                    ..Default::default()
+                };
+                5
+            ],
+        };
+        assert!(rules
+            .validate(4)
+            .iter()
+            .any(|e| e.contains("exceeds maximum")));
+        assert!(rules.validate(5).is_empty());
+    }
+
+    // ---- resolution (Property 1, 2, 5) ----
 
     #[tokio::test]
-    async fn error_recovery_invalid_json_uses_previous_valid_settings() {
+    async fn resolve_no_file_returns_global_defaults() {
         let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        let settings_path = bucket_dir.join("_settings.json");
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("my-bucket/some/key").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(300));
+        assert_eq!(r.head_ttl, Duration::from_secs(60));
+        assert_eq!(r.put_ttl, Duration::from_secs(3600));
+        assert!(r.read_cache_enabled);
+        assert!(r.write_cache_enabled);
+        assert!(r.compression_enabled);
+        assert!(r.ram_cache_eligible);
+        assert!(matches!(r.source, SettingsSource::Global));
+    }
 
-        // Step 1: Load valid settings
+    #[tokio::test]
+    async fn resolve_empty_rules_array_is_global_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cache_rules.json"), r#"{"rules": []}"#).unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("my-bucket/key").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(300));
+        assert!(matches!(r.source, SettingsSource::Global));
+    }
+
+    #[tokio::test]
+    async fn resolve_literal_bucket_prefix_rule() {
+        let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
-            &settings_path,
-            r#"{"get_ttl": "10s", "compression_enabled": false}"#,
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "my-bucket/temp/**", "get_ttl": "0s"}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+
+        let r = mgr.resolve("my-bucket/temp/file.txt").await;
+        assert_eq!(r.get_ttl, Duration::ZERO);
+        assert!(matches!(r.source, SettingsSource::Rule(0, _)));
+
+        // Different bucket → no match → global.
+        let r = mgr.resolve("other-bucket/temp/file.txt").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(300));
+        assert!(matches!(r.source, SettingsSource::Global));
+    }
+
+    #[tokio::test]
+    async fn resolve_global_middle_segment_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**/credit-cards/**", "read_cache_enabled": false}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+
+        // Matches across any bucket and any depth.
+        let r = mgr.resolve("cust1/credit-cards/card.cc").await;
+        assert!(!r.read_cache_enabled);
+        let r = mgr.resolve("cust2/sub/credit-cards/deep/card.cc").await;
+        assert!(!r.read_cache_enabled);
+        // No middle segment → global.
+        let r = mgr.resolve("cust1/other/file").await;
+        assert!(r.read_cache_enabled);
+    }
+
+    #[tokio::test]
+    async fn resolve_first_match_per_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Rule 0 (specific) sets only get_ttl; rule 1 (broad) sets compression + get_ttl.
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [
+                {"pattern": "b/special/**", "get_ttl": "1s"},
+                {"pattern": "**", "get_ttl": "9s", "compression_enabled": false}
+            ]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+
+        let r = mgr.resolve("b/special/x").await;
+        // get_ttl from rule 0 (earlier wins), compression from rule 1 (rule 0 didn't set it).
+        assert_eq!(r.get_ttl, Duration::from_secs(1));
+        assert!(!r.compression_enabled);
+        // source is the first matching rule.
+        assert!(matches!(r.source, SettingsSource::Rule(0, _)));
+
+        // A key only matching the broad rule.
+        let r = mgr.resolve("b/other/y").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(9));
+        assert!(!r.compression_enabled);
+        assert!(matches!(r.source, SettingsSource::Rule(1, _)));
+    }
+
+    #[tokio::test]
+    async fn resolve_zero_ttl_forces_ram_ineligible() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**", "get_ttl": "0s", "ram_cache_eligible": true}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("b/key").await;
+        assert_eq!(r.get_ttl, Duration::ZERO);
+        assert!(!r.ram_cache_eligible);
+    }
+
+    #[tokio::test]
+    async fn resolve_read_disabled_forces_ram_ineligible() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**", "read_cache_enabled": false, "ram_cache_eligible": true}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("b/key").await;
+        assert!(!r.read_cache_enabled);
+        assert!(!r.ram_cache_eligible);
+    }
+
+    // ---- reload / resilience (Requirement 4) ----
+
+    #[tokio::test]
+    async fn reload_invalid_json_keeps_last_known_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "10s"}]}"#).unwrap();
+        let mgr = test_manager_always_reload(tmp.path());
+        let r = mgr.resolve("b/key").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(10));
+
+        std::fs::write(&path, r#"{"rules": BROKEN"#).unwrap();
+        let r = mgr.resolve("b/key").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(10)); // kept
+    }
+
+    #[tokio::test]
+    async fn reload_cap_exceeded_keeps_last_known_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "10s"}]}"#).unwrap();
+        let mut mgr = test_manager_always_reload(tmp.path());
+        mgr.max_rules = 1;
+        let r = mgr.resolve("b/key").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(10));
+
+        std::fs::write(
+            &path,
+            r#"{"rules": [{"pattern": "a/**"}, {"pattern": "b/**"}]}"#,
+        )
+        .unwrap();
+        let r = mgr.resolve("b/key").await;
+        // Over cap → keep previous valid (get_ttl 10s).
+        assert_eq!(r.get_ttl, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn reload_invalid_at_first_start_uses_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cache_rules.json"), r#"NOT JSON"#).unwrap();
+        let mgr = test_manager_always_reload(tmp.path());
+        let r = mgr.resolve("b/key").await;
+        assert_eq!(r.get_ttl, Duration::from_secs(300));
+        assert!(matches!(r.source, SettingsSource::Global));
+    }
+
+    #[tokio::test]
+    async fn reload_valid_after_invalid_picks_up_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "10s"}]}"#).unwrap();
+        let mgr = test_manager_always_reload(tmp.path());
+        assert_eq!(mgr.resolve("b/k").await.get_ttl, Duration::from_secs(10));
+
+        std::fs::write(&path, r#"BROKEN"#).unwrap();
+        assert_eq!(mgr.resolve("b/k").await.get_ttl, Duration::from_secs(10));
+
+        std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "99s"}]}"#).unwrap();
+        assert_eq!(mgr.resolve("b/k").await.get_ttl, Duration::from_secs(99));
+    }
+
+    #[tokio::test]
+    async fn extract_bucket_variants() {
+        assert_eq!(
+            BucketSettingsManager::extract_bucket("/my-bucket/some/key"),
+            Some("my-bucket")
+        );
+        assert_eq!(
+            BucketSettingsManager::extract_bucket("my-bucket/key"),
+            Some("my-bucket")
+        );
+        assert_eq!(
+            BucketSettingsManager::extract_bucket("my-bucket"),
+            Some("my-bucket")
+        );
+        assert_eq!(BucketSettingsManager::extract_bucket("/"), None);
+        assert_eq!(BucketSettingsManager::extract_bucket(""), None);
+    }
+
+    #[tokio::test]
+    async fn rules_accessor_returns_parsed_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "a/**", "get_ttl": "5s"}, {"pattern": "**"}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let rules = mgr.rules().await;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].pattern, "a/**");
+        assert!(mgr.has_rules_file().await);
+    }
+
+    // ---- legacy _settings.json startup-warning detection (Requirement 7.4) ----
+
+    #[test]
+    fn legacy_scan_detects_planted_settings_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Plant cache_dir/metadata/{bucket}/_settings.json for two buckets.
+        let meta = tmp.path().join("metadata");
+        for bucket in ["bucket-a", "bucket-b"] {
+            let bucket_dir = meta.join(bucket);
+            std::fs::create_dir_all(&bucket_dir).unwrap();
+            std::fs::write(bucket_dir.join("_settings.json"), r#"{"get_ttl":"0s"}"#).unwrap();
+        }
+        let found = find_legacy_settings_files(tmp.path());
+        assert_eq!(found.len(), 2);
+        assert!(found
+            .iter()
+            .all(|p| p.file_name().unwrap() == "_settings.json"));
+    }
+
+    #[test]
+    fn legacy_scan_quiet_when_none_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        // metadata/ exists with a bucket dir, but no _settings.json inside it.
+        let bucket_dir = tmp.path().join("metadata").join("bucket-a");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        std::fs::write(bucket_dir.join("something.meta"), "{}").unwrap();
+        assert!(find_legacy_settings_files(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_scan_quiet_when_metadata_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No metadata/ directory at all → no files, no error.
+        assert!(find_legacy_settings_files(tmp.path()).is_empty());
+        // The public warning entry point must not panic in this common case.
+        warn_if_legacy_settings_present(tmp.path());
+    }
+
+    // ---- rules_health() reload counters ----
+
+    #[tokio::test]
+    async fn rules_health_counters_after_successful_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "a/**", "get_ttl": "5s"}, {"pattern": "**"}]}"#,
         )
         .unwrap();
         let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10));
-        assert!(!resolved.compression_enabled);
 
-        // Step 2: Replace with invalid JSON
-        std::fs::write(&settings_path, r#"{"get_ttl": BROKEN"#).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
+        // Trigger a load.
+        let _ = mgr.resolve("a/key").await;
 
-        // Should keep previous valid settings, not fall back to global defaults
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10));
-        assert!(!resolved.compression_enabled);
+        let health = mgr.rules_health();
+        assert_eq!(health.reloads_total, 1);
+        assert_eq!(health.reload_failures_total, 0);
+        assert!(!health.on_fallback);
+        assert_eq!(health.rules_loaded, 2);
+        assert!(health.last_load_unix > 0);
     }
 
     #[tokio::test]
-    async fn error_recovery_invalid_prefixes_uses_previous_valid_settings() {
+    async fn rules_health_counters_after_failed_load() {
         let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        let settings_path = bucket_dir.join("_settings.json");
-
-        // Step 1: Load valid settings
-        std::fs::write(&settings_path, r#"{"get_ttl": "20s", "head_ttl": "5s"}"#).unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        // First load succeeds.
+        std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "10s"}]}"#).unwrap();
         let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(20));
-        assert_eq!(resolved.head_ttl, Duration::from_secs(5));
+        let _ = mgr.resolve("b/k").await;
 
-        // Step 2: Replace with valid JSON but invalid prefix (empty string)
+        let health = mgr.rules_health();
+        assert_eq!(health.reloads_total, 1);
+        assert_eq!(health.reload_failures_total, 0);
+        assert!(!health.on_fallback);
+
+        // Break the file — next load fails, falls back.
+        std::fs::write(&path, r#"NOT JSON"#).unwrap();
+        let _ = mgr.resolve("b/k").await;
+
+        let health = mgr.rules_health();
+        assert_eq!(health.reloads_total, 1); // no new success
+        assert_eq!(health.reload_failures_total, 1);
+        assert!(health.on_fallback);
+        // Still serving the 1 rule from last-known-good.
+        assert_eq!(health.rules_loaded, 1);
+    }
+
+    #[tokio::test]
+    async fn rules_health_recovery_clears_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        std::fs::write(&path, r#"{"rules": [{"pattern": "**", "get_ttl": "10s"}]}"#).unwrap();
+        let mgr = test_manager_always_reload(tmp.path());
+        let _ = mgr.resolve("b/k").await;
+
+        // Break it.
+        std::fs::write(&path, r#"BROKEN"#).unwrap();
+        let _ = mgr.resolve("b/k").await;
+        assert!(mgr.rules_health().on_fallback);
+
+        // Fix it.
         std::fs::write(
-            &settings_path,
-            r#"{"get_ttl": "99s", "prefix_overrides": [{"prefix": "", "get_ttl": "1s"}]}"#,
+            &path,
+            r#"{"rules": [{"pattern": "x/**"}, {"pattern": "**"}]}"#,
         )
         .unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
+        let _ = mgr.resolve("b/k").await;
 
-        // Should keep previous valid settings
-        assert_eq!(resolved.get_ttl, Duration::from_secs(20));
-        assert_eq!(resolved.head_ttl, Duration::from_secs(5));
-    }
-
-    #[tokio::test]
-    async fn error_recovery_file_not_found_uses_global_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Don't create any settings file
-        let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("no-such-bucket", "/key").await;
-
-        // Should use global defaults
-        assert_eq!(resolved.get_ttl, Duration::from_secs(300));
-        assert_eq!(resolved.head_ttl, Duration::from_secs(60));
-        assert_eq!(resolved.put_ttl, Duration::from_secs(3600));
-        assert!(resolved.read_cache_enabled);
-        assert!(resolved.write_cache_enabled);
-        assert!(resolved.compression_enabled);
-        assert!(resolved.ram_cache_eligible);
-        assert!(matches!(resolved.source, SettingsSource::Global));
-    }
-
-    #[tokio::test]
-    async fn error_recovery_file_deleted_after_valid_load_uses_global_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        let settings_path = bucket_dir.join("_settings.json");
-
-        // Step 1: Load valid settings
-        std::fs::write(&settings_path, r#"{"get_ttl": "10s"}"#).unwrap();
-        let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10));
-
-        // Step 2: Delete the file (file not found on reload)
-        std::fs::remove_file(&settings_path).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        // File not found caches "no settings" marker → global defaults
-        assert_eq!(resolved.get_ttl, Duration::from_secs(300));
-        assert!(matches!(resolved.source, SettingsSource::Global));
-    }
-
-    #[tokio::test]
-    async fn error_recovery_no_previous_valid_uses_global_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-
-        // First load is already invalid JSON — no previous valid settings exist
-        std::fs::write(bucket_dir.join("_settings.json"), r#"NOT VALID JSON"#).unwrap();
-
-        let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        // No previous valid → global defaults
-        assert_eq!(resolved.get_ttl, Duration::from_secs(300));
-        assert_eq!(resolved.head_ttl, Duration::from_secs(60));
-        assert!(matches!(resolved.source, SettingsSource::Global));
-    }
-
-    #[tokio::test]
-    async fn error_recovery_multiple_invalid_reloads_preserve_last_valid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        let settings_path = bucket_dir.join("_settings.json");
-
-        // Step 1: Load valid settings
-        std::fs::write(&settings_path, r#"{"get_ttl": "42s"}"#).unwrap();
-        let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(42));
-
-        // Step 2: First invalid reload
-        std::fs::write(&settings_path, r#"BROKEN"#).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(42));
-
-        // Step 3: Second invalid reload — should still preserve the original valid settings
-        std::fs::write(&settings_path, r#"ALSO BROKEN"#).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(42));
-
-        // Step 4: Third invalid reload with different invalid content
-        std::fs::write(&settings_path, r#"{"get_ttl": "not-a-duration"}"#).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(42));
-    }
-
-    #[tokio::test]
-    async fn error_recovery_valid_after_invalid_updates_settings() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        let settings_path = bucket_dir.join("_settings.json");
-
-        // Step 1: Load valid settings
-        std::fs::write(&settings_path, r#"{"get_ttl": "10s"}"#).unwrap();
-        let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10));
-
-        // Step 2: Invalid reload — falls back to previous valid
-        std::fs::write(&settings_path, r#"BROKEN"#).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(10));
-
-        // Step 3: New valid settings — should pick up the new values
-        std::fs::write(&settings_path, r#"{"get_ttl": "99s"}"#).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(99));
-    }
-
-    #[tokio::test]
-    async fn error_recovery_io_error_uses_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_dir = tmp.path().join("metadata").join("my-bucket");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-        let settings_path = bucket_dir.join("_settings.json");
-
-        // Step 1: Load valid settings
-        std::fs::write(&settings_path, r#"{"get_ttl": "15s"}"#).unwrap();
-        let mgr = test_manager_always_reload(tmp.path());
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-        assert_eq!(resolved.get_ttl, Duration::from_secs(15));
-
-        // Step 2: Replace file with a directory to cause an I/O error on read
-        std::fs::remove_file(&settings_path).unwrap();
-        std::fs::create_dir_all(&settings_path).unwrap();
-        let resolved = mgr.resolve("my-bucket", "/key").await;
-
-        // Should fall back to previous valid settings
-        assert_eq!(resolved.get_ttl, Duration::from_secs(15));
+        let health = mgr.rules_health();
+        assert_eq!(health.reloads_total, 2);
+        assert_eq!(health.reload_failures_total, 1);
+        assert!(!health.on_fallback);
+        assert_eq!(health.rules_loaded, 2);
     }
 }

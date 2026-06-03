@@ -384,9 +384,9 @@ impl StaticFileHandler {
         <div id="cache-stats" class="tab-content active">
             <div id="cache-stats-content">Loading...</div>
             <div id="bucket-stats-section" style="display:none;">
-                <h2>Bucket and Prefix Overrides</h2>
+                <h2>Cache Rules and Bucket Stats</h2>
                 <div class="bucket-stats-controls">
-                    <input type="text" id="bucket-filter" placeholder="Filter by bucket name..." />
+                    <input type="text" id="bucket-filter" placeholder="Filter by pattern or bucket..." />
                     <span id="bucket-stats-toggle"></span>
                 </div>
                 <div class="bucket-stats-table">
@@ -394,7 +394,7 @@ impl StaticFileHandler {
                         <thead>
                             <tr>
                                 <th>Bucket</th>
-                                <th>Prefix</th>
+                                <th>Rule / Scope</th>
                                 <th>HEAD</th>
                                 <th>GET</th>
                                 <th></th>
@@ -1383,6 +1383,7 @@ document.getElementById('log-text-filter').addEventListener('input', function() 
 
 // === Bucket and Prefix Overrides Table ===
 let bucketStatsData = [];
+let bucketStatsRules = [];
 let bucketShowAll = false;
 let expandedSettings = new Set(); // Track which rows have settings expanded
 const BUCKET_PAGE_SIZE = 20;
@@ -1393,12 +1394,15 @@ async function loadBucketStats() {
         if (!response.ok) return;
         const data = await response.json();
         const section = document.getElementById('bucket-stats-section');
-        if (!data.buckets || data.buckets.length === 0) {
+        const hasBuckets = data.buckets && data.buckets.length > 0;
+        const hasRules = data.rules && data.rules.length > 0;
+        if (!hasBuckets && !hasRules) {
             section.style.display = 'none';
             return;
         }
         section.style.display = '';
-        bucketStatsData = data.buckets;
+        bucketStatsData = data.buckets || [];
+        bucketStatsRules = data.rules || [];
         renderBucketStats();
     } catch (e) {
         console.error('Failed to load bucket stats:', e);
@@ -1414,35 +1418,29 @@ function hitSummary(hits, total) {
 function renderBucketStats() {
     const filter = (document.getElementById('bucket-filter').value || '').toLowerCase();
     let rows = [];
+    // Cache rules (ordered, first-match-per-field). Each rule is one row.
+    (bucketStatsRules || []).forEach((r, idx) => {
+        if (filter && !r.pattern.toLowerCase().includes(filter)) return;
+        rows.push({
+            rowKey: 'rule::' + idx,
+            bucket: '',
+            prefix: r.pattern,
+            headHits: r.head_hit_count || 0, headTotal: (r.head_hit_count || 0) + (r.head_miss_count || 0),
+            getHits: r.get_hit_count || 0, getTotal: (r.get_hit_count || 0) + (r.get_miss_count || 0),
+            settings: r
+        });
+    });
+    // Per-bucket traffic rollup rows.
     bucketStatsData.forEach(b => {
         if (filter && !b.bucket.toLowerCase().includes(filter)) return;
-        const s = b.settings;
-        const hasBucketLevelOverrides = s.get_ttl || s.head_ttl || s.put_ttl ||
-            s.read_cache_enabled != null || s.write_cache_enabled != null ||
-            s.compression_enabled != null || s.ram_cache_eligible != null;
-        // Bucket-level defaults row
-        if (hasBucketLevelOverrides || !s.prefix_overrides || s.prefix_overrides.length === 0) {
-            rows.push({
-                rowKey: b.bucket + '::default',
-                bucket: b.bucket,
-                prefix: s.prefix_overrides && s.prefix_overrides.length > 0 ? '(bucket default)' : '(all)',
-                headHits: b.head_hit_count || 0, headTotal: (b.head_hit_count || 0) + (b.head_miss_count || 0),
-                getHits: b.get_hit_count || 0, getTotal: (b.get_hit_count || 0) + (b.get_miss_count || 0),
-                settings: s
-            });
-        }
-        if (s.prefix_overrides) {
-            s.prefix_overrides.forEach(po => {
-                rows.push({
-                    rowKey: b.bucket + '::' + po.prefix,
-                    bucket: s.prefix_overrides.length > 0 && !hasBucketLevelOverrides ? b.bucket : '',
-                    prefix: po.prefix,
-                    headHits: po.head_hit_count || 0, headTotal: (po.head_hit_count || 0) + (po.head_miss_count || 0),
-                    getHits: po.get_hit_count || 0, getTotal: (po.get_hit_count || 0) + (po.get_miss_count || 0),
-                    settings: po
-                });
-            });
-        }
+        rows.push({
+            rowKey: 'bucket::' + b.bucket,
+            bucket: b.bucket,
+            prefix: '(bucket total)',
+            headHits: b.head_hit_count || 0, headTotal: (b.head_hit_count || 0) + (b.head_miss_count || 0),
+            getHits: b.get_hit_count || 0, getTotal: (b.get_hit_count || 0) + (b.get_miss_count || 0),
+            settings: null
+        });
     });
 
     const total = rows.length;
@@ -1461,18 +1459,22 @@ function renderBucketStats() {
     display.forEach(r => {
         const tr = document.createElement('tr');
         tr.className = r.bucket ? 'bucket-row' : 'prefix-row';
-        const settingsBtn = '<button class="stats-btn" onclick="event.stopPropagation();toggleSettings(this,\'' + r.rowKey.replace(/'/g, "\\'") + '\')">Settings</button>';
+        const settingsBtn = r.settings
+            ? '<button class="stats-btn" onclick="event.stopPropagation();toggleSettings(this,\'' + r.rowKey.replace(/'/g, "\\'") + '\')">Settings</button>'
+            : '';
         tr.innerHTML =
             '<td>' + escapeHtml(r.bucket) + '</td>' +
             '<td>' + escapeHtml(r.prefix) + '</td>' +
             '<td>' + hitSummary(r.headHits, r.headTotal) + '</td>' +
             '<td>' + hitSummary(r.getHits, r.getTotal) + '</td>' +
             '<td>' + settingsBtn + '</td>';
-        tr.dataset.settings = JSON.stringify(r.settings);
+        if (r.settings) {
+            tr.dataset.settings = JSON.stringify(r.settings);
+        }
         tbody.appendChild(tr);
 
         // Restore expanded settings if previously open
-        if (expandedSettings.has(r.rowKey)) {
+        if (r.settings && expandedSettings.has(r.rowKey)) {
             appendSettingsRow(tr, r.settings, r.rowKey);
         }
     });
@@ -1984,51 +1986,49 @@ impl ApiHandler {
         };
 
         let bsm = cache_manager.get_bucket_settings_manager();
-        let bucket_names = bsm.buckets_with_settings().await;
+        let rules = bsm.rules().await;
 
-        // Get per-bucket cache stats from metrics manager
+        // Get per-bucket cache stats from metrics manager (all buckets with traffic)
         let bucket_cache_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
             mm.read().await.get_bucket_cache_stats().await
         } else {
             std::collections::HashMap::new()
         };
 
-        // Get per-prefix cache stats from metrics manager
-        let prefix_cache_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
-            mm.read().await.get_prefix_cache_stats().await
+        // Get per-rule cache stats from metrics manager (keyed by glob pattern)
+        let rule_cache_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
+            mm.read().await.get_rule_cache_stats().await
         } else {
             std::collections::HashMap::new()
         };
 
+        // Build the ordered rule entries with their resolved fields and stats.
+        let rule_entries: Vec<RuleStatsEntry> = rules
+            .iter()
+            .map(|r| {
+                let rs = rule_cache_stats.get(&r.pattern);
+                RuleStatsEntry {
+                    pattern: r.pattern.clone(),
+                    get_ttl: r.get_ttl.map(crate::bucket_settings::format_duration),
+                    head_ttl: r.head_ttl.map(crate::bucket_settings::format_duration),
+                    put_ttl: r.put_ttl.map(crate::bucket_settings::format_duration),
+                    read_cache_enabled: r.read_cache_enabled,
+                    write_cache_enabled: r.write_cache_enabled,
+                    compression_enabled: r.compression_enabled,
+                    ram_cache_eligible: r.ram_cache_eligible,
+                    head_hit_count: rs.map_or(0, |s| s.head_hit_count),
+                    head_miss_count: rs.map_or(0, |s| s.head_miss_count),
+                    get_hit_count: rs.map_or(0, |s| s.get_hit_count),
+                    get_miss_count: rs.map_or(0, |s| s.get_miss_count),
+                }
+            })
+            .collect();
+
+        // Build per-bucket entries from observed traffic.
+        let mut bucket_names: Vec<&String> = bucket_cache_stats.keys().collect();
+        bucket_names.sort();
         let mut entries = Vec::with_capacity(bucket_names.len());
-        for bucket in &bucket_names {
-            // Resolve bucket-level settings (empty path = bucket level, no prefix match)
-            let resolved = bsm.resolve(bucket, "").await;
-            let prefix_overrides_raw = bsm.get_prefix_overrides(bucket).await;
-
-            let prefix_overrides: Vec<PrefixOverrideSummary> = prefix_overrides_raw
-                .iter()
-                .map(|po| {
-                    let prefix_key = format!("{}/{}", bucket, po.prefix);
-                    let ps = prefix_cache_stats.get(&prefix_key);
-                    PrefixOverrideSummary {
-                        prefix: po.prefix.clone(),
-                        get_ttl: po.get_ttl.map(crate::bucket_settings::format_duration),
-                        head_ttl: po.head_ttl.map(crate::bucket_settings::format_duration),
-                        put_ttl: po.put_ttl.map(crate::bucket_settings::format_duration),
-                        read_cache_enabled: po.read_cache_enabled,
-                        write_cache_enabled: po.write_cache_enabled,
-                        compression_enabled: po.compression_enabled,
-                        ram_cache_eligible: po.ram_cache_eligible,
-                        head_hit_count: ps.map_or(0, |s| s.head_hit_count),
-                        head_miss_count: ps.map_or(0, |s| s.head_miss_count),
-                        get_hit_count: ps.map_or(0, |s| s.get_hit_count),
-                        get_miss_count: ps.map_or(0, |s| s.get_miss_count),
-                    }
-                })
-                .collect();
-            let prefix_count = prefix_overrides.len();
-
+        for bucket in bucket_names {
             let stats = bucket_cache_stats.get(bucket.as_str());
             let hit_count = stats.map_or(0, |s| s.hit_count);
             let miss_count = stats.map_or(0, |s| s.miss_count);
@@ -2052,21 +2052,13 @@ impl ApiHandler {
                 head_miss_count,
                 get_hit_count,
                 get_miss_count,
-                settings: ResolvedSettingsSummary {
-                    get_ttl: crate::bucket_settings::format_duration(resolved.get_ttl),
-                    head_ttl: crate::bucket_settings::format_duration(resolved.head_ttl),
-                    put_ttl: crate::bucket_settings::format_duration(resolved.put_ttl),
-                    read_cache_enabled: resolved.read_cache_enabled,
-                    write_cache_enabled: resolved.write_cache_enabled,
-                    compression_enabled: resolved.compression_enabled,
-                    ram_cache_eligible: resolved.ram_cache_eligible,
-                    prefix_override_count: prefix_count,
-                    prefix_overrides,
-                },
             });
         }
 
-        let response = BucketStatsResponse { buckets: entries };
+        let response = BucketStatsResponse {
+            buckets: entries,
+            rules: rule_entries,
+        };
         let body = serde_json::to_string(&response).map_err(|e| {
             error!("Failed to serialize bucket stats: {}", e);
             ProxyError::SerializationError(format!("Failed to serialize bucket stats: {}", e))
@@ -2516,9 +2508,10 @@ pub struct LogsResponse {
 #[derive(Debug, Serialize)]
 pub struct BucketStatsResponse {
     pub buckets: Vec<BucketStatsEntry>,
+    pub rules: Vec<RuleStatsEntry>,
 }
 
-/// Per-bucket cache stats entry
+/// Per-bucket cache stats entry (traffic-derived; all buckets)
 #[derive(Debug, Serialize)]
 pub struct BucketStatsEntry {
     pub bucket: String,
@@ -2529,27 +2522,12 @@ pub struct BucketStatsEntry {
     pub head_miss_count: u64,
     pub get_hit_count: u64,
     pub get_miss_count: u64,
-    pub settings: ResolvedSettingsSummary,
 }
 
-/// Summary of resolved settings for a bucket (bucket-level, no prefix)
+/// One active cache rule, its set fields, and its hit/miss stats.
 #[derive(Debug, Serialize)]
-pub struct ResolvedSettingsSummary {
-    pub get_ttl: String,
-    pub head_ttl: String,
-    pub put_ttl: String,
-    pub read_cache_enabled: bool,
-    pub write_cache_enabled: bool,
-    pub compression_enabled: bool,
-    pub ram_cache_eligible: bool,
-    pub prefix_override_count: usize,
-    pub prefix_overrides: Vec<PrefixOverrideSummary>,
-}
-
-/// Summary of a prefix override for the dashboard
-#[derive(Debug, Serialize)]
-pub struct PrefixOverrideSummary {
-    pub prefix: String,
+pub struct RuleStatsEntry {
+    pub pattern: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub get_ttl: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2564,7 +2542,7 @@ pub struct PrefixOverrideSummary {
     pub compression_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ram_cache_eligible: Option<bool>,
-    // Per-prefix hit/miss stats
+    // Per-rule hit/miss stats
     pub head_hit_count: u64,
     pub head_miss_count: u64,
     pub get_hit_count: u64,

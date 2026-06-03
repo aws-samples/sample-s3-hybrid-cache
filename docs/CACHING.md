@@ -23,7 +23,7 @@
 - [S3 Response Header Handling](#s3-response-header-handling)
 - [Conditional Headers Handling](#conditional-headers-handling)
 - [Cache Types](#cache-types)
-- [Bucket-Level Cache Settings](#bucket-level-cache-settings)
+- [Cache Rules](#cache-rules)
 - [Cache Bypass for Non-Cacheable Operations](#cache-bypass-for-non-cacheable-operations)
 - [Cache Bypass Headers](#cache-bypass-headers)
 - [Versioned Request Handling](#versioned-request-handling)
@@ -2112,17 +2112,19 @@ ERROR CompleteMultipartUpload S3 error: bucket=my-bucket, key=large-file.bin, st
 
 This error handling ensures that the write cache enhances performance without compromising security, consistency, or reliability.
 
-## Bucket-Level Cache Settings
+## Cache Rules
 
-Per-bucket and per-prefix cache configuration via JSON files at `cache_dir/metadata/{bucket}/_settings.json`. Changes take effect without proxy restart.
+Cache rules override global cache settings for keys matching a glob pattern, configured in a single hot-reloadable file at `cache_dir/cache_rules.json`. Changes take effect without a proxy restart.
 
-See [CONFIGURATION.md](CONFIGURATION.md#bucket-level-cache-settings) for file format, schema reference, and global config fields.
+See [CONFIGURATION.md](CONFIGURATION.md#cache-rules) for the file format, glob syntax, first-match-per-field precedence, reload behavior, cache-key forms, and rule-count guidance. This section describes the runtime behavior of each setting a rule can apply.
 
-### Per-Bucket Cache Control
+> **Breaking change (v2.0.0).** Cache rules replace the per-bucket `cache_dir/metadata/{bucket}/_settings.json` mechanism. `_settings.json` files are no longer read, and there is no automatic migration. See [CHANGELOG.md](../CHANGELOG.md) for a before/after translation.
+
+### Per-Key Cache Control
 
 #### read_cache_enabled
 
-Controls whether GET responses are cached on disk for a bucket or prefix.
+Controls whether GET responses are cached on disk for keys a rule matches.
 
 When `false`:
 - GET response data is not written to disk cache
@@ -2133,11 +2135,11 @@ When `false`:
 
 When `true` (default): Normal caching behavior.
 
-Global default: `cache.read_cache_enabled` in YAML config (default: `true`). Set globally to `false` for an allowlist pattern where only buckets with `_settings.json` containing `"read_cache_enabled": true` are cached.
+Global default: `cache.read_cache_enabled` in YAML config (default: `true`). Set globally to `false` for an allowlist pattern where only keys matched by a rule with `"read_cache_enabled": true` are cached.
 
 #### write_cache_enabled
 
-Controls whether PUT operations are cached for a bucket or prefix.
+Controls whether PUT operations are cached for keys a rule matches.
 
 When `false`: PUT requests are forwarded to S3 but not cached locally.
 When `true` (default from global config): Normal write-through caching.
@@ -2146,7 +2148,7 @@ Independent of `read_cache_enabled` — disabling read cache does not affect wri
 
 #### ram_cache_eligible
 
-Controls whether range data from a bucket or prefix can be stored in RAM cache.
+Controls whether range data for keys a rule matches can be stored in RAM cache.
 
 When `false`: Data is served from disk cache only (no RAM cache promotion).
 When `true` (default): Normal RAM cache behavior.
@@ -2183,27 +2185,30 @@ HEAD responses are cached with `head_expires_at = now`. On every request, `is_he
 
 Zero TTL revalidation applies to both GET-cached and write-cached data. The `is_write_cached` flag does not override zero-TTL revalidation semantics.
 
-### Settings Apply at Cache-Write Time
+### Settings Are Re-Evaluated on Each Read
 
-Bucket and prefix cache settings (TTL values, `read_cache_enabled`, `ram_cache_eligible`) take effect when data is written to cache, not retroactively. The proxy stamps each cache entry with the resolved settings at write time.
+Resolved cache settings (TTL values, `read_cache_enabled`, `ram_cache_eligible`) are re-evaluated against the current rules on each read request. Freshness is determined by comparing `now - created_at` against the current resolved TTL (`get_ttl` for GET, `head_ttl` for HEAD), not by the stored `expires_at` / `head_expires_at` baked at write time. A rule change therefore applies to already-cached objects on the next GET/HEAD after the staleness window, without a restart or manual cache wipe.
 
 Consequences:
-- Changing `get_ttl` from `"3600s"` to `"0s"` does not expire already-cached objects. They retain their original `expires_at` until they expire naturally or are evicted.
-- Changing `get_ttl` from `"0s"` to `"3600s"` does not extend the TTL of existing zero-TTL entries. New requests that trigger a cache write store data with the new TTL.
-- Changing `read_cache_enabled` from `true` to `false` does not delete existing cached data. It stops new data from being cached, and existing data remains on disk until TTL expiry or eviction.
+- Changing `get_ttl` from `"3600s"` to `"0s"` takes effect on the next GET: the object is treated as expired and revalidated against S3 (conditional request; served from cache only on 304).
+- Changing `get_ttl` from `"0s"` to `"3600s"` extends the freshness window for already-cached objects if `now - created_at` is within the new TTL.
+- Changing `read_cache_enabled` from `true` to `false` eagerly deletes the cached entry (range files + metadata) on the first GET/HEAD after the rule takes effect, then forwards to S3. This is self-cleaning: no manual cache wipe needed.
 
 ### Read Cache Disabled Behavior
 
-When `read_cache_enabled` is `false` (at bucket or prefix level), the proxy acts as a pure pass-through for GET requests:
+When `read_cache_enabled` is `false` (resolved from a matching rule or the global default), the proxy acts as a pure pass-through for GET and HEAD requests:
 
 ```
-Client GET → Proxy → S3 → Stream response directly to client (no caching)
+Client GET/HEAD → Proxy → S3 → Stream response directly to client (no caching)
 ```
 
-- No disk cache reads or writes
+- No disk cache reads or writes for new requests
 - No RAM cache promotion or metadata storage
 - PUT write caching is unaffected (controlled by `write_cache_enabled`)
-- Existing cached data for the bucket/prefix remains on disk but is not read; it expires via normal TTL and eviction
+- Existing cached data for the affected keys is eagerly deleted on the first GET/HEAD after the rule takes effect (range `.bin` files + `.meta` metadata, including HEAD `head_expires_at`)
+- Bounded cost: at most one delete per key per instance; subsequent requests find nothing to delete
+- In shared-storage mode, eager deletion writes one journal `Remove` entry (same as DELETE)
+- Conditional requests (Mode B) also honour `read_cache_enabled=false`: they do not answer from cache and trigger the same eager invalidation
 
 ## Cache Bypass for Non-Cacheable Operations
 

@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
+use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::config::{Config, ConnectionPoolConfig};
 use s3_proxy::disk_cache::DiskCacheManager;
@@ -484,6 +485,7 @@ async fn integration_coalesce_full_flow() {
                 true,
                 wait_timeout,
                 Some(mm),
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -636,6 +638,7 @@ async fn integration_coalesce_head_flow() {
                 true,
                 wait_timeout,
                 Some(mm),
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -785,6 +788,7 @@ async fn integration_coalesce_range_flow() {
                 None,
                 inflight_tracker,
                 Some(mm),
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -915,6 +919,7 @@ async fn integration_coalesce_expired_cache() {
             true,
             wait_timeout,
             Some(Arc::clone(&mm)),
+            &ResolvedSettings::default(),
             &None,
         )
         .await
@@ -967,6 +972,7 @@ async fn integration_coalesce_expired_cache() {
                 true,
                 wait_timeout,
                 Some(mm),
+                &ResolvedSettings::default(),
                 &None,
             )
             .await

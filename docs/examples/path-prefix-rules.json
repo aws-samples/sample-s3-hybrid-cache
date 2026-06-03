@@ -1,0 +1,31 @@
+{
+  "$schema": "../cache-rules-schema.json",
+  "rules": [
+    {
+      "pattern": "my-bucket/static/assets/**",
+      "get_ttl": "7d",
+      "compression_enabled": true,
+      "ram_cache_eligible": true
+    },
+    {
+      "pattern": "my-bucket/temp/**",
+      "get_ttl": "30s",
+      "ram_cache_eligible": false
+    },
+    {
+      "pattern": "my-bucket/logs/**",
+      "read_cache_enabled": false
+    },
+    {
+      "pattern": "my-bucket/api-responses/**",
+      "get_ttl": "0s",
+      "write_cache_enabled": true
+    },
+    {
+      "pattern": "my-bucket/**",
+      "get_ttl": "1h",
+      "head_ttl": "30s",
+      "compression_enabled": true
+    }
+  ]
+}

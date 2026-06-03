@@ -1,0 +1,12 @@
+{
+  "$schema": "../cache-rules-schema.json",
+  "rules": [
+    {
+      "pattern": "auth-bucket/**",
+      "get_ttl": "0s",
+      "head_ttl": "0s",
+      "put_ttl": "1h",
+      "write_cache_enabled": true
+    }
+  ]
+}

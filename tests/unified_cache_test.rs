@@ -89,7 +89,7 @@ async fn test_unified_head_get_share_meta_file() {
 
     // Verify HEAD entry can be retrieved
     let head_entry = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(head_entry.is_some(), "HEAD entry should be retrievable");
@@ -105,7 +105,7 @@ async fn test_unified_head_get_share_meta_file() {
 
     // Verify HEAD is still accessible after range storage
     let head_entry2 = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(
@@ -186,9 +186,10 @@ async fn test_independent_head_get_ttls() {
         .await
         .unwrap();
 
-    // Immediately verify HEAD is accessible
+    // Immediately verify HEAD is accessible (using the 1-second head_ttl)
+    let head_ttl = Duration::from_secs(1);
     let head_entry = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, head_ttl)
         .await
         .unwrap();
     assert!(
@@ -199,9 +200,9 @@ async fn test_independent_head_get_ttls() {
     // Wait for HEAD TTL to expire (1 second + buffer)
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    // HEAD should now be expired (returns None)
+    // HEAD should now be expired (returns None) — freshness evaluated against current head_ttl
     let head_entry_after = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, head_ttl)
         .await
         .unwrap();
     assert!(
@@ -245,7 +246,7 @@ async fn test_head_invalidation_preserves_ranges() {
 
     // Verify HEAD is accessible
     assert!(cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap()
         .is_some());
@@ -258,7 +259,7 @@ async fn test_head_invalidation_preserves_ranges() {
 
     // HEAD should now return None (invalidated)
     let head_after = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(head_after.is_none(), "HEAD should be invalidated");
@@ -322,14 +323,14 @@ async fn test_metadata_cache_integration() {
 
     // First retrieval - should populate MetadataCache
     let head1 = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(head1.is_some());
 
     // Second retrieval - should be served from MetadataCache (RAM)
     let head2 = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(head2.is_some());

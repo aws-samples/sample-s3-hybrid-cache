@@ -1,9 +1,64 @@
 # Changelog
 
-All notable changes to S3 Hybrid Cache will be documented in this file.
+All notable changes to Hybrid Cache for Amazon S3 will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [2.0.0] - 2026-06-02
+
+Glob cache match patterns (GitHub #8, #9). **If you never used per-bucket `_settings.json`, this upgrade requires no action** — behaviour is unchanged and the new rules file is optional. This is a **breaking change** only for operators who used `_settings.json` (including `prefix_overrides`): that mechanism is removed and replaced by a single, hot-reloadable `cache_dir/cache_rules.json` of ordered glob rules matched against the full `{bucket}/{object_key}` cache key. There is no auto-migration; translate your configuration by hand. See the before/after example below and `docs/CONFIGURATION.md` / `docs/CACHING.md` before upgrading.
+
+### Added
+- **Metrics: cache rules reload health, eager invalidation, and TTL revalidation counters**: New `cache_rules` section in `/metrics` JSON and OTLP export tracks the lifecycle of `cache_rules.json` hot-reloads: `reloads_total`, `reload_failures_total`, `on_fallback` (1 when the running ruleset is a stale fallback after a failed load), and `rules_loaded`. New `cache.read_disabled_invalidations_total` counts successful eager cache purges triggered by `read_cache_enabled=false` rules. New `cache.ttl_revalidations_total` counts TTL-driven conditional revalidations against S3 (freshness expired → conditional GET/HEAD). Per-bucket hit/miss counters now track all buckets (not only those with the removed `_settings.json`). The per-request `record_bucket_cache_access` path no longer re-resolves settings — it accepts the already-resolved `SettingsSource`, honouring the resolve-once-per-request contract.
+
+### Changed
+- **BREAKING CHANGE — per-bucket `_settings.json` removed, replaced by `cache_dir/cache_rules.json`**: The proxy no longer reads `cache_dir/metadata/{bucket}/_settings.json` (or its `prefix_overrides`). Cache settings now come from a single optional `cache_dir/cache_rules.json` containing an ordered `rules` list. Each rule is a glob `pattern` plus an optional subset of the same settings fields the old per-bucket file carried (`get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`). The rules file inherits the existing edit-and-go reload model (lazy poll on a staleness threshold, last-known-good retained on an invalid edit), so the restart-free upgrade contract is unchanged. This collapses two long-standing requests into one engine: applying one rule across many buckets without duplicating a file into each (#9), and matching a static segment in the middle of a partially-dynamic key (#8).
+
+  **Patterns match the full cache key `{bucket}/{object_key}`** (no leading slash), so the bucket name is part of the match surface:
+  - A literal bucket prefix is a per-bucket rule: `mybucket/temp/**`.
+  - A leading `**` or `*` is a cross-bucket rule: `**/logs/**` matches `logs/` in every bucket.
+  - A wildcard before a literal segment matches a middle segment: `**/credit-cards/**`.
+
+  **Glob syntax** (anchored to the whole key, case-sensitive): `*` matches a run of non-`/` characters (one path segment), `**` matches a run including `/` (crosses segments), `?` matches one non-`/` character, and every other character is a literal.
+
+  **Anchored, not prefix**: the old `prefix_overrides` used `starts_with`, so `/temp/` matched everything beneath it. Globs are anchored to the entire key, so to match "everything under `temp/`" you must write `mybucket/temp/**`. Writing `mybucket/temp` matches only the exact key `mybucket/temp`, and `mybucket/temp/` matches only that exact string — neither matches `mybucket/temp/file.txt`.
+
+  **Precedence is first-match-per-field**: for each settings field independently, the value comes from the earliest rule in list order that sets it; unset fields fall through to later matching rules and finally to the YAML `cache:` scalar defaults. Put specific rules above broad ones. With no `cache_rules.json` (or `rules: []`), every field resolves to the YAML `cache:` defaults.
+
+  **No auto-migration.** Existing `_settings.json` files are ignored after upgrade. If any are found under `cache_dir/metadata/` at startup, the proxy logs a one-time warning pointing to this migration note; it does not read or honour them.
+
+  Before — `cache_dir/metadata/mybucket/_settings.json` (a per-bucket file with a `prefix_overrides` entry that zeroed the GET TTL under `/temp/`):
+
+  ```json
+  {
+    "prefix_overrides": [
+      { "prefix": "/temp/", "get_ttl": "0s" }
+    ]
+  }
+  ```
+
+  After — `cache_dir/cache_rules.json` (one full-key glob rule; note `mybucket/temp/**`, not `mybucket/temp`):
+
+  ```json
+  {
+    "rules": [
+      { "pattern": "mybucket/temp/**", "get_ttl": "0s" }
+    ]
+  }
+  ```
+
+  Full details, including the cache-key forms for regional access points, MRAPs, and S3-compatible hosts: `docs/CONFIGURATION.md`, `docs/CACHING.md`, the rules schema at `docs/cache-rules-schema.json`, and the worked example at `config/cache_rules.example.json`.
+
+- **`bucket_settings_staleness_threshold` retained**: The config field keeps its name (via a serde alias, conceptually "rules staleness") and now governs how often `cache_rules.json` is re-read. No YAML config edits are required to adopt or omit this feature.
+
+- **Resolved cache settings apply on the next read, not at write time**: Cache rules are re-resolved on every read request, so a `cache_rules.json` edit takes effect on already-cached objects on the next GET/HEAD after the staleness window — no restart, no manual cache wipe. Freshness is evaluated against the **current** resolved TTL (`now - created_at` vs `get_ttl` for GET, `head_ttl` for HEAD), not the `expires_at` / `head_expires_at` baked at write time, so `get_ttl=0` / `head_ttl=0` force conditional revalidation against S3 on every GET / HEAD, and a reduced TTL expires an already-cached object once `now - created_at` exceeds it. Resolving `read_cache_enabled=false` for a key that has a cached copy not only stops serving it but **eagerly deletes** the cached entry (range files + metadata, via the DELETE invalidation path) and forwards to S3 — on both the default gate and the conditional-request (`evaluate_conditions_from_cache`) path, for GET and HEAD alike — so a no-cache rule is self-cleaning. The read path reuses the single per-request `ResolvedSettings` (resolve-once preserved) and all comparisons are read-only (no metadata rewrite on read). `read_cache_enabled=true` within the current window, and unchanged rules, behave exactly as before.
+
+- **Proxy identification Referer header renamed**: The `Referer` header added to requests forwarded to S3 now uses the correct product name: `Hybrid Cache for Amazon S3/{version} ({hostname})` (was `s3-hybrid-cache/{version} ({hostname})`). If you query S3 Server Access Logs by Referer (e.g. Athena `WHERE referer LIKE ...`), update your pattern to match the new prefix.
+
+### Fixed
+- **Write-cache GET TTL revalidation**: The first GET of a write-through-cached object now correctly honors `get_ttl=0` (revalidates and authenticates against S3) instead of serving from cache. Previously, the write-cache-to-read-cache TTL transition (`refresh_write_cache_ttl`) fired asynchronously *after* the freshness check, so the first GET saw the `put_ttl`-based `expires_at` and returned a cache hit. The transition now runs synchronously *before* the freshness check at both decision-gate call sites, so `expires_at` is reset to `now + get_ttl` before the Fresh/Expired decision. For `get_ttl=0` this makes the object immediately expired, triggering conditional revalidation on every GET as documented. Non-zero `get_ttl` objects are unaffected (they remain fresh after transition when `now + get_ttl` is in the future). This was a pre-existing bug made more visible by cache rules, which let operators target specific prefixes with `get_ttl=0`.
+- **A reduced `get_ttl` / `head_ttl` was ignored for already-cached objects**: A pre-existing defect (present in 1.x with `_settings.json` too): the read-path freshness check compared the stored write-time `expires_at` / `head_expires_at` to `now` and never re-resolved the current TTL, so lowering a freshness TTL did not shorten the life of objects already in cache — they stayed "fresh" until the original window elapsed or they were evicted, contradicting the documented meaning of `get_ttl=0` / `head_ttl=0` ("validate against S3 on every request"). Freshness is now evaluated against the current resolved TTL on every read (see the new read-time application behavior under Changed), so a tightened or zeroed TTL takes effect on the next GET/HEAD.
 
 ## [1.16.4] - 2026-06-01
 

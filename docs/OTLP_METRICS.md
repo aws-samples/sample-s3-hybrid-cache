@@ -127,6 +127,17 @@ All metrics are gauges with resource attributes `host.name`, `service.name`, and
 | `cache.etag_mismatches_total` | Gauge | ETag mismatches (cache coherency violations) |
 | `cache.range_invalidations_total` | Gauge | Range invalidations triggered by ETag mismatch |
 | `cache.incomplete_uploads_evicted` | Gauge | Incomplete MPU uploads evicted from write cache |
+| `cache.read_disabled_invalidations_total` | Gauge | Eager cache purges triggered by `read_cache_enabled=false` rules |
+| `cache.ttl_revalidations_total` | Gauge | TTL-driven conditional revalidations against S3 |
+
+### Cache Rules — Reload Health
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cache_rules.reloads_total` | Gauge | Successful `cache_rules.json` loads since startup |
+| `cache_rules.reload_failures_total` | Gauge | Failed loads (parse, validation, compile errors) |
+| `cache_rules.on_fallback` | Gauge (0/1) | 1 = running stale fallback rules (last load failed) |
+| `cache_rules.rules_loaded` | Gauge | Number of rules currently active |
 
 ### Compression
 

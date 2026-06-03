@@ -58,7 +58,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Stateless instances—no direct communication between nodes; all coordination via shared storage makes instances ephemeral and replaceable
 - Journal-based metadata updates—each instance writes cache updates to its own journal file, and a background consolidator merges them atomically, eliminating race conditions on shared storage without inter-node communication
 - Content-aware LZ4 compression—2-10x space savings, automatically skips already-compressed formats
-- Per-bucket and per-prefix cache settings—configure TTLs, read/write caching, compression, and RAM cache eligibility per bucket via JSON files, with hot reload
+- Glob-based cache rules—configure TTLs, read/write caching, compression, and RAM cache eligibility for keys matching a glob pattern via a single hot-reloadable `cache_rules.json`
 - Flexible expiration modes—lazy (fixed capacity) or active (elastic storage)
 - Cache storage is flexible—a single proxy with local disk may be suitable on a hypervisor platform that provides high availability. Multi-proxy deployments use any NFS-compatible shared storage: a dedicated NAS appliance, a file server VM within the cluster, or file services built into a hypervisor platform
 

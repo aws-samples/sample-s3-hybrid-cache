@@ -66,7 +66,7 @@ async fn test_head_cache_invalidation_logging() {
 
     // Verify HEAD cache exists using unified method
     let head_entry = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(head_entry.is_some(), "HEAD cache entry should exist");
@@ -80,7 +80,7 @@ async fn test_head_cache_invalidation_logging() {
 
     // Verify HEAD cache was invalidated using unified method
     let head_entry_after = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(

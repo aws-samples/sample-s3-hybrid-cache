@@ -67,7 +67,7 @@ async fn test_head_cache_for_content_length() {
 
     // Retrieve HEAD cache entry using unified method
     let head_entry = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .expect("Failed to get HEAD cache entry")
         .expect("HEAD cache entry should exist");
@@ -100,7 +100,7 @@ async fn test_head_cache_hit_and_miss() {
 
     // First request - cache miss
     let result1 = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(
@@ -134,7 +134,7 @@ async fn test_head_cache_hit_and_miss() {
 
     // Second request - cache hit
     let result2 = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
     assert!(

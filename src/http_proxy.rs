@@ -640,7 +640,7 @@ impl HttpProxy {
         let proxy_referer = if config.server.add_referer_header {
             let hostname = gethostname::gethostname().to_string_lossy().to_string();
             let referer = format!(
-                "s3-hybrid-cache/{} ({})",
+                "Hybrid Cache for Amazon S3/{} ({})",
                 env!("CARGO_PKG_VERSION"),
                 hostname
             );
@@ -1727,6 +1727,10 @@ impl HttpProxy {
                 // Forward to S3 and cache the response (skip cache lookup but cache response)
                 // Requirements: 1.3, 3.3
                 let cache_key = CacheManager::generate_cache_key(path, Some(&host));
+                // This bypass branch returns early and never reaches the main
+                // read-cache gate, so resolve once here for the cache-write path
+                // (still one resolve per logical request). Requirement 8.2.
+                let resolved_settings = cache_manager.resolve_settings(&cache_key).await;
                 return Self::forward_get_head_to_s3_and_cache(
                     method,
                     uri,
@@ -1736,6 +1740,7 @@ impl HttpProxy {
                     cache_manager,
                     s3_client,
                     range_handler,
+                    &resolved_settings,
                     proxy_referer,
                 )
                 .await;
@@ -1754,6 +1759,20 @@ impl HttpProxy {
             }
         }
 
+        // Generate cache key for the main path (used by both the conditional-headers
+        // block and the downstream cache pipeline). Hoisted here so the single
+        // resolve_settings call below is available to Mode B, the default gate,
+        // and all freshness-check sites — exactly one resolve per request on this
+        // path (Requirement 3.3 / cache-match-patterns Property 7).
+        let cache_key = CacheManager::generate_cache_key(path, Some(&host));
+
+        // Resolve cache rules once for the entire main path. The resolved value
+        // carries get_ttl, head_ttl, read_cache_enabled, and
+        // evaluate_conditions_from_cache — reused by Mode B, the default gate,
+        // and the GET/HEAD freshness checks downstream.
+        // Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7
+        let resolved_settings = cache_manager.resolve_settings(&cache_key).await;
+
         // Check for conditional headers — RFC 7232 semantics apply to range and
         // non-range requests uniformly. Per cache config, handle either by forwarding
         // to S3 (Mode A, default) or by evaluating against cached metadata (Mode B).
@@ -1771,11 +1790,6 @@ impl HttpProxy {
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
 
-            // Generate cache key for conditional request handling
-            let cache_key = CacheManager::generate_cache_key(path, Some(&host));
-
-            // Resolve per-bucket/prefix setting for condition-evaluation mode.
-            let resolved_settings = cache_manager.resolve_settings(path).await;
             let mode_b = resolved_settings.evaluate_conditions_from_cache;
 
             debug!(
@@ -1807,6 +1821,64 @@ impl HttpProxy {
             // leave this false so we forward to S3 below.
             let mut mode_b_fresh = false;
             if mode_b {
+                // Class B guard: when read_cache_enabled=false, do NOT evaluate
+                // conditions from cache (GET or HEAD). Probe for a cached copy and
+                // eagerly invalidate it, then forward to S3 unconditionally.
+                // Requirements: 2.3, 2.4, 2.5
+                if !resolved_settings.read_cache_enabled {
+                    // Cheap existence probe via RAM-cached metadata lookup.
+                    let has_cached_copy = cache_manager
+                        .get_metadata_cached(&cache_key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if has_cached_copy {
+                        // Eagerly invalidate: delete range files + .meta (includes
+                        // HEAD head_expires_at metadata in the same .meta file).
+                        // Log-and-continue on failure — never fail the client request.
+                        if let Err(e) = cache_manager
+                            .invalidate_cache_unified_for_operation(
+                                &cache_key,
+                                "read_cache_disabled_eager",
+                            )
+                            .await
+                        {
+                            warn!(
+                                "Eager invalidation failed on Mode B read_cache_enabled=false: cache_key={}, error={}",
+                                cache_key, e
+                            );
+                        } else {
+                            debug!(
+                                "Mode B: eagerly invalidated cached copy (read_cache_enabled=false): cache_key={}",
+                                cache_key
+                            );
+                            if let Some(ref mm) = metrics_manager {
+                                let mm = mm.clone();
+                                tokio::spawn(async move {
+                                    mm.read()
+                                        .await
+                                        .record_read_cache_disabled_invalidation()
+                                        .await;
+                                });
+                            }
+                        }
+                    }
+                    // Forward to S3 without evaluating conditions from cache.
+                    // Use the non-caching forward since read_cache_enabled=false
+                    // means no caching of the response either.
+                    return Self::forward_get_head_to_s3_without_caching(
+                        method,
+                        uri,
+                        host,
+                        header_map,
+                        s3_client,
+                        Some("read_cache_disabled"),
+                        proxy_referer,
+                    )
+                    .await;
+                }
+
                 // Load metadata (RAM-cached fast path).
                 let cached_metadata = cache_manager
                     .get_metadata_cached(&cache_key)
@@ -1815,11 +1887,15 @@ impl HttpProxy {
                     .flatten();
                 if let Some(meta) = cached_metadata.as_ref() {
                     // Check freshness: only evaluate from cache if object is unexpired.
-                    // For HEAD requests use head expiration; for GET use object expiration.
+                    // For HEAD requests use head expiration; for GET use current get_ttl.
                     let is_fresh = if method == Method::HEAD {
                         !meta.is_head_expired()
                     } else {
-                        meta.expires_at > std::time::SystemTime::now()
+                        !resolved_settings.get_ttl.is_zero()
+                            && std::time::SystemTime::now()
+                                .duration_since(meta.created_at)
+                                .unwrap_or(std::time::Duration::ZERO)
+                                <= resolved_settings.get_ttl
                     };
                     if is_fresh {
                         let etag = if meta.object_metadata.etag.is_empty() {
@@ -2077,9 +2153,6 @@ impl HttpProxy {
         // Check for Range header - Requirements 3.1, 3.5
         let range_header = headers.get("range").and_then(|h| h.to_str().ok());
 
-        // Generate cache key (path only, versionId is not included)
-        let cache_key = CacheManager::generate_cache_key(path, Some(&host));
-
         debug!("Cache key for {} {}: {}", method, uri, cache_key);
 
         // Versioned requests bypass cache entirely (no read, no write)
@@ -2108,10 +2181,52 @@ impl HttpProxy {
             .await;
         }
 
-        // Resolve bucket-level cache settings for read cache control
-        // Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7
-        let resolved_settings = cache_manager.resolve_settings(path).await;
+        // read_cache_enabled gate: forward to S3 without caching when disabled.
+        // Uses the single resolved_settings hoisted before the conditional-headers
+        // block (resolve-once, Requirement 3.3).
+        // When a cached copy exists, eagerly invalidate it (delete range files +
+        // .meta, including HEAD head_expires_at metadata) before forwarding — the
+        // first GET/HEAD per key after the rule takes effect purges stale bytes.
+        // Requirements: 2.3, 2.5
         if !resolved_settings.read_cache_enabled {
+            // Cheap existence probe: check if a cached copy exists before attempting
+            // deletion. Keeps the common case (a no-cache key never cached) free of
+            // a delete attempt and lock acquisition.
+            let has_cached_copy = cache_manager
+                .get_metadata_cached(&cache_key)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if has_cached_copy {
+                // Eagerly invalidate: mirrors invalidate_all_ranges on DELETE.
+                // Log-and-continue on failure — never fail the client request because
+                // a delete failed.
+                if let Err(e) = cache_manager
+                    .invalidate_cache_unified_for_operation(&cache_key, "read_cache_disabled_eager")
+                    .await
+                {
+                    warn!(
+                        "Eager invalidation failed on read_cache_enabled=false gate: cache_key={}, error={}",
+                        cache_key, e
+                    );
+                } else {
+                    debug!(
+                        "Eagerly invalidated cached copy (read_cache_enabled=false): cache_key={}, source={:?}",
+                        cache_key, resolved_settings.source
+                    );
+                    if let Some(ref mm) = metrics_manager {
+                        let mm = mm.clone();
+                        tokio::spawn(async move {
+                            mm.read()
+                                .await
+                                .record_read_cache_disabled_invalidation()
+                                .await;
+                        });
+                    }
+                }
+            }
+
             debug!(
                 "Read caching disabled for path={}, source={:?} — streaming directly from S3",
                 path, resolved_settings.source
@@ -2194,6 +2309,7 @@ impl HttpProxy {
                             .download_coordination
                             .max_waiter_resubscriptions,
                         metrics_manager,
+                        &resolved_settings,
                         proxy_referer,
                     )
                     .await;
@@ -2238,6 +2354,7 @@ impl HttpProxy {
                             .download_coordination
                             .max_waiter_resubscriptions,
                         metrics_manager,
+                        &resolved_settings,
                         proxy_referer,
                     )
                     .await;
@@ -2286,7 +2403,7 @@ impl HttpProxy {
                 host,
                 uri,
                 config,
-                resolved_settings.get_ttl,
+                &resolved_settings,
                 current_etag,
                 inflight_tracker,
                 metrics_manager.clone(),
@@ -2304,7 +2421,10 @@ impl HttpProxy {
         );
         if method == Method::HEAD {
             // Check HEAD cache for HEAD requests using unified cache (RAM first, then disk)
-            match cache_manager.get_head_cache_entry_unified(&cache_key).await {
+            match cache_manager
+                .get_head_cache_entry_unified(&cache_key, resolved_settings.head_ttl)
+                .await
+            {
                 Ok(Some(head_entry)) => {
                     // Determine cache layer for logging
                     // The unified cache checks MetadataCache (RAM) first, then disk
@@ -2333,7 +2453,12 @@ impl HttpProxy {
                     // Record per-bucket cache hit for HEAD
                     cache_manager.update_statistics(true, 0, true);
                     cache_manager
-                        .record_bucket_cache_access(&cache_key, true, true)
+                        .record_bucket_cache_access(
+                            &cache_key,
+                            true,
+                            true,
+                            &resolved_settings.source,
+                        )
                         .await;
 
                     // Build response from HEAD cache
@@ -2363,7 +2488,12 @@ impl HttpProxy {
                     // Record per-bucket cache miss for HEAD
                     cache_manager.update_statistics(false, 0, true);
                     cache_manager
-                        .record_bucket_cache_access(&cache_key, false, true)
+                        .record_bucket_cache_access(
+                            &cache_key,
+                            false,
+                            true,
+                            &resolved_settings.source,
+                        )
                         .await;
 
                     // Forward request to S3 and cache response
@@ -2376,6 +2506,7 @@ impl HttpProxy {
                         cache_manager,
                         s3_client,
                         range_handler.clone(),
+                        &resolved_settings,
                         proxy_referer,
                     )
                     .await
@@ -2394,6 +2525,7 @@ impl HttpProxy {
                         cache_manager,
                         s3_client,
                         range_handler,
+                        &resolved_settings,
                         proxy_referer,
                     )
                     .await
@@ -2448,12 +2580,20 @@ impl HttpProxy {
                         Ok(overlap) if overlap.can_serve_from_cache => {
                             // Check if cached ranges are expired and need conditional validation (Requirement 2.2)
                             if !overlap.cached_ranges.is_empty() {
+                                // Synchronous write-cache TTL transition BEFORE freshness check.
+                                // Ensures get_ttl=0 objects are correctly expired on first GET
+                                // (write-cache-get-ttl-revalidation bugfix).
+                                let _ = cache_manager.refresh_write_cache_ttl(&cache_key).await;
+
                                 let disk_cache = range_handler.get_disk_cache_manager();
                                 let disk_cache_guard = disk_cache.read().await;
 
                                 // Check object-level expiration
                                 let cached_range = &overlap.cached_ranges[0];
-                                match disk_cache_guard.check_object_expiration(&cache_key).await {
+                                match disk_cache_guard
+                                    .check_object_expiration(&cache_key, resolved_settings.get_ttl)
+                                    .await
+                                {
                                     Ok(ObjectExpirationResult::Expired {
                                         last_modified,
                                         etag,
@@ -2462,6 +2602,14 @@ impl HttpProxy {
                                         "Full object expired, performing conditional validation: cache_key={}",
                                         cache_key
                                     );
+
+                                        // Record TTL-driven revalidation metric
+                                        if let Some(ref mm) = metrics_manager {
+                                            let mm = mm.clone();
+                                            tokio::spawn(async move {
+                                                mm.read().await.record_ttl_revalidation().await;
+                                            });
+                                        }
 
                                         // Drop the lock before making S3 request
                                         drop(disk_cache_guard);
@@ -2517,6 +2665,7 @@ impl HttpProxy {
                                                             s3_client,
                                                             config,
                                                             metrics_manager.clone(),
+                                                            &resolved_settings,
                                                             proxy_referer,
                                                         )
                                                         .await;
@@ -2611,6 +2760,7 @@ impl HttpProxy {
                                                         uri.path(),
                                                         &header_map,
                                                         config,
+                                                        &resolved_settings,
                                                     )
                                                     .await;
                                                 } else if response.status == StatusCode::OK {
@@ -2778,6 +2928,7 @@ impl HttpProxy {
                                             uri.path(),
                                             &header_map,
                                             config,
+                                            &resolved_settings,
                                         )
                                         .await;
                                     }
@@ -2822,6 +2973,7 @@ impl HttpProxy {
                                     uri.path(),
                                     &header_map,
                                     config,
+                                    &resolved_settings,
                                 )
                                 .await;
                             }
@@ -2923,6 +3075,7 @@ impl HttpProxy {
                                     preloaded_metadata.as_ref(),
                                     inflight_tracker,
                                     metrics_manager,
+                                    &resolved_settings,
                                     proxy_referer,
                                 )
                                 .await;
@@ -2985,6 +3138,7 @@ impl HttpProxy {
                 config.cache.download_coordination.enabled,
                 config.cache.download_coordination.wait_timeout(),
                 metrics_manager,
+                &resolved_settings,
                 proxy_referer,
             )
             .await
@@ -3051,8 +3205,10 @@ impl HttpProxy {
 
         // Check if this is an AWS SigV4 signed request
         if crate::signed_request_proxy::is_aws_sigv4_signed(&headers) {
-            // Resolve per-bucket write cache settings - Requirements 4.1, 4.2, 4.3, 4.4
-            let resolved_settings = cache_manager.resolve_settings(path).await;
+            // Resolve write cache settings against the full cache key (bucket-inclusive).
+            // Requirements 4.1, 4.2, 4.3, 4.4
+            let cache_key = CacheManager::generate_cache_key(path, Some(&host));
+            let resolved_settings = cache_manager.resolve_settings(&cache_key).await;
 
             // Check if write caching is enabled for this bucket/prefix
             if !resolved_settings.write_cache_enabled {
@@ -3062,13 +3218,11 @@ impl HttpProxy {
                 );
 
                 // Forward request to S3 and invalidate cache on success
-                let host_for_cache = host.clone();
                 let response =
                     Self::forward_signed_request(req, host, s3_client, proxy_referer).await?;
 
                 // If PUT was successful, invalidate cache
                 if response.status().is_success() {
-                    let cache_key = CacheManager::generate_cache_key(path, Some(&host_for_cache));
                     if let Err(e) = cache_manager
                         .invalidate_cache_unified_for_operation(&cache_key, "PUT")
                         .await
@@ -3090,9 +3244,6 @@ impl HttpProxy {
             }
 
             debug!("Detected AWS SigV4 signed PUT request, using SignedPutHandler for caching");
-
-            // Generate cache key
-            let cache_key = CacheManager::generate_cache_key(path, Some(&host));
 
             // Get connection pool to resolve DNS and get target IP
             let pool = s3_client.get_connection_pool();
@@ -3282,8 +3433,10 @@ impl HttpProxy {
         // Check write cache configuration and size limits - Requirements 1.2, 1.5, 2.4, 2.5
         let body_size = body_bytes.len() as u64;
 
-        // Resolve per-bucket write cache settings - Requirements 4.1, 4.2, 4.3, 4.4
-        let resolved_settings = cache_manager.resolve_settings(path).await;
+        // Resolve write cache settings against the full cache key (bucket-inclusive).
+        // Requirements 4.1, 4.2, 4.3, 4.4
+        let cache_key = CacheManager::generate_cache_key(path, Some(&host));
+        let resolved_settings = cache_manager.resolve_settings(&cache_key).await;
 
         // Check if write caching is enabled for this bucket/prefix
         if !resolved_settings.write_cache_enabled {
@@ -3293,7 +3446,6 @@ impl HttpProxy {
             );
 
             // Forward to S3 and invalidate cache on success
-            let cache_key = CacheManager::generate_cache_key(path, Some(&host));
             match Self::forward_put_to_s3_with_body(body_bytes, host, path, headers, s3_client)
                 .await
             {
@@ -3330,8 +3482,6 @@ impl HttpProxy {
         // Write caching is enabled - forward to S3 and cache on success
         // Capacity reservation is handled atomically inside store_write_cache_entry
         // via try_reserve() (Requirements 9.1, 9.2)
-        let cache_key = CacheManager::generate_cache_key(path, Some(&host));
-
         match Self::forward_put_to_s3_with_body(
             body_bytes.clone(),
             host.clone(),
@@ -3908,7 +4058,13 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         _config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        // Settings are resolved once per logical request and threaded in here;
+        // the spawned per-range cache-write task reuses these values instead of
+        // re-resolving (Requirement 8.2).
+        let compression_enabled = resolved.compression_enabled;
+        let get_ttl = resolved.get_ttl;
         let mut response_builder = Response::builder().status(s3_response.status);
         let headers_clone = s3_response.headers.clone();
 
@@ -3947,7 +4103,6 @@ impl HttpProxy {
                 let cache_manager = Arc::clone(range_handler.get_cache_manager());
                 tokio::spawn(async move {
                     let expected_size = end - start + 1;
-                    let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
 
                     // Check capacity and evict if needed before beginning the write.
                     // `expected_size` is an upper bound on the bytes that will land on disk
@@ -3963,7 +4118,7 @@ impl HttpProxy {
                             &cache_key_clone,
                             start,
                             end,
-                            resolved.compression_enabled,
+                            compression_enabled,
                         )
                         .await
                     {
@@ -4027,7 +4182,7 @@ impl HttpProxy {
                     // serialize the journal append and size accumulator.
                     let disk_cache_guard = disk_cache.read().await;
                     if let Err(e) = disk_cache_guard
-                        .commit_incremental_range(writer, object_metadata, resolved.get_ttl)
+                        .commit_incremental_range(writer, object_metadata, get_ttl)
                         .await
                     {
                         if e.to_string().contains("size mismatch") {
@@ -4091,7 +4246,7 @@ impl HttpProxy {
         host: String,
         uri: hyper::Uri,
         config: Arc<Config>,
-        resolved_get_ttl: std::time::Duration,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         current_etag: Option<String>,
         inflight_tracker: Arc<InFlightTracker>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
@@ -4241,6 +4396,7 @@ impl HttpProxy {
                                             &header_map,
                                             config.clone(),
                                             preloaded_metadata.as_ref(),
+                                            resolved,
                                         )
                                         .await;
                                     }
@@ -4316,12 +4472,20 @@ impl HttpProxy {
 
                         // Check if cached ranges are expired and need conditional validation (Requirement 1.4)
                         if !overlap.cached_ranges.is_empty() {
+                            // Synchronous write-cache TTL transition BEFORE freshness check.
+                            // Ensures get_ttl=0 objects are correctly expired on first GET
+                            // (write-cache-get-ttl-revalidation bugfix).
+                            let _ = cache_manager.refresh_write_cache_ttl(&cache_key).await;
+
                             let disk_cache = range_handler.get_disk_cache_manager();
                             let disk_cache_guard = disk_cache.read().await;
 
                             // Check object-level expiration
                             let cached_range = &overlap.cached_ranges[0];
-                            match disk_cache_guard.check_object_expiration(&cache_key).await {
+                            match disk_cache_guard
+                                .check_object_expiration(&cache_key, resolved.get_ttl)
+                                .await
+                            {
                                 Ok(ObjectExpirationResult::Expired {
                                     last_modified,
                                     etag,
@@ -4330,6 +4494,14 @@ impl HttpProxy {
                                     "Range expired, performing conditional validation: cache_key={}",
                                     cache_key
                                 );
+
+                                    // Record TTL-driven revalidation metric
+                                    if let Some(ref mm) = metrics_manager {
+                                        let mm = mm.clone();
+                                        tokio::spawn(async move {
+                                            mm.read().await.record_ttl_revalidation().await;
+                                        });
+                                    }
 
                                     // Drop the lock before making S3 request
                                     drop(disk_cache_guard);
@@ -4389,6 +4561,7 @@ impl HttpProxy {
                                                         config,
                                                         is_signed,
                                                         metrics_manager.clone(),
+                                                        resolved,
                                                         proxy_referer,
                                                     )
                                                     .await;
@@ -4438,7 +4611,7 @@ impl HttpProxy {
                                                 if let Err(e) = disk_cache_guard
                                                     .refresh_object_ttl(
                                                         &cache_key,
-                                                        resolved_get_ttl,
+                                                        resolved.get_ttl,
                                                     )
                                                     .await
                                                 {
@@ -4482,6 +4655,7 @@ impl HttpProxy {
                                                     &header_map,
                                                     config.clone(),
                                                     preloaded_metadata.as_ref(),
+                                                    resolved,
                                                 )
                                                 .await;
                                             } else if response.status == StatusCode::OK {
@@ -4531,6 +4705,7 @@ impl HttpProxy {
                                                     s3_client,
                                                     config.clone(),
                                                     preloaded_metadata.as_ref(),
+                                                    resolved,
                                                     proxy_referer,
                                                 )
                                                 .await;
@@ -4607,6 +4782,7 @@ impl HttpProxy {
                                                     s3_client,
                                                     config.clone(),
                                                     preloaded_metadata.as_ref(),
+                                                    resolved,
                                                     proxy_referer,
                                                 )
                                                 .await;
@@ -4663,6 +4839,7 @@ impl HttpProxy {
                                                 s3_client,
                                                 config.clone(),
                                                 preloaded_metadata.as_ref(),
+                                                resolved,
                                                 proxy_referer,
                                             )
                                             .await;
@@ -4727,6 +4904,7 @@ impl HttpProxy {
                                 &header_map,
                                 config.clone(),
                                 preloaded_metadata.as_ref(),
+                                resolved,
                             )
                             .await;
                         } else {
@@ -4737,7 +4915,12 @@ impl HttpProxy {
                             // This is a partial or complete miss since we need to fetch from S3
                             cache_manager.update_statistics(false, 0, false);
                             cache_manager
-                                .record_bucket_cache_access(&cache_key, false, false)
+                                .record_bucket_cache_access(
+                                    &cache_key,
+                                    false,
+                                    false,
+                                    &resolved.source,
+                                )
                                 .await;
 
                             // Check if this is a signed range request (Requirement 1.2, 1.3)
@@ -4767,6 +4950,7 @@ impl HttpProxy {
                                     None, // no preloaded metadata for signed path
                                     inflight_tracker,
                                     metrics_manager,
+                                    resolved,
                                     proxy_referer,
                                 )
                                 .await;
@@ -4830,6 +5014,7 @@ impl HttpProxy {
                                 preloaded_metadata.as_ref(),
                                 inflight_tracker,
                                 metrics_manager,
+                                resolved,
                                 proxy_referer,
                             )
                             .await
@@ -4870,6 +5055,7 @@ impl HttpProxy {
                     cache_manager,
                     s3_client,
                     range_handler,
+                    resolved,
                     proxy_referer,
                 )
                 .await
@@ -4901,6 +5087,7 @@ impl HttpProxy {
         uri: &str,
         headers: &HeaderMap,
         config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Get the cached data using the same logic as range requests
         let perf_start = Instant::now();
@@ -4916,6 +5103,7 @@ impl HttpProxy {
             uri,
             headers,
             &config,
+            resolved,
         )
         .await
         {
@@ -4923,22 +5111,6 @@ impl HttpProxy {
             Err(error_response) => return Ok(error_response),
         };
         let data_load_ms = data_load_start.elapsed().as_millis();
-
-        // Refresh write cache TTL if this is a write-cached object (Requirements 1.4, 5.2)
-        // This is done asynchronously to not block the response
-        let cache_manager_clone = cache_manager.clone();
-        let cache_key_clone = cache_key.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = cache_manager_clone
-                .refresh_write_cache_ttl(&cache_key_clone)
-                .await
-            {
-                debug!(
-                    "Failed to refresh write cache TTL for {}: {}",
-                    cache_key_clone, e
-                );
-            }
-        });
 
         // Get cached metadata to restore original S3 headers
         let cached_metadata = match cache_manager.get_metadata_from_disk(cache_key).await {
@@ -5083,6 +5255,7 @@ impl HttpProxy {
         headers: &HeaderMap,
         config: Arc<Config>,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!(
             "SERVING RANGE FROM CACHE: range={}-{}, cache_key={}",
@@ -5104,21 +5277,6 @@ impl HttpProxy {
                 "RAM cache hit for range {}-{}, serving buffered response",
                 range_spec.start, range_spec.end
             );
-
-            // Refresh write cache TTL asynchronously
-            let cache_manager_clone = cache_manager.clone();
-            let cache_key_clone = cache_key.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = cache_manager_clone
-                    .refresh_write_cache_ttl(&cache_key_clone)
-                    .await
-                {
-                    debug!(
-                        "Failed to refresh write cache TTL for {}: {}",
-                        cache_key_clone, e
-                    );
-                }
-            });
 
             // Resolve metadata for response headers
             let cached_metadata =
@@ -5175,7 +5333,12 @@ impl HttpProxy {
             // Record cache hit statistics
             cache_manager.update_statistics(true, range_size, method == Method::HEAD);
             cache_manager
-                .record_bucket_cache_access(cache_key, true, method == Method::HEAD)
+                .record_bucket_cache_access(
+                    cache_key,
+                    true,
+                    method == Method::HEAD,
+                    &resolved.source,
+                )
                 .await;
 
             return Ok(response);
@@ -5194,21 +5357,6 @@ impl HttpProxy {
                 "Using disk streaming for range {}-{} ({} bytes >= {} threshold), cache_key={}",
                 range_spec.start, range_spec.end, range_size, streaming_threshold, cache_key
             );
-
-            // Refresh write cache TTL asynchronously
-            let cache_manager_clone = cache_manager.clone();
-            let cache_key_clone = cache_key.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = cache_manager_clone
-                    .refresh_write_cache_ttl(&cache_key_clone)
-                    .await
-                {
-                    debug!(
-                        "Failed to refresh write cache TTL for {}: {}",
-                        cache_key_clone, e
-                    );
-                }
-            });
 
             // Resolve metadata for headers (Requirement 5.6)
             let metadata_start = Instant::now();
@@ -5292,6 +5440,7 @@ impl HttpProxy {
                                         headers,
                                         config,
                                         preloaded_metadata,
+                                        resolved,
                                     )
                                     .await;
                                 }
@@ -5316,6 +5465,7 @@ impl HttpProxy {
                                 headers,
                                 config,
                                 preloaded_metadata,
+                                resolved,
                             )
                             .await;
                         }
@@ -5375,6 +5525,7 @@ impl HttpProxy {
                             headers,
                             config,
                             preloaded_metadata,
+                            resolved,
                         )
                         .await;
                     }
@@ -5393,6 +5544,10 @@ impl HttpProxy {
                     let promotion_start = range_spec.start;
                     let promotion_end = range_spec.end;
                     let promotion_etag = cached_metadata.etag.clone();
+                    // Settings are resolved once per logical request and threaded in;
+                    // the promotion task reuses this rather than re-resolving (Req 8.2).
+                    let promotion_ram_eligible = resolved.ram_cache_eligible;
+                    let promotion_source = resolved.source.clone();
 
                     tokio::spawn(async move {
                         use futures::StreamExt;
@@ -5439,14 +5594,12 @@ impl HttpProxy {
                         // Promote to RAM cache after successful streaming (Requirements 2.2, 5.1, 5.2, 6.1, 6.5)
                         if stream_completed {
                             if let Some(buffer) = promotion_buffer {
-                                // Check bucket-level RAM cache eligibility before promoting
-                                let resolved = promotion_cache_manager
-                                    .resolve_settings(&promotion_cache_key)
-                                    .await;
-                                if !resolved.ram_cache_eligible {
+                                // RAM cache eligibility was resolved once per request
+                                // and threaded in (Requirement 8.2).
+                                if !promotion_ram_eligible {
                                     debug!(
                                         "Skipping RAM cache promotion for {}: ram_cache_eligible=false (source={:?})",
-                                        promotion_cache_key, resolved.source
+                                        promotion_cache_key, promotion_source
                                     );
                                 } else {
                                     promotion_cache_manager.promote_range_to_ram_cache(
@@ -5486,7 +5639,7 @@ impl HttpProxy {
                     // Record cache hit statistics for streaming path
                     cache_manager.update_statistics(true, range_size, false);
                     cache_manager
-                        .record_bucket_cache_access(cache_key, true, false)
+                        .record_bucket_cache_access(cache_key, true, false, &resolved.source)
                         .await;
 
                     return Ok(response);
@@ -5510,6 +5663,7 @@ impl HttpProxy {
                         headers,
                         config,
                         preloaded_metadata,
+                        resolved,
                     )
                     .await;
                 }
@@ -5530,6 +5684,7 @@ impl HttpProxy {
             headers,
             config,
             preloaded_metadata,
+            resolved,
         )
         .await
     }
@@ -5687,6 +5842,7 @@ impl HttpProxy {
         headers: &HeaderMap,
         config: Arc<Config>,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Get the cached data using the common logic
         let perf_start = Instant::now();
@@ -5702,6 +5858,7 @@ impl HttpProxy {
             uri,
             headers,
             &config,
+            resolved,
         )
         .await
         {
@@ -5709,22 +5866,6 @@ impl HttpProxy {
             Err(error_response) => return Ok(error_response),
         };
         let data_load_ms = data_load_start.elapsed().as_millis();
-
-        // Refresh write cache TTL if this is a write-cached object (Requirements 1.4, 5.2)
-        // This is done asynchronously to not block the response
-        let cache_manager_clone = cache_manager.clone();
-        let cache_key_clone = cache_key.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = cache_manager_clone
-                .refresh_write_cache_ttl(&cache_key_clone)
-                .await
-            {
-                debug!(
-                    "Failed to refresh write cache TTL for {}: {}",
-                    cache_key_clone, e
-                );
-            }
-        });
 
         // Resolve metadata for response headers
         let cached_metadata =
@@ -5773,7 +5914,7 @@ impl HttpProxy {
         let range_size = range_spec.end - range_spec.start + 1;
         cache_manager.update_statistics(true, range_size, method == Method::HEAD);
         cache_manager
-            .record_bucket_cache_access(cache_key, true, method == Method::HEAD)
+            .record_bucket_cache_access(cache_key, true, method == Method::HEAD, &resolved.source)
             .await;
 
         // Log cache hit at debug level for observability
@@ -5814,6 +5955,7 @@ impl HttpProxy {
         uri: &str,
         headers: &HeaderMap,
         config: &Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<
         (Vec<u8>, Option<(u64, u64, usize, f64)>, bool),
         Response<BoxBody<Bytes, hyper::Error>>,
@@ -5923,6 +6065,8 @@ impl HttpProxy {
                         let data_clone = fetched_data.clone();
                         let s3_headers_clone = s3_response.headers.clone();
                         let s3_client_clone = s3_client.clone();
+                        // Reuse the once-per-request resolved compression setting (Req 8.2).
+                        let compression_enabled = resolved.compression_enabled;
 
                         tokio::spawn(async move {
                             // Use the new method to create ObjectMetadata with all S3 response headers
@@ -5942,6 +6086,7 @@ impl HttpProxy {
                                     &data_clone,
                                     metadata,
                                     ttl,
+                                    compression_enabled,
                                 )
                                 .await
                             {
@@ -6436,6 +6581,7 @@ impl HttpProxy {
         coordination_enabled: bool,
         wait_timeout: std::time::Duration,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // If coordination is disabled, go directly to S3
@@ -6443,7 +6589,7 @@ impl HttpProxy {
         if !coordination_enabled {
             cache_manager.update_statistics(false, 0, false);
             cache_manager
-                .record_bucket_cache_access(&cache_key, false, false)
+                .record_bucket_cache_access(&cache_key, false, false, &resolved.source)
                 .await;
             return Self::forward_get_head_to_s3_and_cache(
                 method,
@@ -6454,6 +6600,7 @@ impl HttpProxy {
                 cache_manager,
                 s3_client,
                 range_handler,
+                resolved,
                 proxy_referer,
             )
             .await;
@@ -6475,7 +6622,7 @@ impl HttpProxy {
                 // Fetcher always goes to S3 — record cache miss
                 cache_manager.update_statistics(false, 0, false);
                 cache_manager
-                    .record_bucket_cache_access(&cache_key, false, false)
+                    .record_bucket_cache_access(&cache_key, false, false, &resolved.source)
                     .await;
 
                 let response = Self::forward_get_head_to_s3_and_cache(
@@ -6487,6 +6634,7 @@ impl HttpProxy {
                     cache_manager,
                     s3_client,
                     range_handler,
+                    resolved,
                     proxy_referer,
                 )
                 .await;
@@ -6576,6 +6724,7 @@ impl HttpProxy {
                                 s3_client,
                                 config,
                                 metrics_manager.clone(),
+                                resolved,
                                 proxy_referer,
                             )
                             .await;
@@ -6605,6 +6754,7 @@ impl HttpProxy {
                                 cache_manager,
                                 s3_client,
                                 range_handler.clone(),
+                                resolved,
                                 proxy_referer,
                             )
                             .await;
@@ -6634,6 +6784,7 @@ impl HttpProxy {
                                 cache_manager,
                                 s3_client,
                                 range_handler.clone(),
+                                resolved,
                                 proxy_referer,
                             )
                             .await;
@@ -6701,6 +6852,7 @@ impl HttpProxy {
                                     cache_manager,
                                     s3_client,
                                     range_handler,
+                                    resolved,
                                     proxy_referer,
                                 )
                                 .await;
@@ -6732,6 +6884,7 @@ impl HttpProxy {
         wait_timeout: std::time::Duration,
         max_resubscriptions: u32,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // If coordination is disabled, go directly to S3
@@ -6745,6 +6898,7 @@ impl HttpProxy {
                 cache_manager,
                 s3_client,
                 range_handler,
+                resolved,
                 proxy_referer,
             )
             .await;
@@ -6770,6 +6924,7 @@ impl HttpProxy {
                     cache_manager,
                     s3_client,
                     range_handler,
+                    resolved,
                     proxy_referer,
                 )
                 .await;
@@ -6840,6 +6995,7 @@ impl HttpProxy {
                                 range_handler,
                                 s3_client,
                                 metrics_manager.clone(),
+                                resolved,
                                 proxy_referer,
                             )
                             .await;
@@ -6864,6 +7020,7 @@ impl HttpProxy {
                                 cache_manager,
                                 s3_client,
                                 range_handler.clone(),
+                                resolved,
                                 proxy_referer,
                             )
                             .await;
@@ -6888,6 +7045,7 @@ impl HttpProxy {
                                 cache_manager,
                                 s3_client,
                                 range_handler.clone(),
+                                resolved,
                                 proxy_referer,
                             )
                             .await;
@@ -6952,6 +7110,7 @@ impl HttpProxy {
                                     cache_manager,
                                     s3_client,
                                     range_handler,
+                                    resolved,
                                     proxy_referer,
                                 )
                                 .await;
@@ -6984,6 +7143,7 @@ impl HttpProxy {
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
         inflight_tracker: Arc<InFlightTracker>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // If coordination is disabled, forward directly
@@ -7001,6 +7161,7 @@ impl HttpProxy {
                     range_handler,
                     s3_client,
                     config,
+                    resolved,
                     proxy_referer,
                 )
                 .await;
@@ -7018,6 +7179,7 @@ impl HttpProxy {
                     s3_client,
                     config,
                     preloaded_metadata,
+                    resolved,
                     proxy_referer,
                 )
                 .await;
@@ -7050,6 +7212,7 @@ impl HttpProxy {
                         range_handler,
                         s3_client,
                         config,
+                        resolved,
                         proxy_referer,
                     )
                     .await
@@ -7067,6 +7230,7 @@ impl HttpProxy {
                         s3_client,
                         config,
                         preloaded_metadata,
+                        resolved,
                         proxy_referer,
                     )
                     .await
@@ -7147,6 +7311,7 @@ impl HttpProxy {
                                 config,
                                 is_signed,
                                 metrics_manager.clone(),
+                                resolved,
                                 proxy_referer,
                             )
                             .await;
@@ -7175,6 +7340,7 @@ impl HttpProxy {
                                     range_handler,
                                     s3_client,
                                     config,
+                                    resolved,
                                     proxy_referer,
                                 )
                                 .await
@@ -7192,6 +7358,7 @@ impl HttpProxy {
                                     s3_client,
                                     config,
                                     preloaded_metadata,
+                                    resolved,
                                     proxy_referer,
                                 )
                                 .await
@@ -7221,6 +7388,7 @@ impl HttpProxy {
                                     range_handler,
                                     s3_client,
                                     config,
+                                    resolved,
                                     proxy_referer,
                                 )
                                 .await
@@ -7238,6 +7406,7 @@ impl HttpProxy {
                                     s3_client,
                                     config,
                                     preloaded_metadata,
+                                    resolved,
                                     proxy_referer,
                                 )
                                 .await
@@ -7308,6 +7477,7 @@ impl HttpProxy {
                                         range_handler,
                                         s3_client,
                                         config,
+                                        resolved,
                                         proxy_referer,
                                     )
                                     .await
@@ -7325,6 +7495,7 @@ impl HttpProxy {
                                         s3_client,
                                         config,
                                         preloaded_metadata,
+                                        resolved,
                                         proxy_referer,
                                     )
                                     .await
@@ -7371,6 +7542,7 @@ impl HttpProxy {
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // 1. Look up cached metadata. If missing, fall back to a full
@@ -7396,6 +7568,7 @@ impl HttpProxy {
                     cache_manager,
                     s3_client,
                     range_handler,
+                    resolved,
                     proxy_referer,
                 )
                 .await;
@@ -7451,7 +7624,12 @@ impl HttpProxy {
 
                 cache_manager.update_statistics(true, total_size, method == Method::HEAD);
                 cache_manager
-                    .record_bucket_cache_access(&cache_key, true, method == Method::HEAD)
+                    .record_bucket_cache_access(
+                        &cache_key,
+                        true,
+                        method == Method::HEAD,
+                        &resolved.source,
+                    )
                     .await;
 
                 if method == Method::HEAD {
@@ -7515,6 +7693,7 @@ impl HttpProxy {
                             uri.path(),
                             &header_map,
                             config,
+                            resolved,
                         )
                         .await
                     }
@@ -7534,6 +7713,7 @@ impl HttpProxy {
                             cache_manager,
                             s3_client,
                             range_handler,
+                            resolved,
                             proxy_referer,
                         )
                         .await
@@ -7681,6 +7861,7 @@ impl HttpProxy {
                     range_handler,
                     s3_client,
                     config,
+                    resolved,
                 )
                 .await
             }
@@ -7707,6 +7888,7 @@ impl HttpProxy {
                     range_handler,
                     s3_client,
                     config,
+                    resolved,
                 )
                 .await
             }
@@ -7727,6 +7909,7 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let total_size = metadata.object_metadata.content_length;
         if total_size == 0 {
@@ -7801,6 +7984,7 @@ impl HttpProxy {
             uri.path(),
             &header_map,
             config,
+            resolved,
         )
         .await
     }
@@ -7825,6 +8009,7 @@ impl HttpProxy {
         config: Arc<Config>,
         is_signed: bool,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let preloaded_metadata = cache_manager
@@ -7859,6 +8044,7 @@ impl HttpProxy {
                         range_handler,
                         s3_client,
                         config,
+                        resolved,
                         proxy_referer,
                     )
                     .await
@@ -7876,6 +8062,7 @@ impl HttpProxy {
                         s3_client,
                         config,
                         None,
+                        resolved,
                         proxy_referer,
                     )
                     .await
@@ -7963,6 +8150,7 @@ impl HttpProxy {
                                 range_handler,
                                 s3_client,
                                 config,
+                                resolved,
                                 proxy_referer,
                             )
                             .await
@@ -7980,6 +8168,7 @@ impl HttpProxy {
                                 s3_client,
                                 config,
                                 Some(&metadata),
+                                resolved,
                                 proxy_referer,
                             )
                             .await
@@ -8007,6 +8196,7 @@ impl HttpProxy {
                     &header_map,
                     config,
                     Some(&metadata),
+                    resolved,
                 )
                 .await
             }
@@ -8067,6 +8257,7 @@ impl HttpProxy {
                     range_handler,
                     s3_client,
                     config,
+                    resolved,
                 )
                 .await
             }
@@ -8093,6 +8284,7 @@ impl HttpProxy {
                     range_handler,
                     s3_client,
                     config,
+                    resolved,
                 )
                 .await
             }
@@ -8113,6 +8305,7 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let overlap = match range_handler
             .find_cached_ranges(cache_key, range_spec, None, Some(metadata))
@@ -8155,6 +8348,7 @@ impl HttpProxy {
             &header_map,
             config,
             Some(metadata),
+            resolved,
         )
         .await
     }
@@ -8176,6 +8370,7 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Look up the cached part. If part metadata is missing, fall back
@@ -8196,6 +8391,7 @@ impl HttpProxy {
                     cache_manager,
                     s3_client,
                     range_handler,
+                    resolved,
                     proxy_referer,
                 )
                 .await;
@@ -8266,7 +8462,7 @@ impl HttpProxy {
                 }
                 cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
                 cache_manager
-                    .record_bucket_cache_access(&cache_key, true, false)
+                    .record_bucket_cache_access(&cache_key, true, false, &resolved.source)
                     .await;
                 Self::serve_cached_part_response(cached_part, method, uri.path()).await
             }
@@ -8345,6 +8541,7 @@ impl HttpProxy {
         cache_manager: Arc<CacheManager>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         range_handler: Arc<RangeHandler>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         if method == Method::GET {
@@ -8458,6 +8655,10 @@ impl HttpProxy {
                             let uri_clone = uri.clone();
                             let range_handler_clone = Arc::clone(&range_handler);
                             let s3_client_clone = Arc::clone(&s3_client);
+                            // Settings are resolved once per logical request and threaded in;
+                            // reuse them here instead of re-resolving (Requirement 8.2).
+                            let compression_enabled = resolved.compression_enabled;
+                            let get_ttl = resolved.get_ttl;
 
                             // Extract content_length for incremental write range bounds
                             let content_length: Option<u64> = response_headers
@@ -8484,15 +8685,12 @@ impl HttpProxy {
                                     // Begin incremental write
                                     let disk_cache =
                                         range_handler_clone.get_disk_cache_manager().read().await;
-                                    let resolved = cache_manager_clone
-                                        .resolve_settings(&cache_key_clone)
-                                        .await;
                                     let writer = match disk_cache
                                         .begin_incremental_range_write(
                                             &cache_key_clone,
                                             start,
                                             end,
-                                            resolved.compression_enabled,
+                                            compression_enabled,
                                         )
                                         .await
                                     {
@@ -8556,11 +8754,7 @@ impl HttpProxy {
                                     let disk_cache =
                                         range_handler_clone.get_disk_cache_manager().read().await;
                                     if let Err(e) = disk_cache
-                                        .commit_incremental_range(
-                                            writer,
-                                            object_metadata,
-                                            resolved.get_ttl,
-                                        )
+                                        .commit_incremental_range(writer, object_metadata, get_ttl)
                                         .await
                                     {
                                         if e.to_string().contains("size mismatch") {
@@ -8782,6 +8976,7 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let perf_s3_start = Instant::now();
@@ -8858,6 +9053,7 @@ impl HttpProxy {
                             range_handler,
                             s3_client,
                             config,
+                            resolved,
                         )
                         .await;
                     }
@@ -8891,6 +9087,7 @@ impl HttpProxy {
                             range_handler,
                             s3_client,
                             config,
+                            resolved,
                         )
                         .await;
                     }
@@ -8934,8 +9131,14 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let status = s3_response.status;
+        // Settings are resolved once per logical request and threaded in; the
+        // spawned per-range cache-write tasks reuse these values rather than
+        // re-resolving (Requirement 8.2).
+        let compression_enabled = resolved.compression_enabled;
+        let get_ttl = resolved.get_ttl;
 
         // Handle successful range response (206 Partial Content)
         if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::OK {
@@ -8977,7 +9180,6 @@ impl HttpProxy {
                             let start = range_spec_clone.start;
                             let end = range_spec_clone.end;
                             let expected_size = end - start + 1;
-                            let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
 
                             // Check capacity and evict if needed before beginning the write.
                             // `expected_size` is an upper bound on the bytes that will land on
@@ -8993,7 +9195,7 @@ impl HttpProxy {
                                     &cache_key_clone,
                                     start,
                                     end,
-                                    resolved.compression_enabled,
+                                    compression_enabled,
                                 )
                                 .await
                             {
@@ -9052,7 +9254,7 @@ impl HttpProxy {
                             // serialize the journal append and size accumulator.
                             let disk_cache_guard = disk_cache.read().await;
                             if let Err(e) = disk_cache_guard
-                                .commit_incremental_range(writer, object_metadata, resolved.get_ttl)
+                                .commit_incremental_range(writer, object_metadata, get_ttl)
                                 .await
                             {
                                 if e.to_string().contains("size mismatch") {
@@ -9174,7 +9376,6 @@ impl HttpProxy {
                             }
 
                             let mut disk_cache_guard = disk_cache.write().await;
-                            let resolved = cache_manager.resolve_settings(&cache_key_clone).await;
                             if let Err(e) = disk_cache_guard
                                 .store_range(
                                     &cache_key_clone,
@@ -9183,7 +9384,7 @@ impl HttpProxy {
                                     &bytes_clone,
                                     object_metadata,
                                     ttl,
-                                    resolved.compression_enabled,
+                                    compression_enabled,
                                 )
                                 .await
                             {
@@ -9278,6 +9479,7 @@ impl HttpProxy {
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Check if all requested bytes are cached (fully cached case) - Requirement 1.3
@@ -9304,6 +9506,7 @@ impl HttpProxy {
                 &header_map,
                 config,
                 preloaded_metadata,
+                resolved,
             )
             .await;
         }
@@ -9340,6 +9543,7 @@ impl HttpProxy {
                 range_handler,
                 s3_client,
                 config,
+                resolved,
             )
             .await;
         }
@@ -9404,6 +9608,8 @@ impl HttpProxy {
                     let end = fetched_spec.end;
                     let data_clone = fetched_data.to_vec();
                     let ttl = config.cache.get_ttl;
+                    // Reuse the once-per-request resolved compression setting (Req 8.2).
+                    let compression_enabled = resolved.compression_enabled;
                     tokio::spawn(async move {
                         if let Err(e) = range_handler_clone
                             .store_range_new_storage(
@@ -9413,6 +9619,7 @@ impl HttpProxy {
                                 &data_clone,
                                 object_metadata,
                                 ttl,
+                                compression_enabled,
                             )
                             .await
                         {
@@ -9527,6 +9734,7 @@ impl HttpProxy {
                     range_handler,
                     s3_client,
                     config,
+                    resolved,
                 )
                 .await
             }
@@ -9553,6 +9761,7 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!(
             "Streaming range {}-{} from S3 with background caching: cache_key={}",
@@ -9606,6 +9815,7 @@ impl HttpProxy {
                         range_handler,
                         s3_client,
                         config,
+                        resolved,
                     )
                     .await
                 } else if s3_response.status == StatusCode::OK {
@@ -9619,6 +9829,7 @@ impl HttpProxy {
                         range_handler,
                         s3_client,
                         config,
+                        resolved,
                     )
                     .await
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED
@@ -9663,6 +9874,7 @@ impl HttpProxy {
                         range_handler,
                         s3_client,
                         config,
+                        resolved,
                     ))
                     .await
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED {
@@ -9706,6 +9918,7 @@ impl HttpProxy {
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         debug!(
             "Fetching complete range {}-{} from S3 as fallback",
@@ -9747,6 +9960,7 @@ impl HttpProxy {
                         range_handler.clone(),
                         s3_client.clone(),
                         config.clone(),
+                        resolved,
                     )
                     .await
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED
@@ -9788,6 +10002,7 @@ impl HttpProxy {
                         range_handler,
                         s3_client,
                         config,
+                        resolved,
                     ))
                     .await
                 } else if s3_response.status == StatusCode::PRECONDITION_FAILED {
@@ -10879,14 +11094,14 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "my-bucket.s3.amazonaws.com".to_string());
 
-        let proxy_referer = Some("s3-hybrid-cache/1.0.0 (test-host)".to_string());
+        let proxy_referer = Some("Hybrid Cache for Amazon S3/1.0.0 (test-host)".to_string());
 
         // No auth header — always safe to add
         maybe_add_referer(&mut headers, &proxy_referer, None);
 
         assert_eq!(
             headers.get("Referer").unwrap(),
-            "s3-hybrid-cache/1.0.0 (test-host)"
+            "Hybrid Cache for Amazon S3/1.0.0 (test-host)"
         );
     }
 
@@ -10898,14 +11113,14 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "my-bucket.s3.amazonaws.com".to_string());
 
-        let proxy_referer = Some("s3-hybrid-cache/1.0.0 (test-host)".to_string());
+        let proxy_referer = Some("Hybrid Cache for Amazon S3/1.0.0 (test-host)".to_string());
         let auth = "AWS4-HMAC-SHA256 Credential=AKID/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abcdef1234567890";
 
         maybe_add_referer(&mut headers, &proxy_referer, Some(auth));
 
         assert_eq!(
             headers.get("Referer").unwrap(),
-            "s3-hybrid-cache/1.0.0 (test-host)"
+            "Hybrid Cache for Amazon S3/1.0.0 (test-host)"
         );
     }
 
@@ -10918,7 +11133,7 @@ mod tests {
         headers.insert("host".to_string(), "my-bucket.s3.amazonaws.com".to_string());
         headers.insert("Referer".to_string(), "https://example.com".to_string());
 
-        let proxy_referer = Some("s3-hybrid-cache/1.0.0 (test-host)".to_string());
+        let proxy_referer = Some("Hybrid Cache for Amazon S3/1.0.0 (test-host)".to_string());
 
         maybe_add_referer(&mut headers, &proxy_referer, None);
 
@@ -10934,7 +11149,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("referer".to_string(), "https://example.com".to_string());
 
-        let proxy_referer = Some("s3-hybrid-cache/1.0.0 (test-host)".to_string());
+        let proxy_referer = Some("Hybrid Cache for Amazon S3/1.0.0 (test-host)".to_string());
 
         maybe_add_referer(&mut headers, &proxy_referer, None);
 
@@ -10951,7 +11166,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "my-bucket.s3.amazonaws.com".to_string());
 
-        let proxy_referer = Some("s3-hybrid-cache/1.0.0 (test-host)".to_string());
+        let proxy_referer = Some("Hybrid Cache for Amazon S3/1.0.0 (test-host)".to_string());
         let auth = "AWS4-HMAC-SHA256 Credential=AKID/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;referer;x-amz-content-sha256;x-amz-date, Signature=abcdef1234567890";
 
         maybe_add_referer(&mut headers, &proxy_referer, Some(auth));
@@ -10975,7 +11190,7 @@ mod tests {
         assert!(!headers.contains_key("Referer"));
     }
 
-    /// Test 6.5: Header format matches `s3-hybrid-cache/{version} ({hostname})`.
+    /// Test 6.5: Header format matches `Hybrid Cache for Amazon S3/{version} ({hostname})`.
     /// Uses env!("CARGO_PKG_VERSION") to verify the version component.
     ///
     /// **Validates: Requirements 1.2, 1.3**
@@ -10985,7 +11200,7 @@ mod tests {
 
         let hostname = "ip-172-31-34-221.us-west-2.compute.internal";
         let version = env!("CARGO_PKG_VERSION");
-        let expected = format!("s3-hybrid-cache/{} ({})", version, hostname);
+        let expected = format!("Hybrid Cache for Amazon S3/{} ({})", version, hostname);
         let proxy_referer = Some(expected.clone());
 
         maybe_add_referer(&mut headers, &proxy_referer, None);
@@ -10995,8 +11210,8 @@ mod tests {
             .expect("Referer header should be present");
         assert_eq!(actual, &expected);
 
-        // Verify the format structure: starts with "s3-hybrid-cache/", contains version, ends with "(hostname)"
-        assert!(actual.starts_with("s3-hybrid-cache/"));
+        // Verify the format structure: starts with "Hybrid Cache for Amazon S3/", contains version, ends with "(hostname)"
+        assert!(actual.starts_with("Hybrid Cache for Amazon S3/"));
         assert!(actual.contains(version));
         assert!(actual.ends_with(&format!("({})", hostname)));
     }

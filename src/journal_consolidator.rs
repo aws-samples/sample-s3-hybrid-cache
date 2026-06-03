@@ -5379,6 +5379,12 @@ mod tests {
     /// **Validates: Requirements 3.6**
     #[quickcheck]
     fn prop_flush_failure_restores_accumulator(delta_val: i16, wc_delta_val: i16) -> TestResult {
+        // CI runs as root, which bypasses Unix file permissions, so a read-only
+        // directory does not produce the I/O error this test depends on. Skip.
+        if unsafe { libc::geteuid() } == 0 {
+            return TestResult::discard();
+        }
+
         // Need at least one non-zero value so flush actually attempts to write
         if delta_val == 0 && wc_delta_val == 0 {
             return TestResult::discard();

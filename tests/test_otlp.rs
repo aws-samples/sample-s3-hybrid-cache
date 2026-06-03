@@ -72,6 +72,8 @@ fn test_system_metrics() -> SystemMetrics {
             metadata_cache_evictions: 5,
             metadata_cache_stale_refreshes: 2,
             bytes_served_from_cache: 50_000_000,
+            read_cache_disabled_invalidations_total: 0,
+            ttl_revalidations_total: 0,
         }),
         compression: Some(CompressionMetrics {
             total_objects_compressed: 100,
@@ -113,6 +115,7 @@ fn test_system_metrics() -> SystemMetrics {
             waiter_conditional_4xx: 1,
             waiter_conditional_error: 0,
         }),
+        cache_rules: None,
         request_metrics: RequestMetrics {
             total_requests: 1000,
             successful_requests: 990,
@@ -240,6 +243,7 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
         atomic_metadata: None,
         consolidation: None,
         coalescing: None,
+        cache_rules: None,
         request_metrics: RequestMetrics {
             total_requests: 0,
             successful_requests: 0,

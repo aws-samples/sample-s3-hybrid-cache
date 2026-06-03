@@ -79,6 +79,10 @@ pub struct CacheMetrics {
     pub metadata_cache_stale_refreshes: u64,
     // Bytes served from cache (for S3 transfer saved)
     pub bytes_served_from_cache: u64,
+    // Eager invalidation counter — read_cache_enabled=false purges
+    pub read_cache_disabled_invalidations_total: u64,
+    // TTL-driven revalidation counter — freshness expired, conditional GET/HEAD to S3
+    pub ttl_revalidations_total: u64,
 }
 
 /// Compression metrics
@@ -221,6 +225,23 @@ pub struct ConsolidationMetrics {
     pub last_consolidation_timestamp: u64,
 }
 
+/// Cache rules reload health metrics.
+/// Tracks the lifecycle of `cache_rules.json` hot-reloads so operators can alert
+/// on a stuck fallback or silent parse failures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheRulesMetrics {
+    /// Total successful rule-file loads since startup.
+    pub reloads_total: u64,
+    /// Total rule-file load failures (parse, validation, compile) since startup.
+    pub reload_failures_total: u64,
+    /// Whether the running ruleset is a stale fallback (last load failed).
+    pub on_fallback: bool,
+    /// Number of rules currently loaded.
+    pub rules_loaded: u64,
+    /// Unix timestamp (seconds) of the last successful load.
+    pub last_load_unix: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMetrics {
     pub timestamp: SystemTime,
@@ -234,6 +255,7 @@ pub struct SystemMetrics {
     pub atomic_metadata: Option<AtomicMetadataMetrics>,
     pub consolidation: Option<ConsolidationMetrics>,
     pub coalescing: Option<CoalescingMetrics>,
+    pub cache_rules: Option<CacheRulesMetrics>,
     pub request_metrics: RequestMetrics,
 }
 
@@ -289,8 +311,9 @@ pub struct AtomicMetadataStats {
     write_mode_fallbacks: u64,
 }
 
-/// Per-bucket (or per-prefix) cache hit/miss counters.
-/// Only tracked for buckets that have a `_settings.json` file.
+/// Per-bucket cache hit/miss counters, split by GET vs HEAD.
+/// Tracked for every bucket with cache traffic. The same struct is reused
+/// for per-rule counters keyed by glob pattern (see `rule_cache_stats`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BucketCacheStats {
     pub hit_count: u64,
@@ -316,10 +339,10 @@ pub struct MetricsManager {
     connection_keepalive_stats: Arc<RwLock<ConnectionKeepaliveStats>>,
     atomic_metadata_stats: Arc<RwLock<AtomicMetadataStats>>,
     coalescing_stats: Arc<RwLock<CoalescingStats>>,
-    /// Per-bucket cache hit/miss counters (only for buckets with `_settings.json`)
+    /// Per-bucket cache hit/miss counters (all buckets, keyed by bucket name)
     bucket_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
-    /// Per-prefix cache hit/miss counters keyed by "bucket/prefix"
-    prefix_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
+    /// Per-rule cache hit/miss counters keyed by the rule's glob pattern
+    rule_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
     last_metrics: Arc<RwLock<Option<SystemMetrics>>>,
     otlp_exporter: Option<Arc<RwLock<OtlpExporter>>>,
     /// Active HTTP connections counter (shared with HttpProxy)
@@ -377,6 +400,10 @@ pub struct ErrorStats {
     cache_part_stores: u64,
     cache_part_evictions: u64,
     cache_part_errors: u64,
+    // Eager invalidation counter — read_cache_enabled=false purges
+    read_cache_disabled_invalidations_total: u64,
+    // TTL-driven revalidation counter — freshness expired, conditional GET/HEAD to S3
+    ttl_revalidations_total: u64,
 }
 
 /// Internal range storage metrics tracking
@@ -509,7 +536,7 @@ impl MetricsManager {
             atomic_metadata_stats: Arc::new(RwLock::new(AtomicMetadataStats::default())),
             coalescing_stats: Arc::new(RwLock::new(CoalescingStats::default())),
             bucket_cache_stats: Arc::new(RwLock::new(HashMap::new())),
-            prefix_cache_stats: Arc::new(RwLock::new(HashMap::new())),
+            rule_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             last_metrics: Arc::new(RwLock::new(None)),
             otlp_exporter: None,
             active_connections: None,
@@ -631,6 +658,12 @@ impl MetricsManager {
         // Requirements: 19.1, 19.2, 19.3, 19.4, 19.5
         let coalescing_metrics = self.collect_coalescing_metrics().await;
 
+        // Collect cache rules health metrics
+        let cache_rules_metrics = self
+            .cache_manager
+            .as_ref()
+            .map(|cache_manager| cache_manager.get_bucket_settings_manager().rules_health());
+
         // Collect request metrics
         let request_metrics = self.collect_request_metrics().await;
 
@@ -646,6 +679,7 @@ impl MetricsManager {
             cache_size: cache_size_metrics,
             consolidation: consolidation_metrics,
             coalescing: coalescing_metrics,
+            cache_rules: cache_rules_metrics,
             request_metrics,
         };
 
@@ -778,6 +812,10 @@ impl MetricsManager {
             metadata_cache_stale_refreshes: metadata_snap.stale_refreshes,
             // Bytes served from cache
             bytes_served_from_cache: stats.bytes_served_from_cache,
+            // Eager invalidation and revalidation counters
+            read_cache_disabled_invalidations_total: error_stats
+                .read_cache_disabled_invalidations_total,
+            ttl_revalidations_total: error_stats.ttl_revalidations_total,
         })
     }
 
@@ -1847,8 +1885,7 @@ impl MetricsManager {
             stats.waiter_conditional_error
         );
     }
-    /// Record a per-bucket cache hit.
-    /// Only call this for buckets that have a `_settings.json` file.
+    /// Record a per-bucket cache hit. Tracked for all buckets.
     pub async fn record_bucket_cache_hit(&self, bucket: &str, is_head: bool) {
         let mut stats = self.bucket_cache_stats.write().await;
         let entry = stats.entry(bucket.to_string()).or_default();
@@ -1860,8 +1897,7 @@ impl MetricsManager {
         }
     }
 
-    /// Record a per-bucket cache miss.
-    /// Only call this for buckets that have a `_settings.json` file.
+    /// Record a per-bucket cache miss. Tracked for all buckets.
     pub async fn record_bucket_cache_miss(&self, bucket: &str, is_head: bool) {
         let mut stats = self.bucket_cache_stats.write().await;
         let entry = stats.entry(bucket.to_string()).or_default();
@@ -1880,10 +1916,10 @@ impl MetricsManager {
         stats.clone()
     }
 
-    /// Record a per-prefix cache hit. Key is "bucket/prefix".
-    pub async fn record_prefix_cache_hit(&self, key: &str, is_head: bool) {
-        let mut stats = self.prefix_cache_stats.write().await;
-        let entry = stats.entry(key.to_string()).or_default();
+    /// Record a per-rule cache hit. Key is the rule's glob pattern.
+    pub async fn record_rule_cache_hit(&self, pattern: &str, is_head: bool) {
+        let mut stats = self.rule_cache_stats.write().await;
+        let entry = stats.entry(pattern.to_string()).or_default();
         entry.hit_count += 1;
         if is_head {
             entry.head_hit_count += 1;
@@ -1892,10 +1928,10 @@ impl MetricsManager {
         }
     }
 
-    /// Record a per-prefix cache miss. Key is "bucket/prefix".
-    pub async fn record_prefix_cache_miss(&self, key: &str, is_head: bool) {
-        let mut stats = self.prefix_cache_stats.write().await;
-        let entry = stats.entry(key.to_string()).or_default();
+    /// Record a per-rule cache miss. Key is the rule's glob pattern.
+    pub async fn record_rule_cache_miss(&self, pattern: &str, is_head: bool) {
+        let mut stats = self.rule_cache_stats.write().await;
+        let entry = stats.entry(pattern.to_string()).or_default();
         entry.miss_count += 1;
         if is_head {
             entry.head_miss_count += 1;
@@ -1904,10 +1940,22 @@ impl MetricsManager {
         }
     }
 
-    /// Get per-prefix cache stats. Keys are "bucket/prefix".
-    pub async fn get_prefix_cache_stats(&self) -> HashMap<String, BucketCacheStats> {
-        let stats = self.prefix_cache_stats.read().await;
+    /// Get per-rule cache stats. Keys are rule glob patterns.
+    pub async fn get_rule_cache_stats(&self) -> HashMap<String, BucketCacheStats> {
+        let stats = self.rule_cache_stats.read().await;
         stats.clone()
+    }
+
+    /// Record a successful eager invalidation triggered by `read_cache_enabled=false`.
+    pub async fn record_read_cache_disabled_invalidation(&self) {
+        let mut stats = self.error_stats.write().await;
+        stats.read_cache_disabled_invalidations_total += 1;
+    }
+
+    /// Record a TTL-driven revalidation (freshness expired, conditional request to S3).
+    pub async fn record_ttl_revalidation(&self) {
+        let mut stats = self.error_stats.write().await;
+        stats.ttl_revalidations_total += 1;
     }
 
     /// Record connection creation
@@ -2862,5 +2910,168 @@ mod tests {
         assert_eq!(error_stats.cache_part_stores, 1);
         assert_eq!(error_stats.cache_part_evictions, 2);
         assert_eq!(error_stats.cache_part_errors, 1);
+    }
+
+    /// Per-rule attribution: rule cache hits/misses are recorded against the
+    /// winning rule's glob pattern, with the HEAD/GET split tracked correctly.
+    ///
+    /// Validates: Requirements 6.1, 6.3
+    #[tokio::test]
+    async fn test_rule_cache_stats_attribution_by_pattern() {
+        let metrics_manager = MetricsManager::new();
+
+        let pattern = "**/credit-cards/**";
+
+        // A GET hit and a HEAD hit attributed to the same rule pattern.
+        metrics_manager.record_rule_cache_hit(pattern, false).await;
+        metrics_manager.record_rule_cache_hit(pattern, true).await;
+        // A GET miss attributed to the same rule pattern.
+        metrics_manager.record_rule_cache_miss(pattern, false).await;
+
+        let stats = metrics_manager.get_rule_cache_stats().await;
+
+        // Attribution is keyed on the rule's glob pattern.
+        let entry = stats
+            .get(pattern)
+            .expect("rule stats should be keyed by the winning rule's pattern");
+
+        // Totals.
+        assert_eq!(entry.hit_count, 2);
+        assert_eq!(entry.miss_count, 1);
+
+        // HEAD/GET split for hits: one HEAD hit, one GET hit.
+        assert_eq!(entry.head_hit_count, 1);
+        assert_eq!(entry.get_hit_count, 1);
+
+        // HEAD/GET split for misses: the single miss was a GET, not a HEAD.
+        assert_eq!(entry.head_miss_count, 0);
+        assert_eq!(entry.get_miss_count, 1);
+
+        // No attribution leaks to other patterns.
+        assert_eq!(stats.len(), 1);
+    }
+
+    /// Multiple distinct rule patterns are tracked independently, so the
+    /// dashboard can show hit/miss counts per rule (Requirement 6.3).
+    ///
+    /// Validates: Requirements 6.1, 6.3
+    #[tokio::test]
+    async fn test_rule_cache_stats_independent_per_pattern() {
+        let metrics_manager = MetricsManager::new();
+
+        let logs_rule = "**/logs/**";
+        let static_rule = "prod-*/static/**";
+
+        metrics_manager
+            .record_rule_cache_hit(logs_rule, false)
+            .await;
+        metrics_manager
+            .record_rule_cache_miss(static_rule, true)
+            .await;
+
+        let stats = metrics_manager.get_rule_cache_stats().await;
+
+        let logs = stats.get(logs_rule).expect("logs rule should be tracked");
+        assert_eq!(logs.hit_count, 1);
+        assert_eq!(logs.get_hit_count, 1);
+        assert_eq!(logs.miss_count, 0);
+
+        let statics = stats
+            .get(static_rule)
+            .expect("static rule should be tracked");
+        assert_eq!(statics.miss_count, 1);
+        assert_eq!(statics.head_miss_count, 1);
+        assert_eq!(statics.hit_count, 0);
+
+        assert_eq!(stats.len(), 2);
+    }
+
+    /// Per-bucket counters are maintained for ALL buckets, including a bucket
+    /// that no rule matched (resolution fell through to the global defaults).
+    /// This demonstrates per-bucket tracking is not restricted to buckets
+    /// referenced by a rule.
+    ///
+    /// Validates: Requirements 6.5
+    #[tokio::test]
+    async fn test_bucket_cache_stats_tracks_bucket_without_matching_rule() {
+        let metrics_manager = MetricsManager::new();
+
+        // This bucket is referenced by a rule (e.g. matched "prod-*/static/**").
+        let rule_bucket = "prod-assets";
+        // This bucket matched no rule at all; resolution used global defaults,
+        // so there is no per-rule attribution for it. Per Requirement 6.5 the
+        // per-bucket counter must still track it.
+        let unruled_bucket = "ad-hoc-bucket";
+
+        metrics_manager
+            .record_bucket_cache_hit(rule_bucket, false)
+            .await;
+
+        // Record a GET hit, a HEAD hit, and a GET miss for the unruled bucket.
+        metrics_manager
+            .record_bucket_cache_hit(unruled_bucket, false)
+            .await;
+        metrics_manager
+            .record_bucket_cache_hit(unruled_bucket, true)
+            .await;
+        metrics_manager
+            .record_bucket_cache_miss(unruled_bucket, false)
+            .await;
+
+        let stats = metrics_manager.get_bucket_cache_stats().await;
+
+        // The bucket with no matching rule is tracked.
+        let unruled = stats
+            .get(unruled_bucket)
+            .expect("per-bucket counter must track buckets with no matching rule");
+        assert_eq!(unruled.hit_count, 2);
+        assert_eq!(unruled.miss_count, 1);
+        assert_eq!(unruled.head_hit_count, 1);
+        assert_eq!(unruled.get_hit_count, 1);
+        assert_eq!(unruled.head_miss_count, 0);
+        assert_eq!(unruled.get_miss_count, 1);
+
+        // The rule-referenced bucket is also tracked, independently.
+        let ruled = stats
+            .get(rule_bucket)
+            .expect("per-bucket counter must track rule-referenced buckets too");
+        assert_eq!(ruled.hit_count, 1);
+        assert_eq!(ruled.get_hit_count, 1);
+        assert_eq!(ruled.miss_count, 0);
+
+        assert_eq!(stats.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_record_read_cache_disabled_invalidation() {
+        let mm = MetricsManager::new();
+
+        // Initially zero.
+        let stats = mm.error_stats.read().await;
+        assert_eq!(stats.read_cache_disabled_invalidations_total, 0);
+        drop(stats);
+
+        // Record two invalidations.
+        mm.record_read_cache_disabled_invalidation().await;
+        mm.record_read_cache_disabled_invalidation().await;
+
+        let stats = mm.error_stats.read().await;
+        assert_eq!(stats.read_cache_disabled_invalidations_total, 2);
+    }
+
+    #[tokio::test]
+    async fn test_record_ttl_revalidation() {
+        let mm = MetricsManager::new();
+
+        let stats = mm.error_stats.read().await;
+        assert_eq!(stats.ttl_revalidations_total, 0);
+        drop(stats);
+
+        mm.record_ttl_revalidation().await;
+        mm.record_ttl_revalidation().await;
+        mm.record_ttl_revalidation().await;
+
+        let stats = mm.error_stats.read().await;
+        assert_eq!(stats.ttl_revalidations_total, 3);
     }
 }

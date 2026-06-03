@@ -1,0 +1,7 @@
+{
+  "$schema": "../cache-rules-schema.json",
+  "rules": [
+    { "pattern": "my-bucket/volatile/**", "read_cache_enabled": false },
+    { "pattern": "my-bucket/**", "get_ttl": "1h" }
+  ]
+}

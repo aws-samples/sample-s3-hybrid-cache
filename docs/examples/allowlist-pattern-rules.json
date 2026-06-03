@@ -1,0 +1,6 @@
+{
+  "$schema": "../cache-rules-schema.json",
+  "rules": [
+    { "pattern": "my-cached-bucket/**", "read_cache_enabled": true }
+  ]
+}

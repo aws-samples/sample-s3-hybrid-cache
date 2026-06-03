@@ -527,7 +527,7 @@ async fn test_head_cache_stores_content_length_in_metadata() {
     // Step 2: Verify HEAD cache entry can be retrieved using unified method
     println!("[TEST] Step 2: Checking if HEAD cache entry can be retrieved");
     let head_entry = cache_manager
-        .get_head_cache_entry_unified(&cache_key)
+        .get_head_cache_entry_unified(&cache_key, std::time::Duration::MAX)
         .await
         .unwrap();
 

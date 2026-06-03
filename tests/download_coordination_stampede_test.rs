@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
+use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::config::Config;
 use s3_proxy::disk_cache::DiskCacheManager;
@@ -426,6 +427,7 @@ async fn pre_warm_cache(
         true,
         wait_timeout,
         Some(Arc::clone(mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -636,6 +638,7 @@ async fn run_scenario(
                 true,
                 wait_timeout,
                 Some(mm),
+                &ResolvedSettings::default(),
                 &None,
             )
             .await

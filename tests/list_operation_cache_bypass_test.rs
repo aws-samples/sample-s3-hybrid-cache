@@ -345,7 +345,7 @@ async fn test_head_object_is_cached() -> Result<(), Box<dyn std::error::Error>> 
 
     // Verify HEAD cache entry exists using unified method
     let head_entry = cache_manager
-        .get_head_cache_entry_unified(&cache_key)
+        .get_head_cache_entry_unified(&cache_key, std::time::Duration::MAX)
         .await?;
     assert!(
         head_entry.is_some(),

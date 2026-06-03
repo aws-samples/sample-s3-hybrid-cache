@@ -79,6 +79,14 @@ struct Instruments {
     req_failed: Gauge<u64>,
     req_avg_latency_ms: Gauge<u64>,
     req_active: Gauge<u64>,
+    // -- cache_rules --
+    cache_rules_reloads_total: Gauge<u64>,
+    cache_rules_reload_failures_total: Gauge<u64>,
+    cache_rules_on_fallback: Gauge<u64>,
+    cache_rules_rules_loaded: Gauge<u64>,
+    // -- cache: invalidation + revalidation --
+    cache_read_disabled_invalidations_total: Gauge<u64>,
+    cache_ttl_revalidations_total: Gauge<u64>,
     // -- top-level --
     uptime_seconds: Gauge<u64>,
     // -- process --
@@ -209,6 +217,16 @@ impl OtlpExporter {
             req_failed: g_u64!("request_metrics.failed_requests"),
             req_avg_latency_ms: g_u64!("request_metrics.average_response_time_ms"),
             req_active: g_u64!("request_metrics.active_requests"),
+            // cache_rules
+            cache_rules_reloads_total: g_u64!("cache_rules.reloads_total"),
+            cache_rules_reload_failures_total: g_u64!("cache_rules.reload_failures_total"),
+            cache_rules_on_fallback: g_u64!("cache_rules.on_fallback"),
+            cache_rules_rules_loaded: g_u64!("cache_rules.rules_loaded"),
+            // cache: invalidation + revalidation
+            cache_read_disabled_invalidations_total: g_u64!(
+                "cache.read_disabled_invalidations_total"
+            ),
+            cache_ttl_revalidations_total: g_u64!("cache.ttl_revalidations_total"),
             // top-level
             uptime_seconds: g_u64!("uptime_seconds"),
             memory_usage_bytes: g_u64!("process.memory_usage_bytes"),
@@ -312,6 +330,24 @@ impl OtlpExporter {
         i.req_failed.record(rm.failed_requests, a);
         i.req_avg_latency_ms.record(rm.average_response_time_ms, a);
         i.req_active.record(rm.active_requests, a);
+
+        // cache_rules
+        if let Some(cr) = &metrics.cache_rules {
+            i.cache_rules_reloads_total.record(cr.reloads_total, a);
+            i.cache_rules_reload_failures_total
+                .record(cr.reload_failures_total, a);
+            i.cache_rules_on_fallback
+                .record(if cr.on_fallback { 1 } else { 0 }, a);
+            i.cache_rules_rules_loaded.record(cr.rules_loaded, a);
+        }
+
+        // cache: invalidation + revalidation (from CacheMetrics)
+        if let Some(c) = &metrics.cache {
+            i.cache_read_disabled_invalidations_total
+                .record(c.read_cache_disabled_invalidations_total, a);
+            i.cache_ttl_revalidations_total
+                .record(c.ttl_revalidations_total, a);
+        }
 
         i.uptime_seconds.record(metrics.uptime_seconds, a);
 

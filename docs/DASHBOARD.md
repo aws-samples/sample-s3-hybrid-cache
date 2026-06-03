@@ -15,13 +15,14 @@ The dashboard provides a lightweight, browser-based interface for monitoring pro
 - **Eviction tracking**: Shows eviction counts and recently evicted items
 - **Effectiveness metrics**: Total requests served and cache effectiveness percentage
 
-### Per-Bucket Cache Statistics
-- **Bucket stats table**: Hit count, miss count, hit rate, GET TTL, read/write/RAM cache status per bucket
-- **Sortable columns**: Click column headers to sort (default: hit count descending)
-- **Top 20 display**: Shows top 20 buckets by default with "Show all" toggle
-- **Bucket name filter**: Client-side text filter for searching by bucket name
-- **Expandable rows**: Click a row to view full resolved settings and prefix overrides
-- **Conditional rendering**: Table only appears when at least one bucket has a `_settings.json` file
+### Cache Rules and Bucket Statistics
+- **Combined table**: Lists the active cache rules in evaluation order, each with the fields it sets and its HEAD/GET hit rate, followed by a per-bucket traffic rollup for every bucket with observed traffic
+- **Rule rows**: One row per rule in `cache_rules.json`, shown in first-match-per-field order. The "Rule / Scope" column holds the rule's glob pattern; HEAD and GET columns show per-rule hit summaries
+- **Per-bucket rollup rows**: One row per bucket that has cache traffic — all buckets, not only those a rule matches — labeled `(bucket total)` in the "Rule / Scope" column
+- **Pattern/bucket filter**: Client-side text filter that matches rule patterns and bucket names
+- **Top 20 display**: Shows the top 20 rows by default with a "Show all" toggle
+- **Expandable settings**: Click "Settings" on a rule row to view the fields that rule sets (GET/HEAD/PUT TTL, read/write/compression/RAM)
+- **Conditional rendering**: Table appears when at least one rule is defined or any bucket has cache traffic
 
 ### Application Log Viewer
 - **Recent entries**: Shows most recent 100 log entries by default (configurable)
@@ -94,7 +95,7 @@ dashboard:
 
 **JSON APIs**:
 - `GET /api/cache-stats` - Current cache statistics
-- `GET /api/bucket-stats` - Per-bucket cache statistics (hit/miss counts, resolved settings, prefix overrides). Only includes buckets with `_settings.json` files.
+- `GET /api/bucket-stats` - Cache rules and per-bucket statistics. Returns `rules` (the ordered rule list, each with the fields it sets plus HEAD/GET hit and miss counts) and `buckets` (per-bucket traffic rollups with hit/miss counts and hit rate for every bucket that has cache traffic).
 - `GET /api/logs` - Recent application log entries
 - `GET /api/system-info` - System information
 

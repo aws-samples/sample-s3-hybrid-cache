@@ -996,30 +996,14 @@ impl CacheManager {
     }
 
     /// Resolve bucket-level settings for a given path.
-    /// Extracts the bucket name from the path and delegates to BucketSettingsManager.
-    /// Convenience method used by TTL lookups and future tasks (4.4-4.7).
+    /// Resolve cache rules for a full cache key.
+    /// Glob rules match against the full key (`{bucket}/{object_key}`), so the
+    /// leading slash is normalized away but the bucket segment is preserved.
     pub async fn resolve_settings(&self, path: &str) -> crate::bucket_settings::ResolvedSettings {
-        let bucket =
-            crate::bucket_settings::BucketSettingsManager::extract_bucket(path).unwrap_or("");
-        // Strip the leading "/{bucket}/" or "{bucket}/" so prefix matching in cascade
-        // works against just the object key (e.g. "many/10x100M/..."), consistent
-        // with how _settings.json prefix_overrides are documented and tested.
-        let object_path = if bucket.is_empty() {
-            path
-        } else {
-            let with_slash = format!("/{}/", bucket);
-            let without_slash = format!("{}/", bucket);
-            if let Some(rest) = path.strip_prefix(with_slash.as_str()) {
-                rest
-            } else if let Some(rest) = path.strip_prefix(without_slash.as_str()) {
-                rest
-            } else {
-                path
-            }
-        };
-        self.bucket_settings_manager
-            .resolve(bucket, object_path)
-            .await
+        // Rules match the cache-key form without a leading slash, consistent with
+        // how cache keys are generated and how patterns are documented.
+        let full_key = path.strip_prefix('/').unwrap_or(path);
+        self.bucket_settings_manager.resolve(full_key).await
     }
 
     /// Get the effective GET TTL for a given path
@@ -2874,57 +2858,41 @@ impl CacheManager {
         inner.statistics.last_updated = SystemTime::now();
     }
 
-    /// Record per-bucket cache hit or miss for buckets with `_settings.json`.
-    /// Extracts the bucket from the cache key, checks if it has custom settings,
-    /// and records the metric if so. Requirements: 11.1, 11.2
-    pub async fn record_bucket_cache_access(&self, cache_key: &str, hit: bool, is_head: bool) {
+    /// Record per-bucket and per-rule cache hit or miss.
+    /// Per-bucket counters are tracked for all buckets; per-rule counters are
+    /// attributed to the first matching rule from settings resolution.
+    ///
+    /// Accepts the already-resolved `SettingsSource` to avoid a redundant
+    /// second resolution per request (resolve-once, Requirement 8.2).
+    pub async fn record_bucket_cache_access(
+        &self,
+        cache_key: &str,
+        hit: bool,
+        is_head: bool,
+        source: &crate::bucket_settings::SettingsSource,
+    ) {
         let bucket = match crate::bucket_settings::BucketSettingsManager::extract_bucket(cache_key)
         {
             Some(b) => b.to_string(),
             None => return,
         };
 
-        if !self
-            .bucket_settings_manager
-            .has_custom_settings(&bucket)
-            .await
-        {
-            return;
-        }
-
-        // Extract the object path (everything after "bucket/") for prefix matching
-        let trimmed = cache_key.strip_prefix('/').unwrap_or(cache_key);
-        let object_path = trimmed
-            .find('/')
-            .map(|pos| &trimmed[pos + 1..])
-            .unwrap_or("");
-
-        // Find the matching prefix override (longest prefix match)
-        let matched_prefix = {
-            let overrides = self
-                .bucket_settings_manager
-                .get_prefix_overrides(&bucket)
-                .await;
-            overrides
-                .into_iter()
-                .filter(|po| object_path.starts_with(&po.prefix))
-                .max_by_key(|po| po.prefix.len())
-                .map(|po| po.prefix)
+        let matched_pattern = match source {
+            crate::bucket_settings::SettingsSource::Rule(_, pattern) => Some(pattern.as_str()),
+            crate::bucket_settings::SettingsSource::Global => None,
         };
 
         if let Some(mm_guard) = self.metrics_manager.read().await.as_ref() {
             let mm = mm_guard.read().await;
             if hit {
                 mm.record_bucket_cache_hit(&bucket, is_head).await;
-                if let Some(ref prefix) = matched_prefix {
-                    mm.record_prefix_cache_hit(&format!("{}/{}", bucket, prefix), is_head)
-                        .await;
+                if let Some(pattern) = matched_pattern {
+                    mm.record_rule_cache_hit(pattern, is_head).await;
                 }
             } else {
                 mm.record_bucket_cache_miss(&bucket, is_head).await;
-                if let Some(ref prefix) = matched_prefix {
-                    mm.record_prefix_cache_miss(&format!("{}/{}", bucket, prefix), is_head)
-                        .await;
+                if let Some(pattern) = matched_pattern {
+                    mm.record_rule_cache_miss(pattern, is_head).await;
                 }
             }
         }
@@ -6867,20 +6835,36 @@ impl CacheManager {
     /// Get HEAD cache entry unified with comprehensive error handling - Task 3.3, 7.1
     /// Requirements: 1.4, 3.1, 11.1
     ///
+    /// Evaluates HEAD freshness against the caller-supplied `current_head_ttl` rather than
+    /// the stored `head_expires_at`. The freshness comparison preserves the "not cached" gate:
+    /// `head_expires_at == None` still reports a miss regardless of `current_head_ttl`.
+    /// When HEAD metadata is present, the entry is fresh iff `current_head_ttl > 0` and
+    /// `now - created_at <= current_head_ttl`.
+    ///
     /// Uses the new MetadataCache for RAM caching and NewCacheMetadata for unified storage.
     pub async fn get_head_cache_entry_unified(
         &self,
         cache_key: &str,
+        current_head_ttl: Duration,
     ) -> Result<Option<HeadCacheEntry>> {
         debug!(
             "Retrieving HEAD cache entry (unified) for key: {}",
             cache_key
         );
 
+        let now = SystemTime::now();
+
         // First tier: Check MetadataCache (RAM) for NewCacheMetadata
         if let Some(metadata) = self.metadata_cache.get(cache_key).await {
-            // Check if HEAD is still valid (not expired)
-            if !metadata.is_head_expired() {
+            // Check if HEAD is still valid using current head_ttl.
+            // Preserve the "not cached" gate: head_expires_at must be Some.
+            let head_fresh = metadata.head_expires_at.is_some()
+                && !current_head_ttl.is_zero()
+                && now
+                    .duration_since(metadata.created_at)
+                    .unwrap_or(Duration::ZERO)
+                    <= current_head_ttl;
+            if head_fresh {
                 debug!("HEAD cache hit (MetadataCache RAM) for key: {}", cache_key);
                 self.metadata_cache.record_head_hit();
                 return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
@@ -6901,8 +6885,14 @@ impl CacheManager {
                     // Store in MetadataCache for future requests
                     self.metadata_cache.put(cache_key, metadata.clone()).await;
 
-                    // Check if HEAD is still valid
-                    if !metadata.is_head_expired() {
+                    // Check if HEAD is still valid using current head_ttl
+                    let head_fresh = metadata.head_expires_at.is_some()
+                        && !current_head_ttl.is_zero()
+                        && now
+                            .duration_since(metadata.created_at)
+                            .unwrap_or(Duration::ZERO)
+                            <= current_head_ttl;
+                    if head_fresh {
                         debug!("HEAD cache hit (disk .meta) for key: {}", cache_key);
                         self.metadata_cache.record_head_disk_hit();
                         return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
@@ -10333,7 +10323,10 @@ impl CacheManager {
                     cache_key
                 );
 
-                match self.get_head_cache_entry_unified(cache_key).await {
+                match self
+                    .get_head_cache_entry_unified(cache_key, Duration::MAX)
+                    .await
+                {
                     Ok(Some(head_entry)) => {
                         let content_length = head_entry.metadata.content_length;
                         debug!(
@@ -13610,6 +13603,121 @@ mod ram_cache_range_unit_tests {
         assert!(
             cm.get_ram_cache_stats().is_none(),
             "RAM cache disabled: stats must be None"
+        );
+    }
+}
+
+#[cfg(test)]
+mod head_freshness_current_ttl_tests {
+    use std::time::{Duration, SystemTime};
+
+    /// Evaluate HEAD freshness against current head_ttl exactly as get_head_cache_entry_unified does.
+    /// Returns true (fresh) iff: head_expires_at is Some, head_ttl > 0, and age <= head_ttl.
+    fn is_head_fresh(
+        head_expires_at: Option<SystemTime>,
+        created_at: SystemTime,
+        current_head_ttl: Duration,
+        now: SystemTime,
+    ) -> bool {
+        head_expires_at.is_some()
+            && !current_head_ttl.is_zero()
+            && now.duration_since(created_at).unwrap_or(Duration::ZERO) <= current_head_ttl
+    }
+
+    /// head_ttl=0 ⇒ always expired regardless of age or head_expires_at
+    #[test]
+    fn test_head_ttl_zero_always_expired() {
+        let now = SystemTime::now();
+        let created_at = now - Duration::from_secs(1);
+        let head_expires_at = Some(now + Duration::from_secs(3600)); // stored expiry far in the future
+
+        assert!(
+            !is_head_fresh(head_expires_at, created_at, Duration::ZERO, now),
+            "head_ttl=0 must always report expired"
+        );
+    }
+
+    /// now - created_at ≤ head_ttl with head_expires_at = Some ⇒ fresh
+    #[test]
+    fn test_within_ttl_window_is_fresh() {
+        let now = SystemTime::now();
+        let created_at = now - Duration::from_secs(30);
+        let head_expires_at = Some(now + Duration::from_secs(30));
+        let current_head_ttl = Duration::from_secs(60); // 60s window, object is 30s old
+
+        assert!(
+            is_head_fresh(head_expires_at, created_at, current_head_ttl, now),
+            "age 30s within 60s head_ttl must be fresh"
+        );
+    }
+
+    /// now - created_at > head_ttl ⇒ expired
+    #[test]
+    fn test_past_ttl_window_is_expired() {
+        let now = SystemTime::now();
+        let created_at = now - Duration::from_secs(120);
+        let head_expires_at = Some(now + Duration::from_secs(3600)); // stored says still fresh
+        let current_head_ttl = Duration::from_secs(60); // current TTL is 60s, but object is 120s old
+
+        assert!(
+            !is_head_fresh(head_expires_at, created_at, current_head_ttl, now),
+            "age 120s exceeding 60s head_ttl must be expired"
+        );
+    }
+
+    /// head_expires_at = None ⇒ miss/expired regardless of head_ttl (not-cached gate preserved)
+    #[test]
+    fn test_head_expires_at_none_is_miss() {
+        let now = SystemTime::now();
+        let created_at = now - Duration::from_secs(1);
+        let current_head_ttl = Duration::from_secs(3600); // large TTL
+
+        assert!(
+            !is_head_fresh(None, created_at, current_head_ttl, now),
+            "head_expires_at=None must report miss regardless of head_ttl"
+        );
+    }
+
+    /// Clock skew (created_at in the future) ⇒ age=0 ⇒ fresh for non-zero head_ttl
+    #[test]
+    fn test_clock_skew_future_created_at_is_fresh() {
+        let now = SystemTime::now();
+        let created_at = now + Duration::from_secs(10); // future timestamp (clock skew)
+        let head_expires_at = Some(now + Duration::from_secs(100));
+        let current_head_ttl = Duration::from_secs(60);
+
+        // duration_since returns Err when created_at > now, unwrap_or(Duration::ZERO) → age=0
+        // 0 <= 60s ⇒ fresh
+        assert!(
+            is_head_fresh(head_expires_at, created_at, current_head_ttl, now),
+            "clock-skew (future created_at) must report fresh for non-zero head_ttl"
+        );
+    }
+
+    /// Clock skew + head_ttl=0 ⇒ still expired (ttl=0 dominates)
+    #[test]
+    fn test_clock_skew_with_zero_ttl_still_expired() {
+        let now = SystemTime::now();
+        let created_at = now + Duration::from_secs(10); // future
+        let head_expires_at = Some(now + Duration::from_secs(100));
+
+        assert!(
+            !is_head_fresh(head_expires_at, created_at, Duration::ZERO, now),
+            "head_ttl=0 must report expired even with clock skew"
+        );
+    }
+
+    /// Boundary: age exactly equals head_ttl ⇒ fresh (≤ comparison)
+    #[test]
+    fn test_age_equals_ttl_is_fresh() {
+        let now = SystemTime::now();
+        let created_at = now - Duration::from_secs(60);
+        let head_expires_at = Some(now + Duration::from_secs(1));
+        let current_head_ttl = Duration::from_secs(60);
+
+        assert!(
+            is_head_fresh(head_expires_at, created_at, current_head_ttl, now),
+            "age exactly equal to head_ttl must be fresh (≤ comparison)"
         );
     }
 }

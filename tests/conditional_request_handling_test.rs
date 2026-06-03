@@ -113,7 +113,7 @@ async fn test_cache_ttl_refresh() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify entry exists
     let entry = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await?;
     assert!(entry.is_some());
     let original_expires_at = entry.unwrap().expires_at;
@@ -126,7 +126,7 @@ async fn test_cache_ttl_refresh() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify TTL was refreshed
     let refreshed_entry = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await?;
     assert!(refreshed_entry.is_some());
     let new_expires_at = refreshed_entry.unwrap().expires_at;
@@ -185,7 +185,7 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify entry exists
     let entry = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await?;
     assert!(entry.is_some());
 
@@ -194,7 +194,7 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify entry is gone
     let entry_after_invalidation = cache_manager
-        .get_head_cache_entry_unified(cache_key)
+        .get_head_cache_entry_unified(cache_key, std::time::Duration::MAX)
         .await?;
     assert!(entry_after_invalidation.is_none());
 

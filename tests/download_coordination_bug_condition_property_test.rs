@@ -107,6 +107,7 @@ use quickcheck_macros::quickcheck;
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
+use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::Config;
@@ -282,7 +283,8 @@ async fn run_one_coordinated_get(
         config,
         true, // coordination_enabled
         wait_timeout,
-        None,  // metrics_manager: not needed for this property
+        None, // metrics_manager: not needed for this property
+        &ResolvedSettings::default(),
         &None, // proxy_referer
     )
     .await

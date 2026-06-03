@@ -823,6 +823,12 @@ impl RangeHandler {
     /// * `end` - End offset of the range
     /// * `data` - The range data to store
     /// * `object_metadata` - Metadata about the S3 object
+    /// * `ttl` - Time-to-live for the cached range
+    /// * `compression_enabled` - Resolved compression setting for this key
+    ///   (resolved once per logical request; Requirement 8.2)
+    // The extra `compression_enabled` arg is the once-per-request resolved
+    // setting threaded in (Requirement 8.2) instead of re-resolving per range.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_range_new_storage(
         &self,
         cache_key: &str,
@@ -831,6 +837,7 @@ impl RangeHandler {
         data: &[u8],
         object_metadata: ObjectMetadata,
         ttl: std::time::Duration,
+        compression_enabled: bool,
     ) -> Result<()> {
         debug!(
             "Storing range using new storage: key={}, range={}-{}, size={}",
@@ -848,8 +855,8 @@ impl RangeHandler {
         }
 
         let mut disk_cache = self.disk_cache_manager.write().await;
-        // Resolve per-bucket compression settings (Requirements 5.1, 5.2, 5.3)
-        let resolved = self.cache_manager.resolve_settings(cache_key).await;
+        // Compression setting is resolved once per request and threaded in
+        // (Requirement 8.2: resolve once, reuse for all per-range cache writes).
         disk_cache
             .store_range(
                 cache_key,
@@ -858,7 +865,7 @@ impl RangeHandler {
                 data,
                 object_metadata,
                 ttl,
-                resolved.compression_enabled,
+                compression_enabled,
             )
             .await?;
 

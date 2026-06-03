@@ -27,7 +27,7 @@ server:
   max_concurrent_requests: 200
   request_timeout: "30s"
   # Add Referer header for proxy identification in S3 Server Access Logs (default: true)
-  # Format: s3-hybrid-cache/{version} ({hostname})
+  # Format: Hybrid Cache for Amazon S3/{version} ({hostname})
   add_referer_header: true
   # Maximum request body size buffered in memory (applies to single-part PUT and UploadPart).
   # Default 5 GiB matches the S3 protocol maximum so all valid S3 clients work transparently.
@@ -313,8 +313,8 @@ cache:
   full_object_check_threshold: 67108864  # 64 MiB in bytes
 
   # Enable/disable read caching for GET responses globally (default: true)
-  # When false, no buckets are read-cached unless explicitly enabled via bucket _settings.json.
-  # This allows an "allowlist" pattern where only specific buckets have caching enabled.
+  # When false, nothing is read-cached unless a matching cache_rules.json rule sets read_cache_enabled: true.
+  # This allows an "allowlist" pattern where only keys matched by an enabling rule have caching.
   read_cache_enabled: true
 
   # Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since,
@@ -328,11 +328,11 @@ cache:
   # (RFC 7232 §6 precedence). Expired cache, missing validators, and client cache-bypass
   # headers fall back to forward. Reduces S3 round trips at the cost of strict freshness.
   # Not recommended with get_ttl: "0s" (fall-back would trigger on every request anyway).
-  # Per-bucket override available in _settings.json.
+  # Per-key override available via cache_rules.json rules.
   evaluate_conditions_from_cache: false
 
-  # How long cached bucket settings (_settings.json) are considered fresh before re-reading from disk (default: 60s)
-  # Controls lazy reload — settings changes take effect after this threshold expires.
+  # How long the loaded cache_rules.json rule set is considered fresh before re-reading from disk (default: 60s)
+  # Controls lazy reload — rule changes take effect after this threshold expires.
   bucket_settings_staleness_threshold: "60s"
 
   # Disk streaming threshold for cached range data (default: 1 MiB)

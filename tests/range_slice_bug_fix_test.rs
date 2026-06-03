@@ -93,6 +93,7 @@ async fn test_range_slice_single_cached_range_larger_than_requested() {
             &cached_data,
             metadata,
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -209,6 +210,7 @@ async fn test_range_slice_middle_of_cached_range() {
             &cached_data,
             metadata,
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -304,6 +306,7 @@ async fn test_range_slice_end_of_cached_range() {
             &cached_data,
             metadata,
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -402,6 +405,7 @@ async fn test_range_slice_exact_match_no_slicing() {
             &cached_data,
             metadata,
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -513,6 +517,7 @@ async fn test_range_slice_multiple_cached_ranges() {
             &range1_data,
             metadata1.clone(),
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -525,6 +530,7 @@ async fn test_range_slice_multiple_cached_ranges() {
             &range2_data,
             metadata1.clone(),
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -537,6 +543,7 @@ async fn test_range_slice_multiple_cached_ranges() {
             &range3_data,
             metadata1,
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -686,6 +693,7 @@ async fn test_range_slice_multiple_cached_ranges_with_gaps() {
             &range1_data,
             metadata.clone(),
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();
@@ -698,6 +706,7 @@ async fn test_range_slice_multiple_cached_ranges_with_gaps() {
             &range2_data,
             metadata,
             std::time::Duration::from_secs(315360000), // 10 years TTL
+            false, // compression disabled (matches default resolved settings)
         )
         .await
         .unwrap();

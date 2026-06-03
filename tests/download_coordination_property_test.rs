@@ -24,6 +24,7 @@ use quickcheck_macros::quickcheck;
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
+use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::Config;
@@ -471,6 +472,7 @@ async fn launch_get_head_concurrent(
                 true,
                 wait_timeout,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -511,6 +513,7 @@ async fn launch_get_head_concurrent(
                 true,
                 wait_timeout,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -588,6 +591,7 @@ async fn launch_range_concurrent(
                 None,
                 inflight_tracker,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -634,6 +638,7 @@ async fn launch_range_concurrent(
                 None,
                 inflight_tracker,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -701,6 +706,7 @@ async fn launch_part_concurrent(
                 wait_timeout,
                 3,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -739,6 +745,7 @@ async fn launch_part_concurrent(
                 wait_timeout,
                 3,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -1139,6 +1146,7 @@ async fn run_preservation_fresh_cache_hit(seed: u64, method_tag: u8) -> TestResu
         s3_client,
         Arc::clone(&config),
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1243,6 +1251,7 @@ async fn run_preservation_single_missing(seed: u64) -> TestResult {
         true,
         wait_timeout,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1337,6 +1346,7 @@ async fn run_preservation_single_expired(seed: u64) -> TestResult {
         true,
         wait_timeout,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1450,6 +1460,7 @@ async fn run_preservation_coordination_disabled(seed: u64, n: usize) -> TestResu
                 false, // coordination_enabled = false
                 wait_timeout,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -1573,6 +1584,7 @@ async fn run_preservation_fetcher_error(seed: u64) -> TestResult {
                 true,
                 wait_timeout,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -1693,6 +1705,7 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
             true,
             wait_timeout,
             None,
+            &ResolvedSettings::default(),
             &None,
         )
         .await
@@ -1783,6 +1796,7 @@ async fn run_preservation_distinct_flight_keys(seed: u64, n: usize) -> TestResul
                 true,
                 wait_timeout,
                 None,
+                &ResolvedSettings::default(),
                 &None,
             )
             .await
@@ -1974,6 +1988,7 @@ async fn run_waiter_conditional_headers_well_formed(seed: u64) -> TestResult {
         s3_client,
         Arc::clone(&config),
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await

@@ -23,6 +23,7 @@ use http_body_util::BodyExt;
 use hyper::{Method, StatusCode};
 use tempfile::TempDir;
 
+use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::Config;
@@ -218,6 +219,7 @@ async fn full_get_validated_serve_304_serves_cached_body() {
         s3_client,
         Arc::clone(&config),
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -276,6 +278,7 @@ async fn full_get_validated_serve_200_serves_s3_body() {
         s3_client,
         Arc::clone(&config),
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -326,6 +329,7 @@ async fn full_get_validated_serve_403_returns_s3_response_cache_preserved() {
         s3_client,
         Arc::clone(&config),
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -378,6 +382,7 @@ async fn full_get_validated_serve_500_falls_back_to_cache() {
         s3_client,
         Arc::clone(&config),
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -426,6 +431,7 @@ async fn full_get_validated_serve_metadata_missing_delegates_to_forward() {
         s3_client,
         Arc::clone(&config),
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -474,6 +480,7 @@ async fn conditional_request_headers_well_formed() {
         s3_client,
         Arc::clone(&config),
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -535,6 +542,7 @@ async fn head_validated_serve_304_returns_empty_body_with_metadata() {
         s3_client,
         Arc::clone(&config),
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -587,6 +595,7 @@ async fn range_validated_serve_304_serves_cached_range() {
         Arc::clone(&config),
         true,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -653,6 +662,7 @@ async fn range_validated_serve_200_serves_s3_body() {
         Arc::clone(&config),
         true,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -707,6 +717,7 @@ async fn range_validated_serve_403_returns_s3_response() {
         Arc::clone(&config),
         true,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -759,6 +770,7 @@ async fn range_validated_serve_500_falls_back_to_cache() {
         Arc::clone(&config),
         true,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -809,6 +821,7 @@ async fn range_validated_serve_metadata_missing_delegates_to_forward() {
         Arc::clone(&config),
         true,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -880,6 +893,7 @@ async fn part_validated_serve_304_serves_cached_part() {
         Arc::clone(&range_handler),
         s3_client,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -948,6 +962,7 @@ async fn part_validated_serve_200_serves_s3_body() {
         Arc::clone(&range_handler),
         s3_client,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1014,6 +1029,7 @@ async fn part_validated_serve_403_returns_s3_response() {
         Arc::clone(&range_handler),
         s3_client,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1078,6 +1094,7 @@ async fn part_validated_serve_500_falls_back_to_cache() {
         Arc::clone(&range_handler),
         s3_client,
         Some(Arc::clone(&mm)),
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1126,6 +1143,7 @@ async fn part_validated_serve_metadata_missing_delegates_to_forward() {
         Arc::clone(&range_handler),
         s3_client,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1176,6 +1194,7 @@ async fn fetcher_branch_completes_success_on_2xx() {
         true,
         wait_timeout,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1220,6 +1239,7 @@ async fn fetcher_branch_completes_error_on_non_2xx() {
         true,
         wait_timeout,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1281,6 +1301,7 @@ async fn range_fetcher_branch_completes_success_on_2xx() {
         None,
         Arc::clone(&inflight_tracker),
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1335,6 +1356,7 @@ async fn range_fetcher_branch_completes_error_on_non_2xx() {
         None,
         Arc::clone(&inflight_tracker),
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1387,6 +1409,7 @@ async fn part_fetcher_branch_completes_success_on_2xx() {
         wait_timeout,
         3,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1433,6 +1456,7 @@ async fn part_fetcher_branch_completes_error_on_non_2xx() {
         wait_timeout,
         3,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1483,6 +1507,7 @@ async fn coordination_disabled_bypasses_inflight_tracker_full_object() {
         false, // coordination_enabled = false
         wait_timeout,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1553,6 +1578,7 @@ async fn coordination_disabled_bypasses_inflight_tracker_range() {
         None,
         Arc::clone(&inflight_tracker),
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await

@@ -202,6 +202,12 @@ async fn main() -> Result<()> {
         config.cache.cache_dir.display(),
         config.cache.max_cache_size / 1024 / 1024
     );
+
+    // One-time breaking-change migration warning: the per-bucket `_settings.json`
+    // mechanism has been replaced by `cache_dir/cache_rules.json`. Scan once at
+    // startup and warn (without reading/honouring the files) if any are present.
+    // (Requirements 7.1, 7.4)
+    s3_proxy::bucket_settings::warn_if_legacy_settings_present(&config.cache.cache_dir);
     if config.cache.ram_cache_enabled {
         info!(
             "RAM cache: enabled, max_size={}MB",

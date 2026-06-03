@@ -5717,15 +5717,25 @@ impl DiskCacheManager {
     }
 
     /// Check if a cached object is expired and needs conditional validation.
-    /// Uses object-level `expires_at` from `NewCacheMetadata`.
+    /// Evaluates GET freshness against a caller-supplied TTL (`current_get_ttl`)
+    /// rather than the stored `expires_at`. This ensures that a tightened or zeroed
+    /// `get_ttl` in `cache_rules.json` takes effect on already-cached objects
+    /// without requiring a proxy restart or manual cache wipe.
+    ///
+    /// Freshness rule: `fresh ⇔ (current_get_ttl > 0) AND (now - created_at ≤ current_get_ttl)`.
+    /// When `current_get_ttl` is zero the entry is always expired (every GET revalidates).
+    /// Clock skew (`created_at` in the future) yields age 0 → fresh for any non-zero TTL.
+    ///
+    /// This is **read-only** — no metadata write on the read path.
     ///
     /// Returns:
-    /// - `Ok(Fresh)` if object is not expired
+    /// - `Ok(Fresh)` if object is fresh per the current `get_ttl`
     /// - `Ok(Expired { last_modified: Some(...) })` if expired with known last_modified
     /// - `Ok(Expired { last_modified: None })` on metadata read/parse failure (fail-safe)
     pub async fn check_object_expiration(
         &self,
         cache_key: &str,
+        current_get_ttl: std::time::Duration,
     ) -> Result<crate::cache_types::ObjectExpirationResult> {
         use crate::cache_types::ObjectExpirationResult;
 
@@ -5772,10 +5782,19 @@ impl DiskCacheManager {
                 }
             };
 
-        if metadata.is_object_expired() {
+        // Evaluate freshness against the current get_ttl (read-only comparison).
+        // get_ttl=0 means "always revalidate"; otherwise fresh when age ≤ ttl.
+        // Clock skew (created_at in the future) yields age 0 → fresh for non-zero ttl.
+        let now = std::time::SystemTime::now();
+        let age = now
+            .duration_since(metadata.created_at)
+            .unwrap_or(std::time::Duration::ZERO);
+        let expired = current_get_ttl.is_zero() || age > current_get_ttl;
+
+        if expired {
             debug!(
-                "Object expired, needs conditional validation: key={}, expires_at={:?}",
-                cache_key, metadata.expires_at
+                "Object expired per current get_ttl: key={}, age={:?}, current_get_ttl={:?}",
+                cache_key, age, current_get_ttl
             );
             Ok(ObjectExpirationResult::Expired {
                 last_modified: Some(metadata.object_metadata.last_modified.clone()),
@@ -8837,7 +8856,7 @@ mod tests {
 
         // check_object_expiration should return Expired { last_modified: None }
         let result = cache_manager
-            .check_object_expiration(cache_key)
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(3600))
             .await
             .unwrap();
         assert_eq!(
@@ -8868,7 +8887,7 @@ mod tests {
 
         // check_object_expiration should return Expired { last_modified: None }
         let result = cache_manager
-            .check_object_expiration(cache_key)
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(3600))
             .await
             .unwrap();
         assert_eq!(
@@ -8894,7 +8913,7 @@ mod tests {
 
         // No metadata file exists
         let result = cache_manager
-            .check_object_expiration(cache_key)
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(3600))
             .await
             .unwrap();
         assert_eq!(
@@ -8925,7 +8944,7 @@ mod tests {
 
         // check_object_expiration should return Expired { last_modified: None }
         let result = cache_manager
-            .check_object_expiration(cache_key)
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(3600))
             .await
             .unwrap();
         assert_eq!(
@@ -8935,6 +8954,215 @@ mod tests {
                 etag: None
             },
             "Empty metadata file should be treated as expired with no last_modified"
+        );
+    }
+
+    // ============================================================================
+    // Tests for check_object_expiration with current_get_ttl
+    // Validates: Requirements 2.1, 2.2, 2.5
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_check_object_expiration_get_ttl_zero_always_expired() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/ttl-zero-object";
+        let now = std::time::SystemTime::now();
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Wed, 01 Jan 2025 12:00:00 GMT".to_string(),
+                content_length: 100,
+                content_type: Some("text/plain".to_string()),
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // get_ttl=0 → always expired regardless of age
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ObjectExpirationResult::Expired { .. }),
+            "get_ttl=0 should always return Expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_object_expiration_within_ttl_is_fresh() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/within-ttl-object";
+        let now = std::time::SystemTime::now();
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Wed, 01 Jan 2025 12:00:00 GMT".to_string(),
+                content_length: 100,
+                content_type: Some("text/plain".to_string()),
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now - std::time::Duration::from_secs(60),
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // age=60s, get_ttl=300s → 60 ≤ 300 → Fresh
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ObjectExpirationResult::Fresh,
+            "Object within TTL window should be Fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_object_expiration_beyond_ttl_is_expired() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/beyond-ttl-object";
+        let now = std::time::SystemTime::now();
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Wed, 01 Jan 2025 12:00:00 GMT".to_string(),
+                content_length: 100,
+                content_type: Some("text/plain".to_string()),
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now - std::time::Duration::from_secs(600),
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // age=600s, get_ttl=300s → 600 > 300 → Expired
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        match result {
+            ObjectExpirationResult::Expired {
+                last_modified,
+                etag,
+            } => {
+                assert_eq!(
+                    last_modified,
+                    Some("Wed, 01 Jan 2025 12:00:00 GMT".to_string())
+                );
+                assert_eq!(etag, Some("\"test-etag\"".to_string()));
+            }
+            ObjectExpirationResult::Fresh => {
+                panic!("Object beyond TTL should be Expired");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_object_expiration_clock_skew_future_created_at() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/clock-skew-object";
+        let now = std::time::SystemTime::now();
+
+        // created_at is in the future (clock skew)
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Wed, 01 Jan 2025 12:00:00 GMT".to_string(),
+                content_length: 100,
+                content_type: Some("text/plain".to_string()),
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now + std::time::Duration::from_secs(60),
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // Clock skew: created_at in the future → age=0 → Fresh for non-zero ttl
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ObjectExpirationResult::Fresh,
+            "Clock skew (created_at in the future) should be treated as Fresh for non-zero ttl"
+        );
+
+        // Clock skew with get_ttl=0 → still expired (get_ttl=0 always means expired)
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ObjectExpirationResult::Expired { .. }),
+            "Clock skew with get_ttl=0 should still be Expired"
         );
     }
 

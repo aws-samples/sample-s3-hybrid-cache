@@ -70,6 +70,7 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 
+use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::Config;
@@ -260,6 +261,7 @@ async fn run_get_head(
         coordination_enabled,
         wait_timeout,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -306,6 +308,7 @@ async fn run_serve_from_cache_validated(
         s3_client,
         config,
         None,
+        &ResolvedSettings::default(),
         &None,
     )
     .await
@@ -1207,6 +1210,7 @@ fn prop_different_flight_keys_are_independent(shape_tag: u8) -> TestResult {
                             None,
                             inflight_tracker,
                             None,
+                            &ResolvedSettings::default(),
                             &None,
                         )
                         .await

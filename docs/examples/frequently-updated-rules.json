@@ -1,0 +1,12 @@
+{
+  "$schema": "../cache-rules-schema.json",
+  "rules": [
+    {
+      "pattern": "frequently-updated-bucket/**",
+      "get_ttl": "30s",
+      "head_ttl": "15s",
+      "put_ttl": "5m",
+      "ram_cache_eligible": false
+    }
+  ]
+}

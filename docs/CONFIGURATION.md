@@ -10,7 +10,13 @@ Complete configuration guide for Hybrid Cache for Amazon S3 including cache beha
 - [Cache Configuration](#cache-configuration)
 - [Time-To-Live (TTL) Configuration](#time-to-live-ttl-configuration)
 - [Write Cache Configuration](#write-cache-configuration)
-- [Bucket-Level Cache Settings](#bucket-level-cache-settings)
+- [Cache Rules](#cache-rules)
+  - [Rules File Format](#rules-file-format)
+  - [Glob Syntax](#glob-syntax)
+  - [First-Match-Per-Field Precedence](#first-match-per-field-precedence)
+  - [Hot Reload and Error Resilience](#hot-reload-and-error-resilience)
+  - [Cache-Key Forms](#cache-key-forms)
+  - [Performance](#performance)
 - [Cache Expiration Scenarios](#cache-expiration-scenarios)
 - [RAM-Disk Cache Coherency](#ram-disk-cache-coherency)
 - [Range Request Optimization](#range-request-optimization)
@@ -111,7 +117,7 @@ server:
   add_referer_header: true   # Add Referer header to forwarded requests (default: true)
 ```
 
-When enabled, the proxy adds a `Referer` header to requests forwarded to S3 in the format `s3-hybrid-cache/{version} ({hostname})`. This header appears in S3 Server Access Logs, enabling usage tracking and per-instance debugging.
+When enabled, the proxy adds a `Referer` header to requests forwarded to S3 in the format `Hybrid Cache for Amazon S3/{version} ({hostname})`. This header appears in S3 Server Access Logs, enabling usage tracking and per-instance debugging.
 
 The header is only added when:
 - The request does not already contain a `Referer` header
@@ -121,14 +127,14 @@ The header is only added when:
 
 The `Referer` header in S3 Server Access Logs enables:
 
-1. **Identify which proxy instance served a request**: Each instance includes its hostname in the header (e.g., `s3-hybrid-cache/0.8.0 (proxy-instance-1)`)
+1. **Identify which proxy instance served a request**: Each instance includes its hostname in the header (e.g., `Hybrid Cache for Amazon S3/2.0.0 (proxy-instance-1)`)
 2. **Determine if requests went through the cache**: Requests with the proxy's `Referer` header were served via HTTP (port 80) where caching occurs. Requests without this header were served via HTTPS passthrough (port 443) with no caching.
 3. **Track proxy version distribution**: Identify which proxy versions are active across your fleet
 4. **Debug routing issues**: Verify traffic is flowing through the expected proxy instances
 
 Example S3 Server Access Log entry showing the `Referer` field:
 ```
-bucket-name [01/Jan/2024:12:00:00 +0000] 192.0.2.1 - REQ123 REST.GET.OBJECT file.txt "GET /file.txt HTTP/1.1" 200 - 1024 1024 10 9 "s3-hybrid-cache/0.8.0 (proxy-instance-1)" "aws-cli/2.x" -
+bucket-name [01/Jan/2024:12:00:00 +0000] 192.0.2.1 - REQ123 REST.GET.OBJECT file.txt "GET /file.txt HTTP/1.1" 200 - 1024 1024 10 9 "Hybrid Cache for Amazon S3/2.0.0 (proxy-instance-1)" "aws-cli/2.x" -
 ```
 
 Query examples using AWS Athena:
@@ -136,14 +142,14 @@ Query examples using AWS Athena:
 -- Count requests by proxy instance
 SELECT referer, COUNT(*) as request_count
 FROM s3_access_logs
-WHERE referer LIKE 's3-hybrid-cache/%'
+WHERE referer LIKE 'Hybrid Cache for Amazon S3/%'
 GROUP BY referer
 ORDER BY request_count DESC;
 
 -- Identify requests that bypassed the cache (HTTPS passthrough)
 SELECT *
 FROM s3_access_logs
-WHERE referer IS NULL OR referer NOT LIKE 's3-hybrid-cache/%';
+WHERE referer IS NULL OR referer NOT LIKE 'Hybrid Cache for Amazon S3/%';
 ```
 
 ### Environment Variables
@@ -383,10 +389,15 @@ cache:
 - CompleteMultipartUpload: Parts assembled with final byte offsets, object metadata created
 - AbortMultipartUpload: All cached parts and tracking metadata deleted
 
-**TTL Refresh on Read**:
-- When a write-cached object is accessed via GET, the TTL is refreshed
-- This keeps frequently accessed objects in cache longer
-- Objects never read expire after the initial TTL
+**TTL Transition on First Read**:
+- When a write-cached object is first accessed via GET, the proxy performs a
+  one-time transition: it clears the `is_write_cached` flag and resets `expires_at`
+  from `now + put_ttl` to `now + get_ttl`. This is not a repeating refresh —
+  subsequent reads do not extend the TTL.
+- After the transition the object follows normal read-cache expiration rules
+  (expires after one `get_ttl` window from the first GET, regardless of how
+  frequently it is accessed).
+- Objects never read expire after the original `put_ttl` and are evicted normally.
 
 ### Capacity Management
 
@@ -453,95 +464,160 @@ cache:
   incomplete_upload_ttl: "6h"
 ```
 
-## Bucket-Level Cache Settings
+## Cache Rules
 
-Per-bucket and per-prefix cache configuration via JSON files stored at `cache_dir/metadata/{bucket}/_settings.json`. Overrides global cache settings without modifying the YAML config or restarting the proxy.
+Cache rules override global cache settings for keys that match a glob pattern, without modifying the YAML config or restarting the proxy. Rules live in a single hot-reloadable file at `cache_dir/cache_rules.json`. The file is optional: when it is absent or its `rules` array is empty, every setting resolves to the global YAML `cache:` defaults, so a deployment that has never used the file behaves exactly as before.
+
+> **Breaking change (v2.0.0).** Cache rules replace the per-bucket `cache_dir/metadata/{bucket}/_settings.json` mechanism. `_settings.json` files are no longer read, and there is no automatic migration. See [CHANGELOG.md](../CHANGELOG.md) for a before/after translation.
 
 ### Global Config Fields
 
+These YAML `cache:` fields supply the defaults that rules fall through to. They are unchanged; only the rules mechanism that overrides them has changed.
+
 ```yaml
 cache:
-  # Enable/disable read caching for GET responses globally (default: true)
-  # When false, no buckets are read-cached unless explicitly enabled via bucket _settings.json.
-  # This allows an "allowlist" pattern where only specific buckets have caching enabled.
+  # Default read caching for GET responses (default: true).
+  # When false, nothing is read-cached unless a matching rule sets read_cache_enabled: true —
+  # an "allowlist" pattern where only keys matched by an enabling rule are cached.
   read_cache_enabled: true
 
-  # Evaluate client conditional headers against cached metadata (default: false)
+  # Default conditional-header evaluation (default: false).
   # When true, the proxy decides 304 / 412 / 200 locally using cached ETag + Last-Modified
   # and does not forward the conditional request to S3 (unless cache is expired or the
   # required validators are missing). Default false preserves strict RFC 7232 consistency.
   # See CACHING.md "Conditional Headers Handling" for full semantics.
   evaluate_conditions_from_cache: false
 
-  # How long cached bucket settings are considered fresh before re-reading from disk (default: 60s)
-  # Controls lazy reload — settings changes take effect after this threshold expires.
+  # How long a loaded rule set is considered fresh before cache_rules.json is re-read from disk
+  # (default: 60s). Controls lazy reload — rule edits take effect on the next request after this
+  # threshold expires. Field name retained for config compatibility (conceptually "rules staleness").
   bucket_settings_staleness_threshold: "60s"
 ```
 
-### Settings File Format
+### Rules File Format
 
-Place a `_settings.json` file at `cache_dir/metadata/{bucket}/_settings.json`. All fields are optional — omitted fields fall back to global config.
+The file holds an optional `$schema` reference plus an ordered `rules` array. Each rule has a required glob `pattern` and an optional subset of settings fields. Omitted fields are unset for that rule and fall through (see [Precedence](#first-match-per-field-precedence)).
 
 ```json
 {
-  "$schema": "../docs/bucket-settings-schema.json",
-  "get_ttl": "5m",
-  "head_ttl": "30s",
-  "put_ttl": "1h",
-  "read_cache_enabled": true,
-  "write_cache_enabled": true,
-  "compression_enabled": false,
-  "ram_cache_eligible": true,
-  "evaluate_conditions_from_cache": false,
-  "prefix_overrides": [
-    {
-      "prefix": "/temp/",
-      "get_ttl": "0s",
-      "ram_cache_eligible": false
-    },
-    {
-      "prefix": "/static/assets/",
-      "get_ttl": "7d",
-      "compression_enabled": true,
-      "evaluate_conditions_from_cache": true
-    }
+  "$schema": "../docs/cache-rules-schema.json",
+  "rules": [
+    { "pattern": "**/credit-cards/**", "read_cache_enabled": false },
+    { "pattern": "**/logs/**",         "get_ttl": "0s" },
+    { "pattern": "prod-*/static/**",   "get_ttl": "7d", "compression_enabled": true },
+    { "pattern": "my-bucket/temp/**",  "get_ttl": "0s" },
+    { "pattern": "**",                 "get_ttl": "5m" }
   ]
 }
 ```
 
-**Supported fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `prefix_overrides`
+**Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`
 
 **Duration format**: Same as global config — `"0s"`, `"30s"`, `"5m"`, `"1h"`, `"7d"`
 
-**Schema validation**: Include `$schema` for IDE autocompletion. Full schema at `docs/bucket-settings-schema.json`.
+**Schema and example**: Include `$schema` for IDE autocompletion. Full schema at [`docs/cache-rules-schema.json`](cache-rules-schema.json); a complete example at [`config/cache_rules.example.json`](../config/cache_rules.example.json).
 
-### Settings Cascade
+### Glob Syntax
 
-Settings resolve with this precedence (highest to lowest):
+Patterns are globs, not regex. A rule matches against the **full cache key** (`{bucket}/{object_key}`, no leading slash). The metacharacters are:
 
-1. **Prefix override** — longest matching prefix in `prefix_overrides`
-2. **Bucket settings** — fields in `_settings.json`
-3. **Global config** — YAML configuration values
+| Glob | Matches |
+|------|---------|
+| `*`  | Any run of characters **except** `/` — one path segment |
+| `**` | Any run of characters **including** `/` — crosses segments |
+| `?`  | Exactly one character **except** `/` |
+| any other char | A literal. Regex metacharacters are escaped, so a bucket named `my.logs` matches `.` literally, not as "any character" |
 
-Each field resolves independently. A prefix override for `get_ttl` does not affect `compression_enabled` resolution — that field still falls through to bucket or global level.
+Two properties matter for writing correct rules:
 
-### Lazy Reload
+- **Case-sensitive.** Patterns match the cache key exactly as cased. This mirrors S3: object keys are case-sensitive and bucket names are lowercase.
+- **Anchored whole-string, not prefix.** A pattern matches only if it matches the *entire* key. `my-bucket/temp` matches only the exact key `my-bucket/temp` — not `my-bucket/temp/file.txt`.
 
-Bucket settings are cached in RAM and re-read from disk when the staleness threshold expires (default: 60 seconds). Modify `_settings.json` on disk and changes take effect on the next request after the threshold. No proxy restart required.
+> **Migration gotcha.** The old `prefix_overrides` used `starts_with`, so `temp/` matched everything under `temp/`. Globs are anchored. To match "everything under `temp/` in `my-bucket`", write `my-bucket/temp/**` — **not** `my-bucket/temp`, which matches only that one exact key.
 
-If a settings file becomes invalid after a reload, the proxy logs an error and continues using the previously valid settings.
+Because the bucket is part of the match surface, one syntax expresses every scope:
 
-### Settings Apply at Cache-Write Time
+| Pattern | Meaning |
+|---------|---------|
+| `my-bucket/temp/**` | The `temp/` prefix in one bucket (the old per-bucket prefix rule) |
+| `**/logs/**` | A `logs/` segment anywhere, in every bucket |
+| `**/credit-cards/**` | A `credit-cards` segment anywhere, in every bucket |
+| `prod-*/static/**` | The `static/` prefix in every bucket whose name starts `prod-` |
 
-Bucket and prefix settings take effect when data is written to cache, not retroactively. Objects cached before a settings change retain their original TTL until they expire naturally or are evicted. For example, changing `get_ttl` from `1h` to `5m` does not shorten the TTL of already-cached objects — only newly cached objects use the updated value.
+### First-Match-Per-Field Precedence
+
+Rules are an ordered list. For **each field independently**, the value comes from the earliest rule in list order that both matches the key and sets that field. A field left unset by a matching rule falls through to the next matching rule, and finally to the global YAML default. Put specific rules above broad ones.
+
+Worked example — fields resolve independently:
+
+```json
+{
+  "rules": [
+    { "pattern": "my-bucket/reports/**", "get_ttl": "1h" },
+    { "pattern": "**",                   "compression_enabled": true }
+  ]
+}
+```
+
+For the key `my-bucket/reports/q3.csv`:
+
+- `get_ttl` → `1h` (from rule 1, the first rule that sets it)
+- `compression_enabled` → `true` (rule 1 does not set it; falls through to rule 2)
+- every other field → its global YAML default
+
+The first rule supplies `get_ttl` and the second supplies `compression_enabled`; the result combines both.
+
+Two invariants are applied after resolution (unchanged from prior behavior):
+
+- `get_ttl == 0s` forces `ram_cache_eligible = false` (RAM cache bypasses revalidation, which would serve stale data).
+- `read_cache_enabled == false` forces `ram_cache_eligible = false`.
+
+### Hot Reload and Error Resilience
+
+The proxy polls `cache_rules.json` on a staleness threshold (`bucket_settings_staleness_threshold`, default 60s). When the file has changed and the threshold has elapsed, the next request recompiles the rule set — no restart. Within the threshold the in-memory rule set is reused without touching disk. The pattern set is compiled once per successful load, never per request.
+
+A bad edit never takes the cache down:
+
+- Invalid JSON, failed validation (empty pattern, a pattern that fails to compile, an unparseable duration), or a rule count over the cap → the proxy keeps the last-known-good rule set and logs a warning.
+- Invalid file at first startup → the proxy starts with an empty rule set (global defaults for every field) and logs a warning.
+
+### Cache-Key Forms
+
+Patterns match the cache key as computed by [cache-key normalization](CACHING.md#cache-directory-structure), which differs by request kind. Match the leading segment accordingly (matching is case-sensitive):
+
+| Request kind | Cache-key leading segment | Example pattern |
+|--------------|---------------------------|-----------------|
+| Regular bucket (any addressing style) | `{bucket}` | `my-bucket/temp/**` |
+| Regional access point | `{name}-{account}-s3alias` | `myap-123456789012-s3alias/**` |
+| Multi-Region Access Point (MRAP) | `{alias}.mrap` | `mfzwi23gnjvgw.mrap/data/**` |
+| Non-AWS S3-compatible / unrecognized host | `{host}:/{path}` (bare normalized path) | `minio.local:/bucket/**` |
+
+See [CACHING.md — Access Point and MRAP Cache Key Prefixing](CACHING.md#access-point-and-mrap-cache-key-prefixing) for how each form is derived.
+
+### Performance
+
+Resolution cost depends on how many rules match a single key, not the total rule
+count. 1024 highly-specific rules where only 1–2 match any given key are
+effectively free; many broad `**` rules that all match the same key cost more.
+Prefer specific patterns over broad catch-alls when rule counts are high.
+
+The default cap of 1024 rules is a safety guardrail. In practice, resolution
+adds negligible latency at any realistic rule count.
+
+### Rules Are Re-Evaluated on Each Read
+
+Resolved settings are re-evaluated against the current rules on each read request, so a rule change applies to already-cached objects on the next GET/HEAD after the staleness window — not only to newly written objects. Freshness is determined by comparing `now - created_at` against the current resolved TTL (`get_ttl` for GET, `head_ttl` for HEAD), not by the `expires_at` / `head_expires_at` baked at write time. For example, tightening a key's resolved `get_ttl` from `1h` to `5m` expires already-cached objects once `now - created_at` exceeds 5m, and `get_ttl: "0s"` forces revalidation against S3 on the next GET. Setting `read_cache_enabled: false` stops serving the key from cache and eagerly deletes the cached entry (range files + metadata) on the first GET/HEAD after the rule takes effect. No restart or manual cache wipe is required.
 
 ### Validation
 
-- Negative TTL values are rejected
-- Empty or invalid prefixes in `prefix_overrides` are rejected
-- On validation failure, the proxy uses the previously valid settings (or global defaults if no previous valid settings exist)
+- Empty `pattern` → rule set rejected
+- A glob that cannot be translated to a valid regex → rule set rejected
+- More than the maximum number of rules (default 1024) → rule set rejected
+- An unparseable duration → rule set rejected
 
-See [CACHING.md](CACHING.md#bucket-level-cache-settings) for detailed behavior of each setting.
+On any validation failure the proxy applies the reload error behavior above: it keeps the last-known-good rule set (or starts with an empty rule set if the file was invalid at first startup) and logs a warning.
+
+See [CACHING.md](CACHING.md#cache-rules) for the runtime behavior of each setting.
 
 ## Cache Expiration Scenarios
 

@@ -3720,6 +3720,29 @@ logging:
     }
 
     #[test]
+    fn test_bucket_settings_staleness_threshold_defaults_when_omitted() {
+        // Config-compatibility regression: a config file that omits
+        // `bucket_settings_staleness_threshold` (the rules-file staleness window)
+        // must still parse and fall back to the 60s default, so upgrading the
+        // binary never requires editing an existing config file.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+
+        assert_eq!(
+            config.cache.bucket_settings_staleness_threshold,
+            Duration::from_secs(60),
+            "omitted bucket_settings_staleness_threshold must default to 60s"
+        );
+    }
+
+    #[test]
     fn test_write_cache_enabled_explicit_true() {
         // Test that write_cache_enabled can be explicitly set to true
         let yaml = r#"
