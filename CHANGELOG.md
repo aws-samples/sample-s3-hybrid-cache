@@ -5,7 +5,7 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0] - 2026-06-09
+## [2.1.0] - 2026-06-12
 
 ### Added
 - **`connection_pool.upstream_overrides`: per-destination upstream transport overrides**: A new optional config map lets the proxy front S3-compatible stores that are not reachable over verified TLS on port 443 — stores served over plaintext HTTP, over validated HTTPS on a non-443 port, or over unvalidated HTTPS (self-signed certificates on trusted networks). Each entry is keyed on a host matcher and port and declares the upstream transport (`scheme`, and for HTTPS `validate_tls`). The override lookup is the sole transport switch for a request: the proxy resolves the destination `(host, port)` against the map and falls back to verified-TLS-on-443 egress when no entry matches. `validate_tls` defaults to `true`, so an HTTPS override is secure unless validation is explicitly waived. Protection-waiving modes (plaintext HTTP and unvalidated HTTPS) emit a startup warning and are intended for local development and trusted networks only. The feature is opt-in, default-off, and additive: with no overrides configured, every destination keeps the existing verified-TLS-on-443 behaviour, identical to a build without this feature. Resolves GitHub #7.
