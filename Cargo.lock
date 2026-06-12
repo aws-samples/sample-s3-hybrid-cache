@@ -1392,7 +1392,6 @@ dependencies = [
  "prost",
  "reqwest",
  "thiserror 2.0.17",
- "tracing",
 ]
 
 [[package]]
@@ -1911,7 +1910,7 @@ checksum = "62049b2877bf12821e8f9ad256ee38fdc31db7387ec2d3b3f403024de2034aea"
 
 [[package]]
 name = "s3-proxy"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "blake3",

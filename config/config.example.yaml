@@ -29,10 +29,22 @@ server:
   # Add Referer header for proxy identification in S3 Server Access Logs (default: true)
   # Format: Hybrid Cache for Amazon S3/{version} ({hostname})
   add_referer_header: true
-  # Maximum request body size buffered in memory (applies to single-part PUT and UploadPart).
+  # Maximum accepted/streamed request body size (applies to single-part PUT and UploadPart).
+  # The cap is still enforced (oversized bodies are rejected with HTTP 413 EntityTooLarge),
+  # but the body is now streamed to the upstream and tee'd to the cache incrementally rather
+  # than held whole in RAM — so this is the largest body the proxy will accept, not an amount
+  # of memory it reserves.
   # Default 5 GiB matches the S3 protocol maximum so all valid S3 clients work transparently.
   # Lower this on memory-constrained instances (e.g. 256m for 256 MiB).
   # max_buffered_request_body_bytes: 5368709120
+  # Cache-tee channel depth for the streaming signed-write path, in frames (default: 5).
+  # On a streamed PUT/UploadPart the body is forwarded to the upstream verbatim while each
+  # frame is tee'd to the write-through cache over a bounded channel of this many frames.
+  # Per-connection streaming-cache memory is one in-flight frame plus this many queued frames.
+  # A frame is a single forwarded request-body frame, bounded by the HTTP read buffer, so the
+  # default of 5 keeps it on par with the GET path — independent of object size.
+  # Raising it can improve cache-write throughput at the cost of more per-connection memory.
+  # write_cache_tee_channel_depth: 5
 
   # TLS Proxy Listener Configuration
   # Terminates TLS using the proxy's own certificate, then processes decrypted HTTP
@@ -411,6 +423,53 @@ connection_pool:
   #
   #   # Cross-region bucket access
   #   "*.s3.eu-west-1.amazonaws.com": ["10.0.4.100", "10.0.4.101"]
+  #
+  # upstream_overrides: Per-destination upstream transport overrides. Empty by default:
+  # every caching-egress destination uses verified TLS on port 443. Set entries only for
+  # the specific stores you front on a non-standard transport.
+  #
+  # Each key is "host:port" (the port is part of the key). Each value is
+  # { scheme: http|https, validate_tls: <bool> }, selecting one of three transport modes:
+  #   - scheme: http                        → plaintext HTTP, no TLS handshake
+  #   - scheme: https, validate_tls: true   → HTTPS verified against the system trust store (default)
+  #   - scheme: https, validate_tls: false  → HTTPS with NO certificate verification
+  # validate_tls defaults to true when omitted (secure by default; skipping validation
+  # is an explicit opt-in). There is no custom-CA mode — validation is full or none.
+  #
+  # Matching: an IP literal matches that IP exactly. A DNS name matches itself AND any
+  # subdomain, so "store.local:9000" also covers "bucket.store.local:9000" (path-style
+  # and virtual-hosted addressing from one entry). A bare "*" matcher is rejected.
+  # Hostnames resolve via the configured external DNS above (never /etc/hosts), so a
+  # publicly-resolvable name like s3.<region>.amazonaws.com resolves to the real origin.
+  # Independent of endpoint_overrides (IP resolution + its TLS-1.2 lock) — they compose.
+  #
+  # SECURITY: scheme: http (cleartext exposure) and validate_tls: false (loss of MITM
+  # protection on the proxy→origin leg) WAIVE a protection. Use them for LOCAL
+  # DEVELOPMENT or TRUSTED NETWORKS ONLY — never across untrusted networks. The proxy
+  # logs a startup warning for each protection-waiving entry. Validated HTTPS waives
+  # nothing and is not warned.
+  #
+  # UPSTREAM PORT SOURCE: the upstream port comes from the request. In forward-proxy
+  # mode the absolute-form request authority carries the upstream host:port, so the
+  # proxy dials any port the client targets. In standard (hosts-file) mode the port
+  # comes from the Host header (defaulting to 80) and the proxy intercepts only the
+  # single http_port it is bound to (plus the 443 TCP passthrough, which does not
+  # cache): point http_port at a non-standard port and that one port is intercepted,
+  # but reaching several ports — or leaving the listener on 80/443 while fronting a
+  # store elsewhere — needs proxy mode. The transport (plaintext vs TLS, and TLS
+  # validation) is selectable on whatever port the request targets in either mode.
+  # Either way the upstream hostname resolves via dns_servers (never /etc/hosts), so it
+  # must resolve to the real origin, not back to the proxy.
+  #
+  # upstream_overrides:
+  #   # Plaintext local store (e.g. MinIO/RustFS on :9000) — cleartext, dev only
+  #   "127.0.0.1:9000": { scheme: http }
+  #
+  #   # Customer store with a publicly-trusted cert on a non-443 port — validated HTTPS
+  #   "store.example.com:9000": { scheme: https, validate_tls: true }
+  #
+  #   # Self-signed store in a trusted network — HTTPS, no cert verification, trusted-net only
+  #   "store.local:9000": { scheme: https, validate_tls: false }
   # IP Distribution: create separate hyper connection pools per S3 IP address.
   # When enabled, the proxy rewrites request URI authorities from hostname to individual
   # IP addresses, causing hyper to maintain per-IP connection pools. This distributes

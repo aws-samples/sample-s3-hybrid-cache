@@ -14,6 +14,7 @@ use s3_proxy::{
     permissions::PermissionValidator,
     shutdown::{ShutdownCoordinator, ShutdownSignal},
     tls_proxy_listener::TlsProxyListener,
+    upstream_overrides::UpstreamOverrides,
     Result,
 };
 use std::net::SocketAddr;
@@ -230,6 +231,21 @@ async fn main() -> Result<()> {
         );
     } else {
         info!("Write cache: disabled");
+    }
+
+    // Warn per protection-waiving upstream override (Requirement 1.6, 1.7).
+    // Startup-only diagnostic build of the matcher: cheap, runs once, and is
+    // separate from the connector/S3Client matcher used on the hot path. Only
+    // Plaintext / TlsUnvalidated entries are surfaced; TlsValidated waives
+    // nothing and is intentionally silent.
+    for entry in UpstreamOverrides::from_config(&config.connection_pool.upstream_overrides)
+        .protection_waiving_entries()
+    {
+        warn!(
+            endpoint = %entry.endpoint,
+            "Upstream override waives a security protection: {}",
+            entry.waived_protection()
+        );
     }
 
     // Initialize shutdown coordinator

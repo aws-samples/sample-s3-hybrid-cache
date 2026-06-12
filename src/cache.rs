@@ -7924,7 +7924,7 @@ impl CacheManager {
         response_headers: HashMap<String, String>,
         effective_put_ttl: std::time::Duration,
     ) -> Result<()> {
-        use crate::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
+        use crate::cache_types::{NewCacheMetadata, ObjectMetadata};
 
         let content_length = data.len() as u64;
         let now = SystemTime::now();
@@ -7936,8 +7936,10 @@ impl CacheManager {
         );
 
         // Atomically reserve write cache capacity (Requirement 9.1, 9.2)
-        // The reservation is held for the duration of this function and auto-releases on drop.
-        let _reservation = if content_length > 0 {
+        // The reservation is moved into the streaming sink (non-empty path) and
+        // held for the sink's lifetime, auto-releasing on drop — preserving the
+        // buffered path's capacity accounting.
+        let reservation = if content_length > 0 {
             match self.try_reserve_write_cache(content_length).await {
                 Some(reservation) => Some(reservation),
                 None => {
@@ -8020,99 +8022,61 @@ impl CacheManager {
             }
         }
 
-        // Store as range 0 to content_length-1
-        let start = 0u64;
+        // Store as range 0 to content_length-1, streaming the bytes through the
+        // same batched `IncrementalRangeWriter` the GET miss path uses (reusing
+        // `compression_batch_size`) rather than compressing the whole object into
+        // one buffer + a single `std::fs::write`. Per-bucket compression control
+        // (Requirements 5.1, 5.2, 5.3) is honoured via `resolved.compression_enabled`.
         let end = content_length - 1;
-
-        // Compress the range data (Requirements 5.1, 5.2, 5.3: per-bucket compression control)
         let resolved = self.resolve_settings(cache_key).await;
-        let path = Self::extract_path_from_cache_key(cache_key);
-        let (compressed_data, compression_algorithm, compressed_size, uncompressed_size) =
-            if resolved.compression_enabled {
-                let compression_result = {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner
-                        .compression_handler
-                        .compress_content_aware_with_metadata(data, &path)
-                };
-                (
-                    compression_result.data,
-                    compression_result.algorithm,
-                    compression_result.compressed_size,
-                    compression_result.original_size,
-                )
-            } else {
-                // Compression disabled for this bucket
-                (
-                    data.to_vec(),
-                    crate::compression::CompressionAlgorithm::None,
-                    data.len() as u64,
-                    data.len() as u64,
-                )
-            };
 
-        // Write range data to .tmp file then atomically rename
-        let range_file_path = self.get_new_range_file_path(cache_key, start, end);
-        let range_tmp_path = range_file_path.with_extension("bin.tmp");
-
-        // Ensure ranges directory exists
-        if let Some(parent) = range_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create ranges directory: {}", e))
-            })?;
-        }
-
-        // Write to temporary file
-        if let Err(e) = std::fs::write(&range_tmp_path, &compressed_data) {
-            // Best-effort cleanup of temp file and lock release
-            let _ = std::fs::remove_file(&range_tmp_path);
-            if lock_acquired {
-                let _ = self.release_write_lock(cache_key).await;
-            }
-            return Err(ProxyError::CacheError(format!(
-                "Failed to write range tmp file: {}",
-                e
-            )));
-        }
-
-        // Atomic rename
-        if let Err(e) = std::fs::rename(&range_tmp_path, &range_file_path) {
-            // Best-effort cleanup of temp file and lock release
-            let _ = std::fs::remove_file(&range_tmp_path);
-            if lock_acquired {
-                let _ = self.release_write_lock(cache_key).await;
-            }
-            return Err(ProxyError::CacheError(format!(
-                "Failed to rename range file: {}",
-                e
-            )));
-        }
-
-        // Create range spec with relative path from ranges/ directory
-        let ranges_dir = self.cache_dir.join("ranges");
-        let range_file_relative_path = match range_file_path.strip_prefix(&ranges_dir) {
-            Ok(path) => path.to_string_lossy().to_string(),
+        // Open the streaming write-cache sink over a configured disk cache manager
+        // (carries `compression_batch_size` + journal/size wiring). The capacity
+        // reservation is moved into the sink and held for its lifetime.
+        let disk_cache = self.create_configured_disk_cache_manager();
+        let mut sink = match WriteCacheRangeSink::open(
+            disk_cache,
+            cache_key,
+            content_length,
+            resolved.compression_enabled,
+            reservation,
+        )
+        .await
+        {
+            Ok(sink) => sink,
             Err(e) => {
-                // Best-effort cleanup of temp file and lock release
-                let _ = std::fs::remove_file(&range_tmp_path);
                 if lock_acquired {
                     let _ = self.release_write_lock(cache_key).await;
                 }
-                return Err(ProxyError::CacheError(format!(
-                    "Failed to compute relative path: {}",
-                    e
-                )));
+                return Err(e);
             }
         };
 
-        let range_spec = RangeSpec::new(
-            start,
-            end,
-            range_file_relative_path,
-            compression_algorithm.clone(),
-            compressed_size,
-            uncompressed_size,
-        );
+        // Feed all object bytes (single write; the writer batches into
+        // `compression_batch_size` LZ4 frames).
+        if let Err(e) = sink.write(data) {
+            sink.discard();
+            if lock_acquired {
+                let _ = self.release_write_lock(cache_key).await;
+            }
+            return Err(e);
+        }
+
+        // Finalize the bytes (publish the `.bin`) and obtain the RangeSpec. The
+        // sink retains the capacity reservation until it drops at the end of this
+        // function — after the metadata write below — matching the buffered path's
+        // reservation lifetime.
+        let range_spec = match sink.finalize() {
+            Ok(range_spec) => range_spec,
+            Err(e) => {
+                if lock_acquired {
+                    let _ = self.release_write_lock(cache_key).await;
+                }
+                return Err(e);
+            }
+        };
+        let compression_algorithm = range_spec.compression_algorithm.clone();
+        let compressed_size = range_spec.compressed_size;
 
         // Create object metadata with write cache tracking fields (Requirements 1.2, 1.3)
         let object_metadata = ObjectMetadata {
@@ -8147,7 +8111,8 @@ impl CacheManager {
             ..Default::default()
         };
 
-        // Store metadata
+        // Store metadata immediately (.meta) so an immediate post-PUT GET is a
+        // cache hit — read-after-write parity with the buffered path.
         let store_result = self.store_new_metadata(&metadata).await;
 
         // Invalidate RAM metadata cache so subsequent requests see the new PUT data
@@ -8172,6 +8137,130 @@ impl CacheManager {
         );
 
         Ok(())
+    }
+
+    /// Open a streaming write-cache sink for a signed-write PUT, reserving
+    /// write-cache capacity for `content_length` bytes and resolving per-bucket
+    /// compression, so the streamed body can be tee'd to the disk cache
+    /// incrementally (streaming-write-path Component 4).
+    ///
+    /// Returns:
+    /// - `Ok(Some(sink))` — capacity reserved and the incremental range write
+    ///   began; the sink holds the reservation for its lifetime (RAII), matching
+    ///   `store_put_as_write_cached_range_with_ttl`.
+    /// - `Ok(None)` — write-cache capacity is unavailable; caching is skipped and
+    ///   the caller still streams the body to the upstream (Req 7.2).
+    /// - `Err(..)` — an unexpected failure beginning the range write.
+    ///
+    /// `content_length` MUST be `> 0`; empty objects are cached via the
+    /// metadata-only path (`WriteCacheRangeSink::open` rejects a zero length).
+    pub(crate) async fn open_write_cache_sink(
+        &self,
+        cache_key: &str,
+        content_length: u64,
+    ) -> Result<Option<WriteCacheRangeSink>> {
+        let reservation = match self.try_reserve_write_cache(content_length).await {
+            Some(reservation) => reservation,
+            None => {
+                debug!(
+                    "Write cache cannot accommodate streamed entry of {} bytes for key: {}",
+                    content_length, cache_key
+                );
+                return Ok(None);
+            }
+        };
+
+        let resolved = self.resolve_settings(cache_key).await;
+        let disk_cache = self.create_configured_disk_cache_manager();
+        let sink = WriteCacheRangeSink::open(
+            disk_cache,
+            cache_key,
+            content_length,
+            resolved.compression_enabled,
+            Some(reservation),
+        )
+        .await?;
+        Ok(Some(sink))
+    }
+
+    /// Open a streaming sink that stages an `UploadPart` body into the upload's
+    /// in-progress directory (`mpus_in_progress/{upload_id}/part{N}.bin`) as it
+    /// flows, so the part is cached incrementally (streaming-write-path Req 6.2)
+    /// rather than buffered whole in RAM like `cache_upload_part` does.
+    ///
+    /// The sink reuses the GET-path batched-LZ4 incremental writer (per-bucket
+    /// compression resolved via [`Self::resolve_settings`]). Parts are not
+    /// write-cache-capacity-reserved (matching `cache_upload_part`); the handler's
+    /// `should_cache` decision already gates whether a part is cached. The caller
+    /// finalizes the sink and records the tracker under `upload.lock` only on S3
+    /// success, preserving the per-part correctness gate.
+    pub(crate) async fn open_multipart_part_sink(
+        &self,
+        cache_key: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<MultipartPartSink> {
+        let resolved = self.resolve_settings(cache_key).await;
+        let disk_cache = self.create_configured_disk_cache_manager();
+        let part_final_path = self
+            .cache_dir
+            .join("mpus_in_progress")
+            .join(upload_id)
+            .join(format!("part{}.bin", part_number));
+        let writer = disk_cache
+            .begin_incremental_part_write(part_final_path, cache_key, resolved.compression_enabled)
+            .await?;
+        Ok(MultipartPartSink {
+            writer: Some(writer),
+            cache_key: cache_key.to_string(),
+        })
+    }
+
+    /// Write the write-cache `.meta` for a streamed PUT whose range bytes were
+    /// already finalized (the `.bin` was published) via
+    /// [`WriteCacheRangeSink::finalize`].
+    ///
+    /// This mirrors the metadata-storing tail of
+    /// [`Self::store_put_as_write_cached_range_with_ttl`]: it stamps the per-range
+    /// compression facts onto the object metadata, builds the
+    /// [`crate::cache_types::NewCacheMetadata`], and writes the `.meta`
+    /// **immediately** via `store_new_metadata` (then invalidates the RAM metadata
+    /// cache). Writing the `.meta` synchronously is what preserves read-after-write
+    /// cache semantics — an immediate post-PUT GET is a hit. The streaming sink's
+    /// journal-only `commit` defers the `.meta` until consolidation, which would
+    /// turn that GET into a miss and regress deployment-verification T9/T10, so the
+    /// streaming cache task uses `finalize` + this method instead of `commit`.
+    pub(crate) async fn store_streamed_write_cache_metadata(
+        &self,
+        cache_key: &str,
+        range_spec: crate::cache_types::RangeSpec,
+        mut object_metadata: crate::cache_types::ObjectMetadata,
+        effective_put_ttl: std::time::Duration,
+    ) -> Result<()> {
+        use crate::cache_types::NewCacheMetadata;
+
+        // The streamed metadata builder leaves compression fields at their defaults;
+        // the true per-range algorithm/size come from the finalized range, exactly
+        // as the buffered path copies them off its `range_spec`.
+        object_metadata.compression_algorithm = range_spec.compression_algorithm.clone();
+        object_metadata.compressed_size = range_spec.compressed_size;
+
+        let now = SystemTime::now();
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata,
+            ranges: vec![range_spec],
+            created_at: now,
+            expires_at: now + effective_put_ttl,
+            compression_info: crate::cache_types::CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let store_result = self.store_new_metadata(&metadata).await;
+        // Invalidate RAM metadata cache so subsequent requests see the new PUT data,
+        // mirroring `store_put_as_write_cached_range_with_ttl`.
+        self.invalidate_metadata_cache(cache_key).await;
+        store_result
     }
 
     /// Store full object as range using new range storage architecture
@@ -10427,6 +10516,256 @@ impl CacheManager {
             metadata.cache_key
         );
         Ok(())
+    }
+}
+
+/// Streaming write-cache sink built over the GET path's
+/// [`crate::disk_cache::IncrementalRangeWriter`].
+///
+/// Lets the signed-write path tee object bytes to the disk cache incrementally:
+/// `open()` reserves write-cache capacity and begins an incremental range write,
+/// `write()` feeds decoded object bytes into the same
+/// `cache.compression_batch_size`-batched LZ4 writer the GET miss path uses
+/// (`begin_incremental_range_write` + `write_range_chunk`), and `commit()` /
+/// `discard()` finalize (`commit_incremental_range`) or abandon
+/// (`abort_incremental_range`) the range. This replaces the whole-object
+/// compress-then-single-`std::fs::write` of
+/// `store_put_as_write_cached_range_with_ttl` with a bounded-memory incremental
+/// write whose peak memory is one `compression_batch_size` batch rather than the
+/// whole object.
+///
+/// The [`crate::write_cache_manager::WriteReservation`] returned by
+/// `try_reserve_write_cache` is held for the sink's lifetime and auto-released on
+/// drop (RAII), preserving today's write-cache capacity accounting whether the
+/// sink commits, is discarded, or is dropped on an error path. If the sink is
+/// dropped before `commit()`/`discard()`, the in-progress `.tmp` file is cleaned
+/// up via `abort_incremental_range`.
+///
+/// The `compression_batch_size` named in the open contract is carried by the
+/// supplied [`crate::disk_cache::DiskCacheManager`] (seeded from
+/// `CacheConfig::compression_batch_size` in `create_configured_disk_cache_manager`),
+/// so the sink batches identically to the GET path without a duplicate knob.
+//
+// NOTE: The whole-buffer caller `store_put_as_write_cached_range_with_ttl` is
+// reimplemented on top of this type (task 2.2) via `open` → `write` → `finalize`.
+// The streaming write-cache task (`SignedPutHandler::run_streaming_cache_write`)
+// also uses `finalize` + an immediate `store_new_metadata` (via
+// `CacheManager::store_streamed_write_cache_metadata`) to preserve read-after-write
+// cache semantics. The journal-only `commit` defers the `.meta` until
+// consolidation; it is retained as the journal-based finalizer and is exercised by
+// `write_cache_range_sink_tests`.
+pub(crate) struct WriteCacheRangeSink {
+    /// Configured disk cache manager used to begin/commit/abort the incremental
+    /// range. Carries `compression_batch_size` and the journal/size-tracking wiring.
+    disk_cache: crate::disk_cache::DiskCacheManager,
+    /// In-progress incremental range writer. `None` once `commit()`/`discard()`
+    /// has consumed it (or after `Drop` cleanup).
+    writer: Option<crate::disk_cache::IncrementalRangeWriter>,
+    /// Cache key being written (used for logging/diagnostics).
+    cache_key: String,
+    /// Write-cache capacity reservation, held for the sink's lifetime. Released by
+    /// its own `Drop` when the sink is dropped (RAII). Never read directly.
+    _reservation: Option<crate::write_cache_manager::WriteReservation>,
+}
+
+impl WriteCacheRangeSink {
+    /// Open a streaming write-cache sink for `cache_key`, reserving capacity and
+    /// beginning an incremental range write covering bytes `0..=content_length-1`.
+    ///
+    /// `disk_cache` MUST be a configured manager (see
+    /// `CacheManager::create_configured_disk_cache_manager`) so commits journal and
+    /// size-track exactly like the GET path; its `compression_batch_size` drives the
+    /// LZ4 batch size. `reservation` is the capacity reservation from
+    /// `try_reserve_write_cache`, held for the sink's lifetime; pass `None` only for
+    /// callers that do not track capacity.
+    ///
+    /// Empty objects (`content_length == 0`) have no range to write and are cached
+    /// via the metadata-only path by the caller, so they are rejected here.
+    pub(crate) async fn open(
+        disk_cache: crate::disk_cache::DiskCacheManager,
+        cache_key: &str,
+        content_length: u64,
+        compression_enabled: bool,
+        reservation: Option<crate::write_cache_manager::WriteReservation>,
+    ) -> Result<Self> {
+        if content_length == 0 {
+            return Err(ProxyError::CacheError(format!(
+                "WriteCacheRangeSink::open requires content_length > 0 (empty objects \
+                 are cached via the metadata-only path): key={}",
+                cache_key
+            )));
+        }
+
+        let start = 0u64;
+        let end = content_length - 1;
+        let writer = disk_cache
+            .begin_incremental_range_write(cache_key, start, end, compression_enabled)
+            .await?;
+
+        Ok(Self {
+            disk_cache,
+            writer: Some(writer),
+            cache_key: cache_key.to_string(),
+            _reservation: reservation,
+        })
+    }
+
+    /// Feed decoded object bytes into the batched incremental writer. Bytes are
+    /// accumulated into a `compression_batch_size` batch and flushed as one LZ4
+    /// frame at the threshold, identical to the GET miss path.
+    pub(crate) fn write(&mut self, chunk: &[u8]) -> Result<()> {
+        match self.writer.as_mut() {
+            Some(writer) => crate::disk_cache::DiskCacheManager::write_range_chunk(writer, chunk),
+            None => Err(ProxyError::CacheError(format!(
+                "WriteCacheRangeSink::write called after commit/discard: key={}",
+                self.cache_key
+            ))),
+        }
+    }
+
+    /// Finalize the range bytes **without** writing metadata: flush any residual
+    /// batch, validate the written length, and atomically publish the `.bin`.
+    /// Returns the [`crate::cache_types::RangeSpec`] describing the published file
+    /// so the caller can build and store the write-cache `.meta` itself (via
+    /// `store_new_metadata`), preserving today's immediate read-after-write cache
+    /// semantics. Takes `&mut self` (rather than consuming) so the capacity
+    /// reservation stays held until the sink drops at the end of the caller —
+    /// after the metadata write — matching the buffered path's reservation
+    /// lifetime. Once called, the writer is consumed; a later `commit`/`discard`
+    /// would error / be a no-op, and `Drop` will not double-finalize.
+    pub(crate) fn finalize(&mut self) -> Result<crate::cache_types::RangeSpec> {
+        let writer = self.writer.take().ok_or_else(|| {
+            ProxyError::CacheError(format!(
+                "WriteCacheRangeSink::finalize called after commit/discard/finalize: key={}",
+                self.cache_key
+            ))
+        })?;
+        let (range_spec, _range_already_existed) =
+            self.disk_cache.finalize_incremental_range(writer)?;
+        Ok(range_spec)
+    }
+
+    /// Finalize the range: flush any residual batch, validate the written length,
+    /// atomically publish the `.bin`, and write the write-cache metadata + journal
+    /// entry with `object_metadata` and `ttl`. Consumes the sink; the capacity
+    /// reservation is released when it drops.
+    //
+    // The journal-only metadata write defers the `.meta` until consolidation. Both
+    // the whole-buffer write-cache path AND the streaming forward path
+    // (`run_streaming_cache_write`) instead use `finalize` + an immediate
+    // `store_new_metadata` so a post-write GET hits the cache, so `commit` has no
+    // production caller. It is retained as the journal-based finalizer and is
+    // exercised by `write_cache_range_sink_tests`; `#[allow(dead_code)]` covers the
+    // non-test build where it is unreferenced.
+    #[allow(dead_code)]
+    pub(crate) async fn commit(
+        mut self,
+        object_metadata: crate::cache_types::ObjectMetadata,
+        ttl: Duration,
+    ) -> Result<()> {
+        let writer = self.writer.take().ok_or_else(|| {
+            ProxyError::CacheError(format!(
+                "WriteCacheRangeSink::commit called with no active writer: key={}",
+                self.cache_key
+            ))
+        })?;
+
+        // Borrow (not move) `self.disk_cache`; `self` drops at the end of this
+        // method, releasing the reservation after the commit completes.
+        self.disk_cache
+            .commit_incremental_range(writer, object_metadata, ttl)
+            .await
+    }
+
+    /// Abandon the range, cleaning up the in-progress `.tmp` file. Consumes the
+    /// sink; the capacity reservation is released when it drops. Used on cache-skip
+    /// / cache-failure paths so the upload can proceed without a cached copy.
+    pub(crate) fn discard(mut self) {
+        if let Some(writer) = self.writer.take() {
+            crate::disk_cache::DiskCacheManager::abort_incremental_range(writer);
+        }
+    }
+}
+
+impl Drop for WriteCacheRangeSink {
+    fn drop(&mut self) {
+        // Sink dropped before an explicit commit/discard (e.g. an early error
+        // return). Clean up the in-progress `.tmp` file so it is not orphaned. The
+        // capacity reservation is released by its own `Drop` immediately after this.
+        if let Some(writer) = self.writer.take() {
+            crate::disk_cache::DiskCacheManager::abort_incremental_range(writer);
+        }
+    }
+}
+
+/// Streaming sink for a single `UploadPart` body, staging the part into
+/// `mpus_in_progress/{upload_id}/part{N}.bin` as bytes flow
+/// (streaming-write-path Component 5, Req 6.2). Opened by
+/// [`CacheManager::open_multipart_part_sink`].
+///
+/// Unlike [`WriteCacheRangeSink`], a part has no final byte offset until the
+/// upload completes, so this sink does not journal/commit object metadata. The
+/// streaming cache task fills it via [`Self::write`], then on S3 success
+/// [`Self::finalize`]s it (atomic `.tmp` → `part{N}.bin` rename) and records the
+/// `upload.meta` tracker under `upload.lock` — the per-part correctness gate.
+/// On any skip/failure the sink is [`Self::discard`]ed (or dropped), abandoning
+/// the `.tmp`, and the upload streams to the upstream unaffected (Req 7).
+pub(crate) struct MultipartPartSink {
+    /// In-progress incremental part writer (batched LZ4 frames). `None` once
+    /// `finalize()`/`discard()` has consumed it (or after `Drop` cleanup).
+    writer: Option<crate::disk_cache::IncrementalRangeWriter>,
+    /// Cache key being written (used for diagnostics).
+    cache_key: String,
+}
+
+impl MultipartPartSink {
+    /// Feed decoded part bytes into the batched incremental writer. Bytes are
+    /// accumulated into a `compression_batch_size` batch and flushed as one LZ4
+    /// frame at the threshold, identical to the GET miss path and the single-PUT
+    /// write-cache sink.
+    pub(crate) fn write(&mut self, chunk: &[u8]) -> Result<()> {
+        match self.writer.as_mut() {
+            Some(writer) => crate::disk_cache::DiskCacheManager::write_range_chunk(writer, chunk),
+            None => Err(ProxyError::CacheError(format!(
+                "MultipartPartSink::write called after finalize/discard: key={}",
+                self.cache_key
+            ))),
+        }
+    }
+
+    /// Finalize the staged part: flush any residual batch, atomically publish
+    /// `part{N}.bin`, and return its [`crate::disk_cache::PartFinalizeInfo`]
+    /// (algorithm + sizes) for the upload tracker. Consumes the sink. MUST be
+    /// called under the upload's `upload.lock` so the on-disk part file and the
+    /// tracker ETag are updated as one critical section (the per-part correctness
+    /// gate, identical to `cache_upload_part`).
+    pub(crate) fn finalize(mut self) -> Result<crate::disk_cache::PartFinalizeInfo> {
+        let writer = self.writer.take().ok_or_else(|| {
+            ProxyError::CacheError(format!(
+                "MultipartPartSink::finalize called after finalize/discard: key={}",
+                self.cache_key
+            ))
+        })?;
+        crate::disk_cache::DiskCacheManager::finalize_incremental_part(writer)
+    }
+
+    /// Abandon the staged part, cleaning up its `.tmp` file. Consumes the sink.
+    /// Used on cache-skip / cache-failure paths so the upload proceeds without a
+    /// cached part (Req 7).
+    pub(crate) fn discard(mut self) {
+        if let Some(writer) = self.writer.take() {
+            crate::disk_cache::DiskCacheManager::abort_incremental_range(writer);
+        }
+    }
+}
+
+impl Drop for MultipartPartSink {
+    fn drop(&mut self) {
+        // Sink dropped before an explicit finalize/discard: clean up the
+        // in-progress `.tmp` so it is not orphaned.
+        if let Some(writer) = self.writer.take() {
+            crate::disk_cache::DiskCacheManager::abort_incremental_range(writer);
+        }
     }
 }
 
@@ -13719,5 +14058,360 @@ mod head_freshness_current_ttl_tests {
             is_head_fresh(head_expires_at, created_at, current_head_ttl, now),
             "age exactly equal to head_ttl must be fresh (≤ comparison)"
         );
+    }
+}
+
+#[cfg(test)]
+mod write_cache_range_sink_tests {
+    use super::*;
+    use crate::cache_types::{ObjectMetadata, RangeSpec};
+    use crate::compression::CompressionAlgorithm;
+    use tempfile::TempDir;
+
+    /// Build a configured-enough disk cache manager for sink tests. `batch_size`
+    /// is small so the test exercises both the batch-flush and residual-flush
+    /// paths without large inputs.
+    async fn make_disk_cache(
+        temp_dir: &TempDir,
+        batch_size: usize,
+    ) -> crate::disk_cache::DiskCacheManager {
+        let dc = crate::disk_cache::DiskCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            true,  // compression_enabled
+            1024,  // compression_threshold
+            false, // write_cache_enabled (unused for the range round-trip)
+            batch_size,
+        );
+        dc.initialize().await.unwrap();
+        dc
+    }
+
+    /// open → write (multiple chunks crossing the batch threshold) → commit must
+    /// store a `.bin` that decodes byte-identically to the fed input.
+    #[tokio::test]
+    async fn open_write_commit_round_trips_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let batch_size = 4096usize;
+        let cache_key = "test-bucket/sink-roundtrip-object";
+
+        // 7000 bytes fed as [5000, 1000, 1000] guarantees a flushed batch plus a
+        // residual batch flushed at commit (mirrors the disk_cache commit test).
+        let total_len: usize = 7_000;
+        let input: Vec<u8> = (0..total_len).map(|i| (i % 251) as u8).collect();
+
+        let dc = make_disk_cache(&temp_dir, batch_size).await;
+        let mut sink = WriteCacheRangeSink::open(
+            dc,
+            cache_key,
+            total_len as u64,
+            true,
+            Some(crate::write_cache_manager::WriteReservation::noop()),
+        )
+        .await
+        .unwrap();
+
+        sink.write(&input[0..5000]).unwrap();
+        sink.write(&input[5000..6000]).unwrap();
+        sink.write(&input[6000..7000]).unwrap();
+
+        let object_metadata = ObjectMetadata {
+            etag: "sink-etag".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: total_len as u64,
+            content_type: Some("application/octet-stream".to_string()),
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: total_len as u64,
+            is_write_cached: true,
+            ..Default::default()
+        };
+        sink.commit(object_metadata, Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        // Read back via a second manager pointed at the same cache dir.
+        let reader = make_disk_cache(&temp_dir, batch_size).await;
+        let start = 0u64;
+        let end = (total_len as u64) - 1;
+        let final_path = reader.get_new_range_file_path(cache_key, start, end);
+        assert!(
+            final_path.exists(),
+            "committed .bin must exist: {:?}",
+            final_path
+        );
+
+        let ranges_dir = temp_dir.path().join("ranges");
+        let relative_path = final_path
+            .strip_prefix(&ranges_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let bin_len = std::fs::metadata(&final_path).unwrap().len();
+        let range_spec = RangeSpec::new(
+            start,
+            end,
+            relative_path,
+            CompressionAlgorithm::Lz4,
+            bin_len,
+            total_len as u64,
+        );
+
+        let loaded = reader.load_range_data(&range_spec).await.unwrap();
+        assert_eq!(
+            loaded, input,
+            "sink-stored bytes must be byte-identical to the fed input"
+        );
+    }
+
+    /// discard() must clean up the in-progress `.tmp` file and leave no `.bin`.
+    #[tokio::test]
+    async fn discard_cleans_up_tmp_and_leaves_no_bin() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/sink-discard-object";
+        let total_len: usize = 3_000;
+
+        let dc = make_disk_cache(&temp_dir, 4096).await;
+        let final_path = dc.get_new_range_file_path(cache_key, 0, (total_len as u64) - 1);
+
+        let mut sink = WriteCacheRangeSink::open(dc, cache_key, total_len as u64, true, None)
+            .await
+            .unwrap();
+        sink.write(&vec![0x5Au8; total_len]).unwrap();
+        sink.discard();
+
+        assert!(
+            !final_path.exists(),
+            "discard must not publish a .bin file: {:?}",
+            final_path
+        );
+        assert_eq!(
+            count_tmp_files(&temp_dir.path().join("ranges")),
+            0,
+            "discard must remove the in-progress .tmp file"
+        );
+    }
+
+    /// Dropping the sink without commit/discard must still clean up the `.tmp`.
+    #[tokio::test]
+    async fn drop_without_finalize_cleans_up_tmp() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/sink-drop-object";
+        let total_len: usize = 2_000;
+
+        let dc = make_disk_cache(&temp_dir, 4096).await;
+        {
+            let mut sink = WriteCacheRangeSink::open(dc, cache_key, total_len as u64, true, None)
+                .await
+                .unwrap();
+            sink.write(&vec![0x11u8; total_len]).unwrap();
+            // sink dropped here without commit/discard
+        }
+
+        assert_eq!(
+            count_tmp_files(&temp_dir.path().join("ranges")),
+            0,
+            "drop must remove the in-progress .tmp file"
+        );
+    }
+
+    /// open() rejects empty objects (cached via the metadata-only path instead).
+    #[tokio::test]
+    async fn open_rejects_empty_object() {
+        let temp_dir = TempDir::new().unwrap();
+        let dc = make_disk_cache(&temp_dir, 4096).await;
+        let result = WriteCacheRangeSink::open(dc, "test-bucket/empty", 0, true, None).await;
+        assert!(result.is_err(), "open must reject content_length == 0");
+    }
+
+    /// Recursively count `.tmp` files under `dir` (empty if the dir is absent).
+    fn count_tmp_files(dir: &std::path::Path) -> usize {
+        fn walk(dir: &std::path::Path, count: &mut usize) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                    *count += 1;
+                }
+            }
+        }
+        let mut count = 0;
+        walk(dir, &mut count);
+        count
+    }
+}
+
+#[cfg(test)]
+mod write_cache_range_sink_property_tests {
+    use super::*;
+    use crate::cache_types::ObjectMetadata;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    /// Cap object size to keep the property fast. The streaming and whole-buffer
+    /// paths are byte-equivalent regardless of size; a few tens of KB is more than
+    /// enough to cross many batch boundaries with the small batch size below.
+    const MAX_OBJECT_BYTES: usize = 48 * 1024;
+
+    /// Small compression batch so even modest inputs (and arbitrary chunk splits)
+    /// cross multiple `compression_batch_size` LZ4 frame boundaries, exercising the
+    /// batch-flush and residual-flush paths the equivalence claim depends on.
+    const BATCH_SIZE: usize = 64;
+
+    /// Build a configured-enough disk cache manager pointed at `temp_dir`, matching
+    /// the wiring `create_configured_disk_cache_manager` gives the real sink
+    /// (compression on, `BATCH_SIZE` as the `compression_batch_size`).
+    async fn make_disk_cache(temp_dir: &TempDir) -> crate::disk_cache::DiskCacheManager {
+        let dc = crate::disk_cache::DiskCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            true, // compression_enabled
+            1024, // compression_threshold
+            false,
+            BATCH_SIZE,
+        );
+        dc.initialize().await.unwrap();
+        dc
+    }
+
+    /// Store `data` through a `WriteCacheRangeSink`, feeding it via the supplied
+    /// `chunks` (each `open` → `write(chunk)*` → `finalize`), then read the
+    /// published `.bin` back and decompress it. Returns the decompressed bytes.
+    async fn store_via_sink_and_read_back(
+        temp_dir: &TempDir,
+        cache_key: &str,
+        total_len: u64,
+        chunks: &[&[u8]],
+    ) -> Vec<u8> {
+        let dc = make_disk_cache(temp_dir).await;
+        let mut sink = WriteCacheRangeSink::open(
+            dc,
+            cache_key,
+            total_len,
+            true, // compression_enabled
+            Some(crate::write_cache_manager::WriteReservation::noop()),
+        )
+        .await
+        .unwrap();
+
+        for chunk in chunks {
+            sink.write(chunk).unwrap();
+        }
+
+        // Build the write-cache metadata exactly as the whole-buffer path does and
+        // commit, so this is a faithful end-to-end store rather than a bare range
+        // finalize.
+        let object_metadata = ObjectMetadata {
+            etag: "prop-etag".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: total_len,
+            content_type: Some("application/octet-stream".to_string()),
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: total_len,
+            is_write_cached: true,
+            ..Default::default()
+        };
+        sink.commit(object_metadata, Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        // Read the committed range back through a second manager on the same dir
+        // and decompress, reconstructing the RangeSpec from the published file.
+        let reader = make_disk_cache(temp_dir).await;
+        let start = 0u64;
+        let end = total_len - 1;
+        let final_path = reader.get_new_range_file_path(cache_key, start, end);
+        let ranges_dir = temp_dir.path().join("ranges");
+        let relative_path = final_path
+            .strip_prefix(&ranges_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let bin_len = std::fs::metadata(&final_path).unwrap().len();
+        let range_spec = crate::cache_types::RangeSpec::new(
+            start,
+            end,
+            relative_path,
+            crate::compression::CompressionAlgorithm::Lz4,
+            bin_len,
+            total_len,
+        );
+        reader.load_range_data(&range_spec).await.unwrap()
+    }
+
+    /// **Feature: streaming-write-path, Property 3: Cache-byte equivalence**
+    ///
+    /// For any object input fed to `WriteCacheRangeSink` in any chunk splitting,
+    /// the decompressed bytes the sink stores equal the bytes the whole-buffer
+    /// cache write stores for the same input (a single `write(all)`). Range/frame
+    /// boundaries may differ with the splitting; the decompressed output may not —
+    /// and both must reproduce the original object bytes exactly.
+    ///
+    /// **Validates: Requirements 3.3, 10.3**
+    #[quickcheck]
+    fn prop_cache_byte_equivalence(data: Vec<u8>, raw_chunk_sizes: Vec<u16>) -> TestResult {
+        // The sink rejects empty objects (cached via the metadata-only path), and
+        // we cap size for speed.
+        if data.is_empty() || data.len() > MAX_OBJECT_BYTES {
+            return TestResult::discard();
+        }
+
+        // Derive an arbitrary chunk splitting that fully covers `data`, with every
+        // chunk at least 1 byte. Any uncovered remainder becomes a final chunk.
+        let mut chunks: Vec<&[u8]> = Vec::new();
+        let mut pos = 0usize;
+        for &sz in &raw_chunk_sizes {
+            if pos >= data.len() {
+                break;
+            }
+            let remaining = data.len() - pos;
+            let take = (sz as usize).max(1).min(remaining);
+            chunks.push(&data[pos..pos + take]);
+            pos += take;
+        }
+        if pos < data.len() {
+            chunks.push(&data[pos..]);
+        }
+
+        let total_len = data.len() as u64;
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+
+            // Streaming path: fed in the arbitrary chunk splitting.
+            let streamed = store_via_sink_and_read_back(
+                &temp_dir,
+                "prop-bucket/streamed-object",
+                total_len,
+                &chunks,
+            )
+            .await;
+
+            // Whole-buffer path: the same input as a single `write(all)`, which is
+            // exactly how `store_put_as_write_cached_range_with_ttl` feeds the sink.
+            let whole = store_via_sink_and_read_back(
+                &temp_dir,
+                "prop-bucket/whole-object",
+                total_len,
+                &[data.as_slice()],
+            )
+            .await;
+
+            if streamed != whole {
+                return TestResult::error(
+                    "streamed (chunk-split) stored bytes differ from whole-buffer stored bytes",
+                );
+            }
+            if streamed != data {
+                return TestResult::error(
+                    "streamed stored bytes differ from the original object bytes",
+                );
+            }
+            TestResult::passed()
+        })
     }
 }

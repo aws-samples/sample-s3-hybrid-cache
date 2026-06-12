@@ -397,6 +397,252 @@ pub fn encode_aws_chunked_with_trailers(
     result
 }
 
+/// Trailers and decoded length produced by [`IncrementalAwsChunkedDecoder::finish`].
+///
+/// Mirrors the trailer shape of the whole-buffer [`AwsChunkedDecodeResult`]
+/// (which carries `data: Vec<u8>` + `trailers: Vec<(String, String)>`); the
+/// incremental decoder has already emitted the decoded object bytes via
+/// [`IncrementalAwsChunkedDecoder::push`], so `finish` returns only the trailers
+/// and the running decoded length for validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsChunkedTrailers {
+    /// Trailers parsed after the zero-size chunk. Each entry is a (key, value)
+    /// pair. Common trailers include `x-amz-checksum-*` and
+    /// `x-amz-trailer-signature`.
+    pub trailers: Vec<(String, String)>,
+    /// Total number of decoded object bytes emitted across all `push` calls.
+    pub decoded_len: u64,
+}
+
+/// Parse state for [`IncrementalAwsChunkedDecoder`].
+///
+/// Mirrors the loop in [`decode_aws_chunked`]: read a chunk header line, emit
+/// `chunk-size` data bytes, consume the trailing CRLF, repeat until the
+/// zero-size chunk, then read the trailer section up to its terminal CRLF.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum DecoderState {
+    /// Accumulating a chunk-header line into `line_buf` until its CRLF.
+    #[default]
+    Header,
+    /// Emitting `remaining` object data bytes for the current chunk.
+    Data { remaining: usize },
+    /// Consuming the CRLF that follows a chunk's data (`\r` then `\n`).
+    DataCrlf { seen_cr: bool },
+    /// Accumulating the trailer section into `line_buf` until its terminal CRLF.
+    Trailers,
+    /// Terminal CRLF consumed; a fully-framed body. Any further bytes are
+    /// trailing garbage and yield `LengthMismatch`.
+    Done,
+}
+
+/// Streaming aws-chunked decoder that consumes bounded increments.
+///
+/// This is the incremental counterpart to [`decode_aws_chunked`]. It mirrors the
+/// same state machine (chunk header → data → CRLF → … → zero chunk → trailers)
+/// and reuses the same [`AwsChunkedError`] taxonomy and the 8 KiB trailer cap,
+/// but it never holds the whole body: object data bytes are emitted from
+/// [`push`](Self::push) as they arrive, and the only carry-over retained between
+/// calls is a partial chunk-header or trailer line (bounded by
+/// [`MAX_TRAILER_SECTION_BYTES`]).
+///
+/// It is used **only** on the cache tee branch of the streaming write path; the
+/// upstream always receives the original chunked bytes verbatim. The whole-buffer
+/// [`decode_aws_chunked`] is retained as the buffered path and the equivalence
+/// oracle in tests.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut decoder = IncrementalAwsChunkedDecoder::new();
+/// let mut object = Vec::new();
+/// for slice in body_slices {
+///     object.extend_from_slice(&decoder.push(slice)?);
+/// }
+/// let trailers = decoder.finish()?; // validates framing; carries decoded_len
+/// ```
+#[derive(Debug, Default)]
+pub struct IncrementalAwsChunkedDecoder {
+    /// Current parse state.
+    state: DecoderState,
+    /// Carry-over for a partial chunk-header line (Header) or the accumulating
+    /// trailer section (Trailers). Bounded by [`MAX_TRAILER_SECTION_BYTES`].
+    line_buf: Vec<u8>,
+    /// Running count of decoded object bytes emitted so far.
+    decoded_len: u64,
+    /// Trailers parsed once the zero-size chunk's trailer section completes.
+    trailers: Vec<(String, String)>,
+    /// Total raw (encoded) bytes consumed across all `push` calls. Used only to
+    /// report `LengthMismatch` bounds when trailing bytes follow a framed body.
+    total_raw: u64,
+}
+
+impl IncrementalAwsChunkedDecoder {
+    /// Create a new decoder positioned at the first chunk header.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the next slice of raw aws-chunked bytes.
+    ///
+    /// Returns any fully-decoded object bytes produced by this slice (which may
+    /// be empty if the slice only advanced framing). Partial chunk-header or
+    /// trailer lines are retained internally as bounded carry-over. Returns an
+    /// [`AwsChunkedError`] if the framing is malformed, mirroring
+    /// [`decode_aws_chunked`].
+    pub fn push(&mut self, input: &[u8]) -> Result<Vec<u8>, AwsChunkedError> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+
+        while cursor < input.len() {
+            match self.state {
+                DecoderState::Header => {
+                    if !self.feed_line(input, &mut cursor)? {
+                        break; // need more input to complete the header line
+                    }
+                    let header_str = std::str::from_utf8(&self.line_buf)
+                        .map_err(|e| AwsChunkedError::InvalidChunkHeader(e.to_string()))?;
+                    let chunk_size = parse_chunk_size(header_str)?;
+                    self.line_buf.clear();
+                    if chunk_size == 0 {
+                        self.state = DecoderState::Trailers;
+                    } else {
+                        self.state = DecoderState::Data {
+                            remaining: chunk_size,
+                        };
+                    }
+                }
+                DecoderState::Data { remaining } => {
+                    let avail = input.len() - cursor;
+                    let take = remaining.min(avail);
+                    out.extend_from_slice(&input[cursor..cursor + take]);
+                    cursor += take;
+                    self.total_raw += take as u64;
+                    self.decoded_len += take as u64;
+                    let left = remaining - take;
+                    self.state = if left == 0 {
+                        DecoderState::DataCrlf { seen_cr: false }
+                    } else {
+                        DecoderState::Data { remaining: left }
+                    };
+                }
+                DecoderState::DataCrlf { seen_cr } => {
+                    let b = input[cursor];
+                    cursor += 1;
+                    self.total_raw += 1;
+                    let expected = if seen_cr { b'\n' } else { b'\r' };
+                    if b != expected {
+                        return Err(AwsChunkedError::InvalidChunkHeader(
+                            "Missing CRLF after chunk data".to_string(),
+                        ));
+                    }
+                    self.state = if seen_cr {
+                        DecoderState::Header
+                    } else {
+                        DecoderState::DataCrlf { seen_cr: true }
+                    };
+                }
+                DecoderState::Trailers => {
+                    if !self.feed_trailers(input, &mut cursor)? {
+                        break; // need more input to complete the trailer section
+                    }
+                    let mut pos = 0usize;
+                    self.trailers = parse_trailers(&self.line_buf, &mut pos)?;
+                    self.line_buf.clear();
+                    self.state = DecoderState::Done;
+                }
+                DecoderState::Done => {
+                    // A complete body was already framed; extra bytes are
+                    // trailing garbage, exactly as the whole-buffer decoder's
+                    // `pos != body.len()` check rejects them.
+                    let remaining = (input.len() - cursor) as u64;
+                    return Err(AwsChunkedError::LengthMismatch {
+                        expected: self.total_raw,
+                        actual: self.total_raw + remaining,
+                    });
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Finalize the decode at end of body.
+    ///
+    /// Validates that the body was fully framed (a zero-size chunk and its
+    /// terminal trailer CRLF were seen) and returns the parsed trailers along
+    /// with the total decoded length. Returns [`AwsChunkedError::UnexpectedEof`]
+    /// if the stream ended mid-frame.
+    pub fn finish(self) -> Result<AwsChunkedTrailers, AwsChunkedError> {
+        match self.state {
+            DecoderState::Done => Ok(AwsChunkedTrailers {
+                trailers: self.trailers,
+                decoded_len: self.decoded_len,
+            }),
+            _ => Err(AwsChunkedError::UnexpectedEof),
+        }
+    }
+
+    /// Total number of decoded object bytes emitted so far.
+    pub fn decoded_len(&self) -> u64 {
+        self.decoded_len
+    }
+
+    /// Accumulate bytes from `input[*cursor..]` into `line_buf` until a CRLF is
+    /// found. On success `line_buf` holds the line content WITHOUT the trailing
+    /// CRLF and `*cursor` is advanced past it; returns `Ok(true)`. Returns
+    /// `Ok(false)` if the slice was exhausted before a CRLF (carry-over
+    /// retained). The line length is bounded by [`MAX_TRAILER_SECTION_BYTES`].
+    fn feed_line(&mut self, input: &[u8], cursor: &mut usize) -> Result<bool, AwsChunkedError> {
+        while *cursor < input.len() {
+            let b = input[*cursor];
+            *cursor += 1;
+            self.total_raw += 1;
+            self.line_buf.push(b);
+            let n = self.line_buf.len();
+            if n >= 2 && self.line_buf[n - 2] == b'\r' && self.line_buf[n - 1] == b'\n' {
+                self.line_buf.truncate(n - 2);
+                return Ok(true);
+            }
+            if self.line_buf.len() > MAX_TRAILER_SECTION_BYTES {
+                return Err(AwsChunkedError::InvalidChunkHeader(
+                    "Chunk header line exceeds maximum size".to_string(),
+                ));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Accumulate the trailer section into `line_buf` until its terminal CRLF.
+    ///
+    /// The section ends at the first empty line: either the section begins with
+    /// `\r\n` (no trailers) or a trailer line is followed by the terminal CRLF
+    /// (`…\r\n\r\n`). On completion `line_buf` holds the entire trailer section
+    /// (including the terminal CRLF) ready for [`parse_trailers`], `*cursor` is
+    /// advanced past it, and the function returns `Ok(true)`. Returns
+    /// `Ok(false)` if more input is needed. Bounded by
+    /// [`MAX_TRAILER_SECTION_BYTES`].
+    fn feed_trailers(&mut self, input: &[u8], cursor: &mut usize) -> Result<bool, AwsChunkedError> {
+        while *cursor < input.len() {
+            let b = input[*cursor];
+            *cursor += 1;
+            self.total_raw += 1;
+            self.line_buf.push(b);
+            let n = self.line_buf.len();
+            let lb = self.line_buf.as_slice();
+            if lb == b"\r\n" || (n >= 4 && &lb[n - 4..] == b"\r\n\r\n") {
+                return Ok(true);
+            }
+            if self.line_buf.len() > MAX_TRAILER_SECTION_BYTES {
+                return Err(AwsChunkedError::TrailerTooLarge {
+                    size: self.line_buf.len(),
+                    max: MAX_TRAILER_SECTION_BYTES,
+                });
+            }
+        }
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +907,252 @@ mod tests {
         let mut encoded = encode_aws_chunked(&data, cs);
         encoded.extend_from_slice(&garbage);
         decode_aws_chunked(&encoded).is_err() // Should reject trailing bytes
+    }
+
+    // ---- IncrementalAwsChunkedDecoder unit tests (Task 1.1) ----
+
+    /// Decode a complete body in a single `push`, matching the whole-buffer
+    /// decoder's output.
+    #[test]
+    fn test_incremental_single_push_roundtrip() {
+        let original = b"This is some data split into chunks";
+        let encoded = encode_aws_chunked(original, 7);
+
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        let decoded = decoder.push(&encoded).unwrap();
+        let trailers = decoder.finish().unwrap();
+
+        assert_eq!(decoded, original);
+        assert!(trailers.trailers.is_empty());
+        assert_eq!(trailers.decoded_len, original.len() as u64);
+    }
+
+    /// Feeding the encoded body one byte at a time (every framing boundary
+    /// split) must still produce the same decoded object.
+    #[test]
+    fn test_incremental_byte_at_a_time() {
+        let original = b"Hello, streaming world! 1234567890";
+        let encoded = encode_aws_chunked(original, 5);
+
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        let mut out = Vec::new();
+        for b in &encoded {
+            out.extend_from_slice(&decoder.push(std::slice::from_ref(b)).unwrap());
+        }
+        let trailers = decoder.finish().unwrap();
+
+        assert_eq!(out, original);
+        assert_eq!(trailers.decoded_len, original.len() as u64);
+    }
+
+    /// An empty object body frames as a single zero-size chunk and decodes to
+    /// zero bytes.
+    #[test]
+    fn test_incremental_empty_body() {
+        let encoded = encode_aws_chunked(b"", 10);
+
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        let decoded = decoder.push(&encoded).unwrap();
+        let trailers = decoder.finish().unwrap();
+
+        assert!(decoded.is_empty());
+        assert!(trailers.trailers.is_empty());
+        assert_eq!(trailers.decoded_len, 0);
+    }
+
+    /// Trailers after the zero-size chunk are parsed identically to the
+    /// whole-buffer decoder, including when the encoded body is split across the
+    /// trailer section.
+    #[test]
+    fn test_incremental_with_trailers_split() {
+        let trailers = &[
+            ("x-amz-checksum-crc32", "abc123"),
+            ("x-amz-trailer-signature", "deadbeef"),
+        ];
+        let encoded = encode_aws_chunked_with_trailers(b"payload", 3, trailers);
+
+        // Split at every offset and confirm a consistent result.
+        for split in 0..=encoded.len() {
+            let mut decoder = IncrementalAwsChunkedDecoder::new();
+            let mut out = Vec::new();
+            out.extend_from_slice(&decoder.push(&encoded[..split]).unwrap());
+            out.extend_from_slice(&decoder.push(&encoded[split..]).unwrap());
+            let result = decoder.finish().unwrap();
+
+            assert_eq!(out, b"payload", "split at {split}");
+            assert_eq!(result.trailers.len(), 2, "split at {split}");
+            assert_eq!(
+                result.trailers[0],
+                ("x-amz-checksum-crc32".to_string(), "abc123".to_string())
+            );
+            assert_eq!(
+                result.trailers[1],
+                (
+                    "x-amz-trailer-signature".to_string(),
+                    "deadbeef".to_string()
+                )
+            );
+        }
+    }
+
+    /// `finish` before the body is fully framed is an error (truncated stream).
+    #[test]
+    fn test_incremental_truncated_finish_errors() {
+        let truncated = b"5;chunk-signature=abc\r\nHel";
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        let _ = decoder.push(truncated).unwrap();
+        assert!(matches!(
+            decoder.finish(),
+            Err(AwsChunkedError::UnexpectedEof)
+        ));
+    }
+
+    /// Bytes after a fully-framed body are rejected as a length mismatch, just
+    /// as the whole-buffer decoder rejects trailing bytes.
+    #[test]
+    fn test_incremental_rejects_trailing_bytes() {
+        let mut encoded = encode_aws_chunked(b"hello", 10);
+        encoded.extend_from_slice(b"extra garbage");
+
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        let result = decoder.push(&encoded);
+        assert!(matches!(
+            result,
+            Err(AwsChunkedError::LengthMismatch { .. })
+        ));
+    }
+
+    /// An invalid (non-hex) chunk size is rejected with the same error variant
+    /// as the whole-buffer decoder.
+    #[test]
+    fn test_incremental_invalid_chunk_size() {
+        let invalid = b"xyz;chunk-signature=abc\r\ndata\r\n0;chunk-signature=def\r\n\r\n";
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        assert!(matches!(
+            decoder.push(invalid),
+            Err(AwsChunkedError::InvalidChunkSize(_))
+        ));
+    }
+
+    /// A missing CRLF after chunk data is rejected with the same error the
+    /// whole-buffer decoder produces.
+    #[test]
+    fn test_incremental_missing_data_crlf() {
+        // 5 bytes of data "hello" followed by "XX" instead of CRLF.
+        let body = b"5;chunk-signature=0\r\nhelloXX0;chunk-signature=0\r\n\r\n";
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        assert!(matches!(
+            decoder.push(body),
+            Err(AwsChunkedError::InvalidChunkHeader(_))
+        ));
+    }
+
+    /// `decoded_len` reflects emitted bytes as they accumulate across pushes.
+    #[test]
+    fn test_incremental_decoded_len_tracks_progress() {
+        let original = vec![0xABu8; 100];
+        let encoded = encode_aws_chunked(&original, 16);
+
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        decoder.push(&encoded).unwrap();
+        assert_eq!(decoder.decoded_len(), 100);
+        let trailers = decoder.finish().unwrap();
+        assert_eq!(trailers.decoded_len, 100);
+    }
+
+    // ---- IncrementalAwsChunkedDecoder property tests (Task 1.2) ----
+
+    /// Drive the incremental decoder over `encoded`, feeding it in slices whose
+    /// sizes are taken (cyclically) from `split_sizes`, and return the
+    /// concatenation of all emitted object bytes. The split sizes are mapped
+    /// into `[1, 64]` so the body is fed in small increments that exercise
+    /// every carry-over boundary (partial chunk headers, split data, split
+    /// CRLFs, split trailer sections); an empty `split_sizes` feeds the whole
+    /// body in one push. The decoder is always `finish`ed so framing/EOF
+    /// validation runs, mirroring the whole-buffer decoder's end-of-input
+    /// checks.
+    fn incremental_decode_arbitrary_split(
+        encoded: &[u8],
+        split_sizes: &[usize],
+    ) -> Result<Vec<u8>, AwsChunkedError> {
+        let mut decoder = IncrementalAwsChunkedDecoder::new();
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        let mut i = 0usize;
+
+        while pos < encoded.len() {
+            let remaining = encoded.len() - pos;
+            let seg = if split_sizes.is_empty() {
+                remaining
+            } else {
+                // Map into [1, 64] then clamp to what's left so we always make
+                // forward progress and never index past the end.
+                ((split_sizes[i % split_sizes.len()] % 64) + 1).min(remaining)
+            };
+            let end = pos + seg;
+            out.extend_from_slice(&decoder.push(&encoded[pos..end])?);
+            pos = end;
+            i += 1;
+        }
+
+        decoder.finish()?;
+        Ok(out)
+    }
+
+    // Validates: Requirements 3.2, 10.4
+    //
+    // Property 4 (valid inputs): for arbitrary object data encoded with
+    // `encode_aws_chunked` and fed to `IncrementalAwsChunkedDecoder` in an
+    // arbitrary slice splitting, the incremental decoder yields exactly the
+    // bytes `decode_aws_chunked` yields for the same encoded body — and both
+    // succeed. The encoded form is a valid aws-chunked body by construction, so
+    // the oracle must decode it to the original `data`.
+    #[quickcheck]
+    fn prop_incremental_matches_whole_buffer_for_valid_inputs(
+        data: Vec<u8>,
+        chunk_size: usize,
+        split_sizes: Vec<usize>,
+    ) -> bool {
+        let cs = (chunk_size % 256).max(1);
+        let encoded = encode_aws_chunked(&data, cs);
+
+        let oracle = match decode_aws_chunked(&encoded) {
+            Ok(result) => result.data,
+            // A body produced by encode_aws_chunked must decode successfully.
+            Err(_) => return false,
+        };
+
+        match incremental_decode_arbitrary_split(&encoded, &split_sizes) {
+            Ok(incremental) => incremental == oracle && incremental == data,
+            Err(_) => false,
+        }
+    }
+
+    // Validates: Requirements 3.2, 10.4
+    //
+    // Property 4 (arbitrary inputs): for arbitrary raw byte buffers, the
+    // incremental decoder agrees with the whole-buffer `decode_aws_chunked`
+    // oracle under any slice splitting:
+    //   - if the oracle rejects the input, the incremental decoder (push across
+    //     splits, then finish) must also error;
+    //   - if the oracle accepts the input, the incremental decoder must produce
+    //     the same decoded bytes.
+    #[quickcheck]
+    fn prop_incremental_matches_whole_buffer_for_arbitrary_inputs(
+        body: Vec<u8>,
+        split_sizes: Vec<usize>,
+    ) -> bool {
+        let oracle = decode_aws_chunked(&body);
+        let incremental = incremental_decode_arbitrary_split(&body, &split_sizes);
+
+        match (oracle, incremental) {
+            // Oracle accepts → incremental must accept with identical bytes.
+            (Ok(result), Ok(decoded)) => result.data == decoded,
+            // Oracle rejects → incremental must also reject (any error).
+            (Err(_), Err(_)) => true,
+            // Any disagreement (one accepts while the other rejects) is a
+            // property violation.
+            _ => false,
+        }
     }
 }

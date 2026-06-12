@@ -425,7 +425,7 @@ For the full multipart upload state machine, correctness gates, concurrency sema
 **HTTP Traffic is Unencrypted**: Communication between clients and the HTTP listener (port 80) uses plaintext HTTP. This applies to both DNS-routed traffic and forward proxy traffic (`HTTP_PROXY=http://proxy:80`). This means:
 
 - **Trusted Network Required**: Deploy only in secured network environments (VPCs, internal networks, isolated subnets)
-- **Data in Transit**: S3 data flows unencrypted between client and proxy on port 80 (proxy-to-S3 communication always uses HTTPS)
+- **Data in Transit**: S3 data flows unencrypted between client and proxy on port 80. By default the proxy connects to the upstream store over verified TLS on port 443; this is the secure default and applies unless you configure a per-destination [upstream transport override](CONFIGURATION.md#upstream-transport-overrides). The protection-waiving overrides (plaintext HTTP, or HTTPS with certificate validation disabled) are intended for local development or trusted networks only.
 - **Network Controls**: Use security groups, firewalls, or network segmentation to restrict proxy access to authorized clients only
 - **Encrypted Alternative**: The TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, providing encrypted client-to-proxy traffic with full caching. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com`. See [Getting Started](GETTING_STARTED.md) for configuration details.
 

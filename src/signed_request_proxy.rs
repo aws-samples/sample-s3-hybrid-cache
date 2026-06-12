@@ -9,13 +9,225 @@ use crate::cache_types::ObjectMetadata;
 use crate::{ProxyError, Result};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::body::Body;
 use hyper::{Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::io;
 use std::net::IpAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
+
+/// How the signed-write path (single-part PUT and the multipart operations)
+/// reaches the upstream for one request.
+///
+/// Built once per request from `connection_pool.upstream_overrides`, mirroring
+/// the GET-path connector (`CustomHttpsConnector`):
+/// - **no override** → `tls: Some(verified-443 connector)`, `port: 443`
+///   (Secure_Default_Behaviour — byte-for-byte the prior egress).
+/// - **`scheme: https`** → `tls: Some(connector)` (system-roots-validated, or the
+///   accept-any verifier when `validate_tls: false`), `port`: the authority port.
+/// - **`scheme: http`** → `tls: None` (plaintext HTTP), `port`: the authority port.
+///
+/// The signed `Host`/SNI hostname is passed separately (it is forwarded verbatim
+/// to preserve SigV4); this descriptor only carries the connect target and the
+/// transport decision.
+#[derive(Clone)]
+pub struct UpstreamTransport {
+    /// Resolved IP address to connect to.
+    pub ip: IpAddr,
+    /// Port to connect to: 443 for the default path, else the request authority port.
+    pub port: u16,
+    /// `Some` → perform a TLS handshake with this connector; `None` → plaintext HTTP.
+    pub tls: Option<Arc<TlsConnector>>,
+    /// For a `TlsValidated` override only: `Some("host:port")`. When set, a TLS
+    /// *handshake* failure is surfaced as a non-retryable
+    /// [`ProxyError::UpstreamTlsValidationFailed`] naming this endpoint (Requirement
+    /// 4), mirroring the GET-path connector. `None` for the default-443 path and the
+    /// `TlsUnvalidated`/`Plaintext` modes, which keep the generic-error behaviour.
+    pub validated_endpoint: Option<String>,
+}
+
+impl UpstreamTransport {
+    /// The verified-TLS-on-443 default transport (Secure_Default_Behaviour). A
+    /// handshake failure here stays a generic (retryable) error, exactly as before.
+    pub fn verified_tls_443(ip: IpAddr, tls_connector: Arc<TlsConnector>) -> Self {
+        Self {
+            ip,
+            port: 443,
+            tls: Some(tls_connector),
+            validated_endpoint: None,
+        }
+    }
+}
+
+/// Outbound stream for the signed-write path — either a TLS stream (the
+/// verified-TLS-on-443 default path plus the `TlsValidated`/`TlsUnvalidated`
+/// override modes) or a plaintext TCP stream (the `Plaintext` override mode).
+///
+/// Mirrors the GET-path `HttpsStream` enum. Both `TlsStream<TcpStream>` and
+/// `TcpStream` implement tokio's `AsyncRead`/`AsyncWrite`, so each arm delegates
+/// to its inner stream. The TLS variant is boxed to keep the enum small
+/// (clippy `large_enum_variant`).
+pub enum UpstreamStream {
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
+
+impl AsyncRead for UpstreamStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            UpstreamStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            UpstreamStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for UpstreamStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            UpstreamStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            UpstreamStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            UpstreamStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            UpstreamStream::Plain(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            UpstreamStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            UpstreamStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Connect to the upstream per the resolved [`UpstreamTransport`], with retry.
+///
+/// TLS modes go through [`establish_tls_with_retry`] (TCP + TLS handshake);
+/// the plaintext mode performs a plain TCP connect with the same retry/backoff
+/// policy. `hostname` is the SNI/Host name (used only for the TLS handshake and
+/// log lines); the connect target is `transport.ip:transport.port`.
+pub async fn connect_upstream_with_retry(
+    transport: &UpstreamTransport,
+    hostname: &str,
+    max_retries: usize,
+) -> Result<UpstreamStream> {
+    match &transport.tls {
+        Some(connector) => {
+            if let Some(endpoint) = &transport.validated_endpoint {
+                // TlsValidated override: retry only the transient TCP connect, then
+                // perform a single TLS handshake. A handshake failure is a
+                // configuration error that cannot succeed on retry, so it is surfaced
+                // immediately as a non-retryable `UpstreamTlsValidationFailed` naming
+                // the endpoint (Requirement 4) — never retried, never downgraded.
+                let tcp =
+                    connect_tcp_with_retry(transport.ip, transport.port, hostname, max_retries)
+                        .await?;
+                let tls = establish_tls(tcp, hostname, connector.as_ref())
+                    .await
+                    .map_err(|e| ProxyError::UpstreamTlsValidationFailed {
+                        endpoint: endpoint.clone(),
+                        source_err: e.to_string(),
+                    })?;
+                Ok(UpstreamStream::Tls(Box::new(tls)))
+            } else {
+                // Default-443 path and TlsUnvalidated override: existing TCP+TLS retry
+                // behaviour, generic error on failure (transient, retryable).
+                let tls = establish_tls_with_retry(
+                    transport.ip,
+                    transport.port,
+                    hostname,
+                    connector.as_ref(),
+                    max_retries,
+                )
+                .await?;
+                Ok(UpstreamStream::Tls(Box::new(tls)))
+            }
+        }
+        None => {
+            let tcp =
+                connect_tcp_with_retry(transport.ip, transport.port, hostname, max_retries).await?;
+            Ok(UpstreamStream::Plain(tcp))
+        }
+    }
+}
+
+/// Plain TCP connect with exponential-backoff retry. Used for the `Plaintext`
+/// override mode and for the TCP leg of a `TlsValidated` override (where the TLS
+/// handshake itself is then attempted once, non-retryably). Mirrors the
+/// TCP-connect retry policy of [`establish_tls_with_retry`].
+async fn connect_tcp_with_retry(
+    target_ip: IpAddr,
+    port: u16,
+    hostname: &str,
+    max_retries: usize,
+) -> Result<TcpStream> {
+    let mut last_error = None;
+    let mut had_failures = false;
+
+    for attempt in 0..max_retries {
+        match connect_to_target(target_ip, port).await {
+            Ok(stream) => {
+                if had_failures {
+                    info!(
+                        "TCP connection succeeded on attempt {} for {} after previous failures",
+                        attempt + 1,
+                        hostname
+                    );
+                }
+                return Ok(stream);
+            }
+            Err(e) => {
+                had_failures = true;
+                warn!(
+                    "TCP connection attempt {} failed for {} ({}:{}): {}",
+                    attempt + 1,
+                    hostname,
+                    target_ip,
+                    port,
+                    e
+                );
+                last_error = Some(e);
+                if attempt < max_retries - 1 {
+                    let clamped_attempt = attempt.min(20) as u32;
+                    let delay_ms = 100u64
+                        .saturating_mul(1u64.checked_shl(clamped_attempt).unwrap_or(u64::MAX))
+                        .min(60_000);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                error!(
+                    "TCP connection failed after {} attempts for {}: {}",
+                    max_retries,
+                    hostname,
+                    last_error.as_ref().unwrap()
+                );
+                return Err(last_error.unwrap());
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| ProxyError::ConnectionError("All retry attempts failed".to_string())))
+}
 
 /// Check whether an Authorization header value uses an AWS SigV4-family algorithm
 /// with proper structural validation.
@@ -211,15 +423,13 @@ pub fn extract_metadata(
 pub async fn forward_signed_request(
     req: Request<hyper::body::Incoming>,
     target_host: &str,
-    target_ip: IpAddr,
-    tls_connector: &TlsConnector,
+    transport: &UpstreamTransport,
     proxy_referer: Option<&str>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     forward_signed_request_bounded(
         req,
         target_host,
-        target_ip,
-        tls_connector,
+        transport,
         proxy_referer,
         default_max_buffered_request_body_bytes(),
     )
@@ -238,14 +448,13 @@ fn default_max_buffered_request_body_bytes() -> u64 {
 pub async fn forward_signed_request_bounded(
     req: Request<hyper::body::Incoming>,
     target_host: &str,
-    target_ip: IpAddr,
-    tls_connector: &TlsConnector,
+    transport: &UpstreamTransport,
     proxy_referer: Option<&str>,
     max_body_bytes: u64,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     debug!(
-        "Forwarding signed request to {} ({})",
-        target_host, target_ip
+        "Forwarding signed request to {} ({}:{})",
+        target_host, transport.ip, transport.port
     );
 
     // Extract request components
@@ -254,104 +463,29 @@ pub async fn forward_signed_request_bounded(
     let headers = req.headers().clone();
     let version = req.version();
 
-    // Read request body with bounded size (Requirement 11.4)
+    // Read request body with bounded size (Requirement 11.4). This enforces the cap
+    // up front and returns the fully-buffered body, exactly as before.
     let body_bytes = read_request_body_bounded(req, max_body_bytes).await?;
 
-    // Determine if we should inject Referer header
-    let should_inject_referer = if let Some(_referer_value) = proxy_referer {
-        // Check if referer already present in original headers
-        let has_referer = headers.contains_key("referer");
-        if has_referer {
-            false
-        } else {
-            // Check if referer is in SignedHeaders
-            let auth_value = headers.get("authorization").and_then(|v| v.to_str().ok());
-            if let Some(auth) = auth_value {
-                if is_sigv4_algorithm(auth) {
-                    if let Some(pos) = auth.find("SignedHeaders=") {
-                        let after_param = &auth[pos + 14..];
-                        let end = after_param
-                            .find(',')
-                            .or_else(|| after_param.find(' '))
-                            .unwrap_or(after_param.len());
-                        let signed_headers = &after_param[..end];
-                        !signed_headers.split(';').any(|h| h == "referer")
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            } else {
-                true // No auth header means unsigned, safe to add
-            }
-        }
-    } else {
-        false
-    };
-
-    // Build raw HTTP request
-    let mut raw_request = Vec::new();
-
-    // Request line: METHOD /path?query HTTP/1.1
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-    raw_request
-        .extend_from_slice(format!("{} {} {:?}\r\n", method, path_and_query, version).as_bytes());
-
-    // Headers - preserve exactly as received
-    for (name, value) in headers.iter() {
-        if let Ok(value_str) = value.to_str() {
-            raw_request
-                .extend_from_slice(format!("{}: {}\r\n", name.as_str(), value_str).as_bytes());
-        }
-    }
-
-    // Inject Referer header if conditions are met
-    if should_inject_referer {
-        if let Some(referer_value) = proxy_referer {
-            debug!(
-                "Adding proxy identification Referer header to signed request: {}",
-                referer_value
-            );
-            raw_request.extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
-        }
-    }
-
-    // End of headers
-    raw_request.extend_from_slice(b"\r\n");
-
-    // Body
-    if !body_bytes.is_empty() {
-        raw_request.extend_from_slice(&body_bytes);
-    }
-
-    debug!("Built raw HTTP request: {} bytes", raw_request.len());
-
-    // Establish TLS connection with retry logic (5 attempts)
-    let mut tls_stream =
-        establish_tls_with_retry(target_ip, 443, target_host, tls_connector, 5).await?;
-
-    // Send raw request
-    tls_stream
-        .write_all(&raw_request)
-        .await
-        .map_err(|e| ProxyError::HttpError(format!("Failed to write request: {}", e)))?;
-
-    tls_stream
-        .flush()
-        .await
-        .map_err(|e| ProxyError::HttpError(format!("Failed to flush request: {}", e)))?;
-
-    debug!("Sent raw HTTP request to S3");
-
-    // Read raw response
-    let response_bytes = read_response(&mut tls_stream).await?;
-
-    debug!("Received raw HTTP response: {} bytes", response_bytes.len());
-
-    // Parse response
-    parse_http_response(&response_bytes, &method, path_and_query)
+    // Delegate to the single streaming forward implementation, wrapping the
+    // pre-buffered body in a single-frame `Full<Bytes>`. Header serialization and
+    // Referer-injection live in `forward_signed_request_streaming` and are identical
+    // to the prior inline logic, so this is byte-for-byte unchanged on the wire.
+    // `tee = None` keeps caching off; passing `max_body_bytes` preserves the same cap
+    // value this function already applied.
+    forward_signed_request_streaming(
+        &method,
+        &uri,
+        &headers,
+        version,
+        Full::new(body_bytes),
+        target_host,
+        transport,
+        proxy_referer,
+        max_body_bytes,
+        None,
+    )
+    .await
 }
 /// Forward a signed request with a pre-buffered body
 ///
@@ -366,9 +500,8 @@ pub async fn forward_signed_request_bounded(
 /// * `headers` - Request headers
 /// * `version` - HTTP version
 /// * `body_bytes` - Pre-buffered request body
-/// * `target_host` - Target hostname for TLS SNI
-/// * `target_ip` - Target IP address
-/// * `tls_connector` - TLS connector instance
+/// * `target_host` - Target hostname for TLS SNI / `Host`
+/// * `transport` - Resolved upstream transport (connect IP/port + TLS-or-plaintext)
 ///
 /// # Returns
 ///
@@ -381,17 +514,133 @@ pub async fn forward_signed_request_with_body(
     version: hyper::Version,
     body_bytes: Bytes,
     target_host: &str,
-    target_ip: IpAddr,
-    tls_connector: &TlsConnector,
+    transport: &UpstreamTransport,
     proxy_referer: Option<&str>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     debug!(
-        "Forwarding signed request with pre-buffered body to {} ({})",
-        target_host, target_ip
+        "Forwarding signed request with pre-buffered body to {} ({}:{})",
+        target_host, transport.ip, transport.port
     );
 
-    // Determine if we should inject Referer header
-    let should_inject_referer = if let Some(_referer_value) = proxy_referer {
+    // Delegate to the single streaming forward implementation, wrapping the
+    // pre-buffered body in a single-frame `Full<Bytes>`. Header serialization and
+    // Referer-injection live in `forward_signed_request_streaming` and are identical
+    // to the prior inline logic here, so this is byte-for-byte unchanged on the wire.
+    //
+    // This caller (CompleteMultipartUpload, the only buffered-body caller) reads the
+    // small completion XML and never applied a body cap, so `cap = u64::MAX`
+    // preserves that no-cap behaviour exactly. `tee = None` keeps caching off — this
+    // path forwards only; cache finalization is handled by the caller.
+    forward_signed_request_streaming(
+        &method,
+        &uri,
+        &headers,
+        version,
+        Full::new(body_bytes),
+        target_host,
+        transport,
+        proxy_referer,
+        u64::MAX,
+        None,
+    )
+    .await
+}
+
+/// Forward a signed request by **streaming** the body to the upstream
+/// frame-by-frame (the Streaming_Write_Path), instead of buffering the whole body
+/// in RAM first.
+///
+/// This is the single streaming forward implementation the signed-write path
+/// converges on. Header serialization is **byte-for-byte identical** to
+/// [`forward_signed_request_with_body`]: the same request line, the same
+/// `headers.iter()` order and casing, and the same Referer-injection rules. This
+/// is load-bearing for SigV4 — any drift in header order, casing, or values
+/// invalidates the signature (Requirements 4.1, 4.2, 4.3, 4.4). Only the body
+/// handling changes: each client body frame is written to the upstream verbatim
+/// with an awaited `write_all`, so the proxy never holds the whole body in memory
+/// (Requirements 1.1, 1.2, 1.3) and the awaited write provides the primary
+/// backpressure to the client (Requirement 2.1).
+///
+/// The upstream connection, transport selection, and the
+/// `UpstreamTlsValidationFailed` mapping are unchanged — they live entirely in
+/// [`connect_upstream_with_retry`] (Requirements 5.3, 5.4), which this function
+/// calls exactly as the buffered path does.
+///
+/// # Parameters
+/// * `cap` — the Body_Size_Cap (`server.max_buffered_request_body_bytes`),
+///   enforced without buffering the whole body (Requirements 8.1, 8.2, 8.3, 8.4):
+///   a declared `Content-Length` exceeding `cap` is rejected with HTTP 413
+///   `EntityTooLarge` before any body byte is read, and a body whose streamed
+///   bytes exceed `cap` mid-stream stops the upload and fails with the same 413.
+///   `cap == u64::MAX` means "no cap" (the `CompleteMultipartUpload`/buffered
+///   callers) and can never trip either check.
+/// * `tee` — optional cache tee (`None` means no caching). When `Some`, each
+///   frame forwarded to the upstream is also sent to this bounded channel using
+///   the `TeeStream` discipline (`try_send`; on `Full` an awaited `send`; on
+///   `Closed` the tee is dropped and forwarding continues verbatim). The bounded
+///   channel plus one in-flight frame is the whole per-request streaming memory
+///   budget (Req 2.2, 2.3, 7.1, 7.3). The background cache task that *consumes*
+///   this channel (incremental decode + `WriteCacheRangeSink`) is wired in a
+///   later task; this function only owns the send side.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_signed_request_streaming<B>(
+    method: &hyper::Method,
+    uri: &hyper::Uri,
+    headers: &hyper::HeaderMap,
+    version: hyper::Version,
+    body: B,
+    target_host: &str,
+    transport: &UpstreamTransport,
+    proxy_referer: Option<&str>,
+    cap: u64,
+    tee: Option<mpsc::Sender<Bytes>>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    // `cap` is enforced below without buffering the whole body (Req 8). When `tee`
+    // is `Some`, each forwarded frame is also tee'd to the bounded cache channel in
+    // the body loop below (the send side of the TeeStream discipline); the
+    // background task that consumes the channel is wired in a later task.
+    debug!(
+        "Streaming signed request to {} ({}:{}), body_cap={}, caching={}",
+        target_host,
+        transport.ip,
+        transport.port,
+        cap,
+        tee.is_some()
+    );
+
+    // Body_Size_Cap fast-reject (Req 8.1): if the client declares a `Content-Length`
+    // exceeding the cap, reject with HTTP 413 `EntityTooLarge` *before* reading any
+    // body bytes — and before connecting to the upstream, so an oversized upload
+    // never opens an upstream connection or streams a single byte. This mirrors the
+    // up-front Content-Length check in `read_request_body_bounded`. The same
+    // `RequestBodyTooLarge` variant is mapped to HTTP 413 by the handler error
+    // mapping. `cap == u64::MAX` (no-cap callers) can never trip this.
+    let content_length_hint = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(cl) = content_length_hint {
+        if cl > cap {
+            warn!(
+                content_length = cl,
+                max_bytes = cap,
+                "Streamed request body exceeds max_buffered_request_body_bytes (Content-Length)"
+            );
+            return Err(ProxyError::RequestBodyTooLarge {
+                content_length: Some(cl),
+                max_bytes: cap,
+            });
+        }
+    }
+
+    // Determine if we should inject the Referer header. These rules are identical to
+    // the buffered forward functions and MUST stay so: they decide which headers are
+    // sent, and SigV4 covers the signed header set.
+    let should_inject_referer = if proxy_referer.is_some() {
         let has_referer = headers.contains_key("referer");
         if has_referer {
             false
@@ -421,19 +670,20 @@ pub async fn forward_signed_request_with_body(
         false
     };
 
-    // Build raw HTTP request
-    let mut raw_request = Vec::new();
+    // Serialize the request line + headers + terminating CRLF exactly as the
+    // buffered path does (byte-for-byte — SigV4 depends on it). This header block is
+    // small and bounded, so buffering it is fine; only the body is streamed.
+    let mut header_block = Vec::new();
 
     // Request line: METHOD /path?query HTTP/1.1
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-    raw_request
+    header_block
         .extend_from_slice(format!("{} {} {:?}\r\n", method, path_and_query, version).as_bytes());
 
     // Headers - preserve exactly as received
     for (name, value) in headers.iter() {
         if let Ok(value_str) = value.to_str() {
-            raw_request
+            header_block
                 .extend_from_slice(format!("{}: {}\r\n", name.as_str(), value_str).as_bytes());
         }
     }
@@ -445,44 +695,158 @@ pub async fn forward_signed_request_with_body(
                 "Adding proxy identification Referer header to signed request: {}",
                 referer_value
             );
-            raw_request.extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
+            header_block.extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
         }
     }
 
     // End of headers
-    raw_request.extend_from_slice(b"\r\n");
+    header_block.extend_from_slice(b"\r\n");
 
-    // Body
-    if !body_bytes.is_empty() {
-        raw_request.extend_from_slice(&body_bytes);
+    // Establish the upstream connection per the resolved transport (unchanged: TLS
+    // on the default/validated/unvalidated paths, plaintext for the http override;
+    // the UpstreamTlsValidationFailed mapping is preserved inside this call).
+    let mut stream = connect_upstream_with_retry(transport, target_host, 5).await?;
+
+    // Write the request line + headers first.
+    stream
+        .write_all(&header_block)
+        .await
+        .map_err(|e| ProxyError::HttpError(format!("Failed to write request headers: {}", e)))?;
+
+    // Stream the body frame-by-frame, verbatim. The awaited `write_all` is the
+    // primary backpressure source: the next client frame is not pulled until the
+    // upstream socket accepts the current one (Requirement 2.1), and no whole-body
+    // buffer is ever materialized (Requirements 1.1, 1.2, 1.3, 4.1, 4.3).
+    //
+    // `sent` tracks the running count of body bytes forwarded so the Body_Size_Cap
+    // is enforced mid-stream without buffering the whole body (Req 8.2, 8.3): on
+    // exceeding `cap` we stop reading the client body and fail with the same 413
+    // `EntityTooLarge` behaviour `read_request_body_bounded` produces, before
+    // writing the offending frame.
+    let mut body = body;
+    // `tee` is rebound mutable so the channel-closed branch below can drop it
+    // (set it to `None`) and stop teeing while continuing to forward verbatim.
+    let mut tee = tee;
+    let mut sent: u64 = 0;
+    // Observability for the streaming-write tuning question (write_cache_tee_channel_depth):
+    // record the body-frame size distribution the tee actually sees and how often the
+    // bounded tee channel backpressured (`Full` → awaited send). `tee_full_waits > 0`
+    // means the cache writer, not the upstream, was the bottleneck for this request.
+    let mut frame_count: u64 = 0;
+    let mut max_frame: usize = 0;
+    let mut tee_full_waits: u64 = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?;
+        // Only data frames carry body bytes; non-data frames (e.g. trailers) carry no
+        // entity bytes to forward.
+        if let Ok(data) = frame.into_data() {
+            if data.is_empty() {
+                continue;
+            }
+            frame_count += 1;
+            if data.len() > max_frame {
+                max_frame = data.len();
+            }
+            // Running cap enforcement (Req 8.2). `saturating_add` makes the
+            // `cap == u64::MAX` (no-cap) callers safe: the sum caps at `u64::MAX` and
+            // `u64::MAX > u64::MAX` is false, so they never trip this check.
+            if sent.saturating_add(data.len() as u64) > cap {
+                warn!(
+                    sent_bytes = sent,
+                    chunk_bytes = data.len(),
+                    max_bytes = cap,
+                    content_length = ?content_length_hint,
+                    "Streamed request body exceeds max_buffered_request_body_bytes"
+                );
+                return Err(ProxyError::RequestBodyTooLarge {
+                    content_length: content_length_hint,
+                    max_bytes: cap,
+                });
+            }
+            // Forward the frame to the upstream verbatim. This awaited `write_all`
+            // is the primary backpressure source and must happen for every forwarded
+            // frame regardless of the tee (Req 4.1, 4.3, 2.1).
+            stream.write_all(&data).await.map_err(|e| {
+                ProxyError::HttpError(format!("Failed to write request body: {}", e))
+            })?;
+            sent = sent.saturating_add(data.len() as u64);
+
+            // Tee the forwarded frame to the cache, applying the same bounded-channel
+            // discipline as `TeeStream` on the GET path. Only frames actually
+            // forwarded to the upstream are tee'd (a frame rejected by the cap check
+            // above returns before reaching here, so it is never tee'd). The tee
+            // receives a cheap `Bytes` clone (a refcount bump); the upstream write
+            // above already used the original bytes verbatim, so the tee can never
+            // alter what the upstream receives (Req 7.3).
+            //
+            // Channel discipline (mirrors `tee_stream.rs`):
+            //   - `try_send` fast path: on `Ok`, the frame is queued, continue.
+            //   - `Full`: the bounded channel is at capacity, so switch to an awaited
+            //     `send` — the one place the cache can briefly backpressure the upload
+            //     (a bounded wait gated by the channel capacity, Req 2.2). The channel
+            //     bounds the buffered bytes to its capacity; there is no unbounded
+            //     internal queue, so per-request streaming memory is one in-flight
+            //     frame plus the channel capacity (Req 2.3, 1.4).
+            //   - `Closed`: the background cache task is gone. Drop the tee (set it to
+            //     `None`) and keep forwarding to the upstream verbatim — a cache
+            //     failure must never fail an upload the upstream would accept
+            //     (Req 7.1, 7.3).
+            if let Some(sender) = tee.as_ref() {
+                let mut tee_gone = false;
+                match sender.try_send(data.clone()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(frame)) => {
+                        tee_full_waits += 1;
+                        if sender.send(frame).await.is_err() {
+                            debug!(
+                                "Cache tee channel closed during backpressure, \
+                                 continuing to forward without caching"
+                            );
+                            tee_gone = true;
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!("Cache tee channel closed, continuing to forward without caching");
+                        tee_gone = true;
+                    }
+                }
+                if tee_gone {
+                    // Stop teeing for the remainder of this request; keep forwarding.
+                    tee = None;
+                }
+            }
+        }
     }
 
-    debug!("Built raw HTTP request: {} bytes", raw_request.len());
-
-    // Establish TLS connection with retry logic (5 attempts)
-    let mut tls_stream =
-        establish_tls_with_retry(target_ip, 443, target_host, tls_connector, 5).await?;
-
-    // Send raw request
-    tls_stream
-        .write_all(&raw_request)
-        .await
-        .map_err(|e| ProxyError::HttpError(format!("Failed to write request: {}", e)))?;
-
-    tls_stream
+    stream
         .flush()
         .await
         .map_err(|e| ProxyError::HttpError(format!("Failed to flush request: {}", e)))?;
 
-    debug!("Sent raw HTTP request to S3");
+    debug!("Streamed signed request to upstream");
 
-    // Read raw response
-    let response_bytes = read_response(&mut tls_stream).await?;
+    // Frame-size / backpressure summary for streaming-write tuning. `mean_frame` and
+    // `max_frame` reveal whether the tee channel holds KB-scale socket reads or
+    // multi-MB client chunks (the write_cache_tee_channel_depth memory question), and
+    // `tee_full_waits` reveals whether the bounded tee ever throttled the upload.
+    if frame_count > 0 {
+        debug!(
+            frame_count,
+            max_frame_bytes = max_frame,
+            mean_frame_bytes = sent.checked_div(frame_count).unwrap_or(0),
+            total_bytes = sent,
+            tee_full_waits,
+            "Streamed-write body frame summary"
+        );
+    }
 
+    // Read raw response (unchanged).
+    let response_bytes = read_response(&mut stream).await?;
     debug!("Received raw HTTP response: {} bytes", response_bytes.len());
 
-    // Parse response
-    parse_http_response(&response_bytes, &method, path_and_query)
+    // Parse response (unchanged).
+    parse_http_response(&response_bytes, method, path_and_query)
 }
 
 /// Read request body from incoming request with a configurable size cap.
@@ -718,8 +1082,8 @@ pub async fn establish_tls_with_retry(
     Err(last_error.unwrap_or_else(|| ProxyError::TlsError("All retry attempts failed".to_string())))
 }
 
-/// Read HTTP response from TLS stream, handling 1xx informational responses
-async fn read_response(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) -> Result<Vec<u8>> {
+/// Read HTTP response from the upstream stream, handling 1xx informational responses
+async fn read_response<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut all_bytes = Vec::new();
     let mut buffer = vec![0u8; 8192];
 
@@ -1783,6 +2147,664 @@ mod tests {
         assert_eq!(
             metadata.content_type,
             Some("application/octet-stream".to_string())
+        );
+    }
+
+    // --- Body-size cap enforcement on the streaming forward (Req 8) ---
+
+    #[tokio::test]
+    async fn test_streaming_cap_rejects_oversized_content_length() {
+        // Req 8.1: a declared `Content-Length` exceeding the cap is rejected with the
+        // same `RequestBodyTooLarge` error (mapped to HTTP 413 `EntityTooLarge`) that
+        // `read_request_body_bounded` returns — before any body byte is read and
+        // before an upstream connection is attempted. The transport points at a port
+        // nothing listens on; the test proves we never reach it.
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "content-length",
+            hyper::header::HeaderValue::from_static("1000"),
+        );
+
+        let transport = UpstreamTransport {
+            ip: "127.0.0.1".parse().unwrap(),
+            port: 1,
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &headers,
+            hyper::Version::HTTP_11,
+            Full::new(Bytes::new()),
+            "example.com",
+            &transport,
+            None,
+            100, // cap < declared Content-Length
+            None,
+        )
+        .await;
+
+        match result {
+            Err(ProxyError::RequestBodyTooLarge {
+                content_length,
+                max_bytes,
+            }) => {
+                assert_eq!(content_length, Some(1000));
+                assert_eq!(max_bytes, 100);
+            }
+            Err(e) => panic!("expected RequestBodyTooLarge, got error: {}", e),
+            Ok(_) => panic!("expected RequestBodyTooLarge, got Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_cap_rejects_oversized_body_midstream() {
+        // Req 8.2/8.3: with no declared `Content-Length`, the running byte counter
+        // trips the cap mid-stream and fails with the same `RequestBodyTooLarge`
+        // behaviour, without buffering the whole body. A mock upstream accepts the
+        // connection (so the header write succeeds) and drains bytes; the function
+        // fails on the first oversized data frame before forwarding it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            }
+        });
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        // 200-byte body, cap 100, no Content-Length header → first frame trips.
+        let body = Full::new(Bytes::from(vec![b'x'; 200]));
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            100,
+            None,
+        )
+        .await;
+
+        match result {
+            Err(ProxyError::RequestBodyTooLarge {
+                content_length,
+                max_bytes,
+            }) => {
+                assert_eq!(content_length, None);
+                assert_eq!(max_bytes, 100);
+            }
+            Err(e) => panic!("expected RequestBodyTooLarge, got error: {}", e),
+            Ok(_) => panic!("expected RequestBodyTooLarge, got Ok response"),
+        }
+    }
+
+    /// Mock upstream: accept one connection, read the request line + headers (up to
+    /// the `\r\n\r\n` terminator), then read exactly `body_len` body bytes, capture
+    /// them, send a minimal `200 OK`, and return the captured body so the test can
+    /// assert verbatim forwarding. Reading the whole body before responding mirrors
+    /// a real upstream draining the request.
+    async fn capture_upstream_body(listener: tokio::net::TcpListener, body_len: usize) -> Vec<u8> {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+
+        // Read until end-of-headers.
+        let header_end = loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                return Vec::new();
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+
+        // Anything past the header terminator is the start of the body; keep reading
+        // until we have the full body.
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < body_len {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        let _ = sock.flush().await;
+        body
+    }
+
+    #[tokio::test]
+    async fn test_tee_closed_channel_keeps_forwarding() {
+        // Req 7.1/7.3: when the cache tee channel is closed (the background cache task
+        // is gone), the forward loop drops the tee and keeps streaming the original
+        // bytes to the upstream verbatim — a dead cache never fails an upload the
+        // upstream would accept.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let payload = Bytes::from(vec![b'z'; 4096]);
+        let payload_len = payload.len();
+        let upstream = tokio::spawn(capture_upstream_body(listener, payload_len));
+
+        // Bounded tee channel whose receiver is dropped immediately → every send sees
+        // `Closed`.
+        let (tee_tx, tee_rx) = mpsc::channel::<Bytes>(4);
+        drop(tee_rx);
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            Full::new(payload.clone()),
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            Some(tee_tx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "closed cache tee must not fail the upload: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let forwarded = upstream.await.unwrap();
+        assert_eq!(
+            forwarded.len(),
+            payload_len,
+            "upstream must receive the full body even when the tee is closed"
+        );
+        assert_eq!(
+            forwarded,
+            payload.to_vec(),
+            "upstream bytes must be verbatim regardless of tee state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tee_full_channel_backpressures_then_forwards() {
+        // Req 2.2/2.3: with a small bounded channel and a slow cache consumer, the
+        // forward loop hits `Full` and switches to an awaited `send` (bounded
+        // backpressure) rather than buffering an unbounded queue. Every forwarded
+        // frame still reaches both the upstream (verbatim) and the tee (in order).
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Multi-frame body so the channel can fill (capacity 1).
+        let frames: Vec<Bytes> = vec![
+            Bytes::from(vec![b'a'; 1024]),
+            Bytes::from(vec![b'b'; 1024]),
+            Bytes::from(vec![b'c'; 1024]),
+            Bytes::from(vec![b'd'; 1024]),
+        ];
+        let expected: Vec<u8> = frames.iter().flat_map(|f| f.to_vec()).collect();
+        let expected_len = expected.len();
+
+        let upstream = tokio::spawn(capture_upstream_body(listener, expected_len));
+
+        let stream_frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> =
+            frames.iter().cloned().map(|b| Ok(Frame::data(b))).collect();
+        let body = StreamBody::new(stream::iter(stream_frames));
+
+        // Capacity-1 channel; a deliberately slow consumer forces the sender to block
+        // on `send().await` after the first queued frame.
+        let (tee_tx, mut tee_rx) = mpsc::channel::<Bytes>(1);
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(b) = tee_rx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                received.extend_from_slice(&b);
+            }
+            received
+        });
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            Some(tee_tx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "streamed upload should succeed: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let forwarded = upstream.await.unwrap();
+        let teed = consumer.await.unwrap();
+
+        assert_eq!(
+            forwarded, expected,
+            "upstream must receive every byte verbatim"
+        );
+        assert_eq!(
+            teed, expected,
+            "the tee must receive every forwarded byte in order under backpressure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tee_closes_midstream_keeps_forwarding() {
+        // Req 7.1/7.3 (cache-failure isolation, Task 4.2): when the cache task bails
+        // *mid-drain* — e.g. a disk-full sink write error or an aws-chunked decode
+        // error, both of which call `tee_rx.close()` in `run_streaming_cache_write`
+        // — the forward loop must see `Closed`, drop the tee, and keep streaming the
+        // remaining body to the upstream verbatim. This complements
+        // `test_tee_closed_channel_keeps_forwarding` (which closes the channel
+        // *before* any frame is sent) by closing it partway through the stream,
+        // matching the real mid-stream-failure timing.
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Eight frames so the channel (capacity 1) is mid-stream when it closes.
+        let frames: Vec<Bytes> = (0..8u8)
+            .map(|i| Bytes::from(vec![b'a' + i; 1024]))
+            .collect();
+        let expected: Vec<u8> = frames.iter().flat_map(|f| f.to_vec()).collect();
+        let expected_len = expected.len();
+
+        let upstream = tokio::spawn(capture_upstream_body(listener, expected_len));
+
+        let stream_frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> =
+            frames.iter().cloned().map(|b| Ok(Frame::data(b))).collect();
+        let body = StreamBody::new(stream::iter(stream_frames));
+
+        // Capacity-1 channel; the consumer drains two frames, then `close()`s the
+        // receiver and stops — exactly what the cache task does when it discards the
+        // sink and abandons the tee mid-stream.
+        let (tee_tx, mut tee_rx) = mpsc::channel::<Bytes>(1);
+        let consumer = tokio::spawn(async move {
+            let mut drained = 0usize;
+            while let Some(_b) = tee_rx.recv().await {
+                drained += 1;
+                if drained == 2 {
+                    tee_rx.close();
+                    break;
+                }
+            }
+            drained
+        });
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            Some(tee_tx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a tee that closes mid-stream must not fail the upload: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let forwarded = upstream.await.unwrap();
+        let _ = consumer.await.unwrap();
+
+        assert_eq!(
+            forwarded.len(),
+            expected_len,
+            "upstream must receive the full body even after the tee closes mid-stream"
+        );
+        assert_eq!(
+            forwarded, expected,
+            "upstream bytes must be verbatim regardless of when the tee closes"
+        );
+    }
+
+    /// **Feature: streaming-write-path, Property 1: Verbatim forwarding**
+    /// **Validates: Requirements 4.1, 10.2**
+    ///
+    /// For arbitrary client body bytes split into an arbitrary sequence of frames,
+    /// the concatenation of bytes received by the (mock plaintext) upstream equals
+    /// the original client body bytes exactly. The cache branch's decoding never
+    /// affects the upstream-bound bytes, so this drives the forward with
+    /// `tee = None` and `cap = u64::MAX` and asserts the upstream sees the body
+    /// verbatim regardless of how the client framed it.
+    ///
+    /// Reuses the loopback-TCP mock upstream (`capture_upstream_body`) and a
+    /// `StreamBody` of `Frame::data(...)` chunks, mirroring
+    /// `test_tee_full_channel_backpressures_then_forwards`. quickcheck is
+    /// synchronous, so each case drives the async forward via a per-case tokio
+    /// runtime (`Runtime::block_on`). Body size is bounded for speed since every
+    /// case spins a real loopback listener.
+    #[quickcheck_macros::quickcheck]
+    fn prop_verbatim_forwarding_arbitrary_frame_splits(
+        frames: Vec<Vec<u8>>,
+    ) -> quickcheck::TestResult {
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        // Bound the body: each case opens a loopback TCP listener and builds a
+        // tokio runtime, so keep arbitrary inputs small for test speed.
+        let total: usize = frames.iter().map(|f| f.len()).sum();
+        if frames.len() > 32 || total > 32 * 1024 {
+            return quickcheck::TestResult::discard();
+        }
+
+        // The verbatim oracle: concatenation of every frame, in order.
+        let expected: Vec<u8> = frames.iter().flatten().copied().collect();
+        let expected_len = expected.len();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let forwarded = rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(capture_upstream_body(listener, expected_len));
+
+            let stream_frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> = frames
+                .iter()
+                .cloned()
+                .map(|f| Ok(Frame::data(Bytes::from(f))))
+                .collect();
+            let body = StreamBody::new(stream::iter(stream_frames));
+
+            let transport = UpstreamTransport {
+                ip: addr.ip(),
+                port: addr.port(),
+                tls: None,
+                validated_endpoint: None,
+            };
+
+            let result = forward_signed_request_streaming(
+                &hyper::Method::PUT,
+                &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+                &hyper::HeaderMap::new(),
+                hyper::Version::HTTP_11,
+                body,
+                "example.com",
+                &transport,
+                None,
+                u64::MAX,
+                None,
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "streamed upload should succeed: {:?}",
+                result.err().map(|e| e.to_string())
+            );
+            upstream.await.unwrap()
+        });
+
+        quickcheck::TestResult::from_bool(forwarded == expected)
+    }
+
+    /// Mock **slow** upstream for the bounded-memory test (Task 4.3). Accept one
+    /// connection, read the request line + headers (up to `\r\n\r\n`), then read
+    /// exactly `body_len` body bytes in chunks with a small delay between reads —
+    /// the delay makes the upstream slower than the client so the awaited
+    /// `write_all` to the upstream exercises the primary backpressure path
+    /// (Req 2.1). Sends a minimal `200 OK` once the body is fully drained and
+    /// returns the number of body bytes read so the caller can assert the whole
+    /// body was forwarded verbatim.
+    async fn slow_drain_upstream(listener: tokio::net::TcpListener, body_len: usize) -> usize {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = vec![0u8; 64 * 1024];
+
+        // Read until end-of-headers.
+        let header_end = loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                return 0;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+
+        // Anything past the header terminator is the start of the body.
+        let mut body_read = buf.len() - header_end;
+        while body_read < body_len {
+            // Drain slowly to keep the upstream the slower side (backpressure).
+            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            body_read += n;
+        }
+
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        let _ = sock.flush().await;
+        body_read
+    }
+
+    /// Drive `forward_signed_request_streaming` for one object of `num_frames`
+    /// `frame_size`-byte frames against the slow mock upstream, teeing to a bounded
+    /// channel of `capacity` with a deliberately slow consumer.
+    ///
+    /// The live-buffer proxy: the body producer increments a shared counter when a
+    /// frame is pulled into the pipeline (handed toward the upstream + tee) and the
+    /// consumer decrements it after it has drained the frame (simulating the cache
+    /// task processing a frame). The returned `max_outstanding` is the high-water
+    /// mark of frames simultaneously live in the pipeline.
+    ///
+    /// Returns `(max_outstanding, forwarded_len, teed_len, total_len)`.
+    async fn run_bounded_memory_case(
+        num_frames: usize,
+        frame_size: usize,
+        capacity: usize,
+        consumer_delay: std::time::Duration,
+    ) -> (usize, usize, usize, usize) {
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let total_len = num_frames * frame_size;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(slow_drain_upstream(listener, total_len));
+
+        // Live-frame accounting (our unit-level proxy for "live buffer").
+        let outstanding = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_outstanding = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // Producer: increment at pull time (frame handed into the pipeline) and
+        // record the high-water mark. `fetch_add(..) + 1` is the exact live count
+        // right after this increment; a concurrent consumer decrement only makes the
+        // true value smaller, so the recorded max is a safe upper bound.
+        let produced = outstanding.clone();
+        let high_water = max_outstanding.clone();
+        let frame_iter = (0..num_frames).map(move |i| {
+            let cur = produced.fetch_add(1, Ordering::SeqCst) + 1;
+            high_water.fetch_max(cur, Ordering::SeqCst);
+            let byte = b'a'.wrapping_add((i % 26) as u8);
+            Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![byte; frame_size])))
+        });
+        let body = StreamBody::new(stream::iter(frame_iter));
+
+        // Small bounded tee channel + a deliberately slow consumer: forces the
+        // channel to fill so the forward loop exercises the `Full` → awaited `send`
+        // backpressure path. The consumer holds exactly one frame "in processing" at
+        // a time (decrementing only after the delay).
+        let (tee_tx, mut tee_rx) = mpsc::channel::<Bytes>(capacity);
+        let consumed = outstanding.clone();
+        let consumer = tokio::spawn(async move {
+            let mut teed_len = 0usize;
+            while let Some(b) = tee_rx.recv().await {
+                tokio::time::sleep(consumer_delay).await;
+                teed_len += b.len();
+                consumed.fetch_sub(1, Ordering::SeqCst);
+            }
+            teed_len
+        });
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            Some(tee_tx),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "streamed upload should succeed: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let forwarded_len = upstream.await.unwrap();
+        let teed_len = consumer.await.unwrap();
+        let max = max_outstanding.load(Ordering::SeqCst);
+        (max, forwarded_len, teed_len, total_len)
+    }
+
+    #[tokio::test]
+    async fn test_bounded_memory_independent_of_object_size() {
+        // Task 4.3 / Design Property 2 — bounded memory (Req 1.2, 1.3, 2.2, 10.1).
+        //
+        // Stream a large synthetic body through `forward_signed_request_streaming`
+        // against a mock SLOW upstream while teeing to a small bounded channel with a
+        // slow consumer. Directly measuring RSS in a unit test is impractical, so we
+        // use a unit-level proxy for "live buffer": the high-water mark of frames
+        // simultaneously live in the pipeline (incremented when a frame is pulled
+        // toward the upstream + tee, decremented when the consumer drains it).
+        //
+        // The structural invariant of the bounded `mpsc` channel guarantees this
+        // high-water mark never exceeds `capacity + 2`: at most `capacity` frames
+        // buffered in the channel, at most one frame held by the forward loop (being
+        // written to the upstream / blocked in the awaited `send`), and at most one
+        // frame the consumer is actively processing. Combined with the awaited
+        // upstream `write_all` (one in-flight frame), this proves the live buffer is
+        // the Per_Connection_Buffer and does NOT grow with the total object size.
+        let frame_size = 32 * 1024; // 32 KiB frames
+        let capacity = 4; // Per_Connection_Buffer ≈ capacity * frame_size = 128 KiB
+        let bound = capacity + 2;
+        let consumer_delay = std::time::Duration::from_micros(200);
+
+        // Small object: 24 frames = 768 KiB (already ≫ the 128 KiB buffer).
+        let (small_max, small_fwd, small_teed, small_total) =
+            run_bounded_memory_case(24, frame_size, capacity, consumer_delay).await;
+
+        // Large object: 192 frames = 6 MiB — 8× the small object, ~48× the buffer.
+        let (large_max, large_fwd, large_teed, large_total) =
+            run_bounded_memory_case(192, frame_size, capacity, consumer_delay).await;
+
+        // The pipeline completed: both objects were streamed verbatim to the upstream
+        // and fully tee'd to the cache consumer, so the bound below is over a real,
+        // completed run rather than a stalled one.
+        assert_eq!(small_fwd, small_total, "small object fully forwarded");
+        assert_eq!(small_teed, small_total, "small object fully tee'd");
+        assert_eq!(large_fwd, large_total, "large object fully forwarded");
+        assert_eq!(large_teed, large_total, "large object fully tee'd");
+
+        // Headline assertion (Req 1.2, 2.2): the live-buffer high-water mark stays
+        // within the Per_Connection_Buffer bound for the small object.
+        assert!(
+            small_max <= bound,
+            "small-object live buffer {} exceeded bound {}",
+            small_max,
+            bound
+        );
+
+        // Independence from object size (Req 1.3, 10.1): the SAME fixed bound — a
+        // function only of the channel capacity, not the frame count — holds for the
+        // 8×-larger object. Peak live memory does not grow with object size.
+        assert!(
+            large_max <= bound,
+            "large-object live buffer {} exceeded the object-size-independent bound {}",
+            large_max,
+            bound
+        );
+
+        // Sanity: a slow consumer on a small channel must actually exercise the
+        // backpressure path (the channel filled), otherwise the bound is vacuous.
+        assert!(
+            large_max >= 2,
+            "expected the bounded channel to fill under a slow consumer, got max={}",
+            large_max
         );
     }
 }

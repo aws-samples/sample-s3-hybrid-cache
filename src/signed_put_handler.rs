@@ -34,23 +34,24 @@
 use crate::aws_chunked_decoder;
 use crate::capacity_manager::{check_cache_capacity, log_bypass_decision, CacheDecision};
 use crate::compression::CompressionHandler;
-use crate::log_sampler::LogSampler;
 use crate::metrics::MetricsManager;
 use crate::s3_client::S3ClientApi;
-use crate::signed_request_proxy::{forward_signed_request, forward_signed_request_with_body};
+use crate::signed_request_proxy::{
+    forward_signed_request, forward_signed_request_streaming, forward_signed_request_with_body,
+    UpstreamTransport,
+};
 use crate::{ProxyError, Result};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Simple response info for background tasks (status + headers only, no body)
-#[derive(Clone)]
-struct ResponseInfo {
+#[derive(Clone, Debug)]
+pub(crate) struct ResponseInfo {
     status: StatusCode,
     headers: HeaderMap,
 }
@@ -64,8 +65,24 @@ impl ResponseInfo {
         &self.headers
     }
 }
-use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
+
+/// Outcome of the streaming write-cache task
+/// ([`SignedPutHandler::run_streaming_cache_write`]).
+///
+/// Lets callers and unit tests observe whether the streamed object was cached or
+/// skipped (and why) without affecting the upload. The spawned wrapper
+/// ([`SignedPutHandler::spawn_streaming_cache_write_task`]) discards this value —
+/// per Req 7 a cache skip/failure never alters the upload result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamingCacheOutcome {
+    /// The object was streamed to the sink and committed to the cache.
+    Committed,
+    /// Caching was skipped without failing the upload. The string is a short,
+    /// stable reason for diagnostics/tests (e.g. `"decoded_length_mismatch"`,
+    /// `"s3_error"`, `"cache_write_error"`).
+    Skipped(&'static str),
+}
 
 /// Represents a part from the CompleteMultipartUpload request body XML.
 /// Used to parse and validate which parts the client wants to include in the final object.
@@ -270,12 +287,15 @@ pub struct SignedPutHandler {
     cache_manager: Option<Arc<crate::cache::CacheManager>>,
     /// S3 client for comprehensive response header extraction
     s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
-    /// Log sampler for reducing log volume
-    log_sampler: LogSampler,
     /// Proxy identification Referer header value (None when disabled)
     proxy_referer: Option<String>,
     /// Maximum request body size to buffer into memory (Requirement 11.1)
     max_buffered_request_body_bytes: u64,
+    /// Bounded depth (in frames) of the streaming write-cache tee channel
+    /// (`server.write_cache_tee_channel_depth`). One in-flight frame plus this many
+    /// queued frames is the whole per-request streaming cache memory budget — see
+    /// the streaming-write-path design (Req 1.4, 2.2, 2.3).
+    write_cache_tee_channel_depth: usize,
 }
 
 impl SignedPutHandler {
@@ -295,6 +315,7 @@ impl SignedPutHandler {
         max_cache_capacity: u64,
         proxy_referer: Option<String>,
         max_buffered_request_body_bytes: u64,
+        write_cache_tee_channel_depth: usize,
     ) -> Self {
         Self {
             cache_dir,
@@ -304,9 +325,9 @@ impl SignedPutHandler {
             metrics_manager: None,
             cache_manager: None,
             s3_client: None,
-            log_sampler: LogSampler::new(),
             proxy_referer,
             max_buffered_request_body_bytes,
+            write_cache_tee_channel_depth,
         }
     }
 
@@ -349,8 +370,7 @@ impl SignedPutHandler {
     /// * `req` - The incoming HTTP request
     /// * `cache_key` - Cache key for storing the object
     /// * `target_host` - Target S3 hostname
-    /// * `target_ip` - Resolved IP address for S3
-    /// * `tls_connector` - TLS connector for S3 connection
+    /// * `transport` - Resolved upstream transport (connect IP/port + TLS-or-plaintext)
     ///
     /// # Returns
     ///
@@ -371,8 +391,7 @@ impl SignedPutHandler {
         req: Request<hyper::body::Incoming>,
         cache_key: String,
         target_host: String,
-        target_ip: IpAddr,
-        tls_connector: Arc<TlsConnector>,
+        transport: Arc<UpstreamTransport>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
         // Check if this is a multipart upload request
         let uri = req.uri();
@@ -382,13 +401,7 @@ impl SignedPutHandler {
         // POST with ?uploads query parameter initiates a multipart upload
         if Self::is_create_multipart_upload(query) {
             return self
-                .handle_create_multipart_upload(
-                    req,
-                    cache_key,
-                    target_host,
-                    target_ip,
-                    tls_connector,
-                )
+                .handle_create_multipart_upload(req, cache_key, target_host, transport)
                 .await;
         }
 
@@ -399,8 +412,7 @@ impl SignedPutHandler {
                     req,
                     cache_key,
                     target_host,
-                    target_ip,
-                    tls_connector,
+                    transport,
                     upload_id,
                     part_number,
                 )
@@ -413,14 +425,7 @@ impl SignedPutHandler {
         if req.method() == hyper::Method::DELETE && Self::is_abort_multipart_upload(query) {
             let upload_id = Self::extract_upload_id(query).unwrap_or_default();
             return self
-                .handle_abort_multipart_upload(
-                    req,
-                    cache_key,
-                    target_host,
-                    target_ip,
-                    tls_connector,
-                    upload_id,
-                )
+                .handle_abort_multipart_upload(req, cache_key, target_host, transport, upload_id)
                 .await;
         }
 
@@ -429,14 +434,7 @@ impl SignedPutHandler {
         if Self::is_complete_multipart_upload(query) {
             let upload_id = Self::extract_upload_id(query).unwrap_or_default();
             return self
-                .handle_complete_multipart_upload(
-                    req,
-                    cache_key,
-                    target_host,
-                    target_ip,
-                    tls_connector,
-                    upload_id,
-                )
+                .handle_complete_multipart_upload(req, cache_key, target_host, transport, upload_id)
                 .await;
         }
 
@@ -471,8 +469,7 @@ impl SignedPutHandler {
                     req,
                     cache_key,
                     target_host,
-                    target_ip,
-                    tls_connector,
+                    transport,
                     request_headers,
                     content_length,
                 )
@@ -487,14 +484,8 @@ impl SignedPutHandler {
                     metrics.read().await.record_bypassed_put().await;
                 }
                 // Forward without caching
-                forward_signed_request(
-                    req,
-                    &target_host,
-                    target_ip,
-                    &tls_connector,
-                    self.proxy_referer.as_deref(),
-                )
-                .await
+                forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
+                    .await
             }
             CacheDecision::StreamWithCapacityCheck => {
                 info!("Streaming signed PUT with capacity check: {}", cache_key);
@@ -503,8 +494,7 @@ impl SignedPutHandler {
                     req,
                     cache_key,
                     target_host,
-                    target_ip,
-                    tls_connector,
+                    transport,
                     request_headers,
                 )
                 .await
@@ -535,761 +525,282 @@ impl SignedPutHandler {
         )
     }
 
-    /// Handle signed PUT with caching (Content-Length known and fits)
+    /// Handle signed PUT with caching (Content-Length known and fits).
     ///
-    /// This method reads the body into memory, spawns a background task to handle
-    /// caching asynchronously, forwards the request to S3, and returns the S3
-    /// response immediately without waiting for cache operations to complete.
+    /// Streams the request body to the upstream **verbatim** while teeing it to the
+    /// write cache incrementally (streaming-write-path Component 5), instead of
+    /// buffering the whole object in RAM. `should_cache` already decided this object
+    /// fits, so a cache tee is opened when caching is viable; with no tee the body
+    /// still streams to the upstream.
     ///
     /// # Requirements
     ///
-    /// - Requirement 4.1: Forward request to S3 without waiting for cache write completion
-    /// - Requirement 4.2: Return S3 response to client immediately
-    /// - Requirement 4.3: Handle cache writes in background tasks
-    /// - Requirement 1.1: Continue with upload even if caching fails
-    /// - Requirement 1.3: Return S3 response unchanged
+    /// - Requirement 1.1: Stream the body to S3 without holding the whole object in RAM
+    /// - Requirement 6.1: Single-part PUT streams per Requirements 1–5
+    /// - Requirement 7.2: A cache skip never alters the forwarded bytes or response
     #[allow(clippy::too_many_arguments)]
     async fn handle_with_caching(
         &self,
         req: Request<hyper::body::Incoming>,
         cache_key: String,
         target_host: String,
-        target_ip: IpAddr,
-        tls_connector: Arc<TlsConnector>,
+        transport: Arc<UpstreamTransport>,
         request_headers: HashMap<String, String>,
         content_length: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
-        // Extract request components before consuming the body
+        self.stream_put_to_upstream(
+            req,
+            cache_key,
+            target_host,
+            transport,
+            request_headers,
+            content_length,
+        )
+        .await
+    }
+
+    /// Stream a single-part PUT body to the upstream verbatim, optionally teeing it
+    /// to the write cache. Shared by [`Self::handle_with_caching`] (Content-Length
+    /// known and fits) and [`Self::handle_with_streaming_capacity_check`] (no
+    /// Content-Length).
+    ///
+    /// This replaces the former buffer-then-forward implementation
+    /// (`read_request_body_bounded` + inline `raw_request` assembly +
+    /// `forward_raw_request_to_s3`) with [`forward_signed_request_streaming`]: the
+    /// client body frames flow straight to the upstream (the awaited socket write is
+    /// the primary backpressure), and the same frames are tee'd to a bounded channel
+    /// feeding the incremental write-cache task when caching is viable. The upstream
+    /// always receives the original bytes byte-for-byte (SigV4 intact); only the
+    /// cache branch decodes aws-chunked (now done incrementally inside the cache
+    /// task, not up front).
+    ///
+    /// Cache viability is decided by [`Self::setup_put_cache_tee`]; when it returns
+    /// no tee, `tee = None` is passed and the body still streams to the upstream
+    /// (Req 7.2). After the forward returns, the S3 `ResponseInfo`/error is delivered
+    /// to the background cache task (if any) exactly as the buffered path did, and
+    /// the S3 response is returned to the client unchanged.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_put_to_upstream(
+        &self,
+        req: Request<hyper::body::Incoming>,
+        cache_key: String,
+        target_host: String,
+        transport: Arc<UpstreamTransport>,
+        request_headers: HashMap<String, String>,
+        content_length: Option<u64>,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        // Extract request components before consuming the body into a stream.
         let method = req.method().clone();
         let uri = req.uri().clone();
         let headers = req.headers().clone();
         let version = req.version();
+        let body = req.into_body();
 
-        // Read the request body with bounded size (Requirements 1.5, 11.1, 11.2, 11.4)
-        // This preserves AWS SigV4 signatures while enforcing body size limits
-        let body_bytes = crate::signed_request_proxy::read_request_body_bounded(
-            req,
-            self.max_buffered_request_body_bytes,
-        )
-        .await?;
-
-        debug!("Read request body: {} bytes", body_bytes.len());
-
-        // Check for aws-chunked encoding and decode if present
-        // (Requirements 1.1, 1.2, 1.4, 1.5, 2.1, 2.3, 4.1, 4.2 from aws-chunked-decoding)
-        let (body_for_cache, effective_content_length) = if aws_chunked_decoder::is_aws_chunked(
-            &request_headers,
-        ) {
-            info!(
-                "aws-chunked encoding detected: cache_key={}, raw_body_size={}",
-                cache_key,
-                body_bytes.len()
-            );
-            match aws_chunked_decoder::decode_aws_chunked(&body_bytes) {
-                Ok(decoded) => {
-                    let decoded_len = decoded.data.len() as u64;
-                    // Validate against x-amz-decoded-content-length if present (Requirement 1.5)
-                    if let Some(expected) =
-                        aws_chunked_decoder::get_decoded_content_length(&request_headers)
-                    {
-                        if decoded_len != expected {
-                            warn!(
-                                "aws-chunked decode length mismatch: cache_key={}, expected={}, actual={} - skipping cache",
-                                cache_key, expected, decoded_len
-                            );
-                            // Record cache bypass metric (Requirement 4.4)
-                            if let Some(metrics) = &self.metrics_manager {
-                                let metrics_clone = metrics.clone();
-                                tokio::spawn(async move {
-                                    metrics_clone
-                                        .read()
-                                        .await
-                                        .record_cache_bypass("aws_chunked_decode_error")
-                                        .await;
-                                });
-                            }
-                            // Skip caching but continue with S3 upload (Requirement 4.1, 4.2)
-                            (None, content_length)
-                        } else {
-                            info!(
-                                "aws-chunked decoded successfully: cache_key={}, raw_size={}, decoded_size={}",
-                                cache_key, body_bytes.len(), decoded_len
-                            );
-                            (Some(Bytes::from(decoded.data)), Some(decoded_len))
-                        }
-                    } else {
-                        info!(
-                            "aws-chunked decoded (no expected length header): cache_key={}, raw_size={}, decoded_size={}",
-                            cache_key, body_bytes.len(), decoded_len
-                        );
-                        (Some(Bytes::from(decoded.data)), Some(decoded_len))
-                    }
-                }
-                Err(e) => {
-                    // Log warning and skip caching, but still forward to S3 (Requirement 4.1, 4.2)
-                    warn!(
-                        "aws-chunked decode failed: cache_key={}, error={} - skipping cache",
-                        cache_key, e
-                    );
-                    // Record cache bypass metric (Requirement 4.4)
-                    if let Some(metrics) = &self.metrics_manager {
-                        let metrics_clone = metrics.clone();
-                        tokio::spawn(async move {
-                            metrics_clone
-                                .read()
-                                .await
-                                .record_cache_bypass("aws_chunked_decode_error")
-                                .await;
-                        });
-                    }
-                    (None, content_length)
-                }
-            }
+        // The cache branch decodes aws-chunked incrementally; the decoded object
+        // length comes from `x-amz-decoded-content-length` for aws-chunked, else the
+        // Content-Length. The upstream always receives the original bytes verbatim.
+        let is_aws_chunked = aws_chunked_decoder::is_aws_chunked(&request_headers);
+        let decoded_len = if is_aws_chunked {
+            aws_chunked_decoder::get_decoded_content_length(&request_headers)
         } else {
-            // Non-chunked: use body as-is (Requirement 3.1, 3.3 from aws-chunked-decoding)
-            (Some(body_bytes.clone()), content_length)
+            content_length
         };
 
-        // Create oneshot channel for S3 result communication
-        let (s3_result_tx, s3_result_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
-
-        // Spawn background cache task only if we have decoded body (Requirement 4.3)
-        // Pass decoded body for caching (Requirement 2.3 from aws-chunked-decoding)
-        if let Some(cache_body) = body_for_cache {
-            Self::spawn_cache_write_task(
-                cache_key.clone(),
-                cache_body, // Use decoded body for cache
-                s3_result_rx,
-                self.cache_dir.clone(),
-                self.compression_handler.clone(),
-                effective_content_length,
-                request_headers.clone(),
-                self.metrics_manager.clone(),
-                self.cache_manager.clone(),
-                self.s3_client.clone(),
-            );
-        } else {
-            // No caching - drop the receiver to signal no cache write
-            drop(s3_result_rx);
-        }
-
-        // Build raw HTTP request for S3
-        let mut raw_request = Vec::new();
-
-        // Request line: METHOD /path?query HTTP/1.1
-        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-        raw_request.extend_from_slice(
-            format!("{} {} {:?}\r\n", method, path_and_query, version).as_bytes(),
-        );
-
-        // Headers - preserve exactly as received
-        for (name, value) in headers.iter() {
-            if let Ok(value_str) = value.to_str() {
-                raw_request
-                    .extend_from_slice(format!("{}: {}\r\n", name.as_str(), value_str).as_bytes());
-            }
-        }
-
-        // Inject proxy identification Referer header if conditions are met
-        if let Some(ref referer_value) = self.proxy_referer {
-            if !headers.contains_key("referer") {
-                let should_add = if let Some(auth) =
-                    headers.get("authorization").and_then(|v| v.to_str().ok())
-                {
-                    if crate::signed_request_proxy::is_sigv4_algorithm(auth) {
-                        if let Some(pos) = auth.find("SignedHeaders=") {
-                            let after_param = &auth[pos + 14..];
-                            let end = after_param
-                                .find(',')
-                                .or_else(|| after_param.find(' '))
-                                .unwrap_or(after_param.len());
-                            let signed_headers = &after_param[..end];
-                            !signed_headers.split(';').any(|h| h == "referer")
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                };
-                if should_add {
-                    debug!("Adding proxy identification Referer header to raw streaming PUT request: {}", referer_value);
-                    raw_request
-                        .extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
-                }
-            }
-        }
-
-        // End of headers
-        raw_request.extend_from_slice(b"\r\n");
-
-        // Body
-        if !body_bytes.is_empty() {
-            raw_request.extend_from_slice(&body_bytes);
-        }
-
-        debug!("Built raw HTTP request: {} bytes", raw_request.len());
-
-        // Forward to S3 immediately without waiting for cache (Requirement 4.1)
-        let s3_response = self
-            .forward_raw_request_to_s3(raw_request, &target_host, target_ip, &tls_connector)
+        // Decide whether to cache and, if so, open the sink + spawn the cache task.
+        // `tee` is the send side handed to the streaming forward; `s3_result_tx` is
+        // the channel the cache task waits on for the S3 result.
+        let (tee, s3_result_tx) = self
+            .setup_put_cache_tee(&cache_key, &request_headers, is_aws_chunked, decoded_len)
             .await;
 
-        // Send S3 result info to background task through channel
-        // Extract status and headers before sending
-        let response_info = match &s3_response {
-            Ok(resp) => Ok(ResponseInfo {
-                status: resp.status(),
-                headers: resp.headers().clone(),
-            }),
-            Err(e) => Err(e.clone()),
-        };
-        let _ = s3_result_tx.send(response_info);
+        // Stream the body to the upstream verbatim (Req 1.1, 4.1). `tee = None`
+        // means no caching, but the body still streams (Req 7.2). The body-size cap
+        // is enforced without buffering the whole body inside the streaming forward.
+        let s3_response = forward_signed_request_streaming(
+            &method,
+            &uri,
+            &headers,
+            version,
+            body,
+            &target_host,
+            &transport,
+            self.proxy_referer.as_deref(),
+            self.max_buffered_request_body_bytes,
+            tee,
+        )
+        .await;
 
-        // Return S3 response to client immediately (Requirement 4.2)
+        // Deliver the S3 result (status + headers, or error) to the background cache
+        // task through the oneshot, exactly as the buffered path did. On success the
+        // task finalizes + commits the cached range; on error/non-success it discards.
+        if let Some(s3_result_tx) = s3_result_tx {
+            let response_info = match &s3_response {
+                Ok(resp) => Ok(ResponseInfo {
+                    status: resp.status(),
+                    headers: resp.headers().clone(),
+                }),
+                Err(e) => Err(e.clone()),
+            };
+            let _ = s3_result_tx.send(response_info);
+        }
+
+        // Return the S3 response to the client unchanged (Req 5.5).
         s3_response
     }
 
-    /// Handle signed PUT with streaming capacity check (no Content-Length)
+    /// Set up the streaming write-cache tee for a single-part PUT, when caching is
+    /// viable. Returns `(tee_sender, s3_result_sender)`:
     ///
-    /// This method reads the body into memory, spawns a background task to handle
-    /// caching asynchronously with capacity checking, forwards the request to S3,
-    /// and returns the S3 response immediately without waiting for cache operations
-    /// to complete.
+    /// - `tee_sender: Some` when a streaming cache sink was opened and a background
+    ///   [`Self::run_streaming_cache_write`] task spawned to consume it; pass it to
+    ///   [`forward_signed_request_streaming`].
+    /// - `s3_result_sender: Some` whenever a background cache task (streaming, or the
+    ///   empty-object metadata-only task) is waiting for the S3 result; the caller
+    ///   must send the `ResponseInfo`/error into it after the forward returns.
+    ///
+    /// Both `None` means no caching for this request — the body still streams to the
+    /// upstream verbatim (Req 7.2). Caching is skipped (no tee) when: there is no
+    /// cache manager; the decoded object length is unknown (e.g. non-chunked with no
+    /// Content-Length, or aws-chunked without `x-amz-decoded-content-length`, since
+    /// the sink must be sized up front); or write-cache capacity cannot be reserved.
+    /// Empty objects (decoded length 0) are cached via the metadata-only buffered
+    /// path (the streaming sink rejects a zero-length open), preserving the buffered
+    /// path's empty-object cache-hit behaviour.
+    async fn setup_put_cache_tee(
+        &self,
+        cache_key: &str,
+        request_headers: &HashMap<String, String>,
+        is_aws_chunked: bool,
+        decoded_len: Option<u64>,
+    ) -> (
+        Option<tokio::sync::mpsc::Sender<Bytes>>,
+        Option<tokio::sync::oneshot::Sender<Result<ResponseInfo>>>,
+    ) {
+        // Caching requires a cache manager.
+        let cache_manager = match &self.cache_manager {
+            Some(cm) => cm.clone(),
+            None => return (None, None),
+        };
+
+        let decoded_len = match decoded_len {
+            Some(n) => n,
+            None => {
+                // Decoded object length unknown: we cannot size the streaming sink,
+                // so skip caching (parity with today's capacity decisions). The body
+                // still streams to the upstream.
+                debug!(
+                    "Streaming PUT: decoded object length unknown, skipping cache: cache_key={}",
+                    cache_key
+                );
+                return (None, None);
+            }
+        };
+
+        // Empty object: there is no range to stream. Cache via the metadata-only
+        // buffered path (the streaming sink rejects a zero-length open), so an
+        // immediate post-PUT GET/HEAD still hits, matching the buffered path.
+        if decoded_len == 0 {
+            let (s3_result_tx, s3_result_rx) =
+                tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+            Self::spawn_cache_write_task(
+                cache_key.to_string(),
+                Bytes::new(),
+                s3_result_rx,
+                self.cache_dir.clone(),
+                self.compression_handler.clone(),
+                Some(0),
+                request_headers.clone(),
+                self.metrics_manager.clone(),
+                Some(cache_manager),
+                self.s3_client.clone(),
+            );
+            return (None, Some(s3_result_tx));
+        }
+
+        // Reserve write-cache capacity and open the streaming sink. A failed
+        // reservation (insufficient capacity) or open simply skips caching — the
+        // body still streams verbatim (Req 7.2).
+        let sink = match cache_manager
+            .open_write_cache_sink(cache_key, decoded_len)
+            .await
+        {
+            Ok(Some(sink)) => sink,
+            Ok(None) => {
+                debug!(
+                    "Streaming PUT: write-cache capacity unavailable, skipping cache: cache_key={}",
+                    cache_key
+                );
+                return (None, None);
+            }
+            Err(e) => {
+                warn!(
+                    "Streaming PUT: failed to open write-cache sink, skipping cache (upload unaffected): cache_key={}, error={}",
+                    cache_key, e
+                );
+                return (None, None);
+            }
+        };
+
+        let ttl = cache_manager.get_effective_put_ttl(cache_key).await;
+        let (tee_tx, tee_rx) =
+            tokio::sync::mpsc::channel::<Bytes>(self.write_cache_tee_channel_depth);
+        let (s3_result_tx, s3_result_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        Self::spawn_streaming_cache_write_task(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_result_rx,
+            is_aws_chunked,
+            Some(decoded_len),
+            ttl,
+            request_headers.clone(),
+            self.metrics_manager.clone(),
+            Some(cache_manager),
+            self.s3_client.clone(),
+        );
+
+        (Some(tee_tx), Some(s3_result_tx))
+    }
+
+    /// Handle signed PUT with streaming capacity check (no Content-Length).
+    ///
+    /// Streams the request body to the upstream verbatim while teeing it to the
+    /// write cache incrementally, instead of buffering the whole object in RAM.
+    /// With no Content-Length up front, caching is gated on
+    /// `x-amz-decoded-content-length` (aws-chunked, needed to size the sink) and an
+    /// atomic write-cache capacity reservation; an unsizable body skips caching but
+    /// still streams to the upstream.
     ///
     /// # Requirements
     ///
-    /// - Requirement 2.1: Sanitize cache keys before path construction
-    /// - Requirement 2.2: Ensure cache paths are within cache directory
-    /// - Requirement 4.1: Forward request to S3 without waiting for cache write completion
-    /// - Requirement 4.2: Return S3 response to client immediately
-    /// - Requirement 4.3: Handle cache writes in background tasks
-    /// - Requirement 1.1: Continue with upload even if caching fails
-    /// - Requirement 1.3: Return S3 response unchanged
+    /// - Requirement 1.1: Stream the body to S3 without holding the whole object in RAM
+    /// - Requirement 6.1: Single-part PUT streams per Requirements 1–5
+    /// - Requirement 7.2: A cache skip never alters the forwarded bytes or response
     async fn handle_with_streaming_capacity_check(
         &self,
         req: Request<hyper::body::Incoming>,
         cache_key: String,
         target_host: String,
-        target_ip: IpAddr,
-        tls_connector: Arc<TlsConnector>,
+        transport: Arc<UpstreamTransport>,
         request_headers: HashMap<String, String>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
-        // Extract request components before consuming the body
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        let headers = req.headers().clone();
-        let version = req.version();
-
-        // Read the request body with bounded size (Requirements 1.5, 11.1, 11.2, 11.4)
-        // This preserves AWS SigV4 signatures while enforcing body size limits
-        let body_bytes = crate::signed_request_proxy::read_request_body_bounded(
+        // No Content-Length up front: pass `None`, so caching is gated on
+        // `x-amz-decoded-content-length` (aws-chunked) — needed to size the sink —
+        // and an atomic write-cache reservation. A non-chunked body with no
+        // Content-Length cannot be sized, so it skips caching while still streaming
+        // verbatim to the upstream. The former up-front
+        // `available_capacity` comparison is subsumed by `try_reserve_write_cache`
+        // inside `setup_put_cache_tee` → `open_write_cache_sink`.
+        self.stream_put_to_upstream(
             req,
-            self.max_buffered_request_body_bytes,
-        )
-        .await?;
-
-        debug!("Read request body: {} bytes", body_bytes.len());
-
-        // Check for aws-chunked encoding and decode if present
-        // Use decoded content length for capacity checking (Requirement 1.3 from aws-chunked-decoding)
-        let (body_for_cache, effective_capacity_length) = if aws_chunked_decoder::is_aws_chunked(
-            &request_headers,
-        ) {
-            info!(
-                "aws-chunked encoding detected (streaming): cache_key={}, raw_body_size={}",
-                cache_key,
-                body_bytes.len()
-            );
-            match aws_chunked_decoder::decode_aws_chunked(&body_bytes) {
-                Ok(decoded) => {
-                    let decoded_len = decoded.data.len() as u64;
-                    // Validate against x-amz-decoded-content-length if present
-                    if let Some(expected) =
-                        aws_chunked_decoder::get_decoded_content_length(&request_headers)
-                    {
-                        if decoded_len != expected {
-                            warn!(
-                                "aws-chunked decode length mismatch (streaming): cache_key={}, expected={}, actual={} - skipping cache",
-                                cache_key, expected, decoded_len
-                            );
-                            // Record cache bypass metric (Requirement 4.4)
-                            if let Some(metrics) = &self.metrics_manager {
-                                let metrics_clone = metrics.clone();
-                                tokio::spawn(async move {
-                                    metrics_clone
-                                        .read()
-                                        .await
-                                        .record_cache_bypass("aws_chunked_decode_error")
-                                        .await;
-                                });
-                            }
-                            (None, None)
-                        } else {
-                            info!(
-                                "aws-chunked decoded successfully (streaming): cache_key={}, raw_size={}, decoded_size={}",
-                                cache_key, body_bytes.len(), decoded_len
-                            );
-                            (Some(Bytes::from(decoded.data)), Some(decoded_len))
-                        }
-                    } else {
-                        info!(
-                            "aws-chunked decoded (streaming, no expected length header): cache_key={}, raw_size={}, decoded_size={}",
-                            cache_key, body_bytes.len(), decoded_len
-                        );
-                        (Some(Bytes::from(decoded.data)), Some(decoded_len))
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "aws-chunked decode failed (streaming): cache_key={}, error={} - skipping cache",
-                        cache_key, e
-                    );
-                    // Record cache bypass metric (Requirement 4.4)
-                    if let Some(metrics) = &self.metrics_manager {
-                        let metrics_clone = metrics.clone();
-                        tokio::spawn(async move {
-                            metrics_clone
-                                .read()
-                                .await
-                                .record_cache_bypass("aws_chunked_decode_error")
-                                .await;
-                        });
-                    }
-                    (None, None)
-                }
-            }
-        } else {
-            // Non-chunked: use body as-is
-            (Some(body_bytes.clone()), Some(body_bytes.len() as u64))
-        };
-
-        // Create oneshot channel for S3 result communication
-        let (s3_result_tx, s3_result_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
-
-        // Calculate available capacity for streaming check
-        let available_capacity = self
-            .max_cache_capacity
-            .saturating_sub(self.current_cache_usage);
-
-        // Spawn background cache task with capacity limit (Requirement 4.3)
-        // Use decoded body for caching and decoded length for capacity check
-        if let Some(cache_body) = body_for_cache {
-            // Use decoded length for capacity checking (Requirement 1.3 from aws-chunked-decoding)
-            let capacity_to_check = effective_capacity_length.unwrap_or(cache_body.len() as u64);
-
-            // Only proceed if decoded body fits in available capacity
-            if capacity_to_check <= available_capacity {
-                Self::spawn_cache_write_task_with_capacity(
-                    cache_key.clone(),
-                    cache_body, // Use decoded body for cache
-                    s3_result_rx,
-                    self.cache_dir.clone(),
-                    self.compression_handler.clone(),
-                    Some(available_capacity),
-                    request_headers.clone(),
-                    self.metrics_manager.clone(),
-                    self.cache_manager.clone(),
-                    self.s3_client.clone(),
-                );
-            } else {
-                debug!(
-                    "Decoded body exceeds capacity: cache_key={}, decoded_size={}, available={}",
-                    cache_key, capacity_to_check, available_capacity
-                );
-                drop(s3_result_rx);
-            }
-        } else {
-            // No caching - drop the receiver to signal no cache write
-            drop(s3_result_rx);
-        }
-
-        // Build raw HTTP request for S3
-        let mut raw_request = Vec::new();
-
-        // Request line: METHOD /path?query HTTP/1.1
-        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-        raw_request.extend_from_slice(
-            format!("{} {} {:?}\r\n", method, path_and_query, version).as_bytes(),
-        );
-
-        // Headers - preserve exactly as received
-        for (name, value) in headers.iter() {
-            if let Ok(value_str) = value.to_str() {
-                raw_request
-                    .extend_from_slice(format!("{}: {}\r\n", name.as_str(), value_str).as_bytes());
-            }
-        }
-
-        // Inject proxy identification Referer header if conditions are met
-        if let Some(ref referer_value) = self.proxy_referer {
-            if !headers.contains_key("referer") {
-                let should_add = if let Some(auth) =
-                    headers.get("authorization").and_then(|v| v.to_str().ok())
-                {
-                    if crate::signed_request_proxy::is_sigv4_algorithm(auth) {
-                        if let Some(pos) = auth.find("SignedHeaders=") {
-                            let after_param = &auth[pos + 14..];
-                            let end = after_param
-                                .find(',')
-                                .or_else(|| after_param.find(' '))
-                                .unwrap_or(after_param.len());
-                            let signed_headers = &after_param[..end];
-                            !signed_headers.split(';').any(|h| h == "referer")
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                };
-                if should_add {
-                    debug!(
-                        "Adding proxy identification Referer header to raw PUT request: {}",
-                        referer_value
-                    );
-                    raw_request
-                        .extend_from_slice(format!("Referer: {}\r\n", referer_value).as_bytes());
-                }
-            }
-        }
-
-        // End of headers
-        raw_request.extend_from_slice(b"\r\n");
-
-        // Body
-        if !body_bytes.is_empty() {
-            raw_request.extend_from_slice(&body_bytes);
-        }
-
-        debug!("Built raw HTTP request: {} bytes", raw_request.len());
-
-        // Forward to S3 immediately without waiting for cache (Requirement 4.1)
-        let s3_response = self
-            .forward_raw_request_to_s3(raw_request, &target_host, target_ip, &tls_connector)
-            .await;
-
-        // Send S3 result info to background task through channel
-        // Extract status and headers before sending
-        let response_info = match &s3_response {
-            Ok(resp) => Ok(ResponseInfo {
-                status: resp.status(),
-                headers: resp.headers().clone(),
-            }),
-            Err(e) => Err(e.clone()),
-        };
-        let _ = s3_result_tx.send(response_info);
-
-        // Return S3 response to client immediately (Requirement 4.2)
-        s3_response
-    }
-
-    /// Forward raw HTTP request to S3 via TLS
-    ///
-    /// This method establishes a TLS connection to S3 and forwards the raw
-    /// HTTP request bytes, then reads and parses the response.
-    ///
-    /// # Arguments
-    ///
-    /// * `raw_request` - Complete raw HTTP request bytes
-    /// * `target_host` - Target S3 hostname
-    /// * `target_ip` - Resolved IP address for S3
-    /// * `tls_connector` - TLS connector for S3 connection
-    ///
-    /// # Returns
-    ///
-    /// Returns the parsed S3 response
-    ///
-    /// # Requirements
-    ///
-    /// - Requirement 8.4: Handle network timeouts
-    /// - Requirement 9.3: Log detailed error information
-    async fn forward_raw_request_to_s3(
-        &self,
-        raw_request: Vec<u8>,
-        target_host: &str,
-        target_ip: IpAddr,
-        tls_connector: &TlsConnector,
-    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::{timeout, Duration};
-
-        // Establish TLS connection with retry logic (Requirement 8.4, 1.1, 1.2, 2.1, 3.1, 3.4)
-        // Use 5 retries with exponential backoff
-        let mut tls_stream = crate::signed_request_proxy::establish_tls_with_retry(
-            target_ip,
-            443,
+            cache_key,
             target_host,
-            tls_connector,
-            5,
+            transport,
+            request_headers,
+            None,
         )
-        .await?;
-
-        // Send raw request with timeout (Requirement 8.4)
-        timeout(Duration::from_secs(60), tls_stream.write_all(&raw_request))
-            .await
-            .map_err(|_| {
-                error!(
-                    "Request write timeout: target_host={}, request_size={}, timeout=60s",
-                    target_host,
-                    raw_request.len()
-                );
-                ProxyError::TimeoutError(format!("Request write timeout to {}", target_host))
-            })?
-            .map_err(|e| {
-                error!(
-                    "Failed to write request: target_host={}, request_size={}, error={}",
-                    target_host,
-                    raw_request.len(),
-                    e
-                );
-                ProxyError::HttpError(format!("Failed to write request: {}", e))
-            })?;
-
-        timeout(Duration::from_secs(10), tls_stream.flush())
-            .await
-            .map_err(|_| {
-                error!(
-                    "Request flush timeout: target_host={}, timeout=10s",
-                    target_host
-                );
-                ProxyError::TimeoutError(format!("Request flush timeout to {}", target_host))
-            })?
-            .map_err(|e| {
-                error!(
-                    "Failed to flush request: target_host={}, error={}",
-                    target_host, e
-                );
-                ProxyError::HttpError(format!("Failed to flush request: {}", e))
-            })?;
-
-        debug!("Sent raw HTTP request to S3");
-
-        // Read response with timeout (Requirement 8.4)
-        let mut response_bytes = Vec::new();
-        let mut buffer = vec![0u8; 8192];
-        let read_timeout = Duration::from_secs(300); // 5 minutes for large responses
-
-        loop {
-            match timeout(read_timeout, tls_stream.read(&mut buffer)).await {
-                Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => {
-                    response_bytes.extend_from_slice(&buffer[..n]);
-
-                    // Check if we have a complete response
-                    if self.has_complete_response(&response_bytes) {
-                        break;
-                    }
-                }
-                Ok(Err(e)) => {
-                    error!(
-                        "Failed to read response: target_host={}, bytes_read={}, error={}",
-                        target_host,
-                        response_bytes.len(),
-                        e
-                    );
-                    return Err(ProxyError::HttpError(format!(
-                        "Failed to read response: {}",
-                        e
-                    )));
-                }
-                Err(_) => {
-                    error!(
-                        "Response read timeout: target_host={}, bytes_read={}, timeout={}s",
-                        target_host,
-                        response_bytes.len(),
-                        read_timeout.as_secs()
-                    );
-                    return Err(ProxyError::TimeoutError(format!(
-                        "Response read timeout from {}",
-                        target_host
-                    )));
-                }
-            }
-
-            // Safety limit
-            if response_bytes.len() > 100 * 1024 * 1024 {
-                warn!(
-                    "Response exceeded 100MB, stopping read: target_host={}, bytes_read={}",
-                    target_host,
-                    response_bytes.len()
-                );
-                break;
-            }
-        }
-
-        debug!("Received raw HTTP response: {} bytes", response_bytes.len());
-
-        // Parse response
-        self.parse_http_response(&response_bytes)
-    }
-
-    /// Check if we have a complete HTTP response (skipping 1xx informational responses)
-    fn has_complete_response(&self, bytes: &[u8]) -> bool {
-        let mut pos = 0;
-
-        loop {
-            // Find the end of headers from current position
-            let remaining_bytes = &bytes[pos..];
-            let header_end = match self.find_header_end(remaining_bytes) {
-                Some(end_pos) => end_pos,
-                None => return false, // No complete headers found
-            };
-
-            // Parse headers to check status code
-            let header_section = &remaining_bytes[..header_end];
-            let header_str = String::from_utf8_lossy(header_section);
-            let mut lines = header_str.lines();
-
-            // Parse status line
-            let status_line = match lines.next() {
-                Some(line) => line,
-                None => return false,
-            };
-
-            // Extract status code
-            let status_code = match self.parse_status_code(status_line) {
-                Ok(code) => code,
-                Err(_) => return false,
-            };
-
-            // If this is a 1xx response, skip it and continue looking
-            if status_code.as_u16() >= 100 && status_code.as_u16() < 200 {
-                // Skip past this response (1xx responses typically have no body)
-                pos = pos + header_end + 4; // Skip \r\n\r\n
-                continue;
-            }
-
-            // This is a final response (2xx-5xx), check if it's complete
-            // Check for Content-Length
-            for line in lines {
-                if line.to_lowercase().starts_with("content-length:") {
-                    if let Some(length_str) = line.split(':').nth(1) {
-                        if let Ok(content_length) = length_str.trim().parse::<usize>() {
-                            let body_start = pos + header_end + 4; // Skip \r\n\r\n
-                            let current_body_length = bytes.len().saturating_sub(body_start);
-                            return current_body_length >= content_length;
-                        }
-                    }
-                }
-
-                // Check for chunked encoding
-                if line.to_lowercase().starts_with("transfer-encoding:") && line.contains("chunked")
-                {
-                    return bytes.ends_with(b"0\r\n\r\n") || bytes.ends_with(b"0\r\n\r\n\r\n");
-                }
-            }
-
-            // If no Content-Length or Transfer-Encoding found, assume response is complete
-            // This handles cases where the response has no body
-            return true;
-        }
-    }
-
-    /// Find the end of HTTP headers (position of \r\n\r\n)
-    fn find_header_end(&self, bytes: &[u8]) -> Option<usize> {
-        (0..bytes.len().saturating_sub(3)).find(|&i| &bytes[i..i + 4] == b"\r\n\r\n")
-    }
-
-    /// Parse raw HTTP response bytes into a Hyper Response
-    fn parse_http_response(&self, bytes: &[u8]) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
-        // Parse response, skipping any 1xx informational responses
-        let mut pos = 0;
-
-        loop {
-            // Find end of headers from current position
-            let remaining_bytes = &bytes[pos..];
-            let header_end = self.find_header_end(remaining_bytes).ok_or_else(|| {
-                ProxyError::HttpError("Invalid HTTP response: no header end found".to_string())
-            })?;
-
-            let header_section = &remaining_bytes[..header_end];
-            let body_start = pos + header_end + 4; // Skip \r\n\r\n
-
-            // Parse status line and headers
-            let header_str = String::from_utf8_lossy(header_section);
-            let mut lines = header_str.lines();
-
-            // Parse status line: HTTP/1.1 200 OK
-            let status_line = lines.next().ok_or_else(|| {
-                ProxyError::HttpError("Invalid HTTP response: no status line".to_string())
-            })?;
-
-            let status_code = self.parse_status_code(status_line)?;
-
-            // If this is a 1xx response, skip it and continue looking for final response
-            if status_code.as_u16() >= 100 && status_code.as_u16() < 200 {
-                info!(
-                    "Received informational response: {} - skipping",
-                    status_code
-                );
-
-                // For 1xx responses, there should be no body, so move to next response
-                pos = body_start;
-                continue;
-            }
-
-            // This is a final response (2xx-5xx), process it
-            let body_bytes = if body_start < bytes.len() {
-                Bytes::copy_from_slice(&bytes[body_start..])
-            } else {
-                Bytes::new()
-            };
-
-            // Build response with final status code
-            let mut response_builder = Response::builder().status(status_code);
-
-            // Parse and add headers
-            for line in lines {
-                if let Some((name, value)) = line.split_once(':') {
-                    let name = name.trim();
-                    let value = value.trim();
-                    response_builder = response_builder.header(name, value);
-                }
-            }
-
-            // Debug log for raw PUT response - detailed logging is in the operation handlers
-            debug!(
-                "Raw PUT response: status={}, body_len={}",
-                status_code,
-                body_bytes.len()
-            );
-
-            return response_builder
-                .body(
-                    Full::new(body_bytes)
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .map_err(|e| ProxyError::HttpError(format!("Failed to build response: {}", e)));
-        }
-    }
-
-    /// Parse HTTP status code from status line
-    fn parse_status_code(&self, status_line: &str) -> Result<StatusCode> {
-        // Status line format: HTTP/1.1 200 OK
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-
-        if parts.len() < 2 {
-            return Err(ProxyError::HttpError(format!(
-                "Invalid status line: {}",
-                status_line
-            )));
-        }
-
-        let code_str = parts[1];
-        let code = code_str.parse::<u16>().map_err(|e| {
-            ProxyError::HttpError(format!("Invalid status code {}: {}", code_str, e))
-        })?;
-
-        StatusCode::from_u16(code)
-            .map_err(|e| ProxyError::HttpError(format!("Invalid status code {}: {}", code, e)))
+        .await
     }
 
     // ============================================================================
@@ -1425,8 +936,7 @@ impl SignedPutHandler {
         req: Request<hyper::body::Incoming>,
         cache_key: String,
         target_host: String,
-        target_ip: IpAddr,
-        tls_connector: Arc<TlsConnector>,
+        transport: Arc<UpstreamTransport>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
         let (bucket, key) = parse_cache_key(&cache_key);
 
@@ -1440,14 +950,9 @@ impl SignedPutHandler {
             .map(|s| s.to_string());
 
         // Forward request to S3
-        let s3_response = forward_signed_request(
-            req,
-            &target_host,
-            target_ip,
-            &tls_connector,
-            self.proxy_referer.as_deref(),
-        )
-        .await?;
+        let s3_response =
+            forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
+                .await?;
 
         let status = s3_response.status();
         let response_headers = s3_response.headers().clone();
@@ -1575,23 +1080,32 @@ impl SignedPutHandler {
         Ok(())
     }
 
-    /// Handle UploadPart request by caching the part as a range file
+    /// Handle an `UploadPart` request by streaming the part body to the upstream
+    /// verbatim while teeing it to a part-staging cache sink.
+    ///
+    /// Mirrors the single-part PUT streaming path ([`Self::stream_put_to_upstream`]):
+    /// the client body frames flow straight to the upstream (the awaited socket
+    /// write is the primary backpressure) and the same frames are tee'd to a bounded
+    /// channel feeding [`Self::run_streaming_part_cache_write`], which incrementally
+    /// decodes aws-chunked (cache branch only) and stages the part into
+    /// `mpus_in_progress/{upload_id}/part{N}.bin`. The upstream always receives the
+    /// original bytes byte-for-byte (SigV4 intact). The per-part correctness gate is
+    /// preserved: the staged part is finalized and recorded in the `upload.meta`
+    /// tracker under `upload.lock` only on S3 success.
     ///
     /// # Requirements
     ///
-    /// - Requirement 5.1: Cache each part as a range file
-    /// - Requirement 5.2: Calculate byte offset based on previously cached parts
-    /// - Requirement 8.1: Handle cache write failures gracefully
-    /// - Requirement 8.2: Clean up cached data on S3 error
-    /// - Requirement 9.3: Log detailed error information
+    /// - Requirement 6.2: `UploadPart` streams per Requirements 1–5 (bounded memory)
+    /// - Requirement 5.1/5.2: cache each part as a range file at its byte offset
+    /// - Requirement 7.1/7.2: a cache skip/failure never alters the forwarded bytes
+    /// - Requirement 8.1/8.2: handle cache write failures gracefully
     #[allow(clippy::too_many_arguments)]
     async fn handle_upload_part(
         &mut self,
         req: Request<hyper::body::Incoming>,
         cache_key: String,
         target_host: String,
-        target_ip: IpAddr,
-        tls_connector: Arc<TlsConnector>,
+        transport: Arc<UpstreamTransport>,
         upload_id: String,
         part_number: u32,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
@@ -1612,219 +1126,82 @@ impl SignedPutHandler {
 
         match cache_decision {
             CacheDecision::Cache | CacheDecision::StreamWithCapacityCheck => {
-                // Read the request body with bounded size (Requirements 11.1, 11.2, 11.4)
+                // Stream the part body to the upstream verbatim while teeing it to
+                // the part-staging cache sink (streaming-write-path Req 6.2). This
+                // replaces the former buffer-then-forward implementation
+                // (`read_request_body_bounded` + inline `raw_request` assembly +
+                // `forward_raw_request_to_s3` + whole-buffer `cache_upload_part`):
+                // the client body frames flow straight to the upstream (the awaited
+                // socket write is the primary backpressure), and the same frames are
+                // tee'd to a bounded channel feeding the incremental part-cache task.
+                // The upstream always receives the original bytes byte-for-byte
+                // (SigV4 intact); only the cache branch decodes aws-chunked (now done
+                // incrementally inside the cache task, not up front).
                 let method = req.method().clone();
                 let uri = req.uri().clone();
                 let headers = req.headers().clone();
                 let version = req.version();
+                let body = req.into_body();
 
-                let original_body_bytes = crate::signed_request_proxy::read_request_body_bounded(
-                    req,
-                    self.max_buffered_request_body_bytes,
-                )
-                .await?;
-
-                debug!(
-                    "Read UploadPart body: {} bytes for part {}, first 20 bytes: {:?}, last 20 bytes: {:?}",
-                    original_body_bytes.len(),
-                    part_number,
-                    &original_body_bytes[..std::cmp::min(20, original_body_bytes.len())],
-                    &original_body_bytes[original_body_bytes.len().saturating_sub(20)..]
-                );
-
-                // Check if body starts with chunked encoding (AWS CLI sends chunked data)
-                // We'll strip it ONLY for caching, but send the original to S3.
-                // Uses the same aws_chunked_decoder module as the non-multipart PUT path
-                // (handle_with_caching), which validates chunk framing and, when the
-                // x-amz-decoded-content-length header is present, verifies the decoded
-                // length matches. On any failure we skip caching this part (bypass
-                // metric recorded) rather than cache potentially-corrupt bytes.
-                //
-                // None = skip caching this part. Some(bytes) = cache these bytes.
-                let cache_body_bytes: Option<Bytes> = if aws_chunked_decoder::is_aws_chunked(
-                    &request_headers,
-                ) {
-                    match aws_chunked_decoder::decode_aws_chunked(&original_body_bytes) {
-                        Ok(decoded) => {
-                            let decoded_len = decoded.data.len() as u64;
-
-                            // If the header is present, validate the decoded length.
-                            // A mismatch means the framing parsed but produced wrong
-                            // bytes, which would silently cache corrupt content — so
-                            // we skip caching instead and record a bypass metric.
-                            if let Some(expected) =
-                                aws_chunked_decoder::get_decoded_content_length(&request_headers)
-                            {
-                                if decoded_len != expected {
-                                    warn!(
-                                        "aws-chunked decode length mismatch: cache_key={}, upload_id={}, part_number={}, expected={}, actual={} - skipping cache",
-                                        cache_key, upload_id, part_number, expected, decoded_len
-                                    );
-                                    if let Some(metrics) = &self.metrics_manager {
-                                        let metrics_clone = metrics.clone();
-                                        tokio::spawn(async move {
-                                            metrics_clone
-                                                .read()
-                                                .await
-                                                .record_cache_bypass("aws_chunked_decode_error")
-                                                .await;
-                                        });
-                                    }
-                                    None
-                                } else {
-                                    if self.log_sampler.should_log("chunked_decode") {
-                                        debug!(
-                                            part_number = part_number,
-                                            original_bytes = original_body_bytes.len(),
-                                            decoded_bytes = decoded_len,
-                                            "aws-chunked decoded for caching"
-                                        );
-                                    }
-                                    Some(Bytes::from(decoded.data))
-                                }
-                            } else {
-                                // No length header to validate against; trust the decoder.
-                                if self.log_sampler.should_log("chunked_decode") {
-                                    debug!(
-                                        part_number = part_number,
-                                        original_bytes = original_body_bytes.len(),
-                                        decoded_bytes = decoded_len,
-                                        "aws-chunked decoded for caching (no length header)"
-                                    );
-                                }
-                                Some(Bytes::from(decoded.data))
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "aws-chunked decode failed: cache_key={}, upload_id={}, part_number={}, error={} - skipping cache for this part",
-                                cache_key, upload_id, part_number, e
-                            );
-                            if let Some(metrics) = &self.metrics_manager {
-                                let metrics_clone = metrics.clone();
-                                tokio::spawn(async move {
-                                    metrics_clone
-                                        .read()
-                                        .await
-                                        .record_cache_bypass("aws_chunked_decode_error")
-                                        .await;
-                                });
-                            }
-                            None
-                        }
-                    }
+                // The cache branch decodes aws-chunked incrementally; the decoded
+                // part length comes from `x-amz-decoded-content-length` for
+                // aws-chunked, else the Content-Length. Used only to validate the
+                // decoded length at finish (Req 3.4); the upstream always receives
+                // the original bytes verbatim.
+                let is_aws_chunked = aws_chunked_decoder::is_aws_chunked(&request_headers);
+                let decoded_len = if is_aws_chunked {
+                    aws_chunked_decoder::get_decoded_content_length(&request_headers)
                 } else {
-                    // Not aws-chunked; cache the body verbatim.
-                    Some(original_body_bytes.clone())
+                    content_length
                 };
 
-                // Forward ORIGINAL body to S3 (with chunked encoding intact)
-                let mut raw_request = Vec::new();
-                let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-                raw_request.extend_from_slice(
-                    format!("{} {} {:?}\r\n", method, path_and_query, version).as_bytes(),
-                );
-
-                for (name, value) in headers.iter() {
-                    if let Ok(value_str) = value.to_str() {
-                        raw_request.extend_from_slice(
-                            format!("{}: {}\r\n", name.as_str(), value_str).as_bytes(),
-                        );
-                    }
-                }
-
-                raw_request.extend_from_slice(b"\r\n");
-                if !original_body_bytes.is_empty() {
-                    raw_request.extend_from_slice(&original_body_bytes);
-                }
-
-                // Forward to S3
-                let s3_response = self
-                    .forward_raw_request_to_s3(raw_request, &target_host, target_ip, &tls_connector)
-                    .await?;
-
-                let status = s3_response.status();
-                let response_headers = s3_response.headers().clone();
-
-                // Read response body for both success and error cases
-                let response_body_bytes = s3_response
-                    .into_body()
-                    .collect()
-                    .await
-                    .map(|collected| collected.to_bytes())
-                    .unwrap_or_default();
-
-                if status.is_success() {
-                    // Extract ETag from response headers
-                    let response_headers_map: HashMap<String, String> = response_headers
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                        .collect();
-
-                    let etag = response_headers_map
-                        .get("etag")
-                        .or_else(|| response_headers_map.get("ETag"))
-                        .cloned()
-                        .unwrap_or_default();
-
-                    // Cache the part as a range file (Requirement 5.1, 8.1, 9.3).
-                    // When aws-chunked decoding failed above, cache_body_bytes is None
-                    // and we skip caching this part; the bypass metric was already
-                    // recorded. S3 has the correct bytes either way since we always
-                    // forward the unmodified body.
-                    if let Some(ref cache_bytes) = cache_body_bytes {
-                        if let Err(e) = self
-                            .cache_upload_part(
-                                &cache_key,
-                                &upload_id,
-                                part_number,
-                                cache_bytes,
-                                &etag,
-                            )
-                            .await
-                        {
-                            error!(
-                                "Failed to cache UploadPart: cache_key={}, upload_id={}, part_number={}, size={}, error_type={}, error={}",
-                                cache_key, upload_id, part_number, cache_bytes.len(), Self::classify_error(&e), e
-                            );
-                        } else {
-                            // Log successful UploadPart with concise format
-                            let (bucket, key) = parse_cache_key(&cache_key);
-                            info!(
-                                "UploadPart: bucket={}, key={}, part={}, size={}",
-                                bucket,
-                                key,
-                                part_number,
-                                format_size(cache_bytes.len() as u64)
-                            );
-                        }
-                    }
-                } else {
-                    // S3 returned error (Requirement 8.2, 9.3)
-                    let error_body = String::from_utf8_lossy(&response_body_bytes);
-                    error!(
-                        "S3 error response for UploadPart: cache_key={}, upload_id={}, part_number={}, status={}, status_code={}, error_body={}",
-                        cache_key, upload_id, part_number, status, status.as_u16(), error_body
-                    );
-                }
-
-                // Rebuild response with the body we read
-                let mut response_builder = Response::builder().status(status);
-                for (name, value) in response_headers.iter() {
-                    response_builder = response_builder.header(name, value);
-                }
-                let rebuilt_response = response_builder
-                    .body(
-                        Full::new(response_body_bytes)
-                            .map_err(|never| match never {})
-                            .boxed(),
+                // Open the part sink + spawn the incremental part-cache task when
+                // caching is viable. `tee = None` means no caching, but the body
+                // still streams to the upstream (Req 7.2).
+                let (tee, s3_result_tx) = self
+                    .setup_upload_part_cache_tee(
+                        &cache_key,
+                        &upload_id,
+                        part_number,
+                        is_aws_chunked,
+                        decoded_len,
                     )
-                    .map_err(|e| {
-                        ProxyError::HttpError(format!("Failed to rebuild response: {}", e))
-                    })?;
+                    .await;
 
-                Ok(rebuilt_response)
+                // Stream the original body to the upstream verbatim (Req 1.1, 4.1),
+                // enforcing the body-size cap without buffering the whole body.
+                let s3_response = forward_signed_request_streaming(
+                    &method,
+                    &uri,
+                    &headers,
+                    version,
+                    body,
+                    &target_host,
+                    &transport,
+                    self.proxy_referer.as_deref(),
+                    self.max_buffered_request_body_bytes,
+                    tee,
+                )
+                .await;
+
+                // Deliver the S3 result (status + headers, or error) to the
+                // background part-cache task. On success it finalizes the part under
+                // `upload.lock` and records the tracker with the response ETag; on
+                // error/non-success/skip it discards the staged part — the per-part
+                // correctness gate (commit only on S3 success) is preserved.
+                if let Some(s3_result_tx) = s3_result_tx {
+                    let response_info = match &s3_response {
+                        Ok(resp) => Ok(ResponseInfo {
+                            status: resp.status(),
+                            headers: resp.headers().clone(),
+                        }),
+                        Err(e) => Err(e.clone()),
+                    };
+                    let _ = s3_result_tx.send(response_info);
+                }
+
+                // Return the S3 response to the client unchanged (Req 5.5).
+                s3_response
             }
             CacheDecision::Bypass(reason) => {
                 log_bypass_decision(&cache_key, &reason);
@@ -1832,14 +1209,8 @@ impl SignedPutHandler {
                 if let Some(metrics) = &self.metrics_manager {
                     metrics.read().await.record_bypassed_put().await;
                 }
-                forward_signed_request(
-                    req,
-                    &target_host,
-                    target_ip,
-                    &tls_connector,
-                    self.proxy_referer.as_deref(),
-                )
-                .await
+                forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
+                    .await
             }
         }
     }
@@ -1997,8 +1368,7 @@ impl SignedPutHandler {
         req: Request<hyper::body::Incoming>,
         cache_key: String,
         target_host: String,
-        target_ip: IpAddr,
-        tls_connector: Arc<TlsConnector>,
+        transport: Arc<UpstreamTransport>,
         upload_id: String,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
         let (bucket, key) = parse_cache_key(&cache_key);
@@ -2046,8 +1416,7 @@ impl SignedPutHandler {
             version,
             request_body_bytes,
             &target_host,
-            target_ip,
-            &tls_connector,
+            &transport,
             self.proxy_referer.as_deref(),
         )
         .await?;
@@ -2140,8 +1509,7 @@ impl SignedPutHandler {
         req: Request<hyper::body::Incoming>,
         cache_key: String,
         target_host: String,
-        target_ip: IpAddr,
-        tls_connector: Arc<TlsConnector>,
+        transport: Arc<UpstreamTransport>,
         upload_id: String,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
         info!(
@@ -2150,14 +1518,9 @@ impl SignedPutHandler {
         );
 
         // Forward request to S3 first
-        let s3_response = forward_signed_request(
-            req,
-            &target_host,
-            target_ip,
-            &tls_connector,
-            self.proxy_referer.as_deref(),
-        )
-        .await?;
+        let s3_response =
+            forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
+                .await?;
 
         // Always clean up cached parts, regardless of S3 response status
         // This ensures we don't leave orphaned cache data
@@ -2867,219 +2230,6 @@ impl SignedPutHandler {
         String::new()
     }
 
-    /// Spawn a background task to handle cache writing asynchronously with capacity checking
-    ///
-    /// This function spawns a tokio task that:
-    /// 1. Creates a cache writer with capacity limit
-    /// 2. Writes the body data to cache
-    /// 3. Waits for the S3 result
-    /// 4. Commits or discards based on S3 success/failure
-    ///
-    /// # Arguments
-    ///
-    /// * `cache_key` - Cache key (will be sanitized internally)
-    /// * `body_data` - The request body data (already read)
-    /// * `s3_result_rx` - Channel receiver for S3 operation result
-    /// * `cache_dir` - Cache directory path
-    /// * `compression_handler` - Compression handler for cache writes
-    /// * `capacity_limit` - Optional capacity limit for streaming check
-    /// * `request_headers` - Request headers for metadata extraction
-    /// * `metrics` - Optional metrics manager
-    /// * `cache_manager` - Optional cache manager for HEAD cache invalidation
-    ///
-    /// # Requirements
-    ///
-    /// - Requirement 4.3: Handle cache operations in background tasks
-    /// - Requirement 4.4: Commit cache on S3 success
-    /// - Requirement 4.5: Discard cache on S3 failure
-    /// - Requirement 1.2: Log warnings on cache failures
-    /// - Requirement 1.4: Record metrics on cache failures
-    /// - Requirement 2.3: Stream to cache until completion or capacity reached
-    /// - Requirement 2.4: Discard cache if capacity exceeded during streaming
-    ///
-    /// Updated for write-through-cache-finalization:
-    /// - Requirement 1.1: Store object data as single range (0 to content-length-1)
-    /// - Requirement 1.2: Create metadata with ETag and Content-Type from S3 response (Last-Modified learned on first cache-miss GET or first HEAD after PUT)
-    /// - Requirement 1.3: Set write cache TTL (default: 1 day)
-    /// - Requirement 9.1: Don't cache on S3 failure
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_cache_write_task_with_capacity(
-        cache_key: String,
-        body_data: Bytes,
-        s3_result_rx: tokio::sync::oneshot::Receiver<Result<ResponseInfo>>,
-        _cache_dir: PathBuf,
-        _compression_handler: CompressionHandler,
-        capacity_limit: Option<u64>,
-        request_headers: HashMap<String, String>,
-        metrics: Option<Arc<RwLock<MetricsManager>>>,
-        cache_manager: Option<Arc<crate::cache::CacheManager>>,
-        s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
-    ) {
-        tokio::spawn(async move {
-            let start_time = std::time::Instant::now();
-            let body_len = body_data.len() as u64;
-
-            // Check capacity limit before proceeding
-            if let Some(limit) = capacity_limit {
-                if body_len > limit {
-                    warn!(
-                        "PUT body exceeds capacity limit, bypassing cache: cache_key={}, size={}, limit={}",
-                        cache_key, body_len, limit
-                    );
-                    if let Some(m) = &metrics {
-                        m.read().await.record_bypassed_put().await;
-                    }
-                    return;
-                }
-            }
-
-            // Wait for S3 result first (Requirement 9.1: Don't cache on S3 failure)
-            match s3_result_rx.await {
-                Ok(Ok(response)) => {
-                    let status = response.status();
-
-                    if status.is_success() {
-                        // S3 success - store as single range with write cache metadata
-                        let response_headers: HashMap<String, String> = response
-                            .headers()
-                            .iter()
-                            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                            .collect();
-
-                        // Use S3 client's comprehensive header extraction if available
-                        let (etag, last_modified, mut comprehensive_headers) =
-                            if let Some(s3_client) = &s3_client {
-                                let object_metadata = s3_client
-                                    .extract_object_metadata_from_response(&response_headers);
-                                (
-                                    object_metadata.etag,
-                                    object_metadata.last_modified,
-                                    object_metadata.response_headers,
-                                )
-                            } else {
-                                // Fallback to manual extraction
-                                let etag = response_headers
-                                    .get("etag")
-                                    .or_else(|| response_headers.get("ETag"))
-                                    .cloned()
-                                    .unwrap_or_default();
-
-                                // S3 PUT responses don't include Last-Modified - leave empty
-                                let last_modified = response_headers
-                                    .get("last-modified")
-                                    .or_else(|| response_headers.get("Last-Modified"))
-                                    .cloned()
-                                    .unwrap_or_default();
-
-                                (etag, last_modified, response_headers.clone())
-                            };
-
-                        // Merge checksum headers from request if not present in response
-                        // Always prefer response headers, but include request checksums as fallback
-                        for (key, value) in &request_headers {
-                            let key_lower = key.to_lowercase();
-                            if (key_lower.starts_with("x-amz-checksum-")
-                                || key_lower.starts_with("x-amz-content-sha256")
-                                || key_lower == "content-md5")
-                                && !comprehensive_headers.contains_key(key)
-                            {
-                                debug!("Adding checksum header from PUT request: {}", key);
-                                comprehensive_headers.insert(key.clone(), value.clone());
-                            }
-                        }
-
-                        let content_type = request_headers
-                            .get("content-type")
-                            .or_else(|| request_headers.get("Content-Type"))
-                            .cloned();
-
-                        // Store directly as range using CacheManager
-                        // (Requirements 3.1, 3.2, 3.3 - unified storage only)
-                        if let Some(cache_mgr) = &cache_manager {
-                            if let Err(e) = cache_mgr
-                                .invalidate_cache_unified_for_operation(&cache_key, "PUT")
-                                .await
-                            {
-                                warn!(
-                                    "Failed to invalidate cache before PUT caching: cache_key={}, error={}",
-                                    cache_key, e
-                                );
-                            }
-
-                            match cache_mgr
-                                .store_put_as_write_cached_range(
-                                    &cache_key,
-                                    &body_data,
-                                    etag.clone(),
-                                    last_modified.clone(),
-                                    content_type.clone(),
-                                    comprehensive_headers.clone(),
-                                )
-                                .await
-                            {
-                                Ok(()) => {
-                                    let streaming_duration_ms =
-                                        start_time.elapsed().as_millis() as u64;
-                                    // Get the effective PUT TTL for logging - Requirement 11.1
-                                    let effective_ttl =
-                                        cache_mgr.get_effective_put_ttl(&cache_key).await;
-                                    info!(
-                                        "Successfully stored PUT as write-cached range (with capacity check): cache_key={}, size={} bytes, ttl={:?}",
-                                        cache_key, body_len, effective_ttl
-                                    );
-                                    if let Some(m) = &metrics {
-                                        m.read()
-                                            .await
-                                            .record_cached_put(body_len, streaming_duration_ms)
-                                            .await;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to store PUT as write-cached range: cache_key={}, error={}",
-                                        cache_key, e
-                                    );
-                                    if let Some(m) = &metrics {
-                                        m.read().await.record_put_cache_failure().await;
-                                    }
-                                }
-                            }
-                        } else {
-                            // No cache_manager available - cannot cache without unified storage
-                            warn!(
-                                "Cannot cache PUT: no cache_manager available for unified storage: cache_key={}",
-                                cache_key
-                            );
-                            if let Some(m) = &metrics {
-                                m.read().await.record_put_cache_failure().await;
-                            }
-                        }
-                    } else {
-                        debug!(
-                            "S3 error response, not caching PUT: cache_key={}, status={}",
-                            cache_key, status
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    debug!(
-                        "S3 error, not caching PUT: cache_key={}, error={}",
-                        cache_key, e
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "S3 result channel closed unexpectedly: cache_key={}, error={:?}",
-                        cache_key, e
-                    );
-                    if let Some(m) = &metrics {
-                        m.read().await.record_put_cache_failure().await;
-                    }
-                }
-            }
-        });
-    }
-
     /// Spawn a background task to handle cache writing asynchronously
     ///
     /// This function spawns a tokio task that:
@@ -3286,39 +2436,945 @@ impl SignedPutHandler {
         });
     }
 
-    /// Classify error type for detailed logging
+    /// Spawn the streaming write-cache task that consumes the bounded tee channel
+    /// fed by `forward_signed_request_streaming` and writes the cached object
+    /// incrementally through a [`crate::cache::WriteCacheRangeSink`]
+    /// (Component 4 of the streaming-write-path design).
     ///
-    /// # Requirements
+    /// This is the streaming analog of [`Self::spawn_cache_write_task`]: instead
+    /// of receiving a fully-buffered decoded body, it drains `tee_rx`
+    /// frame-by-frame as the body streams to the upstream, decoding aws-chunked
+    /// incrementally on the cache branch only (the upstream always receives the
+    /// original bytes verbatim — Req 4). Per-request cache memory stays bounded by
+    /// one in-flight frame plus the channel capacity (Req 1, 2).
     ///
-    /// - Requirement 9.3: Log detailed error information
-    fn classify_error(error: &ProxyError) -> &'static str {
-        match error {
-            ProxyError::IoError(msg) if msg.contains("Disk full") => "disk_full",
-            ProxyError::IoError(_) => "io_error",
-            ProxyError::HttpError(_) => "http_error",
-            ProxyError::ConnectionError(_) => "connection_error",
-            ProxyError::CacheError(msg) if msg.contains("Capacity limit exceeded") => {
-                "capacity_exceeded"
+    /// Cache-failure isolation (Req 7): every skip/error path discards the sink
+    /// and closes the tee receiver, so the forward loop drops the tee and keeps
+    /// streaming verbatim — a cache problem never fails an upload S3 would accept.
+    ///
+    /// The fire-and-forget return value is intentionally ignored; tests call
+    /// [`Self::run_streaming_cache_write`] directly to observe the
+    /// [`StreamingCacheOutcome`].
+    //
+    // Wired into the single-part PUT path via `SignedPutHandler::setup_put_cache_tee`
+    // (task 5.1); `handle_upload_part` adopts it in task 6.1.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_streaming_cache_write_task(
+        cache_key: String,
+        sink: crate::cache::WriteCacheRangeSink,
+        tee_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        s3_result_rx: tokio::sync::oneshot::Receiver<Result<ResponseInfo>>,
+        is_aws_chunked: bool,
+        expected_decoded_len: Option<u64>,
+        ttl: std::time::Duration,
+        request_headers: HashMap<String, String>,
+        metrics: Option<Arc<RwLock<MetricsManager>>>,
+        cache_manager: Option<Arc<crate::cache::CacheManager>>,
+        s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
+    ) {
+        tokio::spawn(async move {
+            let _ = Self::run_streaming_cache_write(
+                cache_key,
+                sink,
+                tee_rx,
+                s3_result_rx,
+                is_aws_chunked,
+                expected_decoded_len,
+                ttl,
+                request_headers,
+                metrics,
+                cache_manager,
+                s3_client,
+            )
+            .await;
+        });
+    }
+
+    /// Drive the streaming write-cache pipeline to completion (the receiver side
+    /// of the streaming forward's bounded tee channel).
+    ///
+    /// Phases:
+    /// 1. Drain `tee_rx` as frames arrive. Non-chunked frames are object bytes and
+    ///    are written straight to the sink; aws-chunked frames are `push`-ed
+    ///    through an [`aws_chunked_decoder::IncrementalAwsChunkedDecoder`] and the
+    ///    decoded bytes are written to the sink. A decode or sink-write error skips
+    ///    caching (discard) without failing the upload (Req 3.4, 7.1, 7.2).
+    /// 2. Once the channel closes (the forward loop finished streaming the body),
+    ///    await the S3 result via the existing oneshot result channel.
+    /// 3. On S3 success, finish the decoder (chunked case) and validate the decoded
+    ///    length against `x-amz-decoded-content-length` when present; on mismatch,
+    ///    discard the sink and skip caching (Req 3.4).
+    /// 4. Build the write-cache [`crate::cache_types::ObjectMetadata`] from the S3
+    ///    response (etag / last-modified / content-type / checksum headers) and
+    ///    `commit` the sink with the resolved TTL.
+    ///
+    /// On any S3 failure / non-success / skip, the sink is discarded (its `.tmp`
+    /// is cleaned up) and nothing else happens — the upload already streamed
+    /// verbatim and its response is returned by the forward loop, untouched.
+    //
+    // Wired into the single-part PUT path (task 5.1); also exercised directly by
+    // the streaming write-cache task tests below.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_streaming_cache_write(
+        cache_key: String,
+        sink: crate::cache::WriteCacheRangeSink,
+        mut tee_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        s3_result_rx: tokio::sync::oneshot::Receiver<Result<ResponseInfo>>,
+        is_aws_chunked: bool,
+        expected_decoded_len: Option<u64>,
+        ttl: std::time::Duration,
+        request_headers: HashMap<String, String>,
+        metrics: Option<Arc<RwLock<MetricsManager>>>,
+        cache_manager: Option<Arc<crate::cache::CacheManager>>,
+        s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
+    ) -> StreamingCacheOutcome {
+        let start_time = std::time::Instant::now();
+
+        // The cache branch decodes aws-chunked incrementally; the upstream leg
+        // (the forward loop) always receives the original bytes verbatim.
+        let decoder = if is_aws_chunked {
+            Some(aws_chunked_decoder::IncrementalAwsChunkedDecoder::new())
+        } else {
+            None
+        };
+        // ---- Phase 1: drain the bounded tee channel, decode, write to sink ----
+        //
+        // `sink.write` performs BLOCKING std::fs I/O (LZ4 compress + `File::write_all`
+        // + flush). Running it inline on the async worker pins a Tokio worker thread
+        // for the entire upload; on a 2-worker runtime (the default on a 2-vCPU host)
+        // two concurrent large PUTs starve the whole runtime — including the /health
+        // task and the shutdown handler. We therefore drain the channel and do the
+        // blocking writes on a dedicated blocking thread via `blocking_recv`, the same
+        // way the rest of the proxy offloads blocking cache I/O. The async worker is
+        // free to poll other tasks while this thread blocks on EFS writeback.
+        // One-shot return from the drain task (once per upload, not a per-frame hot
+        // path), so the size gap between `Continue` and `Skip` is immaterial; boxing
+        // the sink would only add a needless allocation.
+        #[allow(clippy::large_enum_variant)]
+        enum DrainOutcome {
+            Continue {
+                sink: crate::cache::WriteCacheRangeSink,
+                decoder: Option<aws_chunked_decoder::IncrementalAwsChunkedDecoder>,
+                decoded_written: u64,
+            },
+            Skip {
+                reason: &'static str,
+                record_failure: bool,
+            },
+        }
+
+        let drain_key = cache_key.clone();
+        let drain = tokio::task::spawn_blocking(move || {
+            let mut sink = sink;
+            let mut decoder = decoder;
+            let mut decoded_written: u64 = 0;
+            while let Some(frame) = tee_rx.blocking_recv() {
+                let write_result = match decoder.as_mut() {
+                    Some(dec) => match dec.push(frame.as_ref()) {
+                        Ok(decoded) => {
+                            let n = decoded.len() as u64;
+                            sink.write(&decoded).map(|()| n)
+                        }
+                        Err(e) => {
+                            // aws-chunked decode error → skip caching, keep forwarding
+                            // (Req 3.4, 7.2). Not a recorded failure: mirrors the
+                            // buffered handler, which logs and bypasses on decode error.
+                            warn!(
+                                "Streaming cache: aws-chunked decode error, skipping cache (upload unaffected): cache_key={}, error={}",
+                                drain_key, e
+                            );
+                            sink.discard();
+                            // Close the receiver so the forward loop drops the tee and
+                            // keeps streaming verbatim (no deadlock on a full channel).
+                            tee_rx.close();
+                            return DrainOutcome::Skip {
+                                reason: "decode_error",
+                                record_failure: false,
+                            };
+                        }
+                    },
+                    None => {
+                        let n = frame.len() as u64;
+                        sink.write(frame.as_ref()).map(|()| n)
+                    }
+                };
+
+                match write_result {
+                    Ok(n) => decoded_written += n,
+                    Err(e) => {
+                        // Cache write error (disk full, etc.) → skip caching, keep
+                        // forwarding (Req 7.1).
+                        warn!(
+                            "Streaming cache: sink write error, skipping cache (upload unaffected): cache_key={}, error={}",
+                            drain_key, e
+                        );
+                        sink.discard();
+                        tee_rx.close();
+                        return DrainOutcome::Skip {
+                            reason: "cache_write_error",
+                            record_failure: true,
+                        };
+                    }
+                }
             }
-            ProxyError::CacheError(msg) if msg.contains("Disk full") => "disk_full",
-            ProxyError::CacheError(_) => "cache_error",
-            ProxyError::CompressionError(_) => "compression_error",
-            ProxyError::TlsError(_) => "tls_error",
-            ProxyError::ConfigError(_) => "config_error",
-            ProxyError::DnsError(_) => "dns_error",
-            ProxyError::TimeoutError(_) => "timeout_error",
-            ProxyError::SerializationError(_) => "serialization_error",
-            ProxyError::LockError(_) => "lock_error",
-            ProxyError::LockContention(_) => "lock_contention",
-            ProxyError::InvalidRequest(_) => "invalid_request",
-            ProxyError::S3Error(_) => "s3_error",
-            ProxyError::InternalError(_) => "internal_error",
-            ProxyError::ServiceUnavailable(_) => "service_unavailable",
-            ProxyError::InvalidRange(_) => "invalid_range",
-            ProxyError::SystemError(_) => "system_error",
-            ProxyError::RetryAfter(_) => "retry_after",
-            ProxyError::EvictionFenceLost(_) => "eviction_fence_lost",
-            ProxyError::RequestBodyTooLarge { .. } => "request_body_too_large",
+            DrainOutcome::Continue {
+                sink,
+                decoder,
+                decoded_written,
+            }
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            error!(
+                "Streaming cache: drain task panicked, skipping cache (upload unaffected): cache_key={}, error={}",
+                cache_key, join_err
+            );
+            DrainOutcome::Skip {
+                reason: "drain_task_panic",
+                record_failure: true,
+            }
+        });
+
+        let (sink, decoder, decoded_written) = match drain {
+            DrainOutcome::Continue {
+                sink,
+                decoder,
+                decoded_written,
+            } => (sink, decoder, decoded_written),
+            DrainOutcome::Skip {
+                reason,
+                record_failure,
+            } => {
+                if record_failure {
+                    if let Some(m) = &metrics {
+                        m.read().await.record_put_cache_failure().await;
+                    }
+                }
+                return StreamingCacheOutcome::Skipped(reason);
+            }
+        };
+
+        // ---- Phase 2: channel closed (body fully streamed). Await S3 result ----
+        let response = match s3_result_rx.await {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                // S3 failure → don't cache (Req 7.1). The upload already returned
+                // the S3 error to the client via the forward loop.
+                debug!(
+                    "Streaming cache: S3 error, not caching: cache_key={}, error={}",
+                    cache_key, e
+                );
+                sink.discard();
+                return StreamingCacheOutcome::Skipped("s3_error");
+            }
+            Err(e) => {
+                // The forward loop dropped the result sender without sending — treat
+                // as a cache failure but never touch the upload.
+                warn!(
+                    "Streaming cache: S3 result channel closed unexpectedly: cache_key={}, error={:?}",
+                    cache_key, e
+                );
+                sink.discard();
+                if let Some(m) = &metrics {
+                    m.read().await.record_put_cache_failure().await;
+                }
+                return StreamingCacheOutcome::Skipped("s3_channel_closed");
+            }
+        };
+
+        if !response.status().is_success() {
+            // S3 returned an error status → don't cache (Req 7.1).
+            debug!(
+                "Streaming cache: S3 non-success status, not caching: cache_key={}, status={}",
+                cache_key,
+                response.status()
+            );
+            sink.discard();
+            return StreamingCacheOutcome::Skipped("s3_non_success");
+        }
+
+        // ---- Phase 3 (chunked only): finish + decoded-length validation ----
+        if let Some(dec) = decoder {
+            match dec.finish() {
+                Ok(trailers) => {
+                    if let Some(expected) = expected_decoded_len {
+                        if trailers.decoded_len != expected {
+                            // Decoded length disagrees with x-amz-decoded-content-length:
+                            // skip caching, do NOT reject the request, and let the
+                            // original bytes (already forwarded verbatim) stand — S3
+                            // remains the content-length authority (Req 3.4).
+                            warn!(
+                                "Streaming cache: decoded-length mismatch, skipping cache (upload unaffected): cache_key={}, expected={}, actual={}",
+                                cache_key, expected, trailers.decoded_len
+                            );
+                            sink.discard();
+                            return StreamingCacheOutcome::Skipped("decoded_length_mismatch");
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Body framing was incomplete at end-of-stream → skip caching.
+                    warn!(
+                        "Streaming cache: aws-chunked framing incomplete at finish, skipping cache (upload unaffected): cache_key={}, error={}",
+                        cache_key, e
+                    );
+                    sink.discard();
+                    return StreamingCacheOutcome::Skipped("decode_finish_error");
+                }
+            }
+        }
+
+        // ---- Phase 4: finalize the range bytes, then write `.meta` immediately ----
+        //
+        // Read-after-write parity (deployment-verification T9/T10): the buffered
+        // write-cache path (`store_put_as_write_cached_range_with_ttl`) finalizes the
+        // `.bin` and then writes the `.meta` synchronously via `store_new_metadata`,
+        // so an immediate post-PUT GET is a cache hit. `WriteCacheRangeSink::commit`
+        // is journal-only — it defers the `.meta` until consolidation, which would
+        // make that GET a miss. We therefore mirror the buffered path here:
+        // `sink.finalize()` (publish `.bin`) → build metadata → store `.meta` now via
+        // `CacheManager::store_streamed_write_cache_metadata`.
+        let object_metadata = Self::build_streaming_write_cache_metadata(
+            decoded_written,
+            &response,
+            &request_headers,
+            &s3_client,
+            ttl,
+        );
+
+        // Invalidate any existing cache entry for this key BEFORE publishing the new
+        // `.bin`, so invalidation cannot delete the range file we are about to
+        // finalize. Mirrors the buffered write-cache path's PUT invalidation so a
+        // re-PUT replaces stale ranges/metadata.
+        if let Some(cache_mgr) = &cache_manager {
+            if let Err(e) = cache_mgr
+                .invalidate_cache_unified_for_operation(&cache_key, "PUT")
+                .await
+            {
+                warn!(
+                    "Streaming cache: failed to invalidate before commit: cache_key={}, error={}",
+                    cache_key, e
+                );
+            }
+        }
+
+        // Finalize the bytes (flush residual batch, validate length, publish the
+        // `.bin`). This is blocking std::fs (flush + rename), so run it on a blocking
+        // thread rather than the async worker. The sink — and its capacity
+        // reservation — is moved in and returned so it stays alive until the explicit
+        // `drop(sink)` below, after the `.meta` write, matching the buffered path's
+        // reservation lifetime.
+        let (sink, finalize_res) = match tokio::task::spawn_blocking(move || {
+            let mut sink = sink;
+            let res = sink.finalize();
+            (sink, res)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(join_err) => {
+                error!(
+                    "Streaming cache: finalize task panicked, object not cached (upload unaffected): cache_key={}, error={}",
+                    cache_key, join_err
+                );
+                if let Some(m) = &metrics {
+                    m.read().await.record_put_cache_failure().await;
+                }
+                return StreamingCacheOutcome::Skipped("commit_error");
+            }
+        };
+        let range_spec = match finalize_res {
+            Ok(range_spec) => range_spec,
+            Err(e) => {
+                // Finalize failed (disk error, length mismatch, etc.). The writer was
+                // consumed and its `.tmp` cleaned up; the upload is unaffected
+                // (Req 7.1).
+                error!(
+                    "Streaming cache: finalize failed, object not cached (upload unaffected): cache_key={}, error={}",
+                    cache_key, e
+                );
+                if let Some(m) = &metrics {
+                    m.read().await.record_put_cache_failure().await;
+                }
+                return StreamingCacheOutcome::Skipped("commit_error");
+            }
+        };
+
+        let outcome = match &cache_manager {
+            Some(cache_mgr) => {
+                match cache_mgr
+                    .store_streamed_write_cache_metadata(
+                        &cache_key,
+                        range_spec,
+                        object_metadata,
+                        ttl,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let duration_ms = start_time.elapsed().as_millis() as u64;
+                        info!(
+                            "Streaming cache: committed write-cached range (.meta written immediately): cache_key={}, size={} bytes, ttl={:?}",
+                            cache_key, decoded_written, ttl
+                        );
+                        if let Some(m) = &metrics {
+                            m.read()
+                                .await
+                                .record_cached_put(decoded_written, duration_ms)
+                                .await;
+                        }
+                        StreamingCacheOutcome::Committed
+                    }
+                    Err(e) => {
+                        // Metadata write failed; the `.bin` is published but
+                        // unreferenced (a future consolidation/GC reclaims it). The
+                        // upload is unaffected (Req 7.1).
+                        error!(
+                            "Streaming cache: metadata store failed, object not cached (upload unaffected): cache_key={}, error={}",
+                            cache_key, e
+                        );
+                        if let Some(m) = &metrics {
+                            m.read().await.record_put_cache_failure().await;
+                        }
+                        StreamingCacheOutcome::Skipped("commit_error")
+                    }
+                }
+            }
+            None => {
+                // No cache manager wired (unit tests exercise the sink without a
+                // manager): the `.bin` is published, but the `.meta` cannot be
+                // written without a manager. The range bytes are committed.
+                StreamingCacheOutcome::Committed
+            }
+        };
+
+        // Drop the sink now — after the `.meta` write — to release the capacity
+        // reservation, matching the buffered path's reservation lifetime.
+        drop(sink);
+        outcome
+    }
+
+    /// Build the write-cache [`crate::cache_types::ObjectMetadata`] for a streamed
+    /// PUT from the S3 response and request headers, identically to the buffered
+    /// cache task: ETag and Last-Modified come from the S3 response (via the S3
+    /// client's comprehensive header extraction when available), Content-Type from
+    /// the request (S3 echoes what was sent), and request checksum headers are
+    /// merged in as a fallback. The write-cache tracking fields are stamped with
+    /// `now` + the resolved TTL.
+    ///
+    /// `compressed_size`/`compression_algorithm` are left at their defaults here:
+    /// the true per-range compressed size and algorithm are recorded on the
+    /// `RangeSpec` that `commit_incremental_range` derives from the sink and writes
+    /// to the journal; the object-level fields are not used for size accounting.
+    fn build_streaming_write_cache_metadata(
+        content_length: u64,
+        response: &ResponseInfo,
+        request_headers: &HashMap<String, String>,
+        s3_client: &Option<Arc<dyn S3ClientApi + Send + Sync>>,
+        ttl: std::time::Duration,
+    ) -> crate::cache_types::ObjectMetadata {
+        let response_headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        let (etag, last_modified, mut comprehensive_headers) = if let Some(s3_client) = s3_client {
+            let object_metadata =
+                s3_client.extract_object_metadata_from_response(&response_headers);
+            (
+                object_metadata.etag,
+                object_metadata.last_modified,
+                object_metadata.response_headers,
+            )
+        } else {
+            let etag = response_headers
+                .get("etag")
+                .or_else(|| response_headers.get("ETag"))
+                .cloned()
+                .unwrap_or_default();
+            // S3 PUT responses don't include Last-Modified - leave empty.
+            let last_modified = response_headers
+                .get("last-modified")
+                .or_else(|| response_headers.get("Last-Modified"))
+                .cloned()
+                .unwrap_or_default();
+            (etag, last_modified, response_headers.clone())
+        };
+
+        // Merge checksum headers from the request if not present in the response.
+        for (key, value) in request_headers {
+            let key_lower = key.to_lowercase();
+            if (key_lower.starts_with("x-amz-checksum-")
+                || key_lower.starts_with("x-amz-content-sha256")
+                || key_lower == "content-md5")
+                && !comprehensive_headers.contains_key(key)
+            {
+                comprehensive_headers.insert(key.clone(), value.clone());
+            }
+        }
+
+        let content_type = request_headers
+            .get("content-type")
+            .or_else(|| request_headers.get("Content-Type"))
+            .cloned();
+
+        let now = std::time::SystemTime::now();
+        crate::cache_types::ObjectMetadata {
+            etag,
+            last_modified,
+            content_length,
+            content_type,
+            response_headers: comprehensive_headers,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: content_length,
+            is_write_cached: true,
+            write_cache_expires_at: Some(now + ttl),
+            write_cache_created_at: Some(now),
+            write_cache_last_accessed: Some(now),
+            ..Default::default()
+        }
+    }
+
+    /// Set up the streaming part-cache tee for an `UploadPart`, when caching is
+    /// viable. Returns `(tee_sender, s3_result_sender)`:
+    ///
+    /// - `tee_sender: Some` when a part-staging sink was opened and a background
+    ///   [`Self::run_streaming_part_cache_write`] task spawned to consume it; pass
+    ///   it to [`forward_signed_request_streaming`].
+    /// - `s3_result_sender: Some` whenever that task is waiting for the S3 result;
+    ///   the caller sends the `ResponseInfo`/error into it after the forward returns.
+    ///
+    /// Both `None` means no caching for this part — the body still streams to the
+    /// upstream verbatim (Req 7.2). Caching is skipped (no tee) when there is no
+    /// cache manager or the part sink cannot be opened. Unlike the single-part PUT
+    /// sink, a part is not pre-sized and not write-cache-capacity-reserved (matching
+    /// [`Self::cache_upload_part`]); the handler's `should_cache` decision already
+    /// gated this call.
+    async fn setup_upload_part_cache_tee(
+        &self,
+        cache_key: &str,
+        upload_id: &str,
+        part_number: u32,
+        is_aws_chunked: bool,
+        decoded_len: Option<u64>,
+    ) -> (
+        Option<tokio::sync::mpsc::Sender<Bytes>>,
+        Option<tokio::sync::oneshot::Sender<Result<ResponseInfo>>>,
+    ) {
+        let cache_manager = match &self.cache_manager {
+            Some(cm) => cm.clone(),
+            None => return (None, None),
+        };
+
+        // Open the part-staging sink. A failed open simply skips caching this part —
+        // the body still streams verbatim to the upstream (Req 7.2).
+        let sink = match cache_manager
+            .open_multipart_part_sink(cache_key, upload_id, part_number)
+            .await
+        {
+            Ok(sink) => sink,
+            Err(e) => {
+                warn!(
+                    "Streaming UploadPart: failed to open part sink, skipping cache (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
+                    cache_key, upload_id, part_number, e
+                );
+                return (None, None);
+            }
+        };
+
+        let (tee_tx, tee_rx) =
+            tokio::sync::mpsc::channel::<Bytes>(self.write_cache_tee_channel_depth);
+        let (s3_result_tx, s3_result_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        Self::spawn_streaming_part_cache_write_task(
+            cache_key.to_string(),
+            upload_id.to_string(),
+            part_number,
+            sink,
+            tee_rx,
+            s3_result_rx,
+            is_aws_chunked,
+            decoded_len,
+            self.cache_dir.clone(),
+            self.metrics_manager.clone(),
+        );
+
+        (Some(tee_tx), Some(s3_result_tx))
+    }
+
+    /// Spawn the background streaming part-cache task. Fire-and-forget: a cache
+    /// problem never fails an upload the upstream would accept (Req 7). Tests call
+    /// [`Self::run_streaming_part_cache_write`] directly to observe the outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_streaming_part_cache_write_task(
+        cache_key: String,
+        upload_id: String,
+        part_number: u32,
+        sink: crate::cache::MultipartPartSink,
+        tee_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        s3_result_rx: tokio::sync::oneshot::Receiver<Result<ResponseInfo>>,
+        is_aws_chunked: bool,
+        expected_decoded_len: Option<u64>,
+        cache_dir: PathBuf,
+        metrics: Option<Arc<RwLock<MetricsManager>>>,
+    ) {
+        tokio::spawn(async move {
+            let _ = Self::run_streaming_part_cache_write(
+                cache_key,
+                upload_id,
+                part_number,
+                sink,
+                tee_rx,
+                s3_result_rx,
+                is_aws_chunked,
+                expected_decoded_len,
+                cache_dir,
+                metrics,
+            )
+            .await;
+        });
+    }
+
+    /// Drive the streaming part-cache pipeline (the receiver side of the
+    /// `UploadPart` forward's bounded tee channel). Mirrors
+    /// [`Self::run_streaming_cache_write`] but stages the bytes as a multipart part
+    /// and, on S3 success, finalizes the part and records the `upload.meta` tracker
+    /// under `upload.lock` (the per-part correctness gate) instead of committing
+    /// object metadata. On any S3 failure / non-success / skip, the staged part is
+    /// discarded — the upload already streamed verbatim and its response is returned
+    /// by the forward loop, untouched (Req 7).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_streaming_part_cache_write(
+        cache_key: String,
+        upload_id: String,
+        part_number: u32,
+        sink: crate::cache::MultipartPartSink,
+        mut tee_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        s3_result_rx: tokio::sync::oneshot::Receiver<Result<ResponseInfo>>,
+        is_aws_chunked: bool,
+        expected_decoded_len: Option<u64>,
+        cache_dir: PathBuf,
+        metrics: Option<Arc<RwLock<MetricsManager>>>,
+    ) -> StreamingCacheOutcome {
+        // The cache branch decodes aws-chunked incrementally; the upstream leg always
+        // receives the original bytes verbatim.
+        let decoder = if is_aws_chunked {
+            Some(aws_chunked_decoder::IncrementalAwsChunkedDecoder::new())
+        } else {
+            None
+        };
+
+        // ---- Phase 1: drain the bounded tee channel, decode, write to sink ----
+        //
+        // `sink.write` is BLOCKING std::fs I/O; draining + writing on a blocking
+        // thread keeps the async workers free. Inline blocking here can pin a Tokio
+        // worker for the whole part upload and wedge a 2-worker runtime (see
+        // `run_streaming_cache_write` for the full rationale).
+        // One-shot return from the drain task (once per part, not a per-frame hot
+        // path), so the size gap between `Continue` and `Skip` is immaterial; boxing
+        // the sink would only add a needless allocation.
+        #[allow(clippy::large_enum_variant)]
+        enum PartDrainOutcome {
+            Continue {
+                sink: crate::cache::MultipartPartSink,
+                decoder: Option<aws_chunked_decoder::IncrementalAwsChunkedDecoder>,
+            },
+            Skip {
+                reason: &'static str,
+                record_failure: bool,
+            },
+        }
+
+        let drain_key = cache_key.clone();
+        let drain_upload = upload_id.clone();
+        let drain = tokio::task::spawn_blocking(move || {
+            let mut sink = sink;
+            let mut decoder = decoder;
+            while let Some(frame) = tee_rx.blocking_recv() {
+                let write_result = match decoder.as_mut() {
+                    Some(dec) => match dec.push(frame.as_ref()) {
+                        Ok(decoded) => sink.write(&decoded),
+                        Err(e) => {
+                            // aws-chunked decode error → skip caching, keep forwarding
+                            // (Req 3.4, 7.2).
+                            warn!(
+                                "Streaming part cache: aws-chunked decode error, skipping cache (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
+                                drain_key, drain_upload, part_number, e
+                            );
+                            sink.discard();
+                            tee_rx.close();
+                            return PartDrainOutcome::Skip {
+                                reason: "decode_error",
+                                record_failure: false,
+                            };
+                        }
+                    },
+                    None => sink.write(frame.as_ref()),
+                };
+
+                if let Err(e) = write_result {
+                    // Cache write error (disk full, etc.) → skip caching, keep
+                    // forwarding (Req 7.1).
+                    warn!(
+                        "Streaming part cache: sink write error, skipping cache (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
+                        drain_key, drain_upload, part_number, e
+                    );
+                    sink.discard();
+                    tee_rx.close();
+                    return PartDrainOutcome::Skip {
+                        reason: "cache_write_error",
+                        record_failure: true,
+                    };
+                }
+            }
+            PartDrainOutcome::Continue { sink, decoder }
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            error!(
+                "Streaming part cache: drain task panicked, skipping cache (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
+                cache_key, upload_id, part_number, join_err
+            );
+            PartDrainOutcome::Skip {
+                reason: "drain_task_panic",
+                record_failure: true,
+            }
+        });
+
+        let (sink, decoder) = match drain {
+            PartDrainOutcome::Continue { sink, decoder } => (sink, decoder),
+            PartDrainOutcome::Skip {
+                reason,
+                record_failure,
+            } => {
+                if record_failure {
+                    if let Some(m) = &metrics {
+                        m.read().await.record_put_cache_failure().await;
+                    }
+                }
+                return StreamingCacheOutcome::Skipped(reason);
+            }
+        };
+
+        // ---- Phase 2: channel closed (part body fully streamed). Await S3 result --
+        let response = match s3_result_rx.await {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                debug!(
+                    "Streaming part cache: S3 error, not caching: cache_key={}, upload_id={}, part_number={}, error={}",
+                    cache_key, upload_id, part_number, e
+                );
+                sink.discard();
+                return StreamingCacheOutcome::Skipped("s3_error");
+            }
+            Err(e) => {
+                warn!(
+                    "Streaming part cache: S3 result channel closed unexpectedly: cache_key={}, upload_id={}, part_number={}, error={:?}",
+                    cache_key, upload_id, part_number, e
+                );
+                sink.discard();
+                if let Some(m) = &metrics {
+                    m.read().await.record_put_cache_failure().await;
+                }
+                return StreamingCacheOutcome::Skipped("s3_channel_closed");
+            }
+        };
+
+        if !response.status().is_success() {
+            debug!(
+                "Streaming part cache: S3 non-success status, not caching: cache_key={}, upload_id={}, part_number={}, status={}",
+                cache_key, upload_id, part_number, response.status()
+            );
+            sink.discard();
+            return StreamingCacheOutcome::Skipped("s3_non_success");
+        }
+
+        // ---- Phase 3 (chunked only): finish + decoded-length validation ----
+        if let Some(dec) = decoder {
+            match dec.finish() {
+                Ok(trailers) => {
+                    if let Some(expected) = expected_decoded_len {
+                        if trailers.decoded_len != expected {
+                            // Decoded length disagrees with x-amz-decoded-content-length:
+                            // skip caching, do NOT reject (S3 is the length authority),
+                            // original bytes already forwarded verbatim (Req 3.4).
+                            warn!(
+                                "Streaming part cache: decoded-length mismatch, skipping cache (upload unaffected): cache_key={}, upload_id={}, part_number={}, expected={}, actual={}",
+                                cache_key, upload_id, part_number, expected, trailers.decoded_len
+                            );
+                            sink.discard();
+                            return StreamingCacheOutcome::Skipped("decoded_length_mismatch");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Streaming part cache: aws-chunked framing incomplete at finish, skipping cache (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
+                        cache_key, upload_id, part_number, e
+                    );
+                    sink.discard();
+                    return StreamingCacheOutcome::Skipped("decode_finish_error");
+                }
+            }
+        }
+
+        // ---- Phase 4: extract ETag, finalize the part + record tracker under lock -
+        let response_headers_map: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let etag = response_headers_map
+            .get("etag")
+            .or_else(|| response_headers_map.get("ETag"))
+            .cloned()
+            .unwrap_or_default();
+
+        match Self::finalize_and_record_cached_part(
+            &cache_dir,
+            &cache_key,
+            &upload_id,
+            part_number,
+            &etag,
+            sink,
+        )
+        .await
+        {
+            Ok(size) => {
+                let (bucket, key) = parse_cache_key(&cache_key);
+                info!(
+                    "UploadPart: bucket={}, key={}, part={}, size={}",
+                    bucket,
+                    key,
+                    part_number,
+                    format_size(size)
+                );
+                StreamingCacheOutcome::Committed
+            }
+            Err(e) => {
+                error!(
+                    "Streaming part cache: failed to record cached part (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
+                    cache_key, upload_id, part_number, e
+                );
+                if let Some(m) = &metrics {
+                    m.read().await.record_put_cache_failure().await;
+                }
+                StreamingCacheOutcome::Skipped("part_record_error")
+            }
+        }
+    }
+
+    /// Finalize a streamed part and record it in the `upload.meta` tracker, holding
+    /// `upload.lock` across **both** the part-file publish (atomic `.tmp` →
+    /// `part{N}.bin` rename, inside [`crate::cache::MultipartPartSink::finalize`])
+    /// AND the tracker update. This is the same correctness gate as
+    /// [`Self::cache_upload_part`]: a racing same-part-number write cannot leave the
+    /// on-disk bytes and the tracker ETag out of sync. Returns the part's
+    /// uncompressed size for logging.
+    async fn finalize_and_record_cached_part(
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        upload_id: &str,
+        part_number: u32,
+        etag: &str,
+        sink: crate::cache::MultipartPartSink,
+    ) -> Result<u64> {
+        use crate::cache_types::{CachedPartInfo, MultipartUploadTracker};
+        use fs2::FileExt;
+
+        let multipart_dir = cache_dir.join("mpus_in_progress").join(upload_id);
+        // The sink open already created this directory; ensure it regardless.
+        tokio::fs::create_dir_all(&multipart_dir)
+            .await
+            .map_err(|e| {
+                ProxyError::CacheError(format!("Failed to create multipart directory: {}", e))
+            })?;
+
+        let upload_meta_file = multipart_dir.join("upload.meta");
+        let lock_file_path = multipart_dir.join("upload.lock");
+        let cache_key_owned = cache_key.to_string();
+        let upload_id_owned = upload_id.to_string();
+        let etag_owned = etag.to_string();
+
+        // The whole critical section — blocking `flock`, the blocking `sink.finalize()`
+        // (.tmp flush + rename), and the tracker read/modify/write — runs on a blocking
+        // thread under a timeout. The advisory lock is on the shared EFS `upload.lock`;
+        // acquiring it (and holding it across the blocking finalize) on an async worker
+        // would pin that worker and, across instances, could wedge a 2-worker runtime.
+        // This mirrors the timeout+spawn_blocking lock pattern used elsewhere
+        // (`disk_cache.rs`). The flock is still held across the entire publish+tracker
+        // update, preserving the per-part correctness gate.
+        let join = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || -> Result<u64> {
+                let lock_file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_file_path)
+                    .map_err(|e| {
+                        ProxyError::CacheError(format!("Failed to open lock file: {}", e))
+                    })?;
+                lock_file.lock_exclusive().map_err(|e| {
+                    ProxyError::CacheError(format!("Failed to acquire lock for upload.meta: {}", e))
+                })?;
+
+                // Publish the staged part bytes (flush residual batch + atomic rename)
+                // UNDER the lock, so the on-disk part file and the tracker ETag are
+                // updated as one critical section — identical correctness gate to
+                // `cache_upload_part`.
+                let info = sink.finalize()?;
+                let uncompressed_size = info.uncompressed_size;
+
+                let part_info = CachedPartInfo::new(
+                    part_number,
+                    uncompressed_size,
+                    etag_owned,
+                    info.compression_algorithm,
+                );
+
+                let mut tracker = if upload_meta_file.exists() {
+                    let meta_content = std::fs::read_to_string(&upload_meta_file).map_err(|e| {
+                        ProxyError::CacheError(format!("Failed to read upload metadata: {}", e))
+                    })?;
+                    MultipartUploadTracker::from_json(&meta_content).unwrap_or_else(|_| {
+                        warn!("Failed to parse existing upload.meta, creating new tracker");
+                        MultipartUploadTracker::new(
+                            upload_id_owned.clone(),
+                            cache_key_owned.clone(),
+                        )
+                    })
+                } else {
+                    MultipartUploadTracker::new(upload_id_owned.clone(), cache_key_owned.clone())
+                };
+
+                tracker.add_part(part_info);
+
+                let tracker_json = tracker.to_json().map_err(|e| {
+                    ProxyError::CacheError(format!("Failed to serialize upload tracker: {}", e))
+                })?;
+                std::fs::write(&upload_meta_file, tracker_json).map_err(|e| {
+                    ProxyError::CacheError(format!("Failed to write upload metadata: {}", e))
+                })?;
+
+                // Release lock (also released on drop / early `?` return).
+                drop(lock_file);
+                Ok(uncompressed_size)
+            }),
+        )
+        .await;
+
+        match join {
+            Ok(Ok(Ok(size))) => Ok(size),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(join_err)) => Err(ProxyError::CacheError(format!(
+                "Part finalize task panicked: {}",
+                join_err
+            ))),
+            Err(_elapsed) => Err(ProxyError::CacheError(
+                "Timed out (30s) acquiring upload.lock / finalizing streamed part".to_string(),
+            )),
         }
     }
 }
@@ -3337,6 +3393,7 @@ mod tests {
             10 * 1024 * 1024, // 10MB capacity
             None,
             128 * 1024 * 1024, // 128 MiB max request body
+            5,                 // write_cache_tee_channel_depth
         )
     }
 
@@ -3557,6 +3614,7 @@ mod tests {
                     10 * 1024 * 1024,
                     None,
                     128 * 1024 * 1024,
+                    5,
                 );
                 handler
                     .cache_upload_part(&key, &upload, part_number, &data_a_clone, &etag_a_s)
@@ -3575,6 +3633,7 @@ mod tests {
                     10 * 1024 * 1024,
                     None,
                     128 * 1024 * 1024,
+                    5,
                 );
                 handler
                     .cache_upload_part(&key_b, &upload_b, part_number, &data_b_clone, &etag_b_s)
@@ -3826,6 +3885,259 @@ mod tests {
         let metadata_file =
             crate::disk_cache::get_sharded_path(&metadata_dir, cache_key, ".meta").unwrap();
         assert!(!metadata_file.exists());
+    }
+
+    // ============================================================================
+    // Streamed-part → finalize contract (streaming-write-path Task 6.2)
+    //
+    // Task 6.1 converted `handle_upload_part` to stream the part body and stage it
+    // via the streaming part path (`open_multipart_part_sink` →
+    // `MultipartPartSink::write` → `finalize_and_record_cached_part`), recording the
+    // part in the SAME `upload.meta` tracker schema (`MultipartUploadTracker` +
+    // `CachedPartInfo`) and the SAME `mpus_in_progress/{upload_id}/part{N}.bin`
+    // location the buffered `cache_upload_part` uses. These tests prove
+    // `finalize_multipart_upload` reads streamed parts identically to buffered
+    // parts: retain-on-success, and cleanup (no cache entry) on a missing requested
+    // part or an ETag mismatch. The buffered-staging variants of these gates are
+    // covered above; these lock in the streamed-staging path end-to-end.
+    // ============================================================================
+
+    /// Stage an `UploadPart` body through the **streaming** part path, exactly as
+    /// `run_streaming_part_cache_write` does on S3 success: open the part sink,
+    /// write the (decoded) object bytes, then `finalize_and_record_cached_part`
+    /// under `upload.lock`. Writes `part{N}.bin` and the `upload.meta` tracker in
+    /// the same on-disk shape as the buffered `cache_upload_part`.
+    async fn stage_streamed_part(
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+        etag: &str,
+    ) {
+        let cache_mgr = crate::cache::CacheManager::new(
+            cache_dir.to_path_buf(),
+            false, // ram_cache_enabled
+            0,     // max_ram_cache_size
+            100,   // compression_threshold
+            false, // compression_enabled
+        );
+        let mut sink = cache_mgr
+            .open_multipart_part_sink(cache_key, upload_id, part_number)
+            .await
+            .expect("open streaming part sink");
+        sink.write(data)
+            .expect("write part bytes to streaming sink");
+        SignedPutHandler::finalize_and_record_cached_part(
+            cache_dir,
+            cache_key,
+            upload_id,
+            part_number,
+            etag,
+            sink,
+        )
+        .await
+        .expect("finalize + record streamed part");
+    }
+
+    /// Streamed parts that satisfy every gate (S3 success + all requested parts
+    /// cached + every ETag matches) are retained: the object `.meta` is created
+    /// with the correct cumulative byte offsets and the in-progress dir is removed.
+    #[tokio::test]
+    async fn test_finalize_multipart_upload_streamed_parts_retained_on_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_dir = temp_dir.path();
+
+        let cache_key = "test-bucket/streamed-contiguous";
+        let upload_id = "streamed-upload-contiguous";
+        let etag = "test-final-etag";
+        let response_headers = std::collections::HashMap::new();
+
+        // Stage three parts via the STREAMING path (not cache_upload_part).
+        let part1_data = vec![1u8; 1024];
+        let part2_data = vec![2u8; 2048];
+        let part3_data = vec![3u8; 512];
+        stage_streamed_part(cache_dir, cache_key, upload_id, 1, &part1_data, "etag1").await;
+        stage_streamed_part(cache_dir, cache_key, upload_id, 2, &part2_data, "etag2").await;
+        stage_streamed_part(cache_dir, cache_key, upload_id, 3, &part3_data, "etag3").await;
+
+        // The tracker written by the streaming path must be byte-schema-compatible
+        // with what finalize reads.
+        let multipart_dir = cache_dir.join("mpus_in_progress").join(upload_id);
+        let tracker: crate::cache_types::MultipartUploadTracker = serde_json::from_str(
+            &std::fs::read_to_string(multipart_dir.join("upload.meta")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tracker.parts.len(), 3);
+        assert_eq!(tracker.total_size, 1024 + 2048 + 512);
+
+        let requested_parts = vec![
+            RequestedPart {
+                part_number: 1,
+                etag: "etag1".to_string(),
+            },
+            RequestedPart {
+                part_number: 2,
+                etag: "etag2".to_string(),
+            },
+            RequestedPart {
+                part_number: 3,
+                etag: "etag3".to_string(),
+            },
+        ];
+
+        handler
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                etag,
+                &response_headers,
+                Some(&requested_parts),
+            )
+            .await
+            .unwrap();
+
+        // Retain: object metadata created with correct cumulative ranges.
+        let metadata_dir = cache_dir.join("metadata");
+        let metadata_file =
+            crate::disk_cache::get_sharded_path(&metadata_dir, cache_key, ".meta").unwrap();
+        assert!(
+            metadata_file.exists(),
+            "object .meta should be created for fully-cached streamed parts"
+        );
+        let metadata: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_file).unwrap()).unwrap();
+        assert_eq!(metadata.object_metadata.parts_count, Some(3));
+        assert_eq!(
+            metadata.object_metadata.part_ranges.get(&1),
+            Some(&(0, 1023))
+        );
+        assert_eq!(
+            metadata.object_metadata.part_ranges.get(&2),
+            Some(&(1024, 3071))
+        );
+        assert_eq!(
+            metadata.object_metadata.part_ranges.get(&3),
+            Some(&(3072, 3583))
+        );
+        assert_eq!(metadata.object_metadata.content_length, 1024 + 2048 + 512);
+
+        // In-progress dir cleaned up after finalization.
+        assert!(
+            !multipart_dir.exists(),
+            "in-progress dir should be removed after finalization"
+        );
+    }
+
+    /// A requested part that was never streamed/cached locally fails the
+    /// "every requested part cached" gate: finalize cleans up and writes no
+    /// cache entry, exactly as for the buffered staging path.
+    #[tokio::test]
+    async fn test_finalize_multipart_upload_streamed_parts_cleanup_on_missing_part() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_dir = temp_dir.path();
+
+        let cache_key = "test-bucket/streamed-missing";
+        let upload_id = "streamed-upload-missing";
+        let etag = "test-final-etag";
+        let response_headers = std::collections::HashMap::new();
+
+        // Only part 1 is streamed; part 2 is requested but never cached.
+        let part1_data = vec![1u8; 1024];
+        stage_streamed_part(cache_dir, cache_key, upload_id, 1, &part1_data, "etag1").await;
+
+        let requested_parts = vec![
+            RequestedPart {
+                part_number: 1,
+                etag: "etag1".to_string(),
+            },
+            RequestedPart {
+                part_number: 2,
+                etag: "etag2".to_string(),
+            },
+        ];
+
+        handler
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                etag,
+                &response_headers,
+                Some(&requested_parts),
+            )
+            .await
+            .unwrap();
+
+        // Cleanup: no object metadata, in-progress dir removed.
+        let metadata_dir = cache_dir.join("metadata");
+        let metadata_file =
+            crate::disk_cache::get_sharded_path(&metadata_dir, cache_key, ".meta").unwrap();
+        assert!(
+            !metadata_file.exists(),
+            "no cache entry when a requested streamed part is missing"
+        );
+        assert!(
+            !cache_dir.join("mpus_in_progress").join(upload_id).exists(),
+            "in-progress dir should be cleaned up on missing part"
+        );
+    }
+
+    /// A streamed part whose tracker ETag disagrees with the requested ETag fails
+    /// the "every ETag matches" gate: finalize cleans up and writes no cache entry.
+    #[tokio::test]
+    async fn test_finalize_multipart_upload_streamed_parts_cleanup_on_etag_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_dir = temp_dir.path();
+
+        let cache_key = "test-bucket/streamed-etag-mismatch";
+        let upload_id = "streamed-upload-etag-mismatch";
+        let etag = "test-final-etag";
+        let response_headers = std::collections::HashMap::new();
+
+        // Stage part 1 with the ETag S3 returned for the streamed bytes.
+        let part1_data = vec![1u8; 1024];
+        stage_streamed_part(
+            cache_dir,
+            cache_key,
+            upload_id,
+            1,
+            &part1_data,
+            "\"streamed-etag\"",
+        )
+        .await;
+
+        // The completion request claims a DIFFERENT ETag for part 1.
+        let requested_parts = vec![RequestedPart {
+            part_number: 1,
+            etag: "\"different-etag\"".to_string(),
+        }];
+
+        handler
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                etag,
+                &response_headers,
+                Some(&requested_parts),
+            )
+            .await
+            .unwrap();
+
+        // Cleanup: no object metadata, in-progress dir removed.
+        let metadata_dir = cache_dir.join("metadata");
+        let metadata_file =
+            crate::disk_cache::get_sharded_path(&metadata_dir, cache_key, ".meta").unwrap();
+        assert!(
+            !metadata_file.exists(),
+            "no cache entry on streamed-part ETag mismatch"
+        );
+        assert!(
+            !cache_dir.join("mpus_in_progress").join(upload_id).exists(),
+            "in-progress dir should be cleaned up on ETag mismatch"
+        );
     }
 
     // ============================================================================
@@ -5490,5 +5802,751 @@ mod tests {
         }
 
         TestResult::passed()
+    }
+
+    // =========================================================================
+    // Streaming write-cache task tests (Task 4.1)
+    //
+    // Exercise `run_streaming_cache_write` directly (the spawned wrapper just
+    // discards its outcome) over a real `WriteCacheRangeSink` backed by a temp
+    // disk cache. They cover: non-chunked write+commit, aws-chunked decode+commit,
+    // decoded-length mismatch → discard, and S3-failure → discard.
+    // =========================================================================
+
+    /// Build a configured-enough disk cache manager for sink-backed streaming
+    /// cache tests (mirrors `cache::write_cache_range_sink_tests::make_disk_cache`).
+    async fn make_streaming_disk_cache(
+        temp_dir: &TempDir,
+        batch_size: usize,
+    ) -> crate::disk_cache::DiskCacheManager {
+        let dc = crate::disk_cache::DiskCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            true, // compression_enabled
+            1024, // compression_threshold
+            false,
+            batch_size,
+        );
+        dc.initialize().await.unwrap();
+        dc
+    }
+
+    async fn open_streaming_sink(
+        dc: crate::disk_cache::DiskCacheManager,
+        cache_key: &str,
+        content_length: u64,
+    ) -> crate::cache::WriteCacheRangeSink {
+        crate::cache::WriteCacheRangeSink::open(
+            dc,
+            cache_key,
+            content_length,
+            true,
+            Some(crate::write_cache_manager::WriteReservation::noop()),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn ok_response_info() -> ResponseInfo {
+        let mut headers = HeaderMap::new();
+        headers.insert("etag", "\"stream-etag\"".parse().unwrap());
+        ResponseInfo {
+            status: StatusCode::OK,
+            headers,
+        }
+    }
+
+    /// Build a minimal single-chunk aws-chunked body for `payload`.
+    fn aws_chunked_single_chunk(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("{:x};chunk-signature=0\r\n", payload.len()).as_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\r\n0;chunk-signature=0\r\n\r\n");
+        out
+    }
+
+    /// Non-chunked body: frames are object bytes; S3 success → Committed + `.bin`.
+    #[tokio::test]
+    async fn streaming_cache_non_chunked_commits() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/stream-nonchunked";
+        let object: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+
+        let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
+        let final_path = dc.get_new_range_file_path(cache_key, 0, (object.len() as u64) - 1);
+        let sink = open_streaming_sink(dc, cache_key, object.len() as u64).await;
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        // Feed the object in two frames, then close the channel and deliver success.
+        tee_tx
+            .send(Bytes::copy_from_slice(&object[..3000]))
+            .await
+            .unwrap();
+        tee_tx
+            .send(Bytes::copy_from_slice(&object[3000..]))
+            .await
+            .unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_cache_write(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_rx,
+            false,
+            None,
+            std::time::Duration::from_secs(3600),
+            HashMap::new(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, StreamingCacheOutcome::Committed);
+        assert!(
+            final_path.exists(),
+            "committed .bin must exist: {:?}",
+            final_path
+        );
+    }
+
+    /// Regression for Requirement 12 (cache writes must not block the async runtime),
+    /// acceptance criterion 12.4: the streamed write path, run under a
+    /// worker-constrained runtime with concurrent large writes, must keep the runtime
+    /// responsive rather than wedging it.
+    ///
+    /// Why this is deterministic and not a timing race:
+    ///
+    /// The original incident was that the drain loop's blocking `tee_rx.blocking_recv()`
+    /// + blocking `sink.write` ran *inline on the async worker thread*. On the 2-worker
+    /// default runtime, two concurrent large PUTs pinned both workers in synchronous
+    /// writeback and starved everything else (the `/health` task, the SIGTERM handler).
+    /// The fix moves that blocking work onto a `spawn_blocking` thread.
+    ///
+    /// This test reproduces the structural precondition rather than measuring latency:
+    /// each write's body frames are produced by a *separate spawned async task*, and
+    /// each write's S3 result is delivered by that same async task — i.e. completing a
+    /// write *requires async tasks to be scheduled on a worker while the drain is
+    /// running*. We launch more concurrent writes (`N = 4`) than worker threads (2).
+    ///
+    /// - With the fix: the four drains run on blocking threads, so the two workers stay
+    ///   free to poll the four feeder tasks. Frames flow through the bounded
+    ///   (depth-2) channels, the feeders deliver the S3 results, and all four writes
+    ///   commit. The join completes.
+    /// - With the bug (blocking work back on the workers): the first two drains scheduled
+    ///   pin both workers inside `blocking_recv`; their feeder tasks can never be polled,
+    ///   so no frame is ever sent, `blocking_recv` blocks forever, and the runtime
+    ///   deadlocks. The join never completes.
+    ///
+    /// So correct code completes in milliseconds and a regression *cannot* complete at
+    /// all. The `timeout` is only a safety net to turn that deadlock into a loud failure
+    /// instead of a hung CI job; it is not a latency assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_cache_writes_do_not_block_async_workers() {
+        // More concurrent writes than worker threads, so under the bug the drains
+        // exhaust the worker pool and starve the feeders.
+        const N: usize = 4;
+        // Enough frames through a small bounded channel that the feeder must be
+        // repeatedly re-polled (awaiting on a full channel) while the drain consumes —
+        // exercising the worker/blocking-thread hand-off, not a single shot.
+        const FRAMES: usize = 32;
+        const FRAME_LEN: usize = 4096;
+        let object_len = (FRAMES * FRAME_LEN) as u64;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut run_handles = Vec::with_capacity(N);
+
+        for i in 0..N {
+            let cache_key = format!("test-bucket/stream-noblock-{i}");
+            // Distinct disk cache per sink (open takes the manager by value); all share
+            // the temp dir with distinct keys.
+            let dc = make_streaming_disk_cache(&temp_dir, FRAME_LEN).await;
+            let sink = open_streaming_sink(dc, &cache_key, object_len).await;
+
+            // Bounded, deliberately shallow so the feeder backpressures on `send`.
+            let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(2);
+            let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+            // Feeder: an independent async task. It can only make progress if a worker
+            // thread is free to poll it — which is the whole property under test.
+            tokio::spawn(async move {
+                let frame = Bytes::from(vec![(i % 256) as u8; FRAME_LEN]);
+                for _ in 0..FRAMES {
+                    if tee_tx.send(frame.clone()).await.is_err() {
+                        return;
+                    }
+                }
+                drop(tee_tx);
+                let _ = s3_tx.send(Ok(ok_response_info()));
+            });
+
+            // Runner: the real streamed write-cache path, spawned as its own task.
+            run_handles.push(tokio::spawn(SignedPutHandler::run_streaming_cache_write(
+                cache_key,
+                sink,
+                tee_rx,
+                s3_rx,
+                false,
+                None,
+                std::time::Duration::from_secs(3600),
+                HashMap::new(),
+                None,
+                None,
+                None,
+            )));
+        }
+
+        // Safety net only: correct code finishes in milliseconds; a regression deadlocks
+        // and would otherwise hang CI forever.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut outcomes = Vec::with_capacity(N);
+            for h in run_handles {
+                outcomes.push(h.await.unwrap());
+            }
+            outcomes
+        })
+        .await
+        .expect(
+            "streamed write path wedged the worker-constrained runtime: concurrent cache \
+             writes blocked the async workers (Requirement 12.4 regression)",
+        );
+
+        assert_eq!(joined.len(), N);
+        for outcome in joined {
+            assert_eq!(
+                outcome,
+                StreamingCacheOutcome::Committed,
+                "every concurrent streamed write must commit while the runtime stays responsive"
+            );
+        }
+    }
+
+    /// aws-chunked body: decoded incrementally, S3 success → Committed + `.bin`.
+    #[tokio::test]
+    async fn streaming_cache_aws_chunked_commits() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/stream-chunked";
+        let payload = b"hello streaming world!";
+        let encoded = aws_chunked_single_chunk(payload);
+
+        let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
+        let final_path = dc.get_new_range_file_path(cache_key, 0, (payload.len() as u64) - 1);
+        let sink = open_streaming_sink(dc, cache_key, payload.len() as u64).await;
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        // Split the encoded body across two frames to exercise incremental push.
+        let split = encoded.len() / 2;
+        tee_tx
+            .send(Bytes::copy_from_slice(&encoded[..split]))
+            .await
+            .unwrap();
+        tee_tx
+            .send(Bytes::copy_from_slice(&encoded[split..]))
+            .await
+            .unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_cache_write(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_rx,
+            true,
+            Some(payload.len() as u64),
+            std::time::Duration::from_secs(3600),
+            HashMap::new(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, StreamingCacheOutcome::Committed);
+        assert!(
+            final_path.exists(),
+            "committed .bin must exist: {:?}",
+            final_path
+        );
+    }
+
+    /// Decoded length disagrees with the expected (x-amz-decoded-content-length):
+    /// the sink is discarded, caching is skipped, and no `.bin` is published.
+    #[tokio::test]
+    async fn streaming_cache_decoded_length_mismatch_discards() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/stream-mismatch";
+        let payload = b"hello streaming world!"; // decodes to 22 bytes
+        let encoded = aws_chunked_single_chunk(payload);
+        let claimed_len: u64 = 9999; // deliberately wrong
+
+        let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
+        let final_path = dc.get_new_range_file_path(cache_key, 0, claimed_len - 1);
+        let sink = open_streaming_sink(dc, cache_key, claimed_len).await;
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        tee_tx.send(Bytes::copy_from_slice(&encoded)).await.unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_cache_write(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_rx,
+            true,
+            Some(claimed_len),
+            std::time::Duration::from_secs(3600),
+            HashMap::new(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            StreamingCacheOutcome::Skipped("decoded_length_mismatch")
+        );
+        assert!(
+            !final_path.exists(),
+            "mismatch must not publish a .bin: {:?}",
+            final_path
+        );
+    }
+
+    /// S3 failure: the sink is discarded, caching is skipped, no `.bin` published.
+    #[tokio::test]
+    async fn streaming_cache_s3_failure_discards() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/stream-s3-failure";
+        let object: Vec<u8> = vec![0x42u8; 4000];
+
+        let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
+        let final_path = dc.get_new_range_file_path(cache_key, 0, (object.len() as u64) - 1);
+        let sink = open_streaming_sink(dc, cache_key, object.len() as u64).await;
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        tee_tx.send(Bytes::copy_from_slice(&object)).await.unwrap();
+        drop(tee_tx);
+        // Deliver an S3 error result.
+        s3_tx
+            .send(Err(ProxyError::HttpError(
+                "simulated upstream 500".to_string(),
+            )))
+            .unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_cache_write(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_rx,
+            false,
+            None,
+            std::time::Duration::from_secs(3600),
+            HashMap::new(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, StreamingCacheOutcome::Skipped("s3_error"));
+        assert!(
+            !final_path.exists(),
+            "S3 failure must not publish a .bin: {:?}",
+            final_path
+        );
+    }
+
+    /// Cache-failure isolation (Task 4.2 / Req 7.1, 7.2): an aws-chunked decode
+    /// error mid-drain must discard the sink, **close the tee receiver** so the
+    /// forward loop drops the tee and keeps streaming verbatim, and skip caching —
+    /// never publishing a `.bin` and never touching the upload. This is the Phase-1
+    /// early-return path the 4.1 commit/mismatch/s3-failure tests do not exercise
+    /// (those decode successfully or fail only after the channel is drained).
+    #[tokio::test]
+    async fn streaming_cache_decode_error_closes_tee() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/stream-decode-error";
+        // A complete, malformed chunk header line (non-hex size) → `push` errors on
+        // the first frame, before any object bytes are written.
+        let malformed = b"zzz;chunk-signature=0\r\n";
+
+        let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
+        // The claimed length is irrelevant here; the decode error fires first.
+        let final_path = dc.get_new_range_file_path(cache_key, 0, 99);
+        let sink = open_streaming_sink(dc, cache_key, 100).await;
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        // Hold `s3_tx` without sending: the decode error returns in Phase 1, before
+        // the S3 result is ever awaited.
+        let (_s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        tee_tx.send(Bytes::from_static(malformed)).await.unwrap();
+        // Deliberately keep `tee_tx` alive so we can observe the receiver being
+        // closed by the cache task (a real forward loop would see `Closed` on its
+        // next send and drop the tee, continuing to stream verbatim).
+
+        let outcome = SignedPutHandler::run_streaming_cache_write(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_rx,
+            true, // aws-chunked
+            Some(100),
+            std::time::Duration::from_secs(3600),
+            HashMap::new(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, StreamingCacheOutcome::Skipped("decode_error"));
+        assert!(
+            tee_tx.is_closed(),
+            "decode error must close the tee receiver so the forward loop drops the \
+             tee and keeps forwarding verbatim"
+        );
+        assert!(
+            !final_path.exists(),
+            "decode error must not publish a .bin: {:?}",
+            final_path
+        );
+    }
+
+    /// Read-after-write parity (deployment-verification T9/T10): a streamed PUT
+    /// committed through `run_streaming_cache_write` against a real `CacheManager`
+    /// must write the `.meta` **immediately**, so an immediate post-PUT GET is a
+    /// cache hit. This guards the parity fix that finalizes the range and stores the
+    /// `.meta` synchronously (via `CacheManager::store_streamed_write_cache_metadata`)
+    /// rather than using the journal-only `WriteCacheRangeSink::commit`, which would
+    /// defer the `.meta` until consolidation and make that GET a miss.
+    #[tokio::test]
+    async fn streaming_cache_writes_meta_immediately_for_read_after_write_hit() {
+        use crate::cache::CacheManager;
+        use crate::cache_types::NewCacheMetadata;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new(
+            temp_dir.path().to_path_buf(),
+            false, // ram_cache_enabled — disabled; .meta on disk is what a GET reads
+            0,     // RAM cache size
+            1024,  // compression_threshold
+            true,  // compression_enabled
+        ));
+        // Wire the journal consolidator into the manager (required before
+        // `initialize`, and what `create_configured_disk_cache_manager` does for the
+        // real proxy startup path).
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/stream-read-after-write";
+        let object: Vec<u8> = (0..6000u32).map(|i| (i % 97) as u8).collect();
+
+        // Open the sink the same way the single-PUT handler does (Task 5.1).
+        let sink = cache_manager
+            .open_write_cache_sink(cache_key, object.len() as u64)
+            .await
+            .expect("open_write_cache_sink should not error")
+            .expect("capacity should be available for the sink");
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        tee_tx.send(Bytes::copy_from_slice(&object)).await.unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_cache_write(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_rx,
+            false,
+            None,
+            std::time::Duration::from_secs(3600),
+            HashMap::new(),
+            None,
+            Some(cache_manager.clone()),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, StreamingCacheOutcome::Committed);
+
+        // The `.meta` must exist immediately — this is what makes a post-PUT GET hit.
+        let meta_path = cache_manager.get_new_metadata_file_path(cache_key);
+        assert!(
+            meta_path.exists(),
+            "streamed PUT must write .meta immediately for read-after-write parity: {:?}",
+            meta_path
+        );
+
+        let metadata: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert!(
+            metadata.object_metadata.is_write_cached,
+            "streamed PUT .meta must be marked write-cached"
+        );
+        assert_eq!(
+            metadata.object_metadata.content_length,
+            object.len() as u64,
+            "cached object length must match the streamed object"
+        );
+        assert_eq!(
+            metadata.ranges.len(),
+            1,
+            "streamed PUT must produce exactly one range (0..len-1)"
+        );
+        assert_eq!(metadata.ranges[0].start, 0);
+        assert_eq!(metadata.ranges[0].end, object.len() as u64 - 1);
+    }
+
+    // =========================================================================
+    // Streaming part-cache task tests (Task 6.1)
+    //
+    // Exercise `run_streaming_part_cache_write` directly (the spawned wrapper just
+    // discards its outcome) over a real `MultipartPartSink` backed by a temp cache.
+    // They cover: non-chunked stage+record + LZ4 round-trip, aws-chunked decode +
+    // decoded-length validation, and S3-failure → discard.
+    // =========================================================================
+
+    /// A streamed non-chunked `UploadPart` commits: the part `.bin` is published in
+    /// the upload's in-progress dir, the `upload.meta` tracker records the part
+    /// (number, decoded size, S3 ETag), and the staged bytes round-trip through the
+    /// LZ4 frame decoder — the concatenated-frame format the GET-side range loader
+    /// reads after the part is linked into the object.
+    #[tokio::test]
+    async fn streaming_part_cache_non_chunked_records_part_and_round_trips() {
+        use crate::cache::CacheManager;
+        use crate::cache_types::MultipartUploadTracker;
+        use std::io::Read;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1024,
+            true,
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/stream-part-object";
+        let upload_id = "upload-stream-1";
+        let part_number = 2u32;
+        let object: Vec<u8> = (0..7000u32).map(|i| (i % 131) as u8).collect();
+
+        let sink = cache_manager
+            .open_multipart_part_sink(cache_key, upload_id, part_number)
+            .await
+            .expect("open_multipart_part_sink should succeed");
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+        tee_tx
+            .send(Bytes::copy_from_slice(&object[..4000]))
+            .await
+            .unwrap();
+        tee_tx
+            .send(Bytes::copy_from_slice(&object[4000..]))
+            .await
+            .unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_part_cache_write(
+            cache_key.to_string(),
+            upload_id.to_string(),
+            part_number,
+            sink,
+            tee_rx,
+            s3_rx,
+            false,
+            None,
+            temp_dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        assert_eq!(outcome, StreamingCacheOutcome::Committed);
+
+        let upload_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+        let part_path = upload_dir.join(format!("part{}.bin", part_number));
+        assert!(
+            part_path.exists(),
+            "part file must be published: {:?}",
+            part_path
+        );
+
+        let meta = std::fs::read_to_string(upload_dir.join("upload.meta")).unwrap();
+        let tracker = MultipartUploadTracker::from_json(&meta).unwrap();
+        assert_eq!(tracker.parts.len(), 1);
+        assert_eq!(tracker.parts[0].part_number, part_number);
+        assert_eq!(
+            tracker.parts[0].size,
+            object.len() as u64,
+            "tracker must record the decoded part size"
+        );
+        assert_eq!(normalize_etag(&tracker.parts[0].etag), "stream-etag");
+
+        // The staged bytes round-trip through the LZ4 frame decoder (concatenated
+        // frames), proving the part file is readable by the GET-side range loader.
+        let compressed = std::fs::read(&part_path).unwrap();
+        let mut decoder = lz4_flex::frame::FrameDecoder::new(&compressed[..]);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(
+            decoded, object,
+            "decompressed part bytes must equal the streamed object"
+        );
+    }
+
+    /// A streamed aws-chunked `UploadPart` decodes incrementally: the cached part is
+    /// the decoded payload (not the chunked wire bytes), the decoded-length check
+    /// against `x-amz-decoded-content-length` passes, and the tracker records the
+    /// decoded size.
+    #[tokio::test]
+    async fn streaming_part_cache_aws_chunked_decodes_and_records() {
+        use crate::cache::CacheManager;
+        use crate::cache_types::MultipartUploadTracker;
+        use std::io::Read;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1024,
+            true,
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/stream-part-chunked";
+        let upload_id = "upload-stream-chunked";
+        let part_number = 3u32;
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 199) as u8).collect();
+        let chunked = aws_chunked_single_chunk(&payload);
+
+        let sink = cache_manager
+            .open_multipart_part_sink(cache_key, upload_id, part_number)
+            .await
+            .unwrap();
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+        tee_tx.send(Bytes::copy_from_slice(&chunked)).await.unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_part_cache_write(
+            cache_key.to_string(),
+            upload_id.to_string(),
+            part_number,
+            sink,
+            tee_rx,
+            s3_rx,
+            true,
+            Some(payload.len() as u64),
+            temp_dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        assert_eq!(outcome, StreamingCacheOutcome::Committed);
+
+        let upload_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+        let meta = std::fs::read_to_string(upload_dir.join("upload.meta")).unwrap();
+        let tracker = MultipartUploadTracker::from_json(&meta).unwrap();
+        assert_eq!(
+            tracker.parts[0].size,
+            payload.len() as u64,
+            "tracker must record the DECODED payload length, not the chunked wire length"
+        );
+
+        let part_path = upload_dir.join(format!("part{}.bin", part_number));
+        let compressed = std::fs::read(&part_path).unwrap();
+        let mut decoder = lz4_flex::frame::FrameDecoder::new(&compressed[..]);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(
+            decoded, payload,
+            "cached part must be the decoded payload, not the aws-chunked wire bytes"
+        );
+    }
+
+    /// On S3 failure the streamed part is discarded (Req 7.1): no `part{N}.bin` is
+    /// published and no `upload.meta` tracker is written — the per-part correctness
+    /// gate (commit only on S3 success) holds on the streamed path.
+    #[tokio::test]
+    async fn streaming_part_cache_s3_error_discards() {
+        use crate::cache::CacheManager;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1024,
+            true,
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/stream-part-err";
+        let upload_id = "upload-stream-err";
+        let part_number = 1u32;
+
+        let sink = cache_manager
+            .open_multipart_part_sink(cache_key, upload_id, part_number)
+            .await
+            .unwrap();
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+        tee_tx
+            .send(Bytes::from_static(b"some part bytes"))
+            .await
+            .unwrap();
+        drop(tee_tx);
+        s3_tx
+            .send(Err(ProxyError::HttpError("boom".to_string())))
+            .unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_part_cache_write(
+            cache_key.to_string(),
+            upload_id.to_string(),
+            part_number,
+            sink,
+            tee_rx,
+            s3_rx,
+            false,
+            None,
+            temp_dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        assert_eq!(outcome, StreamingCacheOutcome::Skipped("s3_error"));
+
+        let upload_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+        assert!(
+            !upload_dir.join(format!("part{}.bin", part_number)).exists(),
+            "no part file should be published on S3 error"
+        );
+        assert!(
+            !upload_dir.join("upload.meta").exists(),
+            "no tracker should be written on S3 error"
+        );
     }
 }

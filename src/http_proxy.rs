@@ -994,15 +994,25 @@ impl HttpProxy {
 
         // Detect forward proxy request (absolute URI) or fall through to direct mode
         // Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 5.1, 5.2, 11.1, 14.1, 14.2, 14.3, 14.4
-        let (host, effective_uri) =
-            if let Some((proxy_host, relative_uri)) = Self::detect_forward_proxy(&req) {
+        //
+        // `host` is the port-stripped authority host used for the cache key, access
+        // logging and alias detection (unchanged). `_routing_authority` carries the
+        // explicit upstream port (Req 3.4). The absolute-URI construction sources that
+        // port from the signed `Host` header (the Signed_Authority, equal to the
+        // request authority for a well-formed forward-proxy request and forwarded
+        // verbatim), so the egress dials the request's port without rewriting the
+        // signed host (Req 5.1).
+        let (host, _routing_authority, effective_uri) =
+            if let Some((proxy_host, proxy_authority, relative_uri)) =
+                Self::detect_forward_proxy(&req)
+            {
                 debug!(
                     "Forward proxy request detected: method={}, host={}, path={}",
                     req.method(),
                     proxy_host,
                     relative_uri.path()
                 );
-                (proxy_host, relative_uri)
+                (proxy_host, proxy_authority, relative_uri)
             } else {
                 // Existing direct-mode path: extract host from Host header
                 let host = match Self::validate_host_header(&req) {
@@ -1010,7 +1020,8 @@ impl HttpProxy {
                     Err(response) => return Ok(response),
                 };
                 let effective_uri = req.uri().clone();
-                (host, effective_uri)
+                let routing_authority = host.clone();
+                (host, routing_authority, effective_uri)
             };
 
         // Rewrite the request URI to the effective (relative) URI so all downstream
@@ -1191,22 +1202,41 @@ impl HttpProxy {
     /// processing.
     ///
     /// Requirements: 1.1, 1.2, 1.3, 1.4
-    fn detect_forward_proxy(req: &Request<hyper::body::Incoming>) -> Option<(String, Uri)> {
+    fn detect_forward_proxy(req: &Request<hyper::body::Incoming>) -> Option<(String, String, Uri)> {
         Self::detect_forward_proxy_uri(req.uri())
     }
 
     /// Core URI detection logic extracted for testability.
     ///
-    /// Returns `Some((host, relative_uri))` when the URI has a scheme (absolute URI),
-    /// `None` otherwise (relative URI / direct mode).
+    /// Returns `Some((cache_host, routing_authority, relative_uri))` when the URI has a
+    /// scheme (absolute URI), `None` otherwise (relative URI / direct mode).
     ///
-    /// Requirements: 1.1, 1.2, 1.3, 1.4
-    fn detect_forward_proxy_uri(uri: &Uri) -> Option<(String, Uri)> {
+    /// - `cache_host` is the **port-stripped** authority host. It is what feeds the
+    ///   cache-key derivation (and access logging / alias detection), so the cache-key
+    ///   namespace is unaffected by the upstream port — two ports on the same host share
+    ///   a cache namespace (Requirement 7.1). This value is byte-for-byte what this
+    ///   function returned before port preservation was added.
+    /// - `routing_authority` is the connect/routing authority with the **explicit port
+    ///   preserved** (e.g. `store:9000`). The caching egress dials this port and the
+    ///   upstream-override lookup keys on `host:port` (Requirement 3.4). When the URI
+    ///   omits the port, `routing_authority` equals `cache_host` (identical to today).
+    ///
+    /// Requirements: 1.1, 1.2, 1.3, 1.4, 3.4, 7.1
+    fn detect_forward_proxy_uri(uri: &Uri) -> Option<(String, String, Uri)> {
         if uri.scheme().is_some() {
-            let host = uri.authority()?.host().to_string();
+            let authority = uri.authority()?;
+            // Port-stripped host for the cache key / logging (unchanged contract).
+            let cache_host = authority.host().to_string();
+            // Routing/connect authority preserving the explicit port. Reconstructed from
+            // host() + port_u16() (rather than authority.as_str()) so any userinfo is
+            // excluded and IPv6 brackets in host() are kept intact.
+            let routing_authority = match authority.port_u16() {
+                Some(port) => format!("{}:{}", authority.host(), port),
+                None => cache_host.clone(),
+            };
             let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
             let relative_uri: Uri = path_and_query.parse().ok()?;
-            Some((host, relative_uri))
+            Some((cache_host, routing_authority, relative_uri))
         } else {
             None
         }
@@ -1273,6 +1303,34 @@ impl HttpProxy {
             }
             None => Ok(value),
         }
+    }
+
+    /// Extract the explicit port from the request's `Host` header.
+    ///
+    /// Returns `None` when the Host header is absent, unparseable, or carries no
+    /// explicit port — the caller then defaults to 80, the caching-egress origin
+    /// port. Handles bracketed IPv6 literals (`[::1]:9000` → `9000`). This is the
+    /// authority port for the signed-write path: in forward-proxy mode the inbound
+    /// URI is rewritten to origin-form (no authority), but the signed `Host` header
+    /// is forwarded verbatim and carries the target `host:port` (the SigV4
+    /// Signed_Authority), so it is the correct source for the upstream-override
+    /// port lookup — mirroring `build_egress_authority`.
+    fn host_header_port(req: &Request<hyper::body::Incoming>) -> Option<u16> {
+        let raw = req.headers().get("host")?.to_str().ok()?.trim();
+        let port_str = if let Some(rest) = raw.strip_prefix('[') {
+            // Bracketed IPv6: the port (if any) follows the matching ']'.
+            let end = rest.find(']')?;
+            rest[end + 1..].strip_prefix(':')?
+        } else {
+            // host:port — unbracketed IPv6 is illegal in a Host header, so reject
+            // anything with a colon remaining in the host portion.
+            let (host, port) = raw.rsplit_once(':')?;
+            if host.contains(':') {
+                return None;
+            }
+            port
+        };
+        port_str.parse::<u16>().ok().filter(|p| *p != 0)
     }
 
     /// Validate Host header and extract hostname (strips port if present).
@@ -3245,110 +3303,94 @@ impl HttpProxy {
 
             debug!("Detected AWS SigV4 signed PUT request, using SignedPutHandler for caching");
 
-            // Get connection pool to resolve DNS and get target IP
-            let pool = s3_client.get_connection_pool();
-            let pool_manager = pool.read().await;
-
-            // Get distributed IP for the host
-            let target_ip_opt = pool_manager.get_distributed_ip(&host);
-            drop(pool_manager);
-
-            match target_ip_opt {
-                Some(target_ip) => {
-                    // Create TLS connector
-                    let root_store = match crate::tls_trust_store::load_root_cert_store() {
-                        Ok(rs) => rs,
-                        Err(e) => {
-                            error!("Failed to load native certs: {}", e);
-                            return Ok(Self::build_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "InternalError",
-                                "Failed to load TLS certificates",
-                                None,
-                            ));
-                        }
-                    };
-
-                    let tls_config = {
-                        let pool = s3_client.get_connection_pool();
-                        let pm = pool.read().await;
-                        crate::https_connector::build_tls_config_for_host(&host, root_store, &pm)
-                    };
-
-                    let tls_connector =
-                        Arc::new(tokio_rustls::TlsConnector::from(Arc::new(tls_config)));
-
-                    // Get current cache usage and max capacity for capacity checking
-                    let cache_stats = cache_manager.get_statistics();
-                    let current_cache_usage =
-                        cache_stats.read_cache_size + cache_stats.write_cache_size;
-                    let max_cache_capacity = config.cache.max_cache_size;
-
-                    // Create SignedPutHandler
-                    let compression_handler = cache_manager.get_compression_handler();
-                    let mut signed_put_handler = crate::signed_put_handler::SignedPutHandler::new(
-                        config.cache.cache_dir.clone(),
-                        (*compression_handler).clone(),
-                        current_cache_usage,
-                        max_cache_capacity,
-                        proxy_referer.clone(),
-                        config.server.max_buffered_request_body_bytes,
-                    );
-
-                    // Set metrics manager if available (Requirements 9.1, 9.2, 9.3, 9.4, 9.5)
-                    if let Some(metrics) = &metrics_manager {
-                        signed_put_handler.set_metrics_manager(metrics.clone());
+            // Resolve the upstream transport, honouring connection_pool.upstream_overrides
+            // (plaintext / validated / unvalidated); otherwise the verified-TLS-on-443
+            // default. The signed Host is forwarded verbatim — the override only changes
+            // the proxy→S3 transport, never the request bytes (SigV4 stays intact).
+            let authority_port = Self::host_header_port(&req).unwrap_or(80);
+            let transport =
+                match Self::resolve_signed_upstream_transport(&host, authority_port, &s3_client)
+                    .await
+                {
+                    Some(t) => t,
+                    None => {
+                        Self::log_s3_forward_error(&uri, &"PUT", &"no distributed IP available");
+                        return Ok(Self::build_error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "BadGateway",
+                            "Failed to resolve S3 endpoint",
+                            None,
+                        ));
                     }
+                };
 
-                    // Set cache manager for HEAD cache invalidation (Requirements 3.1, 4.1)
-                    signed_put_handler.set_cache_manager(Arc::clone(&cache_manager));
+            // Get current cache usage and max capacity for capacity checking
+            let cache_stats = cache_manager.get_statistics();
+            let current_cache_usage = cache_stats.read_cache_size + cache_stats.write_cache_size;
+            let max_cache_capacity = config.cache.max_cache_size;
 
-                    // Set S3 client for comprehensive response header extraction
-                    signed_put_handler.set_s3_client(Arc::clone(&s3_client));
+            // Create SignedPutHandler
+            let compression_handler = cache_manager.get_compression_handler();
+            let mut signed_put_handler = crate::signed_put_handler::SignedPutHandler::new(
+                config.cache.cache_dir.clone(),
+                (*compression_handler).clone(),
+                current_cache_usage,
+                max_cache_capacity,
+                proxy_referer.clone(),
+                config.server.max_buffered_request_body_bytes,
+                config.server.write_cache_tee_channel_depth,
+            );
 
-                    // Handle signed PUT with caching (Requirements 1.1, 2.1, 9.1, 9.2)
-                    match signed_put_handler
-                        .handle_signed_put(req, cache_key, host, target_ip, tls_connector)
-                        .await
-                    {
-                        Ok(response) => Ok(response),
-                        Err(crate::ProxyError::RequestBodyTooLarge {
-                            content_length,
-                            max_bytes,
-                        }) => {
-                            let msg = format!(
+            // Set metrics manager if available (Requirements 9.1, 9.2, 9.3, 9.4, 9.5)
+            if let Some(metrics) = &metrics_manager {
+                signed_put_handler.set_metrics_manager(metrics.clone());
+            }
+
+            // Set cache manager for HEAD cache invalidation (Requirements 3.1, 4.1)
+            signed_put_handler.set_cache_manager(Arc::clone(&cache_manager));
+
+            // Set S3 client for comprehensive response header extraction
+            signed_put_handler.set_s3_client(Arc::clone(&s3_client));
+
+            // Handle signed PUT with caching (Requirements 1.1, 2.1, 9.1, 9.2)
+            match signed_put_handler
+                .handle_signed_put(req, cache_key, host, transport)
+                .await
+            {
+                Ok(response) => Ok(response),
+                Err(crate::ProxyError::RequestBodyTooLarge {
+                    content_length,
+                    max_bytes,
+                }) => {
+                    let msg = format!(
                                 "Request body exceeds maximum allowed size of {} bytes (Content-Length: {})",
                                 max_bytes,
                                 content_length
                                     .map(|cl| cl.to_string())
                                     .unwrap_or_else(|| "unknown".to_string())
                             );
-                            Ok(Self::build_error_response(
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                "EntityTooLarge",
-                                &msg,
-                                None,
-                            ))
-                        }
-                        Err(e) => {
-                            Self::log_s3_forward_error(&uri, &"PUT", &e);
-                            Ok(Self::build_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "BadGateway",
-                                "Failed to forward signed PUT request to S3",
-                                None,
-                            ))
-                        }
-                    }
-                }
-                None => {
-                    Self::log_s3_forward_error(&uri, &"PUT", &"no distributed IP available");
                     Ok(Self::build_error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "BadGateway",
-                        "Failed to resolve S3 endpoint",
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "EntityTooLarge",
+                        &msg,
                         None,
                     ))
+                }
+                Err(e) => {
+                    Self::log_s3_forward_error(&uri, &"PUT", &e);
+                    // A TlsValidated upstream override whose certificate failed
+                    // verification is a non-retryable config error → 400
+                    // UpstreamTLSValidationFailed (Requirement 4), never a 5xx.
+                    if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+                        Ok(Self::proxy_error_to_response(&e))
+                    } else {
+                        Ok(Self::build_error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "BadGateway",
+                            "Failed to forward signed PUT request to S3",
+                            None,
+                        ))
+                    }
                 }
             }
         } else {
@@ -3737,15 +3779,12 @@ impl HttpProxy {
 
                 Self::convert_s3_response_to_http(s3_response)
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &method, &e);
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &method,
+                &e,
+                "Failed to forward request to S3",
+            )),
         }
     }
 
@@ -3840,13 +3879,32 @@ impl HttpProxy {
     ///   deterministic client errors — retrying will not help (Requirement 4.3),
     ///   so we return a terminal 4xx rather than falling through to S3.
     /// - `ProxyError::RequestBodyTooLarge` → HTTP 413 `EntityTooLarge` (Requirement 11.2)
+    /// - `ProxyError::UpstreamTlsValidationFailed` → HTTP 400 `UpstreamTLSValidationFailed`
+    ///   naming the upstream `host:port`. A TlsValidated upstream override whose
+    ///   certificate fails verification is a configuration error that cannot succeed
+    ///   on retry, so it is surfaced as a non-retryable 4xx (never a 5xx) and the
+    ///   proxy never falls back to plaintext/unvalidated TLS (Requirements 4.1-4.4).
     /// - All other variants → HTTP 500 `InternalError` as a safe default.
-    #[allow(dead_code)]
     fn proxy_error_to_response(err: &crate::ProxyError) -> Response<BoxBody<Bytes, hyper::Error>> {
         use crate::ProxyError;
         match err {
             ProxyError::CacheError(msg) => {
                 Self::build_error_response(StatusCode::BAD_REQUEST, "InvalidArgument", msg, None)
+            }
+            ProxyError::UpstreamTlsValidationFailed { endpoint, .. } => {
+                // 400 (not 5xx) so S3 client retry/backoff is not triggered for a
+                // condition that cannot succeed on retry (Requirement 4.3). The
+                // connector already logged the verification error with the endpoint
+                // (Requirement 4.4), so we do not re-log here to avoid double noise.
+                let msg = format!(
+                    "Upstream TLS certificate validation failed for {endpoint}; the proxy did not fall back to plaintext or unvalidated TLS"
+                );
+                Self::build_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "UpstreamTLSValidationFailed",
+                    &msg,
+                    None,
+                )
             }
             ProxyError::RequestBodyTooLarge {
                 content_length,
@@ -3873,6 +3931,34 @@ impl HttpProxy {
                 None,
             ),
         }
+    }
+
+    /// Convert a `forward_request` failure into a client-facing error response.
+    ///
+    /// An upstream TLS *validation* failure (a `TlsValidated` override whose
+    /// certificate failed verification) is mapped to a non-retryable 400
+    /// `UpstreamTLSValidationFailed` naming the upstream `host:port` (Requirements
+    /// 4.1-4.4) via [`Self::proxy_error_to_response`] — never a 5xx, and never with a
+    /// fallback to plaintext/unvalidated TLS. The connector already logged the
+    /// verification error with the endpoint, so this path does not re-log it (avoids
+    /// double noise). Every other forwarding error keeps the existing rate-limited
+    /// log plus 502 `BadGateway` behaviour, with the caller's `fallback_message`.
+    fn s3_forward_error_response(
+        uri: &impl std::fmt::Display,
+        method: &impl std::fmt::Display,
+        err: &crate::ProxyError,
+        fallback_message: &str,
+    ) -> Response<BoxBody<Bytes, hyper::Error>> {
+        if matches!(err, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+            return Self::proxy_error_to_response(err);
+        }
+        Self::log_s3_forward_error(uri, method, err);
+        Self::build_error_response(
+            StatusCode::BAD_GATEWAY,
+            "BadGateway",
+            fallback_message,
+            None,
+        )
     }
 
     /// Read request body into bytes with a size cap (Requirement 11.4)
@@ -3944,15 +4030,12 @@ impl HttpProxy {
                 // Convert S3Response to HTTP Response
                 Self::convert_s3_response_to_http(s3_response)
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &method, &e);
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &method,
+                &e,
+                "Failed to forward request to S3",
+            )),
         }
     }
 
@@ -3969,8 +4052,14 @@ impl HttpProxy {
             body_bytes.len()
         );
 
-        // Build URI
-        let uri: hyper::Uri = match format!("https://{}{}", host, path).parse() {
+        // Build URI. The authority carries any explicit upstream port from the signed
+        // Host header so the egress dials it and the upstream-override lookup keys on
+        // host:port (Requirements 3.4, 3.5, 5.1); absent a port this is today's URI.
+        let authority = crate::s3_client::build_egress_authority(
+            &host,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        let uri: hyper::Uri = match format!("https://{}{}", authority, path).parse() {
             Ok(uri) => uri,
             Err(e) => {
                 error!("Failed to parse URI: {}", e);
@@ -3997,15 +4086,12 @@ impl HttpProxy {
                 debug!("Successfully forwarded PUT request with body to S3");
                 Self::convert_s3_response_to_http(s3_response)
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &"PUT", &e);
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &"PUT",
+                &e,
+                "Failed to forward request to S3",
+            )),
         }
     }
 
@@ -6002,8 +6088,16 @@ impl HttpProxy {
                             })
                             .collect();
 
-                        // Build absolute URI for S3 request
-                        let absolute_uri = match format!("https://{}{}", host, uri).parse() {
+                        // Build absolute URI for S3 request. The authority carries any
+                        // explicit upstream port from the signed Host header so the
+                        // recovery refetch dials it and the upstream-override lookup
+                        // keys on host:port (Requirements 3.4, 3.5, 5.1); absent a port
+                        // this is byte-for-byte today's URI.
+                        let host_header = headers
+                            .get(hyper::header::HOST)
+                            .and_then(|v| v.to_str().ok());
+                        let authority = crate::s3_client::build_egress_authority(host, host_header);
+                        let absolute_uri = match format!("https://{}{}", authority, uri).parse() {
                             Ok(uri) => uri,
                             Err(e) => {
                                 error!("Failed to parse URI: {}", e);
@@ -6030,6 +6124,15 @@ impl HttpProxy {
                         let s3_response = match s3_client.forward_request(context).await {
                             Ok(resp) => resp,
                             Err(e) => {
+                                // A TlsValidated upstream cert failure is a
+                                // non-retryable config error → surface the 400
+                                // (Requirements 4.1-4.3) rather than a 500.
+                                if matches!(
+                                    e,
+                                    crate::ProxyError::UpstreamTlsValidationFailed { .. }
+                                ) {
+                                    return Err(Self::proxy_error_to_response(&e));
+                                }
                                 Self::log_s3_forward_error(&uri, &"GET", &e);
                                 return Err(Self::build_error_response(
                                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -6409,15 +6512,12 @@ impl HttpProxy {
                     }
                 }
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &method, &e);
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &method,
+                &e,
+                "Failed to forward request to S3",
+            )),
         }
     }
 
@@ -6472,15 +6572,12 @@ impl HttpProxy {
                 // Error responses are passed through without modification - Requirements 1.5, 2.4, 3.4, 4.4, 5.4, 6.10
                 Self::convert_s3_response_to_http(s3_response)
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &method, &e);
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &method,
+                &e,
+                "Failed to forward request to S3",
+            )),
         }
     }
 
@@ -8937,16 +9034,12 @@ impl HttpProxy {
                     }
                 }
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &method, &e);
-
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &method,
+                &e,
+                "Failed to forward request to S3",
+            )),
         }
     }
 
@@ -9058,6 +9151,12 @@ impl HttpProxy {
                         .await;
                     }
                     Err(e) => {
+                        // Non-retryable: a TlsValidated cert failure cannot succeed
+                        // on retry, so surface the 400 immediately without further
+                        // attempts (Requirements 4.1-4.3).
+                        if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+                            return Ok(Self::proxy_error_to_response(&e));
+                        }
                         warn!(
                             "S3 request retry {} failed: cache_key={}, error={}",
                             attempt + 1,
@@ -9092,6 +9191,12 @@ impl HttpProxy {
                         .await;
                     }
                     Err(e) => {
+                        // Non-retryable: a TlsValidated cert failure cannot succeed
+                        // on retry, so surface the 400 immediately without retrying
+                        // (Requirements 4.1-4.3).
+                        if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+                            return Ok(Self::proxy_error_to_response(&e));
+                        }
                         debug!(
                             "S3 request failed (will retry): cache_key={}, error={}",
                             cache_key, e
@@ -9102,7 +9207,8 @@ impl HttpProxy {
             }
         }
 
-        // All retries exhausted
+        // All retries exhausted. (A TlsValidated cert failure is handled inside the
+        // loop as non-retryable — Requirements 4.1-4.3 — so it never reaches here.)
         Self::log_s3_forward_error(
             &uri,
             &method,
@@ -9893,15 +9999,12 @@ impl HttpProxy {
                     Self::convert_s3_response_to_http(s3_response)
                 }
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &method, &e);
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward range request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &method,
+                &e,
+                "Failed to forward range request to S3",
+            )),
         }
     }
 
@@ -10020,15 +10123,12 @@ impl HttpProxy {
                     Self::convert_s3_response_to_http(s3_response)
                 }
             }
-            Err(e) => {
-                Self::log_s3_forward_error(&uri, &method, &e);
-                Ok(Self::build_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "BadGateway",
-                    "Failed to forward range request to S3",
-                    None,
-                ))
-            }
+            Err(e) => Ok(Self::s3_forward_error_response(
+                &uri,
+                &method,
+                &e,
+                "Failed to forward range request to S3",
+            )),
         }
     }
 
@@ -10051,91 +10151,165 @@ impl HttpProxy {
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
         proxy_referer: &Option<String>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
-        // Get connection pool to resolve DNS and get target IP
         let req_uri = req.uri().clone();
         let req_method = req.method().clone();
-        let pool = s3_client.get_connection_pool();
-        let pool_manager = pool.read().await;
 
-        // Get distributed IP for the host
-        let target_ip_opt = pool_manager.get_distributed_ip(&host);
-        drop(pool_manager);
-
-        match target_ip_opt {
-            Some(target_ip) => {
-                // Create TLS connector
-                let root_store = match crate::tls_trust_store::load_root_cert_store() {
-                    Ok(rs) => rs,
-                    Err(e) => {
-                        error!("Failed to load native certs: {}", e);
-                        return Ok(Self::build_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InternalError",
-                            "Failed to load TLS certificates",
-                            None,
-                        ));
-                    }
-                };
-
-                let tls_config = {
-                    let pool = s3_client.get_connection_pool();
-                    let pm = pool.read().await;
-                    crate::https_connector::build_tls_config_for_host(&host, root_store, &pm)
-                };
-
-                let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-
-                // Forward the signed request using raw HTTP forwarding
-                match crate::signed_request_proxy::forward_signed_request(
-                    req,
-                    &host,
-                    target_ip,
-                    &tls_connector,
-                    proxy_referer.as_deref(),
-                )
-                .await
-                {
-                    Ok(response) => {
-                        debug!("Successfully forwarded signed request");
-                        Ok(response)
-                    }
-                    Err(crate::ProxyError::RequestBodyTooLarge {
-                        content_length,
-                        max_bytes,
-                    }) => {
-                        let msg = format!(
-                            "Request body exceeds maximum allowed size of {} bytes (Content-Length: {})",
-                            max_bytes,
-                            content_length
-                                .map(|cl| cl.to_string())
-                                .unwrap_or_else(|| "unknown".to_string())
-                        );
-                        Ok(Self::build_error_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "EntityTooLarge",
-                            &msg,
-                            None,
-                        ))
-                    }
-                    Err(e) => {
-                        Self::log_s3_forward_error(&req_uri, &req_method, &e);
-                        Ok(Self::build_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "BadGateway",
-                            "Failed to forward signed request to S3",
-                            None,
-                        ))
-                    }
-                }
-            }
+        // Resolve the upstream transport, honouring connection_pool.upstream_overrides
+        // (plaintext / validated / unvalidated); otherwise the verified-TLS-on-443
+        // default. The signed request bytes are forwarded verbatim — the override only
+        // changes the proxy→S3 transport, so SigV4 stays intact.
+        let authority_port = Self::host_header_port(&req).unwrap_or(80);
+        let transport = match Self::resolve_signed_upstream_transport(
+            &host,
+            authority_port,
+            &s3_client,
+        )
+        .await
+        {
+            Some(t) => t,
             None => {
                 Self::log_s3_forward_error(&req_uri, &req_method, &"no distributed IP available");
-                Ok(Self::build_error_response(
+                return Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",
                     "Failed to resolve S3 endpoint",
                     None,
+                ));
+            }
+        };
+
+        // Forward the signed request using raw HTTP forwarding
+        match crate::signed_request_proxy::forward_signed_request(
+            req,
+            &host,
+            &transport,
+            proxy_referer.as_deref(),
+        )
+        .await
+        {
+            Ok(response) => {
+                debug!("Successfully forwarded signed request");
+                Ok(response)
+            }
+            Err(crate::ProxyError::RequestBodyTooLarge {
+                content_length,
+                max_bytes,
+            }) => {
+                let msg = format!(
+                    "Request body exceeds maximum allowed size of {} bytes (Content-Length: {})",
+                    max_bytes,
+                    content_length
+                        .map(|cl| cl.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                Ok(Self::build_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "EntityTooLarge",
+                    &msg,
+                    None,
                 ))
+            }
+            Err(e) => {
+                Self::log_s3_forward_error(&req_uri, &req_method, &e);
+                // A TlsValidated upstream override whose certificate failed
+                // verification is a non-retryable config error → 400
+                // UpstreamTLSValidationFailed (Requirement 4), never a 5xx.
+                if matches!(e, crate::ProxyError::UpstreamTlsValidationFailed { .. }) {
+                    Ok(Self::proxy_error_to_response(&e))
+                } else {
+                    Ok(Self::build_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "BadGateway",
+                        "Failed to forward signed request to S3",
+                        None,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Resolve the upstream transport for a signed-write request (single-part PUT
+    /// and the multipart operations), honouring `connection_pool.upstream_overrides`.
+    ///
+    /// Mirrors the GET-path connector (`CustomHttpsConnector`):
+    /// - An override match resolves the connect IP via the pool's external DNS
+    ///   resolver (or an IP literal directly) — never `/etc/hosts` — and selects
+    ///   plaintext, accept-any TLS, or system-roots TLS for the authority port.
+    /// - No override → the verified-TLS-on-443 default: a distributed IP plus a
+    ///   system-roots TLS connector (`build_tls_config_for_host`).
+    ///
+    /// Returns `None` when no connect IP is available (the caller maps this to the
+    /// existing 502 "Failed to resolve S3 endpoint"), preserving prior behaviour
+    /// for the no-override path.
+    async fn resolve_signed_upstream_transport(
+        host: &str,
+        authority_port: u16,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+    ) -> Option<Arc<crate::signed_request_proxy::UpstreamTransport>> {
+        use crate::signed_request_proxy::UpstreamTransport;
+        use crate::upstream_overrides::TransportMode;
+
+        let overrides = s3_client.get_upstream_overrides();
+
+        match overrides.resolve(host, authority_port) {
+            Some(mode) => {
+                // Resolve the connect IP: IP literals dial directly; hostnames go
+                // through the pool's configured DNS resolver (bypasses /etc/hosts,
+                // which would loop hosts-file routing back to the proxy).
+                let ip = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    ip
+                } else {
+                    let pool = s3_client.get_connection_pool();
+                    let pm = pool.read().await;
+                    pm.resolve_endpoint(host).await.ok()?.into_iter().next()?
+                };
+
+                let tls = match mode {
+                    TransportMode::Plaintext => None,
+                    TransportMode::TlsUnvalidated => {
+                        let cfg = crate::https_connector::build_tls_accept_any_config();
+                        Some(Arc::new(tokio_rustls::TlsConnector::from(Arc::new(cfg))))
+                    }
+                    TransportMode::TlsValidated => {
+                        let root_store = crate::tls_trust_store::load_root_cert_store().ok()?;
+                        let pool = s3_client.get_connection_pool();
+                        let pm = pool.read().await;
+                        let cfg = crate::https_connector::build_tls_config_for_host(
+                            host, root_store, &pm,
+                        );
+                        Some(Arc::new(tokio_rustls::TlsConnector::from(Arc::new(cfg))))
+                    }
+                };
+
+                // Only a TlsValidated override surfaces a non-retryable
+                // UpstreamTlsValidationFailed (400) on a handshake failure, naming
+                // the endpoint (Requirement 4) — matching the GET-path connector.
+                let validated_endpoint = match mode {
+                    TransportMode::TlsValidated => Some(format!("{host}:{authority_port}")),
+                    TransportMode::Plaintext | TransportMode::TlsUnvalidated => None,
+                };
+
+                Some(Arc::new(UpstreamTransport {
+                    ip,
+                    port: authority_port,
+                    tls,
+                    validated_endpoint,
+                }))
+            }
+            None => {
+                // Secure_Default_Behaviour: distributed IP + verified TLS on 443.
+                let pool = s3_client.get_connection_pool();
+                let ip = {
+                    let pm = pool.read().await;
+                    pm.get_distributed_ip(host)?
+                };
+                let root_store = crate::tls_trust_store::load_root_cert_store().ok()?;
+                let cfg = {
+                    let pm = pool.read().await;
+                    crate::https_connector::build_tls_config_for_host(host, root_store, &pm)
+                };
+                let tls = Arc::new(tokio_rustls::TlsConnector::from(Arc::new(cfg)));
+                Some(Arc::new(UpstreamTransport::verified_tls_443(ip, tls)))
             }
         }
     }
@@ -10144,6 +10318,44 @@ impl HttpProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_upstream_tls_validation_failure_maps_to_non_retryable_400() {
+        // Validates: Requirements 4.1, 4.2, 4.3 (Property 5)
+        //
+        // A `TlsValidated` override whose certificate fails verification is surfaced as
+        // a non-retryable 400 `UpstreamTLSValidationFailed` naming the upstream
+        // host:port. It must never be a 5xx (which would trigger S3 client
+        // retry/backoff against a condition that cannot succeed) and the proxy never
+        // falls back to plaintext/unvalidated TLS — the mapping only ever yields 400.
+        let err = crate::ProxyError::UpstreamTlsValidationFailed {
+            endpoint: "store:9000".to_string(),
+            source_err: "bad cert".to_string(),
+        };
+
+        let response = HttpProxy::proxy_error_to_response(&err);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // No-downgrade is structural: the mapping returns a client error, never a 5xx,
+        // so no retry/backoff storm and no transport fallback can occur.
+        assert!(response.status().is_client_error());
+        assert!(
+            !response.status().is_server_error(),
+            "certificate-validation failure must never be a 5xx (Requirement 4.3)"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("error body is valid UTF-8");
+
+        assert!(
+            body.contains("<Code>UpstreamTLSValidationFailed</Code>"),
+            "body must carry the distinct S3-style error code; got: {body}"
+        );
+        assert!(
+            body.contains("store:9000"),
+            "error must name the upstream endpoint host:port; got: {body}"
+        );
+    }
 
     #[test]
     fn test_has_sse_c_headers_algorithm() {
@@ -11375,13 +11587,21 @@ mod tests {
         };
 
         // Call detect_forward_proxy_uri — must return Some for absolute URIs
-        let (extracted_host, relative_uri) = match HttpProxy::detect_forward_proxy_uri(&uri) {
-            Some(result) => result,
-            None => return TestResult::failed(),
-        };
+        let (extracted_host, routing_authority, relative_uri) =
+            match HttpProxy::detect_forward_proxy_uri(&uri) {
+                Some(result) => result,
+                None => return TestResult::failed(),
+            };
 
-        // Verify extracted host matches the generated host
+        // Verify extracted (cache-key) host matches the generated host
         if extracted_host != host {
+            return TestResult::failed();
+        }
+
+        // This generator never emits a port, so the routing authority (which preserves
+        // any explicit port) must equal the port-stripped cache host here. Port
+        // preservation itself is covered by the dedicated port-plumbing test.
+        if routing_authority != extracted_host {
             return TestResult::failed();
         }
 

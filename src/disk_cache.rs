@@ -64,6 +64,20 @@ impl IncrementalRangeWriter {
     }
 }
 
+/// Compression facts for a finalized multipart part, returned by
+/// [`DiskCacheManager::finalize_incremental_part`] so the caller can record them
+/// in the upload tracker (`upload.meta`). `finalize_multipart_upload` later builds
+/// the object's `RangeSpec` from the tracker (reading the published file's size
+/// directly), so only the algorithm and uncompressed length are surfaced here.
+pub(crate) struct PartFinalizeInfo {
+    /// Algorithm the part bytes were written with (`Lz4` when compression is
+    /// enabled, else `None`), recorded so the GET-side range loader decompresses
+    /// correctly after the part is linked into the object.
+    pub(crate) compression_algorithm: crate::compression::CompressionAlgorithm,
+    /// Total decoded (uncompressed) object bytes written for this part.
+    pub(crate) uncompressed_size: u64,
+}
+
 /// Disk cache manager for file-based cache operations
 pub struct DiskCacheManager {
     cache_dir: PathBuf,
@@ -1738,10 +1752,78 @@ impl DiskCacheManager {
     /// proceed in parallel.
     pub async fn commit_incremental_range(
         &self,
-        mut writer: IncrementalRangeWriter,
+        writer: IncrementalRangeWriter,
         object_metadata: crate::cache_types::ObjectMetadata,
         ttl: Duration,
     ) -> Result<()> {
+        let cache_key = writer.cache_key.clone();
+
+        // Finalize the bytes (flush residual batch, validate length, publish the
+        // `.bin`). Shared with the no-journal write-cache path so both produce
+        // byte-identical range files.
+        let (range_spec, range_already_existed) = self.finalize_incremental_range(writer)?;
+        let (start, end, compressed_size) =
+            (range_spec.start, range_spec.end, range_spec.compressed_size);
+
+        // Write journal entry (same pattern as store_range)
+        if let Some(hybrid_writer) = &self.hybrid_metadata_writer {
+            let mut hw = hybrid_writer.lock().await;
+            if let Err(e) = hw
+                .write_range_metadata(
+                    &cache_key,
+                    range_spec,
+                    WriteMode::JournalOnly,
+                    Some(object_metadata.clone()),
+                    ttl,
+                )
+                .await
+            {
+                error!(
+                    "Journal write failed for incremental range (range file exists, will be orphaned): key={}, range={}-{}, error={}",
+                    cache_key, start, end, e
+                );
+                return Err(e);
+            }
+
+            // Track size via in-memory accumulator
+            if let Some(consolidator) = &self.journal_consolidator {
+                if !range_already_existed {
+                    consolidator.size_accumulator().add_range(
+                        &cache_key,
+                        start,
+                        end,
+                        compressed_size,
+                    );
+                    if object_metadata.is_write_cached {
+                        consolidator
+                            .size_accumulator()
+                            .add_write_cache(compressed_size);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finalize an incremental range write **without** writing metadata or
+    /// updating size tracking: flush any residual batch as a final LZ4 frame,
+    /// validate the written length, flush the file, and atomically rename
+    /// `.tmp` → `.bin`. Returns the [`crate::cache_types::RangeSpec`] describing
+    /// the published file and whether the final `.bin` already existed (so a
+    /// size-tracking caller can avoid double-counting an overwrite).
+    ///
+    /// `commit_incremental_range` uses this for the byte-finalize step and then
+    /// writes the journal entry + size deltas. The write-cache PUT path
+    /// (`CacheManager::store_put_as_write_cached_range_with_ttl` via
+    /// `WriteCacheRangeSink::finalize`) uses it directly and writes its `.meta`
+    /// immediately through `store_new_metadata`, preserving read-after-write cache
+    /// semantics — the journal-only commit defers the `.meta` until consolidation,
+    /// which would turn an immediate post-PUT GET into a cache miss.
+    pub(crate) fn finalize_incremental_range(
+        &self,
+        mut writer: IncrementalRangeWriter,
+    ) -> Result<(crate::cache_types::RangeSpec, bool)> {
         use crate::cache_types::RangeSpec;
         use std::io::Write;
 
@@ -1804,12 +1886,12 @@ impl DiskCacheManager {
         })?;
 
         debug!(
-            "Committed incremental range: key={}, range={}-{}, uncompressed={}, compressed={}, path={:?}",
+            "Finalized incremental range: key={}, range={}-{}, uncompressed={}, compressed={}, path={:?}",
             writer.cache_key, writer.start, writer.end,
             writer.bytes_written, writer.compressed_bytes_written, writer.final_path
         );
 
-        // Build RangeSpec for metadata/journal
+        // Build RangeSpec describing the published file
         let ranges_dir = self.cache_dir.join("ranges");
         let range_file_relative_path = writer
             .final_path
@@ -1827,45 +1909,7 @@ impl DiskCacheManager {
             writer.bytes_written,
         );
 
-        // Write journal entry (same pattern as store_range)
-        if let Some(hybrid_writer) = &self.hybrid_metadata_writer {
-            let mut hw = hybrid_writer.lock().await;
-            if let Err(e) = hw
-                .write_range_metadata(
-                    &writer.cache_key,
-                    range_spec,
-                    WriteMode::JournalOnly,
-                    Some(object_metadata.clone()),
-                    ttl,
-                )
-                .await
-            {
-                error!(
-                    "Journal write failed for incremental range (range file exists, will be orphaned): key={}, range={}-{}, error={}",
-                    writer.cache_key, writer.start, writer.end, e
-                );
-                return Err(e);
-            }
-
-            // Track size via in-memory accumulator
-            if let Some(consolidator) = &self.journal_consolidator {
-                if !range_already_existed {
-                    consolidator.size_accumulator().add_range(
-                        &writer.cache_key,
-                        writer.start,
-                        writer.end,
-                        writer.compressed_bytes_written,
-                    );
-                    if object_metadata.is_write_cached {
-                        consolidator
-                            .size_accumulator()
-                            .add_write_cache(writer.compressed_bytes_written);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        Ok((range_spec, range_already_existed))
     }
 
     /// Abort an incremental write, cleaning up the `.tmp` file.
@@ -1879,6 +1923,142 @@ impl DiskCacheManager {
                 tmp_path, e
             );
         }
+    }
+
+    /// Begin an incremental **multipart-part** write that stages bytes into the
+    /// upload's in-progress directory (`mpus_in_progress/{upload_id}/part{N}.bin`)
+    /// instead of the sharded `ranges/` tree.
+    ///
+    /// Reuses the same batched-LZ4-frame writer as
+    /// [`Self::begin_incremental_range_write`] — bytes are fed via
+    /// [`Self::write_range_chunk`] and flushed as concatenated LZ4 frames by
+    /// `flush_batch`, byte-compatible with the range files the GET path reads
+    /// (`FrameDecoder` decodes concatenated frames transparently). Unlike a range
+    /// write, a part has no final byte offset yet (offsets are assigned at
+    /// `CompleteMultipartUpload`), so the returned writer is finalized with
+    /// [`Self::finalize_incremental_part`], which performs no range-length
+    /// validation, writes no metadata/journal entry, and renames the `.tmp` to the
+    /// given `part_final_path`. The part is tracked in `upload.meta` and only linked
+    /// into object metadata when the upload completes.
+    pub async fn begin_incremental_part_write(
+        &self,
+        part_final_path: PathBuf,
+        cache_key: &str,
+        compression_enabled: bool,
+    ) -> Result<IncrementalRangeWriter> {
+        // Ensure the upload's in-progress directory exists.
+        if let Some(parent) = part_final_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProxyError::CacheError(format!("Failed to create multipart part directory: {}", e))
+            })?;
+        }
+
+        // Unique .tmp filename with random suffix for concurrent write safety
+        // (the upload.lock serializes the later rename + tracker update, but
+        // distinct streamed bodies write their own tmp files in parallel first).
+        let random_suffix: u32 = fastrand::u32(..);
+        let stem = part_final_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let tmp_filename = format!("{}.{:08x}.tmp", stem, random_suffix);
+        let tmp_path = part_final_path.with_file_name(tmp_filename);
+
+        let file = std::fs::File::create(&tmp_path).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to create incremental part tmp file {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+
+        let content_path = self.extract_path_from_cache_key(cache_key);
+
+        debug!(
+            "Begin incremental part write: key={}, tmp={:?}, final={:?}, compression={}",
+            cache_key, tmp_path, part_final_path, compression_enabled
+        );
+
+        // `start`/`end` are unused by the part finalizer (a part's final offset is
+        // unknown until completion); they are set to `0` sentinels here.
+        Ok(IncrementalRangeWriter {
+            tmp_path,
+            final_path: part_final_path,
+            file,
+            bytes_written: 0,
+            compressed_bytes_written: 0,
+            cache_key: cache_key.to_string(),
+            start: 0,
+            end: 0,
+            compression_enabled,
+            content_path,
+            batch_buf: Vec::with_capacity(self.compression_batch_size),
+            batch_size: self.compression_batch_size,
+        })
+    }
+
+    /// Finalize a multipart-part incremental write: flush any residual batch as a
+    /// final LZ4 frame, flush the file, and atomically rename `.tmp` → the part
+    /// file. Returns the [`PartFinalizeInfo`] (algorithm + sizes) for the upload
+    /// tracker.
+    ///
+    /// Unlike [`Self::finalize_incremental_range`], this performs **no**
+    /// range-length validation (a part's final offset/length-as-range is unknown
+    /// until completion) and writes **no** metadata/journal entry — the part is
+    /// recorded in `upload.meta` under `upload.lock` by the caller and only linked
+    /// into object metadata at `CompleteMultipartUpload`. An associated function
+    /// (no `&self`), mirroring [`Self::write_range_chunk`] /
+    /// [`Self::abort_incremental_range`].
+    pub(crate) fn finalize_incremental_part(
+        mut writer: IncrementalRangeWriter,
+    ) -> Result<PartFinalizeInfo> {
+        use std::io::Write;
+
+        // Flush any residual batched bytes as a final LZ4 frame before the rename,
+        // so the part file is complete when it becomes visible. No-op when
+        // compression is disabled or the buffer is empty.
+        if writer.compression_enabled && !writer.batch_buf.is_empty() {
+            if let Err(e) = Self::flush_batch(&mut writer) {
+                let _ = std::fs::remove_file(&writer.tmp_path);
+                return Err(e);
+            }
+        }
+
+        let mut file = writer.file;
+        file.flush().map_err(|e| {
+            let _ = std::fs::remove_file(&writer.tmp_path);
+            ProxyError::CacheError(format!("Failed to flush incremental part tmp file: {}", e))
+        })?;
+        // Defer the fd close to a blocking task (NFS close triggers synchronous
+        // writeback); same rationale as `finalize_incremental_range`.
+        tokio::task::spawn_blocking(move || drop(file));
+
+        let compression_algorithm = if writer.compression_enabled {
+            crate::compression::CompressionAlgorithm::Lz4
+        } else {
+            crate::compression::CompressionAlgorithm::None
+        };
+
+        // Atomic rename .tmp → part{N}.bin
+        std::fs::rename(&writer.tmp_path, &writer.final_path).map_err(|e| {
+            let _ = std::fs::remove_file(&writer.tmp_path);
+            ProxyError::CacheError(format!(
+                "Failed to rename incremental part tmp file to final: {}",
+                e
+            ))
+        })?;
+
+        debug!(
+            "Finalized incremental part: key={}, uncompressed={}, compressed={}, path={:?}",
+            writer.cache_key,
+            writer.bytes_written,
+            writer.compressed_bytes_written,
+            writer.final_path
+        );
+
+        Ok(PartFinalizeInfo {
+            compression_algorithm,
+            uncompressed_size: writer.bytes_written,
+        })
     }
 
     /// Get metadata for a cache entry without loading range data

@@ -48,6 +48,7 @@ pub mod tcp_proxy;
 pub mod tee_stream;
 pub mod tls_proxy_listener;
 pub mod tls_trust_store;
+pub mod upstream_overrides;
 pub mod write_cache_manager;
 
 pub use error::{ProxyError, Result};

@@ -8,6 +8,7 @@ use crate::config::ConnectionPoolConfig;
 use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
 use crate::https_connector::CustomHttpsConnector;
 use crate::tls_trust_store;
+use crate::upstream_overrides::UpstreamOverrides;
 use crate::{ProxyError, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,6 +36,10 @@ pub struct S3Client {
     /// True when endpoint_overrides is configured (PrivateLink destinations).
     /// Used to lock outbound TLS to 1.2 for VPC interface endpoint compatibility.
     has_endpoint_overrides: bool,
+    /// Per-destination upstream transport overrides, parsed once at construction
+    /// and shared (via `Arc`) with the `CustomHttpsConnector`. Held here so the
+    /// IP-distribution rewrite can be skipped for matched targets (task 4.2).
+    upstream_overrides: Arc<UpstreamOverrides>,
 }
 
 /// S3 request context for forwarding
@@ -143,6 +148,17 @@ pub trait S3ClientApi: Send + Sync {
         &self,
     ) -> Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>>;
 
+    /// The parsed `connection_pool.upstream_overrides` matcher shared with the
+    /// connector. The signed-write path resolves the upstream transport against
+    /// this so PUT / multipart egress honours the same override as GET egress.
+    /// Defaults to an empty matcher (no overrides → verified-TLS-on-443), which
+    /// is the correct behaviour for test stubs that don't configure overrides.
+    fn get_upstream_overrides(&self) -> Arc<UpstreamOverrides> {
+        Arc::new(UpstreamOverrides::from_config(
+            &std::collections::HashMap::new(),
+        ))
+    }
+
     /// True when the client was built with endpoint overrides (PrivateLink
     /// destinations). Consumers use this to decide whether to lock outbound
     /// TLS to 1.2.
@@ -185,6 +201,10 @@ impl S3ClientApi for S3Client {
         &self,
     ) -> Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>> {
         S3Client::get_connection_pool(self)
+    }
+
+    fn get_upstream_overrides(&self) -> Arc<UpstreamOverrides> {
+        Arc::clone(&self.upstream_overrides)
     }
 
     fn has_endpoint_overrides(&self) -> bool {
@@ -237,6 +257,12 @@ impl S3Client {
         // Create shared metrics manager reference that can be set later
         let metrics_ref = Arc::new(tokio::sync::RwLock::new(metrics_manager.clone()));
 
+        // Parse the per-destination upstream transport overrides once, here, and
+        // share the matcher (via `Arc`) with the connector (transport selection)
+        // and this `S3Client` (IP-distribution rewrite skip, task 4.2).
+        let upstream_overrides =
+            Arc::new(UpstreamOverrides::from_config(&config.upstream_overrides));
+
         // Create custom HTTPS connector with pool manager, health tracker, and config.
         // Per-host TLS version selection (TLS 1.2 for PrivateLink, default otherwise)
         // is handled at connection time via build_tls_config_for_host.
@@ -245,6 +271,7 @@ impl S3Client {
             root_store,
             config.clone(),
             Arc::clone(&health_tracker),
+            Arc::clone(&upstream_overrides),
         );
 
         // Set the shared metrics manager reference on connector
@@ -287,6 +314,7 @@ impl S3Client {
             metrics_manager: metrics_ref,
             health_tracker,
             has_endpoint_overrides: !config.endpoint_overrides.is_empty(),
+            upstream_overrides,
         })
     }
 
@@ -407,9 +435,38 @@ impl S3Client {
         // by tracking total requests vs connections created
         let _endpoint = context.host.clone();
 
+        // Upstream transport override bypass: when the Upstream_Target host:port
+        // matches a configured override, skip IP-distribution authority rewriting and
+        // forward with the original authority. The connector keys on the URI authority
+        // host, so rewriting it to a resolved IP literal would both replace the signed
+        // Host with an IP AND make the override no longer match — silently dropping back
+        // to the default TLS/443 path. Forwarding the original authority keeps connect
+        // authority == signed Host and keeps the override matching in the connector,
+        // which resolves the hostname via external DNS or dials the IP literal directly
+        // (Requirements 5.1, 5.2, 5.3, 6). The port defaults to 80 (HTTP-origin) to
+        // mirror the connector exactly — never 443. A missing host can never match an
+        // override, so fall through to existing behaviour.
+        let upstream_override_matched = context
+            .uri
+            .host()
+            .map(|target_host| {
+                let target_port = context.uri.port_u16().unwrap_or(80);
+                self.upstream_overrides
+                    .resolve(target_host, target_port)
+                    .is_some()
+            })
+            .unwrap_or(false);
+
         // IP distribution: rewrite URI authority from hostname to IP address so hyper
         // creates separate connection pools per IP (Requirement 1.1, 1.2)
-        let (effective_uri, selected_ip) = if self.ip_distribution_enabled {
+        let (effective_uri, selected_ip) = if upstream_override_matched {
+            debug!(
+                host = %context.host,
+                uri = %context.uri,
+                "Upstream override matched; skipping IP-distribution rewrite and forwarding with original authority"
+            );
+            (context.uri.clone(), None)
+        } else if self.ip_distribution_enabled {
             let distributed_ip = {
                 let pool_manager = self.pool_manager.read().await;
                 pool_manager.get_distributed_ip(&context.host)
@@ -516,6 +573,17 @@ impl S3Client {
                         });
                     }
                 }
+                // A TlsValidated upstream override whose certificate failed
+                // verification surfaces from the connector as a typed
+                // `ProxyError::UpstreamTlsValidationFailed`. hyper wraps the
+                // connector (Service) error inside its own error, so recover the
+                // typed variant by walking the source chain. Preserving it here is
+                // load-bearing: the proxy maps it to a non-retryable 400 upstream
+                // (Requirements 4.1-4.4). Without this it would be flattened into a
+                // generic `HttpError` and surface as a retryable 502.
+                if let Some(tls_err) = Self::recover_upstream_tls_validation_error(&e) {
+                    return tls_err;
+                }
                 ProxyError::HttpError(format!("Failed to send request: {}", e))
             })?;
 
@@ -584,6 +652,35 @@ impl S3Client {
         );
 
         Ok(response)
+    }
+
+    /// Recover a typed `ProxyError::UpstreamTlsValidationFailed` from a hyper
+    /// client error.
+    ///
+    /// The custom connector (`CustomHttpsConnector`) reports a failed TlsValidated
+    /// certificate verification as `ProxyError::UpstreamTlsValidationFailed`, but
+    /// hyper boxes the connector (Service) error inside its own error chain. Walk
+    /// the `std::error::Error::source()` chain and downcast at each level so the
+    /// typed variant is preserved (and can be mapped to a non-retryable 400 by the
+    /// proxy — Requirements 4.1-4.4) instead of being flattened into a string.
+    fn recover_upstream_tls_validation_error(
+        err: &(dyn std::error::Error + 'static),
+    ) -> Option<ProxyError> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(e) = current {
+            if let Some(ProxyError::UpstreamTlsValidationFailed {
+                endpoint,
+                source_err,
+            }) = e.downcast_ref::<ProxyError>()
+            {
+                return Some(ProxyError::UpstreamTlsValidationFailed {
+                    endpoint: endpoint.clone(),
+                    source_err: source_err.clone(),
+                });
+            }
+            current = e.source();
+        }
+        None
     }
 
     /// Check if error should trigger a retry
@@ -877,14 +974,16 @@ pub fn build_s3_request_context(
 
     // Build absolute URI for S3 request if the URI is relative
     let absolute_uri = if uri.scheme().is_none() {
-        // URI is relative, construct absolute URI with https:// scheme
+        // URI is relative, construct absolute URI with https:// scheme. The authority
+        // carries any explicit upstream port from the signed Host header so the egress
+        // dials it and the upstream-override lookup keys on host:port (Req 3.4, 3.5).
         let path_and_query = uri
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(uri.path());
         format!(
             "https://{}{}",
-            format_authority_host(&host, None),
+            build_egress_authority(&host, headers.get("host").map(|s| s.as_str())),
             path_and_query
         )
         .parse()
@@ -919,14 +1018,16 @@ pub fn build_s3_request_context_with_operation(
 
     // Build absolute URI for S3 request if the URI is relative
     let absolute_uri = if uri.scheme().is_none() {
-        // URI is relative, construct absolute URI with https:// scheme
+        // URI is relative, construct absolute URI with https:// scheme. The authority
+        // carries any explicit upstream port from the signed Host header so the egress
+        // dials it and the upstream-override lookup keys on host:port (Req 3.4, 3.5).
         let path_and_query = uri
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(uri.path());
         format!(
             "https://{}{}",
-            format_authority_host(&host, None),
+            build_egress_authority(&host, headers.get("host").map(|s| s.as_str())),
             path_and_query
         )
         .parse()
@@ -983,6 +1084,48 @@ fn format_authority_host(host: &str, port: Option<u16>) -> String {
         Some(p) => format!("{}:{}", bracketed, p),
         None => bracketed,
     }
+}
+
+/// Extract an explicit port from a `Host` header value, if one is present.
+///
+/// Handles the RFC 3986 authority forms `host:port`, `ipv4:port`, and the bracketed
+/// `[ipv6]:port`. Returns `None` for a bare host (no port), an empty/invalid port, or
+/// an unbracketed IPv6 literal (ambiguous, not legal in a `Host` header).
+pub(crate) fn host_header_port(value: &str) -> Option<u16> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // Bracketed IPv6: `[..]` optionally followed by `:port`.
+    if let Some(rest) = value.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let after = &rest[end + 1..];
+        return after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+    }
+    // Unbracketed: at most one colon may separate host and port. More than one colon
+    // implies an unbracketed IPv6 literal, which has no extractable port here.
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => port.parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+/// Build the absolute-egress URI authority (`host[:port]`) for a request that arrived
+/// in relative form.
+///
+/// The caching egress is HTTP-origin: a forward-proxy client targets
+/// `http://host[:port]` and signs `Host: host[:port]`, so any explicit upstream port
+/// lives in the signed `Host` header (the Signed_Authority, forwarded verbatim). To
+/// dial that port and let the upstream-override lookup key on `host:port`
+/// (Requirements 3.4, 3.5, 5.1), carry the `Host` header's port into the constructed
+/// authority. The host component is always the port-stripped `host` (IPv6-bracketed by
+/// `format_authority_host`), so `context.host` semantics and the cache key are
+/// unchanged. When the `Host` header carries no port (the standard S3 case, and
+/// forward-proxy without an explicit port), the result is byte-for-byte today's
+/// authority — the `https` scheme is cosmetic and is never used to default the port to
+/// 443.
+pub(crate) fn build_egress_authority(host: &str, host_header: Option<&str>) -> String {
+    format_authority_host(host, host_header.and_then(host_header_port))
 }
 
 #[cfg(test)]
@@ -1106,6 +1249,245 @@ mod tests {
         assert_eq!(context.body, body);
         assert_eq!(context.host, host);
         assert_eq!(context.request_size, Some(9)); // "test data" is 9 bytes
+    }
+
+    #[test]
+    fn test_host_header_port_parsing() {
+        // Validates: Requirements 3.4, 3.5
+        assert_eq!(host_header_port("store:9000"), Some(9000));
+        assert_eq!(host_header_port("127.0.0.1:9000"), Some(9000));
+        assert_eq!(host_header_port("[::1]:9000"), Some(9000));
+        assert_eq!(host_header_port(" store:9000 "), Some(9000)); // trimmed
+                                                                  // No explicit port -> None (egress keeps today's port-defaulting behaviour).
+        assert_eq!(host_header_port("store"), None);
+        assert_eq!(host_header_port("s3.amazonaws.com"), None);
+        assert_eq!(host_header_port("[::1]"), None);
+        assert_eq!(host_header_port(""), None);
+        // Unbracketed IPv6 is ambiguous and yields no port.
+        assert_eq!(host_header_port("::1"), None);
+        // Invalid port digits.
+        assert_eq!(host_header_port("store:notaport"), None);
+    }
+
+    #[test]
+    fn test_build_egress_authority_preserves_explicit_port() {
+        // Validates: Requirements 3.4, 3.5 - the signed Host header's explicit port is
+        // carried into the constructed authority so the egress dials it.
+        assert_eq!(
+            build_egress_authority("store", Some("store:9000")),
+            "store:9000"
+        );
+        assert_eq!(
+            build_egress_authority("127.0.0.1", Some("127.0.0.1:9000")),
+            "127.0.0.1:9000"
+        );
+    }
+
+    #[test]
+    fn test_build_egress_authority_no_port_unchanged() {
+        // Validates: Requirement 3.5 - without an explicit port the authority is
+        // byte-for-byte today's value (the https scheme never defaults the port to 443).
+        assert_eq!(
+            build_egress_authority("s3.amazonaws.com", Some("s3.amazonaws.com")),
+            "s3.amazonaws.com"
+        );
+        assert_eq!(
+            build_egress_authority("s3.amazonaws.com", None),
+            "s3.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn test_build_s3_request_context_relative_preserves_port() {
+        // Validates: Requirements 3.4, 3.5 - a forward-proxy request to an explicit
+        // upstream port produces an absolute egress URI carrying that port, so the
+        // connector's uri.port_u16() returns it. context.host stays port-stripped.
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "store:9000".to_string());
+        let uri: Uri = "/bucket/key".parse().unwrap();
+
+        let context = build_s3_request_context(
+            Method::GET,
+            uri,
+            headers,
+            None,
+            "store".to_string(), // port-stripped host (cache key / context.host)
+        );
+
+        assert_eq!(context.uri.host(), Some("store"));
+        assert_eq!(context.uri.port_u16(), Some(9000));
+        assert_eq!(context.uri.scheme_str(), Some("https"));
+        assert_eq!(context.uri.path(), "/bucket/key");
+        assert_eq!(context.host, "store"); // unchanged: port-stripped
+    }
+
+    #[test]
+    fn test_build_s3_request_context_relative_no_port_unchanged() {
+        // Validates: Requirement 3.5 - without an explicit port the constructed URI is
+        // identical to today's (no port, https scheme), so non-overridden egress is
+        // byte-for-byte unchanged.
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "s3.amazonaws.com".to_string());
+        let uri: Uri = "/bucket/key?x=1".parse().unwrap();
+
+        let context = build_s3_request_context(
+            Method::GET,
+            uri,
+            headers,
+            None,
+            "s3.amazonaws.com".to_string(),
+        );
+
+        assert_eq!(
+            context.uri.to_string(),
+            "https://s3.amazonaws.com/bucket/key?x=1"
+        );
+        assert_eq!(context.uri.port_u16(), None);
+    }
+
+    // ---- Task 4.3* — Signature integrity (Property 3) ----
+
+    /// Build a raw `upstream_overrides` config map from `(key, scheme, validate_tls)`
+    /// triples, mirroring what `S3Client::new` parses from `ConnectionPoolConfig`.
+    fn override_map(
+        entries: &[(&str, crate::config::UpstreamScheme, bool)],
+    ) -> std::collections::HashMap<String, crate::config::UpstreamOverrideConfig> {
+        entries
+            .iter()
+            .map(|(key, scheme, validate_tls)| {
+                (
+                    (*key).to_string(),
+                    crate::config::UpstreamOverrideConfig {
+                        scheme: scheme.clone(),
+                        validate_tls: *validate_tls,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_override_resolution_drives_ip_distribution_bypass() {
+        // Validates: Requirements 5.1, 5.2, 5.3
+        //
+        // `try_forward_request` keys the IP-distribution-rewrite skip on
+        // `self.upstream_overrides.resolve(host, port).is_some()`. This test pins that
+        // decision: a matched target resolves to `Some(mode)` (so the rewrite is
+        // skipped and the signed authority survives), while an off-override authority
+        // resolves to `None` (so the rewrite still happens, unchanged behaviour).
+        use crate::config::UpstreamScheme;
+        use crate::upstream_overrides::{TransportMode, UpstreamOverrides};
+
+        let raw = override_map(&[
+            // Hostname entry the fleet verification (T22) depends on: real S3 over
+            // plaintext HTTP on port 80.
+            ("s3.us-east-1.amazonaws.com:80", UpstreamScheme::Http, true),
+            // IP-literal entry (local plaintext store).
+            ("127.0.0.1:9000", UpstreamScheme::Http, true),
+        ]);
+        let overrides = UpstreamOverrides::from_config(&raw);
+
+        // Matched hostname authority resolves to Some(Plaintext): because the lookup
+        // matches, `try_forward_request` skips the IP-distribution rewrite, so the
+        // authority is NOT rewritten to an S3 IP and the override keeps matching — the
+        // exact path the fleet T22 group relies on.
+        assert_eq!(
+            overrides.resolve("s3.us-east-1.amazonaws.com", 80),
+            Some(TransportMode::Plaintext),
+            "hostname override must match the un-rewritten authority (fleet T22 path)"
+        );
+        // Matched IP-literal authority also resolves, triggering the bypass.
+        assert_eq!(
+            overrides.resolve("127.0.0.1", 9000),
+            Some(TransportMode::Plaintext),
+            "IP-literal override must match so the rewrite is skipped"
+        );
+
+        // Off-override authorities resolve to None, so the IP-distribution rewrite
+        // still happens for non-matched targets (purely additive).
+        assert_eq!(
+            overrides.resolve("s3.us-east-1.amazonaws.com", 443),
+            None,
+            "same host on the non-overridden port must NOT match (port is part of key)"
+        );
+        assert_eq!(
+            overrides.resolve("s3.eu-west-1.amazonaws.com", 80),
+            None,
+            "a different region host must NOT match"
+        );
+        assert_eq!(
+            overrides.resolve("127.0.0.1", 8080),
+            None,
+            "same IP on a different port must NOT match"
+        );
+    }
+
+    #[test]
+    fn test_matched_override_preserves_signed_host_verbatim() {
+        // Validates: Requirements 5.1, 5.3
+        //
+        // For a matched override the rewrite is skipped and the signed authority is
+        // forwarded verbatim. Confirm the constructed egress authority equals the
+        // client-signed `Host` (including port) and that the preserved authority STILL
+        // resolves to the override — i.e. no rewrite/normalization breaks the match.
+        use crate::config::UpstreamScheme;
+        use crate::upstream_overrides::UpstreamOverrides;
+
+        let raw = override_map(&[("store:9000", UpstreamScheme::Https, false)]);
+        let overrides = UpstreamOverrides::from_config(&raw);
+
+        let signed_host = "store:9000";
+        // The signed Host's explicit port is carried into the egress authority verbatim.
+        let egress = build_egress_authority("store", Some(signed_host));
+        assert_eq!(
+            egress, "store:9000",
+            "signed Host port must be preserved verbatim (no strip/re-case/rewrite)"
+        );
+
+        // The preserved (un-rewritten) authority still matches the override, so the
+        // transport selection and the signed Host stay in agreement.
+        let port = host_header_port(signed_host).unwrap_or(80);
+        assert_eq!(port, 9000);
+        assert!(
+            overrides.resolve("store", port).is_some(),
+            "the verbatim-preserved authority must keep matching the override"
+        );
+    }
+
+    #[test]
+    fn test_upstream_tls_validation_failure_is_not_retryable() {
+        // Validates: Requirements 4.1, 4.3 (Property 5)
+        //
+        // A `TlsValidated` certificate failure is a configuration error that cannot
+        // succeed on retry. `should_retry_error` must classify it as non-retryable, so
+        // the proxy never retries (and the 400 mapping never downgrades).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let config = create_test_config();
+        let result = S3Client::new(&config, None);
+        // Follow the existing guard pattern: skip if certs are unavailable in the test
+        // environment (S3Client::new loads the system trust store).
+        if result.is_err() {
+            eprintln!("Skipping TLS test - certificates not available in test environment");
+            return;
+        }
+        let client = result.unwrap();
+
+        let err = ProxyError::UpstreamTlsValidationFailed {
+            endpoint: "store:9000".to_string(),
+            source_err: "bad cert".to_string(),
+        };
+        assert!(
+            !client.should_retry_error(&err),
+            "UpstreamTlsValidationFailed must be non-retryable (no retry storm, no downgrade)"
+        );
+
+        // Control: a genuine connection error IS retryable, proving the predicate is
+        // not trivially returning false for every input.
+        assert!(
+            client.should_retry_error(&ProxyError::ConnectionError("conn reset".to_string())),
+            "connection errors remain retryable (sanity control)"
+        );
     }
 
     #[test]

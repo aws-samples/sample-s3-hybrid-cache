@@ -37,6 +37,11 @@ Quick start guide for installing, configuring, and running Hybrid Cache for Amaz
   - [Configuration](#configuration)
   - [Client Configuration](#client-configuration)
   - [High Availability: Shared NFS Cache Pattern](#high-availability-shared-nfs-cache-pattern)
+- [Fronting a Plaintext or Non-Standard Store (upstream_overrides)](#fronting-a-plaintext-or-non-standard-store-upstream_overrides)
+  - [Local-Dev Recipe: Plaintext MinIO on :9000](#local-dev-recipe-plaintext-minio-on-9000)
+  - [Fronting Real S3 over Plaintext HTTP](#fronting-real-s3-over-plaintext-http)
+  - [Cache-Key Caveat: Ports Are Stripped](#cache-key-caveat-ports-are-stripped)
+  - [Security: Local-Dev and Trusted Networks Only](#security-local-dev-and-trusted-networks-only)
 - [Configuration Files](#configuration-files)
 - [Verification](#verification)
   - [Test Basic Functionality](#test-basic-functionality)
@@ -82,7 +87,9 @@ The binary has no bundled assets. At runtime it needs a config file, cache direc
 
 ### Upgrading
 
-Configuration is backward-compatible: new options always have defaults, so existing config files keep working across versions. Review `CHANGELOG.md` and `config/config.example.yaml` for new features and tuning knobs, but no config edits are required to upgrade.
+Configuration is backward-compatible at the field level: new options always have defaults, so an existing `config.yaml` keeps parsing and running across versions. Review `CHANGELOG.md` and `config/config.example.yaml` for new features and tuning knobs — in the normal case no config edits are required to upgrade.
+
+**Exception — upgrading to 2.0.0 (per-bucket `_settings.json` removed).** 2.0.0 replaced the per-bucket `cache_dir/metadata/{bucket}/_settings.json` mechanism (including `prefix_overrides`) with a single optional `cache_dir/cache_rules.json` holding an ordered list of glob rules matched against the full `{bucket}/{object_key}` cache key. There is no auto-migration: after upgrade any `_settings.json` files are ignored — the proxy logs a one-time warning if it finds them under `cache_dir/metadata/` — so their settings stop taking effect until you translate them by hand into `cache_rules.json`. Watch the matching change while translating: the old `prefix_overrides` were prefix matches, whereas rules are anchored globs, so "everything under `temp/` in `mybucket`" becomes the pattern `mybucket/temp/**`. If you never used `_settings.json`, no action is needed. See [Cache Rules](CONFIGURATION.md#cache-rules) and the 2.0.0 entry in [CHANGELOG.md](../CHANGELOG.md) for the rule syntax and a before/after example.
 
 The upgrade flow is: rebuild (or copy the binary from a build host), replace, restart.
 
@@ -1065,6 +1072,110 @@ How it works:
 | **Best for** | Shared proxy fleet serving many clients | Compute clusters where each node runs its own workload |
 
 DNS multi-value routing (see [Option B: DNS Zone](#option-b-dns-zone-production-deployments)) is better when a small number of proxy instances serve many clients. The shared NFS cache pattern is better when each compute node generates its own S3 traffic and you want to avoid DNS infrastructure entirely.
+
+## Fronting a Plaintext or Non-Standard Store (upstream_overrides)
+
+By default every caching connection the proxy makes to an upstream uses verified TLS on port 443 — the secure default. `connection_pool.upstream_overrides` lets you declare, per destination, that a specific `host:port` speaks a different transport: plaintext HTTP, validated HTTPS on a non-443 port, or HTTPS with certificate validation disabled. The map is empty by default; with no overrides configured, every destination uses verified TLS on 443.
+
+The client always speaks `http://` to the proxy regardless of the upstream transport — exactly as when fronting real S3 (the client uses `--endpoint-url http://s3...` and the proxy still connects to S3 over TLS). The client scheme is the client→proxy leg and never signals how the proxy connects to the store, so the upstream scheme comes from configuration. The *port*, by contrast, travels in the request authority and is both the port the proxy dials and the override lookup key.
+
+This works because the upstream `host:port` is carried in the request the proxy receives. In forward-proxy mode the absolute-form request authority carries it, so the proxy dials any port the client targets. In standard (hosts-file) mode the port comes from the `Host` header (defaulting to 80), and the proxy intercepts only the single `http_port` it is bound to (plus the 443 TCP passthrough, which does not cache): point `http_port` at a non-standard port and that one port is intercepted, but reaching several ports — or leaving the listener on 80/443 while fronting a store elsewhere — needs forward-proxy mode, which the recipe below uses. The transport (plaintext vs TLS, and TLS validation) is selectable by configuration on whatever port the request targets in either mode. Either way the proxy resolves the upstream hostname via its configured `dns_servers` (never `/etc/hosts`), so that name must resolve to the real origin, not back to the proxy.
+
+### Local-Dev Recipe: Plaintext MinIO on :9000
+
+This recipe fronts a plaintext S3-compatible store (MinIO shown; RustFS or any S3-compatible server works the same) listening on `127.0.0.1:9000`, with the proxy in [Proxy-Only Mode](#proxy-only-mode). The same mechanism (a plaintext `scheme: http` override fronting a real MinIO origin, PUT then GET round-trip) is exercised on every deploy by the fleet deployment-verification suite (group T24), so the path below is known-good — adjust only the host/port for your store.
+
+**1. Start the store.** MinIO listens on `:9000` in plaintext by default:
+
+```bash
+minio server /tmp/minio-data --address :9000  # plaintext S3-compatible store on 127.0.0.1:9000
+```
+
+MinIO's default root credentials are `minioadmin` / `minioadmin`. Leave it running in its own terminal.
+
+**2. Configure the proxy override.** Map the store's `host:port` — exactly as the client targets it — to `scheme: http` (Plaintext mode):
+
+```yaml
+server:
+  mode: "proxy_only"
+  # proxy_port: 3128  (default)
+
+cache:
+  cache_dir: "./tmp/cache"
+  max_cache_size: 524288000  # 500MB
+
+connection_pool:
+  upstream_overrides:
+    "127.0.0.1:9000":   # the store's host:port as the client addresses it (IP literal → exact match, path-style only)
+      scheme: http      # Plaintext mode — the proxy connects to the store over plaintext TCP, no TLS handshake
+```
+
+Start the proxy:
+
+```bash
+cargo run --release -- -c config.yaml  # no sudo needed in proxy-only mode
+```
+
+On startup the proxy logs a warning naming the endpoint and the protection being waived (cleartext) — this is expected for a plaintext override. Validated-TLS overrides produce no warning because nothing is waived.
+
+**3. Configure the client.** The client signs against the store's `Host` (`127.0.0.1:9000`) and routes through the proxy's forward-proxy port. IP endpoints require path-style addressing:
+
+```bash
+export AWS_ACCESS_KEY_ID=minioadmin               # MinIO root user
+export AWS_SECRET_ACCESS_KEY=minioadmin           # MinIO root password
+export AWS_DEFAULT_REGION=us-east-1               # arbitrary — the store ignores it, but SigV4 needs a region
+export HTTP_PROXY=http://127.0.0.1:3128           # route the client's request through the proxy's forward-proxy port
+aws configure set default.s3.addressing_style path  # IP endpoints must use path-style (no virtual-hosted form)
+```
+
+The client always uses `--endpoint-url http://127.0.0.1:9000` — `http://` because the client speaks plaintext HTTP to the proxy. The proxy reads the target authority (`127.0.0.1:9000`), matches the override, and connects to the store over plaintext on port 9000.
+
+`NO_PROXY` caveat: make sure `127.0.0.1` and `localhost` are **not** in `NO_PROXY`, or the AWS CLI will bypass `HTTP_PROXY` and talk to the store directly — skipping the proxy and the cache entirely. (On EC2, still keep `export NO_PROXY=169.254.169.254` so IMDS credential retrieval bypasses the proxy; just don't add `127.0.0.1`.)
+
+**4. Exercise it (PUT, GET miss, GET hit).** This is the verification that the recipe works:
+
+```bash
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://test-bucket                          # create a bucket on the store
+echo "hello plaintext upstream" > /tmp/obj.txt
+aws --endpoint-url http://127.0.0.1:9000 s3 cp /tmp/obj.txt s3://test-bucket/obj.txt      # PUT — write-through cached
+time aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://test-bucket/obj.txt /tmp/get1.txt  # first GET — cache MISS, fetched from the store
+time aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://test-bucket/obj.txt /tmp/get2.txt  # second GET — cache HIT, served by the proxy
+```
+
+Expected outcome: both GETs return identical bytes (`diff /tmp/get1.txt /tmp/get2.txt` is empty), and the second GET is served from cache. Confirm the hit on the proxy side:
+
+```bash
+curl -s http://127.0.0.1:9090/metrics | grep cache_hit_rate  # hit rate rises after the second GET
+```
+
+The hit is also visible on the dashboard (`http://127.0.0.1:8081`) and in the access log (the second GET is logged as served from cache). For a larger object the second GET is also noticeably faster than the first, since it avoids the round trip to the store.
+
+### Fronting Real S3 over Plaintext HTTP
+
+A publicly-resolvable endpoint reached over HTTP can be overridden the same way. To front real S3 over plaintext HTTP on port 80, override the regional endpoint on `:80`:
+
+```yaml
+connection_pool:
+  upstream_overrides:
+    "s3.us-east-1.amazonaws.com:80":   # a DNS name covers itself and all subdomains (e.g. bucket.s3.us-east-1.amazonaws.com)
+      scheme: http
+```
+
+```bash
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1                                   # http:// → port 80 → matches the :80 override
+```
+
+The proxy resolves `s3.us-east-1.amazonaws.com` via its configured external DNS (`connection_pool.dns_servers`, default Google/Cloudflare), never `/etc/hosts`, so it reaches the real S3 origin — even in a hosts-file deployment where the name would otherwise loop back to the proxy. The signed `Host` is forwarded verbatim and SigV4 validates at the origin, because the signature covers the `Host` and path, not the scheme. Because the key is a DNS name, the single entry also covers virtual-hosted bucket addressing (`bucket.s3.us-east-1.amazonaws.com`).
+
+### Cache-Key Caveat: Ports Are Stripped
+
+The cache-key host component is port-stripped. Two upstreams on the **same host but different ports** (for example `127.0.0.1:9000` and `127.0.0.1:9001`) therefore share one cache-key namespace: an object at the same key path on both stores collides in the cache, and whichever is fetched first wins until it is evicted or invalidated. The transport mode does not enter the cache key either, so the same object served over different transports of the same host is not duplicated. If you front two distinct stores, give them distinct hostnames (or distinct key paths) rather than relying on the port to separate them. See [Configuration Guide — Cache-key note](CONFIGURATION.md#cache-key-note) for the canonical statement of this rule.
+
+### Security: Local-Dev and Trusted Networks Only
+
+Plaintext (`scheme: http`) and unvalidated TLS (`scheme: https` with `validate_tls: false`) each waive a security protection on the proxy→origin leg — cleartext exposure, or loss of MITM protection. They are intended for local development or fully trusted networks only. Do not enable them across untrusted networks. Validated HTTPS on a non-443 port (`scheme: https`, with `validate_tls` defaulting to `true`) waives nothing and is safe to use anywhere the default 443 path is.
 
 ## Configuration Files
 

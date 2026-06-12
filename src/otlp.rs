@@ -398,3 +398,45 @@ impl OtlpExporter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Regression guard (telemetry-enhancements Req 9.2): `opentelemetry-otlp`'s
+    /// default features pull in `reqwest-blocking-client`, whose blocking client
+    /// cannot be constructed inside the Tokio runtime and makes the HTTP exporter
+    /// fail at init with "no http client specified" — silently disabling all
+    /// telemetry. With default features disabled and the async `reqwest-client`
+    /// enabled, `initialize()` must succeed inside a Tokio runtime.
+    #[tokio::test]
+    async fn otlp_exporter_initializes_without_blocking_client() {
+        let cfg = OtlpConfig {
+            enabled: true,
+            endpoint: "http://localhost:4318/v1/metrics".to_string(),
+            export_interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(10),
+            ..OtlpConfig::default()
+        };
+        let mut exporter = OtlpExporter::new(cfg);
+        let res = exporter.initialize().await;
+        assert!(
+            res.is_ok(),
+            "OTLP exporter init must succeed (no http client regression): {:?}",
+            res.err()
+        );
+        let _ = exporter.shutdown().await;
+    }
+
+    /// A disabled exporter must initialize to a no-op without constructing a client.
+    #[tokio::test]
+    async fn otlp_exporter_disabled_is_noop() {
+        let cfg = OtlpConfig {
+            enabled: false,
+            ..OtlpConfig::default()
+        };
+        let mut exporter = OtlpExporter::new(cfg);
+        assert!(exporter.initialize().await.is_ok());
+    }
+}

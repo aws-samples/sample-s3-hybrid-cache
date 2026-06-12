@@ -239,6 +239,25 @@ pub struct ServerConfig {
     /// Requirement: 11.1, 11.2, 11.3
     #[serde(default = "default_max_buffered_request_body_bytes")]
     pub max_buffered_request_body_bytes: u64,
+    /// Cache-tee channel depth for the streaming signed-write path (default: 5 frames).
+    ///
+    /// On a streamed signed write (single-part PUT / UploadPart), the request body is
+    /// forwarded to the upstream verbatim while a clone of each frame is tee'd to the
+    /// write-through cache over a bounded `mpsc` channel of this many frames. The depth
+    /// bounds the per-connection streaming buffer: at most this many frames are queued
+    /// for the cache writer before backpressure stalls the next client read, so proxy
+    /// memory is `O(per-connection buffer)` rather than `O(object size)`.
+    ///
+    /// A frame is a single forwarded request-body frame, bounded by the HTTP read
+    /// buffer, so a depth of 5 keeps per-connection streaming memory on par with the GET
+    /// path and independent of object size. Worst-case fleet streaming memory stays
+    /// bounded by `max_concurrent_requests × write_cache_tee_channel_depth × frame`.
+    ///
+    /// This is a new, additive knob; it does not change the meaning of
+    /// `max_buffered_request_body_bytes`.
+    /// Requirement: 9.1, 9.2, 9.3
+    #[serde(default = "default_write_cache_tee_channel_depth")]
+    pub write_cache_tee_channel_depth: usize,
     /// Optional TLS proxy listener configuration
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -292,6 +311,22 @@ fn default_max_buffered_request_body_bytes() -> u64 {
     5 * 1024 * 1024 * 1024 // 5 GiB — S3 single-part / UploadPart maximum
 }
 
+/// Default cache-tee channel depth: 5 frames.
+///
+/// On the streaming signed-write path, the request body is forwarded to the upstream
+/// verbatim while being tee'd to the write-through cache over a bounded `mpsc` channel
+/// of this many frames. The depth bounds the per-connection streaming buffer: at most
+/// this many frames are queued for the cache writer before backpressure stalls the next
+/// client read.
+///
+/// A frame is a single forwarded request-body frame, bounded by the HTTP read buffer,
+/// so a depth of 5 keeps per-connection streaming memory on par with the GET path and
+/// independent of object size. Worst-case fleet streaming memory stays bounded by
+/// `max_concurrent_requests × write_cache_tee_channel_depth × frame`.
+fn default_write_cache_tee_channel_depth() -> usize {
+    5
+}
+
 fn default_tls_proxy_port() -> u16 {
     3129
 }
@@ -307,6 +342,7 @@ impl Default for ServerConfig {
             request_timeout: default_request_timeout(),
             add_referer_header: default_add_referer_header(),
             max_buffered_request_body_bytes: default_max_buffered_request_body_bytes(),
+            write_cache_tee_channel_depth: default_write_cache_tee_channel_depth(),
             tls: None,
         }
     }
@@ -1590,6 +1626,14 @@ pub struct ConnectionPoolConfig {
     /// Example: {"s3.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]}
     #[serde(default)]
     pub endpoint_overrides: std::collections::HashMap<String, Vec<String>>,
+    /// Per-destination upstream transport overrides. Empty (default) means the feature
+    /// is off and every caching-egress destination gets verified TLS on port 443, exactly
+    /// as a build without this feature. Each entry maps a host-matcher-and-port key
+    /// (e.g. "127.0.0.1:9000", "store.local:9000") to the upstream transport declaration
+    /// (`scheme`, and for HTTPS `validate_tls`). Independent of `endpoint_overrides`
+    /// (IP resolution) and its TLS-1.2 lock. See docs for the three transport modes.
+    #[serde(default)]
+    pub upstream_overrides: std::collections::HashMap<String, UpstreamOverrideConfig>,
     /// Enable per-IP connection pool distribution (default: true)
     /// When enabled, the proxy rewrites request URI authorities to individual S3 IP addresses,
     /// causing hyper to create separate connection pools per IP for better load distribution.
@@ -1698,6 +1742,7 @@ impl Default for ConnectionPoolConfig {
             pool_check_interval: default_pool_check_interval(),
             dns_servers: default_dns_servers(),
             endpoint_overrides: std::collections::HashMap::new(),
+            upstream_overrides: std::collections::HashMap::new(),
             ip_distribution_enabled: true,
             max_idle_per_ip: default_max_idle_per_ip(),
             keepalive_idle_secs: default_keepalive_idle_secs(),
@@ -1709,6 +1754,34 @@ impl Default for ConnectionPoolConfig {
             health_probe_max_cooldown: default_health_probe_max_cooldown(),
         }
     }
+}
+
+/// Upstream transport scheme for an `upstream_overrides` entry.
+///
+/// Deserializes from the lowercase strings `"http"` and `"https"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamScheme {
+    /// Plaintext HTTP — no TLS handshake.
+    Http,
+    /// HTTPS — TLS handshake (validated or unvalidated per `validate_tls`).
+    Https,
+}
+
+/// Per-destination upstream transport declaration (the value side of an
+/// `upstream_overrides` entry).
+///
+/// `validate_tls` is only meaningful for `scheme: https` and defaults to `true`
+/// (secure by default — skipping certificate validation is an explicit opt-in).
+/// For `scheme: http` it is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamOverrideConfig {
+    /// Upstream transport scheme: `http` (plaintext) or `https` (TLS).
+    pub scheme: UpstreamScheme,
+    /// For HTTPS, whether to verify the server certificate against the system trust
+    /// store. Defaults to `true`. Ignored for `scheme: http`.
+    #[serde(default = "default_true")]
+    pub validate_tls: bool,
 }
 
 /// Compression configuration
@@ -1856,6 +1929,7 @@ impl Default for Config {
                 request_timeout: Duration::from_secs(30),
                 add_referer_header: true,
                 max_buffered_request_body_bytes: default_max_buffered_request_body_bytes(),
+                write_cache_tee_channel_depth: default_write_cache_tee_channel_depth(),
                 tls: None,
             },
             cache: CacheConfig {
@@ -1916,6 +1990,7 @@ impl Default for Config {
                 pool_check_interval: Duration::from_secs(10), // 10 seconds
                 dns_servers: Vec::new(),                // Default: Google DNS + Cloudflare DNS
                 endpoint_overrides: std::collections::HashMap::new(),
+                upstream_overrides: std::collections::HashMap::new(),
                 ip_distribution_enabled: true,
                 max_idle_per_ip: default_max_idle_per_ip(),
                 keepalive_idle_secs: default_keepalive_idle_secs(),
@@ -3720,6 +3795,45 @@ logging:
     }
 
     #[test]
+    fn test_upstream_overrides_defaults_empty_when_omitted() {
+        // Config-compatibility regression (Requirements 1.2, 10.1, 10.2):
+        // a config file that omits `connection_pool.upstream_overrides` must
+        // still parse, fall back to an empty map (the feature is off /
+        // Secure_Default_Behaviour holds), and pass connection-pool validation.
+        // This guards the restart-free upgrade contract for the new field.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+
+        assert!(
+            config.connection_pool.upstream_overrides.is_empty(),
+            "omitted upstream_overrides must default to an empty map (feature off)"
+        );
+
+        // Secure_Default_Behaviour holds: the matcher built from the default
+        // (empty) map applies no override to any destination.
+        let overrides = crate::upstream_overrides::UpstreamOverrides::from_config(
+            &config.connection_pool.upstream_overrides,
+        );
+        assert!(
+            overrides.is_empty(),
+            "an empty upstream_overrides map must produce an empty matcher"
+        );
+
+        // The config must validate successfully with the field absent.
+        assert!(
+            config.connection_pool.validate().is_ok(),
+            "connection pool config must validate when upstream_overrides is omitted"
+        );
+    }
+
+    #[test]
     fn test_bucket_settings_staleness_threshold_defaults_when_omitted() {
         // Config-compatibility regression: a config file that omits
         // `bucket_settings_staleness_threshold` (the rules-file staleness window)
@@ -3739,6 +3853,29 @@ logging:
             config.cache.bucket_settings_staleness_threshold,
             Duration::from_secs(60),
             "omitted bucket_settings_staleness_threshold must default to 60s"
+        );
+    }
+
+    #[test]
+    fn test_write_cache_tee_channel_depth_defaults_when_omitted() {
+        // Config-compatibility regression (Requirement 9.4): a config file that
+        // omits `server.write_cache_tee_channel_depth` (the streaming signed-write
+        // cache-tee channel depth) must still parse and fall back to the documented
+        // default of 5 frames, so upgrading the binary never requires editing an
+        // existing config file. Guards the restart-free upgrade contract.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+
+        assert_eq!(
+            config.server.write_cache_tee_channel_depth, 5,
+            "omitted write_cache_tee_channel_depth must default to 5 frames"
         );
     }
 

@@ -72,6 +72,12 @@ pub enum ProxyError {
         content_length: Option<u64>,
         max_bytes: u64,
     },
+
+    #[error("Upstream TLS validation failed for {endpoint}: {source_err}")]
+    UpstreamTlsValidationFailed {
+        endpoint: String,
+        source_err: String,
+    },
 }
 
 impl From<std::io::Error> for ProxyError {

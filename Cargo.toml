@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 # MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
 # Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
@@ -88,7 +88,10 @@ dashmap = "6.0"
 # OpenTelemetry for OTLP metrics export (0.29 uses rand 0.9, fully resolves RUSTSEC-2026-0097)
 opentelemetry = { version = "0.29", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.29", features = ["http-proto", "reqwest-client"] }
+# default features pull in `reqwest-blocking-client`, whose blocking client cannot
+# be constructed inside the Tokio runtime and makes the HTTP exporter fail at init
+# with "no http client specified". Disable defaults and use the async reqwest-client.
+opentelemetry-otlp = { version = "0.29", default-features = false, features = ["metrics", "http-proto", "reqwest-client"] }
 opentelemetry-semantic-conventions = "0.29"
 
 # Platform-specific dependencies

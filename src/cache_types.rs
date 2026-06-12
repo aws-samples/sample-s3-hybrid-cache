@@ -1723,6 +1723,7 @@ mod tests {
                 10 * 1024 * 1024, // 10MB capacity
                 None,
                 128 * 1024 * 1024, // 128 MiB body cap
+                5,                 // write_cache_tee_channel_depth
             );
 
             let cache_key = "test-bucket/test-object";
