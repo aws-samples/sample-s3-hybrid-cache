@@ -34,7 +34,7 @@
 use crate::aws_chunked_decoder;
 use crate::capacity_manager::{check_cache_capacity, log_bypass_decision, CacheDecision};
 use crate::compression::CompressionHandler;
-use crate::metrics::MetricsManager;
+use crate::metrics::{MetricsManager, RequestType};
 use crate::path_safety::is_safe_path_component;
 use crate::s3_client::S3ClientApi;
 use crate::signed_request_proxy::{
@@ -467,10 +467,23 @@ impl SignedPutHandler {
             cache_key, content_length
         );
 
+        // Compute bytes_uploaded for per-bucket traffic accounting (Design §4b).
+        // Use x-amz-decoded-content-length for aws-chunked bodies; else Content-Length.
+        let is_aws_chunked = aws_chunked_decoder::is_aws_chunked(&request_headers);
+        let body_bytes_uploaded = if is_aws_chunked {
+            aws_chunked_decoder::get_decoded_content_length(&request_headers).unwrap_or(0)
+        } else {
+            content_length.unwrap_or(0)
+        };
+
+        // Save bucket before cache_key is consumed by the match arms.
+        let (bucket_ref, _) = parse_cache_key(&cache_key);
+        let bucket_owned = bucket_ref.to_string();
+
         // Decide whether to cache based on capacity (Requirement 2.1)
         let cache_decision = self.should_cache(content_length);
 
-        match cache_decision {
+        let result = match cache_decision {
             CacheDecision::Cache => {
                 info!("Caching signed PUT request: {}", cache_key);
                 // Stream to both S3 and cache
@@ -508,7 +521,28 @@ impl SignedPutHandler {
                 )
                 .await
             }
+        };
+
+        // Per-bucket traffic accounting — Spec: per-bucket-metrics, Req 2.1, 2.2, 2.3
+        // Record once at the completion of the full request-response cycle (Req 2.3).
+        // Skip if bucket is empty (Req 2.4). PutObject response body is empty (bytes_served = 0).
+        if !bucket_owned.is_empty() {
+            if let Some(metrics) = &self.metrics_manager {
+                metrics
+                    .read()
+                    .await
+                    .record_bucket_traffic(
+                        &bucket_owned,
+                        None, // prefix: no per-bucket prefix config in this handler; bucket-level
+                        RequestType::Put,
+                        0, // bytes_served: PutObject response body is empty
+                        body_bytes_uploaded,
+                    )
+                    .await;
+            }
         }
+
+        result
     }
 
     /// Determine whether a PUT request should be cached
@@ -1027,6 +1061,10 @@ impl SignedPutHandler {
             )
             .map_err(|e| ProxyError::HttpError(format!("Failed to rebuild response: {}", e)))?;
 
+        // CreateMultipartUpload is a POST and is out of scope for per-bucket traffic
+        // (only GET object reads and PUT object/part writes are counted). The part data
+        // bytes are recorded on the UploadPart path; the control POSTs are not counted.
+
         Ok(rebuilt_response)
     }
 
@@ -1149,7 +1187,23 @@ impl SignedPutHandler {
         // Check capacity
         let cache_decision = self.should_cache(content_length);
 
-        match cache_decision {
+        // Compute bytes_uploaded for per-bucket traffic accounting (Design §4b).
+        // Use x-amz-decoded-content-length for aws-chunked bodies; else Content-Length.
+        // This is a header-only check — no I/O, safe to do before the match.
+        let body_bytes_uploaded = {
+            let is_chunked = aws_chunked_decoder::is_aws_chunked(&request_headers);
+            if is_chunked {
+                aws_chunked_decoder::get_decoded_content_length(&request_headers).unwrap_or(0)
+            } else {
+                content_length.unwrap_or(0)
+            }
+        };
+
+        // Save bucket before cache_key is consumed by the match arms.
+        let (bucket_ref, _) = parse_cache_key(&cache_key);
+        let bucket_owned = bucket_ref.to_string();
+
+        let result = match cache_decision {
             CacheDecision::Cache | CacheDecision::StreamWithCapacityCheck => {
                 // Stream the part body to the upstream verbatim while teeing it to
                 // the part-staging cache sink (streaming-write-path Req 6.2). This
@@ -1237,7 +1291,29 @@ impl SignedPutHandler {
                 forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
                     .await
             }
+        };
+
+        // Per-bucket traffic accounting — Spec: per-bucket-metrics, Req 2.1, 2.2, 2.3
+        // UploadPart maps to RequestType::Put (Design §4a). Record once at the completion
+        // of the full request-response cycle (Req 2.3). Skip if bucket empty (Req 2.4).
+        // Response body for UploadPart is empty (bytes_served = 0).
+        if !bucket_owned.is_empty() {
+            if let Some(metrics) = &self.metrics_manager {
+                metrics
+                    .read()
+                    .await
+                    .record_bucket_traffic(
+                        &bucket_owned,
+                        None,             // prefix: no per-bucket prefix config in this handler
+                        RequestType::Put, // UploadPart is a PUT operation
+                        0,                // bytes_served: UploadPart response body is empty
+                        body_bytes_uploaded,
+                    )
+                    .await;
+            }
         }
+
+        result
     }
 
     /// Cache an upload part as a range file

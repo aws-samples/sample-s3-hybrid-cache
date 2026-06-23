@@ -12,6 +12,7 @@ use crate::{
     disk_cache::{DiskCacheManager, IncrementalRangeWriter},
     inflight_tracker::{FetchGuard, FetchRole, InFlightTracker},
     logging::{mask_presigned_params, LoggerManager},
+    metrics::{resolve_traffic_key, RequestType},
     range_handler::{RangeHandler, RangeParseResult, RangeSpec},
     s3_client::{
         build_s3_request_context, build_s3_request_context_with_operation, S3Client, S3ClientApi,
@@ -1308,7 +1309,48 @@ impl HttpProxy {
         if let Some(mm) = metrics_for_recording.as_ref() {
             let elapsed = start_time.elapsed();
             let success = response.status().is_success();
-            mm.read().await.record_request(success, elapsed).await;
+            let mm_guard = mm.read().await;
+            mm_guard.record_request(success, elapsed).await;
+
+            // Per-bucket traffic accounting — Spec: per-bucket-metrics, Req 2.1, 2.2, 2.3, 2.4
+            // GET only: object reads are recorded here (exactly-once for GET, which no
+            // handler records). PUT/UploadPart are recorded in the PUT handlers where the
+            // request-body byte count is available (signed_put_handler.rs and
+            // handle_unsigned_put_request); recording them here too would double-count.
+            if method == Method::GET {
+                // Derive bucket + object_key from the request URI (path-only).
+                let uri_path = uri.path();
+                let stripped = uri_path.strip_prefix('/').unwrap_or(uri_path);
+                let (bucket, object_key) = if let Some(slash_pos) = stripped.find('/') {
+                    (&stripped[..slash_pos], &stripped[slash_pos + 1..])
+                } else {
+                    (stripped, "")
+                };
+
+                // Only object GETs (non-empty key). Bucket-level GETs with no key
+                // (list-objects) are out of scope (GET object / PUT object|part only).
+                if !bucket.is_empty() && !object_key.is_empty() {
+                    let configured_prefixes = mm_guard.bucket_prefixes_for(bucket);
+                    let traffic_key = resolve_traffic_key(bucket, object_key, configured_prefixes);
+
+                    let bytes_sent = response
+                        .headers()
+                        .get("content-length")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+
+                    mm_guard
+                        .record_bucket_traffic(
+                            &traffic_key.bucket,
+                            traffic_key.prefix.as_deref(),
+                            RequestType::Get,
+                            bytes_sent,
+                            0, // GET carries no request body
+                        )
+                        .await;
+                }
+            }
         }
 
         Ok(response)

@@ -78,6 +78,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - **[Connection Pooling](docs/CONNECTION_POOLING.md)** - Connection management and load balancing
 - **[Dashboard](docs/DASHBOARD.md)** - Web-based monitoring interface
 - **[Error Handling](docs/ERROR_HANDLING.md)** - Error handling patterns
+- **[Metrics](docs/METRICS.md)** - Per-bucket traffic metrics and cache savings inference
 - **[OTLP Metrics](docs/OTLP_METRICS.md)** - OpenTelemetry metrics export
 
 ## Quick Start

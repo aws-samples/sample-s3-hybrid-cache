@@ -125,6 +125,7 @@ fn test_system_metrics() -> SystemMetrics {
             active_requests: 3,
             max_concurrent_requests: 50,
         },
+        bucket_traffic: HashMap::new(),
     }
 }
 
@@ -157,6 +158,7 @@ async fn enabled_exporter_empty_endpoint_returns_error() {
         timeout: Duration::from_secs(10),
         headers: HashMap::new(),
         compression: Default::default(),
+        per_bucket_enabled: false,
     };
 
     let mut exporter = OtlpExporter::new(config);
@@ -253,6 +255,7 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
             active_requests: 0,
             max_concurrent_requests: 0,
         },
+        bucket_traffic: HashMap::new(),
     };
 
     let result = exporter.export_metrics(&metrics).await;

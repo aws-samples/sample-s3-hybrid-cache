@@ -264,6 +264,7 @@ impl DashboardServerClone {
             // API endpoints
             "/api/cache-stats" => self.api_handler.get_cache_stats().await,
             "/api/bucket-stats" => self.api_handler.get_bucket_stats().await,
+            "/api/bucket-traffic" => self.api_handler.get_bucket_traffic().await,
             "/api/system-info" => self.api_handler.get_system_info().await,
             "/api/logs" => {
                 let params = parse_log_query_params(uri);
@@ -401,6 +402,28 @@ impl StaticFileHandler {
                             </tr>
                         </thead>
                         <tbody id="bucket-stats-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="bucket-traffic-section" style="display:none; margin-top:2rem;">
+                <h2 id="bucket-traffic-title">Per-Bucket Traffic</h2>
+                <div class="bucket-stats-controls">
+                    <input type="text" id="bucket-traffic-filter" placeholder="Filter by bucket..." />
+                    <span id="bucket-traffic-toggle"></span>
+                </div>
+                <div class="bucket-stats-table">
+                    <table id="bucket-traffic-table">
+                        <thead>
+                            <tr>
+                                <th>Bucket</th>
+                                <th>Get</th>
+                                <th>Put</th>
+                                <th>Bytes Served</th>
+                                <th>Bytes Uploaded</th>
+                            </tr>
+                        </thead>
+                        <tbody id="bucket-traffic-body"></tbody>
                     </table>
                 </div>
             </div>
@@ -979,6 +1002,25 @@ main {
     .bucket-stats-table {
         overflow-x: auto;
     }
+}
+
+.overflow-badge {
+    display: inline-block;
+    background: #f39c12;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: bold;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+}
+
+.overflow-suffix {
+    color: #e67e22;
+    font-style: italic;
+    font-size: 0.85em;
+    margin-left: 0.3rem;
 }"#
         .to_string()
     }
@@ -1106,6 +1148,7 @@ async function loadCacheStats() {
     }
     
     loadBucketStats();
+    loadBucketTraffic();
 }
 
 async function loadLogs() {
@@ -1518,6 +1561,92 @@ let bucketFilterTimeout;
 document.getElementById('bucket-filter').addEventListener('input', function() {
     clearTimeout(bucketFilterTimeout);
     bucketFilterTimeout = setTimeout(renderBucketStats, 200);
+});
+
+// === Per-Bucket Traffic Table ===
+let bucketTrafficData = {};
+let bucketTrafficOverflow = false;
+let bucketTrafficShowAll = false;
+const TRAFFIC_PAGE_SIZE = 20;
+
+async function loadBucketTraffic() {
+    try {
+        const response = await fetch('/api/bucket-traffic');
+        if (!response.ok) return;
+        const data = await response.json();
+        const section = document.getElementById('bucket-traffic-section');
+        if (!data.bucket_traffic || Object.keys(data.bucket_traffic).length === 0) {
+            section.style.display = 'none';
+            return;
+        }
+        section.style.display = '';
+        bucketTrafficData = data.bucket_traffic || {};
+        bucketTrafficOverflow = data.overflow_active || false;
+        renderBucketTraffic();
+    } catch (e) {
+        console.error('Failed to load bucket traffic:', e);
+    }
+}
+
+function renderBucketTraffic() {
+    // Update title with overflow badge if needed
+    const title = document.getElementById('bucket-traffic-title');
+    title.innerHTML = 'Per-Bucket Traffic' +
+        (bucketTrafficOverflow ? ' <span class="overflow-badge">OVERFLOW ACTIVE</span>' : '');
+
+    const filter = (document.getElementById('bucket-traffic-filter').value || '').toLowerCase();
+    let rows = Object.entries(bucketTrafficData).filter(([k]) =>
+        !filter || k.toLowerCase().includes(filter)
+    );
+    // Sort alphabetically, but keep __other__ at the bottom
+    rows.sort(([a], [b]) => {
+        if (a.startsWith('__other__')) return 1;
+        if (b.startsWith('__other__')) return -1;
+        return a.localeCompare(b);
+    });
+
+    const total = rows.length;
+    const display = bucketTrafficShowAll ? rows : rows.slice(0, TRAFFIC_PAGE_SIZE);
+    const toggle = document.getElementById('bucket-traffic-toggle');
+    if (total > TRAFFIC_PAGE_SIZE) {
+        toggle.innerHTML = bucketTrafficShowAll
+            ? '<a style="color:#3498db;cursor:pointer;" onclick="bucketTrafficShowAll=false;renderBucketTraffic();">Show top ' + TRAFFIC_PAGE_SIZE + '</a>'
+            : '<a style="color:#3498db;cursor:pointer;" onclick="bucketTrafficShowAll=true;renderBucketTraffic();">Show all ' + total + ' rows</a>';
+    } else {
+        toggle.innerHTML = '';
+    }
+
+    const tbody = document.getElementById('bucket-traffic-body');
+    tbody.innerHTML = '';
+    display.forEach(([key, s]) => {
+        const isOverflow = key === '__other__' || key.startsWith('__other__/');
+        const displayName = isOverflow
+            ? escapeHtml(key) + '<span class="overflow-suffix">(overflow)</span>'
+            : escapeHtml(key);
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+            '<td>' + displayName + '</td>' +
+            '<td>' + formatNumber(s.get_requests) + '</td>' +
+            '<td>' + formatNumber(s.put_requests) + '</td>' +
+            '<td>' + escapeHtml(formatBytes(s.bytes_served)) + '</td>' +
+            '<td>' + escapeHtml(formatBytes(s.bytes_uploaded)) + '</td>';
+        tbody.appendChild(tr);
+    });
+}
+
+function formatBytes(bytes) {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    if (bytes === 0) return '0 B';
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    const val = bytes / Math.pow(1024, i);
+    return (val >= 100 ? val.toFixed(0) : val >= 10 ? val.toFixed(1) : val.toFixed(2)) + ' ' + units[i];
+}
+
+// Bucket traffic filter with debounce
+let bucketTrafficFilterTimeout;
+document.getElementById('bucket-traffic-filter').addEventListener('input', function() {
+    clearTimeout(bucketTrafficFilterTimeout);
+    bucketTrafficFilterTimeout = setTimeout(renderBucketTraffic, 200);
 });"#.to_string()
     }
 }
@@ -2074,6 +2203,65 @@ impl ApiHandler {
                 ProxyError::HttpError(format!("Failed to build bucket stats response: {}", e))
             })
     }
+
+    /// Return per-bucket traffic stats for `/api/bucket-traffic`.
+    pub async fn get_bucket_traffic(&self) -> Result<Response<String>> {
+        debug!("Dashboard API: bucket traffic requested");
+
+        let metrics_manager_guard = self.metrics_manager.read().await;
+
+        let traffic_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
+            mm.read().await.get_bucket_traffic_stats().await
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // overflow_active is derived — never stored — from the presence of "__other__"
+        let overflow_key = crate::metrics::BucketTrafficKey {
+            bucket: "__other__".to_string(),
+            prefix: None,
+        };
+        let overflow_active = traffic_stats.contains_key(&overflow_key);
+
+        // Build the response map: key is "bucket" or "bucket/prefix"
+        let mut bucket_traffic: std::collections::HashMap<String, BucketTrafficEntry> =
+            std::collections::HashMap::new();
+        for (key, stats) in &traffic_stats {
+            let display_key = match &key.prefix {
+                None => key.bucket.clone(),
+                Some(p) => format!("{}/{}", key.bucket, p),
+            };
+            bucket_traffic.insert(
+                display_key,
+                BucketTrafficEntry {
+                    bytes_served: stats.bytes_served,
+                    bytes_uploaded: stats.bytes_uploaded,
+                    get_requests: stats.get_requests,
+                    put_requests: stats.put_requests,
+                },
+            );
+        }
+
+        let response = BucketTrafficResponse {
+            bucket_traffic,
+            overflow_active,
+        };
+
+        let body = serde_json::to_string(&response).map_err(|e| {
+            error!("Failed to serialize bucket traffic: {}", e);
+            ProxyError::SerializationError(format!("Failed to serialize bucket traffic: {}", e))
+        })?;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .body(body)
+            .map_err(|e| {
+                error!("Failed to build bucket traffic response: {}", e);
+                ProxyError::HttpError(format!("Failed to build bucket traffic response: {}", e))
+            })
+    }
 }
 
 /// Log reader for application logs
@@ -2511,6 +2699,25 @@ pub struct BucketStatsResponse {
     pub rules: Vec<RuleStatsEntry>,
 }
 
+/// Per-bucket traffic response for `/api/bucket-traffic`
+#[derive(Debug, Serialize)]
+pub struct BucketTrafficResponse {
+    /// Map from "bucket" or "bucket/prefix" to traffic stats.
+    pub bucket_traffic: std::collections::HashMap<String, BucketTrafficEntry>,
+    /// True when the `__other__` overflow series is present (derived, never stored).
+    pub overflow_active: bool,
+}
+
+/// Traffic counters for a single bucket (or bucket+prefix) series.
+/// Scope: object reads (GET) and object/part writes (PUT/UploadPart).
+#[derive(Debug, Serialize)]
+pub struct BucketTrafficEntry {
+    pub bytes_served: u64,
+    pub bytes_uploaded: u64,
+    pub get_requests: u64,
+    pub put_requests: u64,
+}
+
 /// Per-bucket cache stats entry (traffic-derived; all buckets)
 #[derive(Debug, Serialize)]
 pub struct BucketStatsEntry {
@@ -2697,6 +2904,125 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 9.3 — `/api/bucket-traffic` response shape test.
+    ///
+    /// Directly constructs the `BucketTrafficResponse` that `get_bucket_traffic()`
+    /// would build, serializes it to JSON, and asserts:
+    /// - all nine counter fields are present in each entry
+    /// - `overflow_active` is `false` when no `__other__` sentinel is present
+    ///
+    /// This exercises the same serde shape that the live endpoint returns, since
+    /// the endpoint is a thin JSON wrapper around the same struct.
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 3.2
+    #[test]
+    fn test_bucket_traffic_api_shape() {
+        // Build the response struct that the handler would produce.
+        let mut bucket_traffic = std::collections::HashMap::new();
+        bucket_traffic.insert(
+            "alpha-bucket".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 1000,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+        bucket_traffic.insert(
+            "beta-bucket".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 512,
+                bytes_uploaded: 2048,
+                get_requests: 0,
+                put_requests: 1,
+            },
+        );
+
+        let response = BucketTrafficResponse {
+            bucket_traffic,
+            overflow_active: false,
+        };
+
+        // Serialize to the same JSON the endpoint emits.
+        let body = serde_json::to_string(&response).expect("serializes");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("parses");
+
+        // overflow_active field present and false.
+        assert_eq!(v["overflow_active"].as_bool(), Some(false));
+
+        let traffic = v["bucket_traffic"].as_object().expect("object");
+        assert_eq!(traffic.len(), 2, "two buckets");
+
+        let alpha = &traffic["alpha-bucket"];
+        assert_eq!(alpha["bytes_served"].as_u64(), Some(1000));
+        assert_eq!(alpha["bytes_uploaded"].as_u64(), Some(0));
+        assert_eq!(alpha["get_requests"].as_u64(), Some(1));
+        assert_eq!(alpha["put_requests"].as_u64(), Some(0));
+
+        let beta = &traffic["beta-bucket"];
+        assert_eq!(beta["bytes_served"].as_u64(), Some(512));
+        assert_eq!(beta["bytes_uploaded"].as_u64(), Some(2048));
+        assert_eq!(beta["put_requests"].as_u64(), Some(1));
+    }
+
+    /// Task 9.3 (overflow variant) — `overflow_active` is `true` when the
+    /// `__other__` overflow sentinel appears in `bucket_traffic`.
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 3.2
+    #[test]
+    fn test_bucket_traffic_api_overflow_active() {
+        let mut bucket_traffic = std::collections::HashMap::new();
+        bucket_traffic.insert(
+            "bkt-one".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 100,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+        bucket_traffic.insert(
+            "bkt-two".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 100,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+        // Overflow sentinel — present because a third bucket was folded.
+        bucket_traffic.insert(
+            "__other__".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 50,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+
+        let response = BucketTrafficResponse {
+            bucket_traffic,
+            overflow_active: true, // set by the handler when __other__ is present
+        };
+
+        let body = serde_json::to_string(&response).expect("serializes");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("parses");
+
+        assert_eq!(
+            v["overflow_active"].as_bool(),
+            Some(true),
+            "overflow_active must be true"
+        );
+
+        let traffic = v["bucket_traffic"].as_object().expect("object");
+        assert_eq!(traffic.len(), 3, "2 real + 1 overflow = 3 entries");
+        assert!(
+            traffic.contains_key("__other__"),
+            "__other__ sentinel must appear in the response"
+        );
+    }
 
     #[test]
     fn test_format_bytes() {

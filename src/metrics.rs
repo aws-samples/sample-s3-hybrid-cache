@@ -257,6 +257,11 @@ pub struct SystemMetrics {
     pub coalescing: Option<CoalescingMetrics>,
     pub cache_rules: Option<CacheRulesMetrics>,
     pub request_metrics: RequestMetrics,
+    /// Per-bucket (or per-bucket+prefix) traffic counters.
+    /// Key: `"bucket"` (no prefix) or `"bucket/prefix"` (prefix attribution active).
+    /// Always present; empty map when no traffic has been recorded.
+    /// Spec: per-bucket-metrics. Requirements: 3.1, 3.3
+    pub bucket_traffic: HashMap<String, BucketTrafficStats>,
 }
 
 /// Request processing metrics
@@ -311,6 +316,104 @@ pub struct AtomicMetadataStats {
     write_mode_fallbacks: u64,
 }
 
+/// Request type taxonomy mirroring S3's named request-metric subtypes.
+///
+/// Derived from the S3-style `AccessLogEntry.operation` string — **never** from the
+/// raw HTTP method.  The raw HTTP verb alone is insufficient: a `GET` on a bucket
+/// is a list, a `POST ?delete` is a delete, and `UploadPart` is a PUT despite the
+/// surrounding multipart context.  Mapping from the operation semantics keeps the
+/// proxy's per-type counters dimensionally comparable to S3's named request metrics.
+///
+/// `SelectRequests` is intentionally out of scope: the proxy does not serve
+/// `SelectObjectContent`.
+///
+/// Request type tracked for per-bucket traffic.
+///
+/// Scope is intentionally limited to object reads (GET) and object/part writes
+/// (PUT, including UploadPart). Other S3 operations — HEAD, DELETE, the multipart
+/// lifecycle POSTs (Create/Complete), and LIST — are deliberately NOT counted.
+///
+/// Spec: per-bucket-metrics. Requirements: 1.2, 2.2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestType {
+    /// Object read: `GET <bucket>/<key>`, including range and presigned GETs.
+    /// Mirrors S3 `GetRequests`. Bucket-level GETs with no object key
+    /// (list-objects) are intentionally not counted.
+    Get,
+    /// Object or part write: `PUT <bucket>/<key>` (PutObject) and
+    /// `PUT <bucket>/<key>?partNumber=..` (UploadPart). Mirrors S3 `PutRequests`.
+    Put,
+}
+
+/// Attribution key for per-bucket traffic accounting.
+///
+/// Bucket-level when no prefix is configured or no prefix matches the object key.
+/// Prefix-level (Some(prefix)) when prefix attribution is active.
+///
+/// `__other__` as the `bucket` field (with `prefix: None`) is the reserved overflow
+/// sentinel — it is not a valid S3 DNS-compliant bucket name (leading underscore),
+/// so it cannot collide with real traffic.
+///
+/// Spec: per-bucket-metrics. Requirements: 1.1, 5.2
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BucketTrafficKey {
+    pub bucket: String,
+    /// `None` = bucket-level aggregation. `Some(prefix)` = prefix-level attribution.
+    pub prefix: Option<String>,
+}
+
+/// Per-bucket (or per-bucket+prefix) cumulative traffic counters.
+///
+/// All fields are monotonically increasing since proxy start (no resets).
+/// Scope is limited to object reads (GET) and object/part writes (PUT/UploadPart);
+/// see `RequestType`.
+///
+/// Spec: per-bucket-metrics. Requirements: 1.1, 1.2, 1.3
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BucketTrafficStats {
+    /// Cumulative bytes sent to the client (response body). Mirrors S3 `BytesDownloaded`.
+    pub bytes_served: u64,
+    /// Cumulative bytes received from the client (request body for PUT/UploadPart).
+    /// Mirrors S3 `BytesUploaded`. Zero for GET.
+    pub bytes_uploaded: u64,
+    /// Object reads (GET). Mirrors S3 `GetRequests`.
+    pub get_requests: u64,
+    /// Object/part writes (PutObject + UploadPart). Mirrors S3 `PutRequests`.
+    pub put_requests: u64,
+}
+
+/// Resolve the traffic attribution key for a request.
+///
+/// If `configured_prefixes` is `Some` and non-empty, returns the longest configured
+/// prefix that `object_key` starts with. If multiple prefixes match, the longest wins.
+/// If no prefix matches, or if `configured_prefixes` is `None` or empty, returns a
+/// bucket-level key (`prefix: None`).
+///
+/// An empty-string prefix in the configured list is treated as "no match" (the config
+/// layer already rejects them with a warning, but this is the safety net).
+///
+/// The `bucket` string is used verbatim — normalization (lower-casing etc.) is the
+/// caller's responsibility; none is applied here so the key matches the raw bucket
+/// name used throughout the proxy.
+///
+/// Spec: per-bucket-metrics. Requirements: 5.2, 5.3, 5.4
+pub fn resolve_traffic_key(
+    bucket: &str,
+    object_key: &str,
+    configured_prefixes: Option<&[String]>,
+) -> BucketTrafficKey {
+    let best = configured_prefixes
+        .unwrap_or(&[])
+        .iter()
+        .filter(|p| !p.is_empty() && object_key.starts_with(p.as_str()))
+        .max_by_key(|p| p.len());
+
+    BucketTrafficKey {
+        bucket: bucket.to_string(),
+        prefix: best.cloned(),
+    }
+}
+
 /// Per-bucket cache hit/miss counters, split by GET vs HEAD.
 /// Tracked for every bucket with cache traffic. The same struct is reused
 /// for per-rule counters keyed by glob pattern (see `rule_cache_stats`).
@@ -343,6 +446,17 @@ pub struct MetricsManager {
     bucket_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
     /// Per-rule cache hit/miss counters keyed by the rule's glob pattern
     rule_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
+    /// Per-bucket traffic counters (keyed by BucketTrafficKey).
+    /// Mirrors the bucket_cache_stats concurrency pattern.
+    /// Spec: per-bucket-metrics. Requirements: 1.1, 1.4, 7.2
+    bucket_traffic_stats: Arc<RwLock<HashMap<BucketTrafficKey, BucketTrafficStats>>>,
+    /// Maximum number of distinct bucket+prefix series tracked.
+    /// Beyond this, traffic folds into the __other__ overflow sentinel.
+    max_bucket_traffic_series: usize,
+    /// Per-bucket prefix configuration for prefix-level attribution.
+    /// Populated by set_per_bucket_config from PerBucketMetricsConfig.bucket_prefixes.
+    /// Spec: per-bucket-metrics. Requirements: 5.1, 5.2
+    per_bucket_prefixes: HashMap<String, Vec<String>>,
     last_metrics: Arc<RwLock<Option<SystemMetrics>>>,
     otlp_exporter: Option<Arc<RwLock<OtlpExporter>>>,
     /// Active HTTP connections counter (shared with HttpProxy)
@@ -550,6 +664,9 @@ impl MetricsManager {
             coalescing_stats: Arc::new(RwLock::new(CoalescingStats::default())),
             bucket_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             rule_cache_stats: Arc::new(RwLock::new(HashMap::new())),
+            bucket_traffic_stats: Arc::new(RwLock::new(HashMap::new())),
+            max_bucket_traffic_series: 100, // config-compatible default; overridden via set_per_bucket_config
+            per_bucket_prefixes: HashMap::new(),
             last_metrics: Arc::new(RwLock::new(None)),
             otlp_exporter: None,
             active_connections: None,
@@ -566,6 +683,23 @@ impl MetricsManager {
             info!("OTLP metrics exporter initialized");
         }
         Ok(())
+    }
+
+    /// Enable per-bucket OTLP observable counters.
+    ///
+    /// Passes the shared `bucket_traffic_stats` handle to
+    /// `OtlpExporter::initialize_per_bucket`. Has no effect when OTLP is disabled
+    /// or `initialize_otlp` has not been called.
+    ///
+    /// Call this after `initialize_otlp` and before the metrics collection loop
+    /// starts (i.e., during startup, before wrapping in `Arc<RwLock<...>>`).
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 4.1, 4.3
+    pub async fn enable_per_bucket_otlp(&self) {
+        if let Some(otlp) = &self.otlp_exporter {
+            let stats = self.bucket_traffic_stats.clone();
+            otlp.write().await.initialize_per_bucket(stats);
+        }
     }
 
     /// Set cache manager reference
@@ -680,6 +814,10 @@ impl MetricsManager {
         // Collect request metrics
         let request_metrics = self.collect_request_metrics().await;
 
+        // Collect per-bucket traffic stats (string-keyed for JSON).
+        // Spec: per-bucket-metrics. Requirements: 3.1, 3.3
+        let bucket_traffic = self.get_bucket_traffic_stats_json().await;
+
         let metrics = SystemMetrics {
             timestamp: SystemTime::now(),
             uptime_seconds: uptime,
@@ -694,6 +832,7 @@ impl MetricsManager {
             coalescing: coalescing_metrics,
             cache_rules: cache_rules_metrics,
             request_metrics,
+            bucket_traffic,
         };
 
         // Cache the result
@@ -1983,6 +2122,130 @@ impl MetricsManager {
         stats.clone()
     }
 
+    /// Configure per-bucket traffic accounting from the loaded config.
+    /// Must be called before any recording starts.
+    pub fn set_per_bucket_config(
+        &mut self,
+        max_series: usize,
+        bucket_prefixes: HashMap<String, Vec<String>>,
+    ) {
+        self.max_bucket_traffic_series = max_series;
+        self.per_bucket_prefixes = bucket_prefixes;
+    }
+
+    /// Return the configured prefix list for a bucket, if any.
+    ///
+    /// Used by the HTTP proxy completion site to resolve the traffic attribution key
+    /// before calling `record_bucket_traffic`. Returns `None` when no prefixes are
+    /// configured for the bucket (bucket-level attribution applies).
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 5.1, 5.2
+    pub fn bucket_prefixes_for(&self, bucket: &str) -> Option<&[String]> {
+        self.per_bucket_prefixes.get(bucket).map(|v| v.as_slice())
+    }
+
+    /// Record traffic for a completed request.
+    ///
+    /// Non-blocking write to the per-bucket traffic map (O(1) critical section,
+    /// mirrors bucket_cache_stats pattern). Empty bucket is a no-op at debug level.
+    ///
+    /// Overflow: once the map has `max_bucket_traffic_series` distinct series, any
+    /// new series is folded into the `__other__` overflow sentinel (bucket:
+    /// "__other__", prefix: None). Traffic is never dropped — only the series key
+    /// changes. `warn!` once per process on first overflow activation.
+    ///
+    /// Only GET and PUT (object/part) are recorded — see `RequestType`.
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 1.1, 1.2, 1.3, 1.4, 2.3, 2.4, 7.2, 7.3
+    pub async fn record_bucket_traffic(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        request_type: RequestType,
+        bytes_served: u64,
+        bytes_uploaded: u64,
+    ) {
+        if bucket.is_empty() {
+            debug!("record_bucket_traffic: empty bucket, skipping");
+            return;
+        }
+
+        const OVERFLOW_SENTINEL: &str = "__other__";
+
+        let mut stats = self.bucket_traffic_stats.write().await;
+
+        // Determine the attribution key, applying the overflow cap.
+        let key = BucketTrafficKey {
+            bucket: bucket.to_string(),
+            prefix: prefix.map(|p| p.to_string()),
+        };
+
+        let use_key = if stats.contains_key(&key) {
+            // Existing series — fast path, no cap check needed.
+            key
+        } else {
+            // New series: check if we are at or over the cap.
+            let overflow_key = BucketTrafficKey {
+                bucket: OVERFLOW_SENTINEL.to_string(),
+                prefix: None,
+            };
+            if stats.len() >= self.max_bucket_traffic_series && !stats.contains_key(&overflow_key) {
+                // First overflow activation — warn once.
+                warn!(
+                    max_series = self.max_bucket_traffic_series,
+                    bucket = %bucket,
+                    "Per-bucket traffic cap reached; further new series folded into __other__"
+                );
+            }
+            if stats.len() >= self.max_bucket_traffic_series {
+                overflow_key
+            } else {
+                key
+            }
+        };
+
+        let entry = stats.entry(use_key).or_default();
+        entry.bytes_served = entry.bytes_served.saturating_add(bytes_served);
+        entry.bytes_uploaded = entry.bytes_uploaded.saturating_add(bytes_uploaded);
+
+        match request_type {
+            RequestType::Get => entry.get_requests = entry.get_requests.saturating_add(1),
+            RequestType::Put => entry.put_requests = entry.put_requests.saturating_add(1),
+        }
+    }
+
+    /// Snapshot of per-bucket traffic stats (non-resetting).
+    ///
+    /// `overflow_active` is derived from the presence of the `__other__` key in the
+    /// returned map — callers should check `map.contains_key(&BucketTrafficKey { bucket: "__other__", prefix: None })`.
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 1.3, 7.3
+    pub async fn get_bucket_traffic_stats(&self) -> HashMap<BucketTrafficKey, BucketTrafficStats> {
+        self.bucket_traffic_stats.read().await.clone()
+    }
+
+    /// Snapshot of per-bucket traffic stats with string keys suitable for JSON serialization.
+    ///
+    /// Converts the `BucketTrafficKey` struct key (which cannot be a JSON object key
+    /// directly) into a string key: `"bucket"` when no prefix is active, or
+    /// `"bucket/prefix"` when prefix attribution is active.
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 3.1, 3.3
+    pub async fn get_bucket_traffic_stats_json(&self) -> HashMap<String, BucketTrafficStats> {
+        self.bucket_traffic_stats
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| {
+                let key = match &k.prefix {
+                    Some(p) => format!("{}/{}", k.bucket, p),
+                    None => k.bucket.clone(),
+                };
+                (key, v.clone())
+            })
+            .collect()
+    }
+
     /// Record a per-rule cache hit. Key is the rule's glob pattern.
     pub async fn record_rule_cache_hit(&self, pattern: &str, is_head: bool) {
         let mut stats = self.rule_cache_stats.write().await;
@@ -3140,5 +3403,855 @@ mod tests {
 
         let stats = mm.error_stats.read().await;
         assert_eq!(stats.ttl_revalidations_total, 3);
+    }
+
+    // ── resolve_traffic_key prefix edge case tests ────────────────────────
+    // Spec: per-bucket-metrics, task 2.3. Requirements: 5.4.
+
+    #[test]
+    fn test_resolve_traffic_key_exact_match() {
+        // Object key exactly equals a configured prefix
+        let prefixes = vec!["logs/".to_string(), "data/".to_string()];
+        let result = resolve_traffic_key("my-bucket", "logs/", Some(&prefixes));
+        assert_eq!(
+            result,
+            BucketTrafficKey {
+                bucket: "my-bucket".to_string(),
+                prefix: Some("logs/".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_traffic_key_longest_match_wins() {
+        // Longer prefix wins over shorter when both match
+        let prefixes = vec![
+            "data/".to_string(),
+            "data/raw/".to_string(),
+            "data/raw/2024/".to_string(),
+        ];
+        let result = resolve_traffic_key("my-bucket", "data/raw/2024/file.csv", Some(&prefixes));
+        assert_eq!(
+            result,
+            BucketTrafficKey {
+                bucket: "my-bucket".to_string(),
+                prefix: Some("data/raw/2024/".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_traffic_key_no_match() {
+        // Key doesn't start with any configured prefix → bucket-level (prefix: None)
+        let prefixes = vec!["logs/".to_string(), "data/".to_string()];
+        let result = resolve_traffic_key("my-bucket", "images/photo.jpg", Some(&prefixes));
+        assert_eq!(
+            result,
+            BucketTrafficKey {
+                bucket: "my-bucket".to_string(),
+                prefix: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_traffic_key_empty_prefix_list() {
+        // Empty prefix list → always bucket-level
+        let prefixes: Vec<String> = vec![];
+        let result = resolve_traffic_key("my-bucket", "anything/here.txt", Some(&prefixes));
+        assert_eq!(
+            result,
+            BucketTrafficKey {
+                bucket: "my-bucket".to_string(),
+                prefix: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_traffic_key_none_prefix_list() {
+        // None configured_prefixes → bucket-level
+        let result = resolve_traffic_key("my-bucket", "anything/here.txt", None);
+        assert_eq!(
+            result,
+            BucketTrafficKey {
+                bucket: "my-bucket".to_string(),
+                prefix: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_traffic_key_empty_string_prefix_rejected() {
+        // An empty-string prefix is filtered out (treated as bucket-level per
+        // the design Error Handling table: "zero-length prefix that matches
+        // everything — equivalent to bucket-level. Validation rejects it.")
+        let prefixes = vec!["".to_string(), "logs/".to_string()];
+        let result = resolve_traffic_key("my-bucket", "logs/access.log", Some(&prefixes));
+        // "logs/" matches; the empty string is skipped
+        assert_eq!(
+            result,
+            BucketTrafficKey {
+                bucket: "my-bucket".to_string(),
+                prefix: Some("logs/".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_traffic_key_empty_string_only_prefix() {
+        // When the only configured prefix is an empty string, it is filtered out,
+        // so no prefix matches → bucket-level
+        let prefixes = vec!["".to_string()];
+        let result = resolve_traffic_key("my-bucket", "some/key.txt", Some(&prefixes));
+        assert_eq!(
+            result,
+            BucketTrafficKey {
+                bucket: "my-bucket".to_string(),
+                prefix: None,
+            }
+        );
+    }
+
+    // ── Property 7: Prefix attribution correctness ────────────────────────
+    // Spec: per-bucket-metrics, task 2.2.
+    // **Validates: Requirements 5.2, 5.3, 5.4, 4.2**
+    //
+    // Three sub-properties tested:
+    // 1. If the key starts_with a configured prefix, the resolved key carries
+    //    that prefix (or a longer one that also matches).
+    // 2. If no configured prefix matches, prefix is None (bucket-level).
+    // 3. Longest-match wins: if multiple prefixes match, the longest is selected.
+
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+
+    /// Property 7a: When a key matches at least one configured prefix, the
+    /// resolved prefix is one that the key starts_with AND is the longest such
+    /// prefix in the configured set.
+    #[quickcheck]
+    fn prop_prefix_attribution_longest_match(
+        bucket: String,
+        key_suffix: String,
+        prefix_base: String,
+    ) -> TestResult {
+        // Constrain inputs to useful ranges — empty bucket is a no-op in practice
+        if bucket.is_empty() || prefix_base.is_empty() {
+            return TestResult::discard();
+        }
+        // Avoid pathologically large inputs
+        if bucket.len() > 64 || prefix_base.len() > 64 || key_suffix.len() > 128 {
+            return TestResult::discard();
+        }
+
+        // Build a prefix hierarchy: "a/", "a/b/", "a/b/c/" style from prefix_base
+        let short_prefix = format!("{}/", &prefix_base);
+        let long_prefix = format!("{}/sub/", &prefix_base);
+        // Object key that matches both prefixes
+        let object_key = format!("{}/sub/object{}", &prefix_base, &key_suffix);
+
+        let prefixes = vec![short_prefix.clone(), long_prefix.clone()];
+        let result = resolve_traffic_key(&bucket, &object_key, Some(&prefixes));
+
+        // The key starts_with both, so longest-match must win
+        assert_eq!(result.bucket, bucket);
+        assert_eq!(result.prefix, Some(long_prefix));
+        TestResult::passed()
+    }
+
+    /// Property 7b: When no configured prefix matches the key, the resolved
+    /// prefix is None (bucket-level attribution).
+    #[quickcheck]
+    fn prop_prefix_attribution_no_match_bucket_level(
+        bucket: String,
+        object_key: String,
+        prefix_a: String,
+        prefix_b: String,
+    ) -> TestResult {
+        if bucket.is_empty() {
+            return TestResult::discard();
+        }
+        // Avoid pathologically large inputs
+        if bucket.len() > 64 || object_key.len() > 128 || prefix_a.len() > 64 || prefix_b.len() > 64
+        {
+            return TestResult::discard();
+        }
+        // Skip empty prefixes (filtered out by the function)
+        if prefix_a.is_empty() || prefix_b.is_empty() {
+            return TestResult::discard();
+        }
+
+        // Only proceed when the key genuinely doesn't match either prefix
+        if object_key.starts_with(&prefix_a) || object_key.starts_with(&prefix_b) {
+            return TestResult::discard();
+        }
+
+        let prefixes = vec![prefix_a, prefix_b];
+        let result = resolve_traffic_key(&bucket, &object_key, Some(&prefixes));
+
+        assert_eq!(result.bucket, bucket);
+        assert_eq!(result.prefix, None);
+        TestResult::passed()
+    }
+
+    /// Property 7c: The resolved prefix is always the longest matching prefix
+    /// from the configured set — never a shorter one. For any resolved prefix P,
+    /// there is no configured prefix Q where |Q| > |P| and key starts_with Q.
+    #[quickcheck]
+    fn prop_prefix_attribution_resolved_is_longest(
+        bucket: String,
+        object_key: String,
+        raw_prefixes: Vec<String>,
+    ) -> TestResult {
+        if bucket.is_empty() {
+            return TestResult::discard();
+        }
+        if bucket.len() > 64 || object_key.len() > 128 {
+            return TestResult::discard();
+        }
+        // Need at least one non-empty prefix to be interesting
+        let prefixes: Vec<String> = raw_prefixes
+            .into_iter()
+            .filter(|p| !p.is_empty() && p.len() <= 64)
+            .take(10) // bound cardinality for test speed
+            .collect();
+        if prefixes.is_empty() {
+            return TestResult::discard();
+        }
+
+        let result = resolve_traffic_key(&bucket, &object_key, Some(&prefixes));
+
+        match &result.prefix {
+            None => {
+                // No match: assert that indeed no configured prefix matches the key
+                for p in &prefixes {
+                    assert!(
+                        !object_key.starts_with(p.as_str()),
+                        "prefix {:?} matches key {:?} but resolve returned None",
+                        p,
+                        object_key
+                    );
+                }
+            }
+            Some(resolved) => {
+                // Resolved must itself match the key
+                assert!(
+                    object_key.starts_with(resolved.as_str()),
+                    "resolved prefix {:?} does not match key {:?}",
+                    resolved,
+                    object_key
+                );
+                // No configured prefix that matches the key is longer
+                for p in &prefixes {
+                    if object_key.starts_with(p.as_str()) {
+                        assert!(
+                            p.len() <= resolved.len(),
+                            "prefix {:?} (len {}) matches key {:?} and is longer than resolved {:?} (len {})",
+                            p, p.len(), object_key, resolved, resolved.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(result.bucket, bucket);
+        TestResult::passed()
+    }
+
+    // ── Property 1: Cumulative byte summation ────────────────────────────
+    // Spec: per-bucket-metrics, task 3.2.
+    // **Validates: Requirements 1.1, 2.1**
+    //
+    // For any sequence of N record_bucket_traffic calls to the same bucket, the
+    // snapshot's bytes_served equals the sum of all bytes_served arguments, and
+    // bytes_uploaded equals the sum of all bytes_uploaded arguments.
+
+    /// Property 1: After N calls to record_bucket_traffic for the same bucket,
+    /// bytes_served == Σ(bytes_served args) and bytes_uploaded == Σ(bytes_uploaded args).
+    #[quickcheck]
+    fn prop_cumulative_byte_summation(
+        served_values: Vec<u16>,
+        uploaded_values: Vec<u16>,
+    ) -> TestResult {
+        if served_values.is_empty() || uploaded_values.is_empty() {
+            return TestResult::discard();
+        }
+        if served_values.len() > 100 || uploaded_values.len() > 100 {
+            return TestResult::discard();
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let metrics = MetricsManager::new();
+            let bucket = "test-bucket";
+
+            let n = served_values.len().max(uploaded_values.len());
+            let mut expected_served: u64 = 0;
+            let mut expected_uploaded: u64 = 0;
+
+            for i in 0..n {
+                let bs = served_values[i % served_values.len()] as u64;
+                let bu = uploaded_values[i % uploaded_values.len()] as u64;
+                expected_served += bs;
+                expected_uploaded += bu;
+
+                // GET for the served bytes, PUT for the uploaded bytes — type is
+                // irrelevant to byte summation, but we alternate to exercise both.
+                let rtype = if i % 2 == 0 {
+                    RequestType::Get
+                } else {
+                    RequestType::Put
+                };
+                metrics
+                    .record_bucket_traffic(bucket, None, rtype, bs, bu)
+                    .await;
+            }
+
+            let snapshot = metrics.get_bucket_traffic_stats().await;
+            let key = BucketTrafficKey {
+                bucket: bucket.to_string(),
+                prefix: None,
+            };
+            let stats = snapshot.get(&key).expect("bucket should be in snapshot");
+
+            assert_eq!(stats.bytes_served, expected_served);
+            assert_eq!(stats.bytes_uploaded, expected_uploaded);
+            TestResult::passed()
+        })
+    }
+
+    // ── Property 3: Exactly-once recording ────────────────────────────────
+    // Spec: per-bucket-metrics, task 3.4.
+    // **Validates: Requirements 2.1, 2.3**
+    //
+    // One record_bucket_traffic call moves the snapshot by exactly its byte
+    // volume and exactly one request-type increment — no more, no less.
+
+    /// Property 3: a single call produces exactly the expected delta.
+    #[quickcheck]
+    fn prop_exactly_once_recording(
+        bucket_seed: u8,
+        bytes_served: u16,
+        bytes_uploaded: u16,
+        is_put: bool,
+    ) -> TestResult {
+        let bucket = format!("bucket-{}", bucket_seed % 10);
+        let bytes_served = bytes_served as u64;
+        let bytes_uploaded = bytes_uploaded as u64;
+        let request_type = if is_put {
+            RequestType::Put
+        } else {
+            RequestType::Get
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let metrics = MetricsManager::new();
+
+            let snap_before = metrics.get_bucket_traffic_stats().await;
+            metrics
+                .record_bucket_traffic(&bucket, None, request_type, bytes_served, bytes_uploaded)
+                .await;
+            let snap_after = metrics.get_bucket_traffic_stats().await;
+
+            let key = BucketTrafficKey {
+                bucket: bucket.clone(),
+                prefix: None,
+            };
+            let before = snap_before.get(&key).cloned().unwrap_or_default();
+            let after = snap_after
+                .get(&key)
+                .expect("bucket must appear after recording");
+
+            assert_eq!(after.bytes_served - before.bytes_served, bytes_served);
+            assert_eq!(after.bytes_uploaded - before.bytes_uploaded, bytes_uploaded);
+
+            let get_delta = after.get_requests - before.get_requests;
+            let put_delta = after.put_requests - before.put_requests;
+            match request_type {
+                RequestType::Get => {
+                    assert_eq!(get_delta, 1, "get_requests should increment by 1");
+                    assert_eq!(put_delta, 0, "put_requests should not move");
+                }
+                RequestType::Put => {
+                    assert_eq!(put_delta, 1, "put_requests should increment by 1");
+                    assert_eq!(get_delta, 0, "get_requests should not move");
+                }
+            }
+            TestResult::passed()
+        })
+    }
+
+    // ── Property 5: Counter monotonicity ─────────────────────────────────
+    // Spec: per-bucket-metrics, task 3.5.
+    // **Validates: Requirements 1.3, 4.4**
+    //
+    // Between two snapshots with no restart between them, no counter ever
+    // decreases for any bucket present in the earlier snapshot.
+
+    /// Property 5: no counter decreases between two snapshots.
+    #[quickcheck]
+    fn prop_counter_monotonicity(
+        initial_calls: Vec<(u8, bool, u16, u16)>,
+        additional_calls: Vec<(u8, bool, u16, u16)>,
+    ) -> TestResult {
+        // Each tuple: (bucket_idx, is_put, bytes_served, bytes_uploaded)
+        if initial_calls.is_empty() {
+            return TestResult::discard();
+        }
+        if initial_calls.len() > 50 || additional_calls.len() > 50 {
+            return TestResult::discard();
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let metrics = MetricsManager::new();
+
+            for (bucket_idx, is_put, bs, bu) in &initial_calls {
+                let bucket_name = format!("bucket-{}", bucket_idx % 5);
+                let rtype = if *is_put {
+                    RequestType::Put
+                } else {
+                    RequestType::Get
+                };
+                metrics
+                    .record_bucket_traffic(&bucket_name, None, rtype, *bs as u64, *bu as u64)
+                    .await;
+            }
+            let s1 = metrics.get_bucket_traffic_stats().await;
+
+            for (bucket_idx, is_put, bs, bu) in &additional_calls {
+                let bucket_name = format!("bucket-{}", bucket_idx % 5);
+                let rtype = if *is_put {
+                    RequestType::Put
+                } else {
+                    RequestType::Get
+                };
+                metrics
+                    .record_bucket_traffic(&bucket_name, None, rtype, *bs as u64, *bu as u64)
+                    .await;
+            }
+            let s2 = metrics.get_bucket_traffic_stats().await;
+
+            for (key, stats_s1) in &s1 {
+                let stats_s2 = s2
+                    .get(key)
+                    .expect("bucket present in S1 must still be present in S2");
+                assert!(stats_s2.bytes_served >= stats_s1.bytes_served);
+                assert!(stats_s2.bytes_uploaded >= stats_s1.bytes_uploaded);
+                assert!(stats_s2.get_requests >= stats_s1.get_requests);
+                assert!(stats_s2.put_requests >= stats_s1.put_requests);
+            }
+            TestResult::passed()
+        })
+    }
+
+    // ── Property 6: Concurrent recording integrity ────────────────────────
+    // Spec: per-bucket-metrics, task 3.6.
+    // **Validates: Requirements 1.4**
+    //
+    // N concurrent calls of 1 GET request and B bytes → exactly N get_requests
+    // and N×B bytes_served. Nothing lost under the RwLock.
+
+    /// Property 6: N concurrent calls yield exactly N requests and N×B bytes.
+    #[quickcheck]
+    fn prop_concurrent_recording_integrity(n_raw: u8, b_raw: u16) -> TestResult {
+        let n = (n_raw % 99) as u64 + 2; // 2..100 concurrent tasks
+        let b = (b_raw % 10000) as u64 + 1; // 1..10000 bytes per call
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let metrics = std::sync::Arc::new(MetricsManager::new());
+            let bucket = "concurrency-test-bucket";
+
+            let mut handles = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let mm = metrics.clone();
+                let bkt = bucket.to_string();
+                handles.push(tokio::spawn(async move {
+                    mm.record_bucket_traffic(&bkt, None, RequestType::Get, b, 0)
+                        .await;
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("task should not panic");
+            }
+
+            let snapshot = metrics.get_bucket_traffic_stats().await;
+            let key = BucketTrafficKey {
+                bucket: bucket.to_string(),
+                prefix: None,
+            };
+            let stats = snapshot.get(&key).expect("bucket should be present");
+
+            assert_eq!(stats.get_requests, n, "expected {} get_requests", n);
+            assert_eq!(stats.bytes_served, n * b, "expected {} bytes_served", n * b);
+            assert_eq!(stats.bytes_uploaded, 0);
+            assert_eq!(stats.put_requests, 0);
+            TestResult::passed()
+        })
+    }
+
+    // ── Property 8: Bounded cardinality with conservation ─────────────────
+    // Spec: per-bucket-metrics, task 3.7.
+    // **Validates: Requirements 7.2, 7.3**
+    //
+    // (1) Bound: distinct series ≤ max_series + 1.
+    // (2) Conservation: Σ (get_requests + put_requests) across all series equals
+    //     total calls; Σ bytes_served and Σ bytes_uploaded equal recorded totals.
+
+    /// Property 8: bounded cardinality, count-conserving overflow.
+    #[quickcheck]
+    fn prop_bounded_cardinality_with_conservation(call_specs: Vec<(u8, u16, u16)>) -> TestResult {
+        // call_specs: (bucket_index, bytes_served, bytes_uploaded)
+        if call_specs.is_empty() || call_specs.len() > 200 {
+            return TestResult::discard();
+        }
+
+        let max_series: usize = 5;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut metrics = MetricsManager::new();
+            metrics.set_per_bucket_config(max_series, HashMap::new());
+
+            let mut total_requests: u64 = 0;
+            let mut total_bytes_served: u64 = 0;
+            let mut total_bytes_uploaded: u64 = 0;
+
+            for (bucket_idx, served, uploaded) in &call_specs {
+                let bucket = format!("bucket-{}", bucket_idx);
+                let bs = *served as u64;
+                let bu = *uploaded as u64;
+                metrics
+                    .record_bucket_traffic(&bucket, None, RequestType::Get, bs, bu)
+                    .await;
+                total_requests += 1;
+                total_bytes_served += bs;
+                total_bytes_uploaded += bu;
+            }
+
+            let snapshot = metrics.get_bucket_traffic_stats().await;
+
+            // (1) Bound
+            assert!(
+                snapshot.len() <= max_series + 1,
+                "cardinality bound violated: {} > {}",
+                snapshot.len(),
+                max_series + 1
+            );
+
+            // (2) Conservation
+            let mut sum_requests: u64 = 0;
+            let mut sum_bytes_served: u64 = 0;
+            let mut sum_bytes_uploaded: u64 = 0;
+            for stats in snapshot.values() {
+                sum_requests += stats.get_requests + stats.put_requests;
+                sum_bytes_served += stats.bytes_served;
+                sum_bytes_uploaded += stats.bytes_uploaded;
+            }
+            assert_eq!(
+                sum_requests, total_requests,
+                "request conservation violated"
+            );
+            assert_eq!(
+                sum_bytes_served, total_bytes_served,
+                "bytes_served conservation violated"
+            );
+            assert_eq!(
+                sum_bytes_uploaded, total_bytes_uploaded,
+                "bytes_uploaded conservation violated"
+            );
+            TestResult::passed()
+        })
+    }
+
+    // ── Unit test: recording mix across multiple buckets ───────────────────
+    // Spec: per-bucket-metrics, task 3.8. Requirements: 1.5.
+    //
+    // Records a mix of GET and PUT (object/part) across 2 buckets and asserts
+    // per-bucket byte totals and per-type counts.
+
+    #[tokio::test]
+    async fn test_recording_mix() {
+        let metrics = MetricsManager::new();
+
+        // Bucket A: 2 GETs (object reads), 1 PUT (object write).
+        metrics
+            .record_bucket_traffic("bucket-a", None, RequestType::Get, 100, 0)
+            .await;
+        metrics
+            .record_bucket_traffic("bucket-a", None, RequestType::Get, 200, 0)
+            .await;
+        metrics
+            .record_bucket_traffic("bucket-a", None, RequestType::Put, 0, 500)
+            .await;
+
+        // Bucket B: 1 GET, 1 PUT (PutObject), 1 PUT (UploadPart).
+        metrics
+            .record_bucket_traffic("bucket-b", None, RequestType::Get, 300, 0)
+            .await;
+        metrics
+            .record_bucket_traffic("bucket-b", None, RequestType::Put, 0, 1000)
+            .await;
+        metrics
+            .record_bucket_traffic("bucket-b", None, RequestType::Put, 0, 2000)
+            .await;
+
+        let snapshot = metrics.get_bucket_traffic_stats().await;
+
+        let stats_a = snapshot
+            .get(&BucketTrafficKey {
+                bucket: "bucket-a".to_string(),
+                prefix: None,
+            })
+            .expect("bucket-a should be in snapshot");
+        assert_eq!(stats_a.bytes_served, 300); // 100 + 200
+        assert_eq!(stats_a.bytes_uploaded, 500);
+        assert_eq!(stats_a.get_requests, 2);
+        assert_eq!(stats_a.put_requests, 1);
+
+        let stats_b = snapshot
+            .get(&BucketTrafficKey {
+                bucket: "bucket-b".to_string(),
+                prefix: None,
+            })
+            .expect("bucket-b should be in snapshot");
+        assert_eq!(stats_b.bytes_served, 300);
+        assert_eq!(stats_b.bytes_uploaded, 3000); // 1000 + 2000
+        assert_eq!(stats_b.get_requests, 1);
+        // UploadPart maps to Put, so two PUTs total.
+        assert_eq!(stats_b.put_requests, 2);
+
+        assert_eq!(snapshot.len(), 2);
+    }
+
+    // ── Property 9: /metrics JSON completeness ──────────────────────────
+    // **Validates: Requirements 3.1**
+    //
+    // Every bucket that received ≥1 request appears in SystemMetrics.bucket_traffic
+    // (or under __other__ when folded) with all four required fields present.
+
+    #[quickcheck]
+    fn prop_metrics_json_completeness(call_specs: Vec<(u8, u16, u16, bool)>) -> TestResult {
+        // (bucket_index, bytes_served, bytes_uploaded, is_put)
+        if call_specs.is_empty() || call_specs.len() > 150 {
+            return TestResult::discard();
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let max_series: usize = 8;
+            let mut metrics = MetricsManager::new();
+            metrics.set_per_bucket_config(max_series, HashMap::new());
+
+            let mut buckets_with_traffic: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            for (bucket_idx, served, uploaded, is_put) in &call_specs {
+                let bucket = format!("prop9-bucket-{}", bucket_idx);
+                let rtype = if *is_put {
+                    RequestType::Put
+                } else {
+                    RequestType::Get
+                };
+                metrics
+                    .record_bucket_traffic(&bucket, None, rtype, *served as u64, *uploaded as u64)
+                    .await;
+                buckets_with_traffic.insert(bucket);
+            }
+
+            let system_metrics = metrics.collect_metrics().await;
+            let bt = &system_metrics.bucket_traffic;
+            let overflow_active = bt.contains_key("__other__");
+
+            for bucket in &buckets_with_traffic {
+                if !bt.contains_key(bucket) {
+                    assert!(
+                        overflow_active,
+                        "bucket '{}' missing and __other__ not present — lost data",
+                        bucket
+                    );
+                }
+            }
+
+            let json_str =
+                serde_json::to_string(&system_metrics).expect("SystemMetrics must serialize");
+            let json_value: serde_json::Value =
+                serde_json::from_str(&json_str).expect("JSON must parse");
+            let bt_json = json_value
+                .get("bucket_traffic")
+                .expect("JSON must have bucket_traffic");
+            assert!(bt_json.is_object());
+
+            let required_fields = [
+                "bytes_served",
+                "bytes_uploaded",
+                "get_requests",
+                "put_requests",
+            ];
+            for (key, entry) in bt_json.as_object().unwrap() {
+                for field in &required_fields {
+                    let val = entry.get(*field);
+                    assert!(
+                        val.and_then(|v| v.as_u64()).is_some(),
+                        "bucket_traffic[\"{}\"].{} missing or not a non-negative integer",
+                        key,
+                        field
+                    );
+                }
+            }
+
+            assert!(!bt.is_empty());
+            TestResult::passed()
+        })
+    }
+
+    /// Task 8.3: `collect_metrics()` returns a JSON-serializable SystemMetrics
+    /// whose bucket_traffic section is keyed by bucket name with the four counter
+    /// fields present and populated.
+    /// Spec: per-bucket-metrics. Requirements: 3.4
+    #[tokio::test]
+    async fn test_metrics_json_shape() {
+        let metrics = MetricsManager::new();
+
+        metrics
+            .record_bucket_traffic("shape-test-bucket", None, RequestType::Get, 1024, 0)
+            .await;
+        metrics
+            .record_bucket_traffic("shape-test-bucket", None, RequestType::Put, 0, 512)
+            .await;
+
+        let system_metrics = metrics.collect_metrics().await;
+        assert!(!system_metrics.bucket_traffic.is_empty());
+
+        let stats = system_metrics
+            .bucket_traffic
+            .get("shape-test-bucket")
+            .expect("shape-test-bucket should appear in bucket_traffic");
+        assert_eq!(stats.bytes_served, 1024);
+        assert_eq!(stats.bytes_uploaded, 512);
+        assert_eq!(stats.get_requests, 1);
+        assert_eq!(stats.put_requests, 1);
+
+        let json_str = serde_json::to_string_pretty(&system_metrics)
+            .expect("SystemMetrics should serialize to JSON");
+        let json_value: serde_json::Value =
+            serde_json::from_str(&json_str).expect("JSON should parse back");
+        let bt = json_value
+            .get("bucket_traffic")
+            .expect("JSON must have a bucket_traffic field");
+        let entry = bt
+            .get("shape-test-bucket")
+            .expect("shape-test-bucket must be present in JSON bucket_traffic");
+
+        for field in &[
+            "bytes_served",
+            "bytes_uploaded",
+            "get_requests",
+            "put_requests",
+        ] {
+            assert!(
+                entry.get(field).and_then(|v| v.as_u64()).is_some(),
+                "bucket_traffic entry must have numeric field '{}'",
+                field
+            );
+        }
+    }
+
+    /// Task 6.5: Exactly-once across paths.
+    ///
+    /// Simulates the request-completion recording contract across serving paths:
+    /// - HTTP proxy / TLS-terminating path: GET (miss, hit, coalesced, range, TLS)
+    /// - Signed write-through path: PUT (PutObject) and PUT (UploadPart)
+    ///
+    /// Each call contributes exactly one request and its byte volume — no double
+    /// counting regardless of path or cache outcome. (The production double-count
+    /// guard is that the HTTP tail records GET only and the signed handler records
+    /// PUT/UploadPart only; this test pins the per-call exactly-once contract those
+    /// sites rely on.)
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 2.5
+    #[tokio::test]
+    async fn test_exactly_once_across_paths() {
+        let metrics = MetricsManager::new();
+        let bucket = "exactly-once-bucket";
+
+        // HTTP proxy GET cache miss (origin served 4096 bytes).
+        metrics
+            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0)
+            .await;
+        // GET cache hit — still exactly one recording.
+        metrics
+            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0)
+            .await;
+        // GET coalesced fetch — the coalesced client records once at completion.
+        metrics
+            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0)
+            .await;
+        // Range request (partial content) — 1024 bytes served.
+        metrics
+            .record_bucket_traffic(bucket, None, RequestType::Get, 1024, 0)
+            .await;
+        // Signed PUT write-through — 8192 bytes uploaded.
+        metrics
+            .record_bucket_traffic(bucket, None, RequestType::Put, 0, 8192)
+            .await;
+        // UploadPart (maps to Put) — 5 MiB part uploaded.
+        metrics
+            .record_bucket_traffic(bucket, None, RequestType::Put, 0, 5_242_880)
+            .await;
+        // TLS-terminating listener GET — 2048 bytes served.
+        metrics
+            .record_bucket_traffic(bucket, None, RequestType::Get, 2048, 0)
+            .await;
+
+        let snapshot = metrics.get_bucket_traffic_stats().await;
+        let stats = snapshot
+            .get(&BucketTrafficKey {
+                bucket: bucket.to_string(),
+                prefix: None,
+            })
+            .expect("bucket should be present in snapshot");
+
+        // 5 GETs (miss + hit + coalesced + range + TLS), 2 PUTs (write-through + UploadPart).
+        assert_eq!(stats.get_requests, 5, "5 GET requests across all paths");
+        assert_eq!(
+            stats.put_requests, 2,
+            "2 PUT requests (write-through + UploadPart)"
+        );
+
+        // bytes_served: 4096 + 4096 + 4096 + 1024 + 2048 = 15360
+        assert_eq!(stats.bytes_served, 15360);
+        // bytes_uploaded: 8192 + 5242880 = 5251072
+        assert_eq!(stats.bytes_uploaded, 5_251_072);
+
+        // Only one bucket series exists (no overflow, no spurious keys).
+        assert_eq!(snapshot.len(), 1);
     }
 }

@@ -8,7 +8,8 @@ use s3_proxy::{
     config::{
         AccessLogMode, CacheConfig, CompressionAlgorithm, CompressionConfig, Config,
         ConnectionPoolConfig, DashboardConfig, EvictionAlgorithm, HealthConfig, LoggingConfig,
-        MetricsConfig, OtlpCompression, OtlpConfig, ServerConfig, SharedStorageConfig,
+        MetricsConfig, OtlpCompression, OtlpConfig, PerBucketMetricsConfig, ServerConfig,
+        SharedStorageConfig,
     },
     connection_pool::ConnectionPoolManager,
     destination_policy::DestinationPolicy,
@@ -150,7 +151,9 @@ fn create_test_config() -> Config {
                 timeout: Duration::from_secs(10),
                 headers: HashMap::new(),
                 compression: OtlpCompression::None,
+                per_bucket_enabled: false,
             },
+            per_bucket: PerBucketMetricsConfig::default(),
         },
         dashboard: DashboardConfig::default(),
     }

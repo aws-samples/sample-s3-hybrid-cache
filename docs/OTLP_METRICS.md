@@ -24,6 +24,12 @@ Or via CLI:
 s3-proxy --otlp-endpoint http://localhost:4318 --otlp-export-interval 60
 ```
 
+### Per-bucket counters (opt-in)
+
+Set `metrics.otlp.per_bucket_enabled: true` to emit four additional `ObservableCounter<u64>` instruments — `s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, `s3proxy.put_requests` — with a `bucket` attribute and an optional `prefix` attribute. These mirror S3's named CloudWatch request metrics for direct comparison.
+
+In-memory accounting is always active regardless of this flag; the flag only controls OTLP export. See [Metrics and Observability](METRICS.md) for the full per-bucket reference including the cache savings inference formula.
+
 ## Publishing Metrics to Observability Backends
 
 ### CloudWatch

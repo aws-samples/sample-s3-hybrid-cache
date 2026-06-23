@@ -34,6 +34,7 @@ Complete configuration guide for Hybrid Cache for Amazon S3 including cache beha
   - [Buffered Access Logging](#buffered-access-logging)
   - [Log Retention and Rotation](#log-retention-and-rotation)
 - [Metrics Configuration](#metrics-configuration)
+  - [Per-Bucket Traffic Metrics](#per-bucket-traffic-metrics)
 - [Dashboard Configuration](#dashboard-configuration)
 - [Health Check Configuration](#health-check-configuration)
 - [HTTPS Passthrough](#https-passthrough)
@@ -1492,6 +1493,39 @@ otlp:
     Authorization: "Bearer your-token"
     X-Custom-Header: "value"
 ```
+
+### Per-Bucket Traffic Metrics
+
+The proxy tracks cumulative per-bucket bandwidth and request counters across all serving paths. In-memory accounting and local observability (`/metrics` JSON endpoint and dashboard) are always active. OTLP export is opt-in.
+
+```yaml
+metrics:
+  # Export gate for per-bucket OTLP observable counters (default: false).
+  # In-memory accounting and /metrics + dashboard views are always active.
+  otlp:
+    per_bucket_enabled: false
+
+  # Always-on accounting knobs.
+  per_bucket:
+    max_series: 100               # Max distinct bucket[+prefix] series (default: 100).
+                                  # Beyond this, traffic folds into an "__other__" overflow entry.
+    bucket_prefixes:              # Optional per-bucket prefix lists for prefix-level attribution.
+      my-bucket:                  # Key: bucket name. Value: list of prefix strings.
+        - "logs/"
+        - "data/raw/"
+```
+
+**`metrics.otlp.per_bucket_enabled`** (bool, default `false`)
+
+Enable per-bucket OTLP cumulative counter export. When true, the proxy emits four `ObservableCounter<u64>` instruments per collection cycle — `s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, and `s3proxy.put_requests` — each with a `bucket` attribute and, when prefix attribution is active, a `prefix` attribute. Metric names mirror S3's `BytesDownloaded`/`BytesUploaded`/`GetRequests`/`PutRequests` for direct CloudWatch comparison. Only object reads (GET) and object/part writes (PUT/UploadPart) are tracked.
+
+**`metrics.per_bucket.max_series`** (usize, default `100`)
+
+Maximum number of distinct bucket+prefix series tracked in memory. Once the cap is reached, traffic from new buckets or prefixes is folded into a synthetic `__other__` series (visible in `/metrics` and the dashboard) rather than creating a new entry. Total traffic is conserved; only the series key changes. A `warn!` is logged once on first overflow.
+
+**`metrics.per_bucket.bucket_prefixes`** (map, default `{}`)
+
+Optional per-bucket prefix lists for prefix-level attribution. When configured, requests are attributed to the longest matching prefix. Requests with no matching prefix — or when the bucket has no configured prefixes — are attributed at the bucket level. Empty-string prefixes are rejected with a warning at config load.
 
 ## Dashboard Configuration
 

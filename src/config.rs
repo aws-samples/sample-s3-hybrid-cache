@@ -7,6 +7,7 @@ use crate::{ProxyError, Result};
 use clap::{Arg, Command};
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -2027,6 +2028,30 @@ impl Default for HealthConfig {
     }
 }
 
+/// Per-bucket metrics accounting knobs. Nested on MetricsConfig as `metrics.per_bucket`.
+/// These govern always-on in-memory accounting that feeds /metrics and the dashboard.
+/// The OTLP export gate is `metrics.otlp.per_bucket_enabled` (see OtlpConfig).
+/// Design §6b.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PerBucketMetricsConfig {
+    /// Maximum number of distinct bucket+prefix series tracked in memory (default: 100).
+    /// Beyond this, traffic folds into an "__other__" overflow series.
+    pub max_series: usize,
+    /// Optional per-bucket prefix lists for prefix-level attribution.
+    /// Key: bucket name. Value: list of prefix strings.
+    pub bucket_prefixes: HashMap<String, Vec<String>>,
+}
+
+impl Default for PerBucketMetricsConfig {
+    fn default() -> Self {
+        Self {
+            max_series: 100,
+            bucket_prefixes: HashMap::new(),
+        }
+    }
+}
+
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -2057,6 +2082,11 @@ pub struct MetricsConfig {
     pub include_connection_stats: bool,
     #[serde(default)]
     pub otlp: OtlpConfig,
+    /// Always-on per-bucket accounting knobs (cardinality cap and prefix attribution).
+    /// Governs in-memory accounting fed to /metrics and the dashboard.
+    /// The OTLP export gate is metrics.otlp.per_bucket_enabled.
+    #[serde(default)]
+    pub per_bucket: PerBucketMetricsConfig,
 }
 
 /// OTLP (OpenTelemetry Protocol) configuration
@@ -2070,6 +2100,14 @@ pub struct OtlpConfig {
     pub timeout: Duration,
     pub headers: std::collections::HashMap<String, String>,
     pub compression: OtlpCompression,
+    /// Enable per-bucket OTLP export (default: false). In-memory accounting and the
+    /// /metrics + dashboard views are always active regardless of this flag.
+    /// Setting this to true causes the proxy to emit nine per-bucket cumulative counters
+    /// (bytes_downloaded, bytes_uploaded, get/put/head/delete/post/list/all_requests)
+    /// via OTLP on every collection cycle, each with a `bucket` attribute.
+    /// Design §6a.
+    #[serde(default)]
+    pub per_bucket_enabled: bool,
 }
 
 /// Manual Debug impl that redacts header values (may contain auth tokens/API keys).
@@ -2085,6 +2123,7 @@ impl std::fmt::Debug for OtlpConfig {
                 &format_args!("<{} redacted>", self.headers.len()),
             )
             .field("compression", &self.compression)
+            .field("per_bucket_enabled", &self.per_bucket_enabled)
             .finish()
     }
 }
@@ -2108,6 +2147,7 @@ impl Default for OtlpConfig {
             timeout: Duration::from_secs(10),
             headers: std::collections::HashMap::new(),
             compression: OtlpCompression::default(),
+            per_bucket_enabled: false,
         }
     }
 }
@@ -2124,6 +2164,7 @@ impl Default for MetricsConfig {
             include_compression_stats: true,
             include_connection_stats: true,
             otlp: OtlpConfig::default(),
+            per_bucket: PerBucketMetricsConfig::default(),
         }
     }
 }
@@ -2250,7 +2291,9 @@ impl Default for Config {
                     timeout: Duration::from_secs(10),
                     headers: std::collections::HashMap::new(),
                     compression: OtlpCompression::default(),
+                    per_bucket_enabled: false,
                 },
+                per_bucket: PerBucketMetricsConfig::default(),
             },
             dashboard: DashboardConfig::default(),
         }
@@ -2437,6 +2480,34 @@ impl Config {
 
         info!("Configuration loaded successfully");
         debug!("Configuration: {:?}", config);
+
+        // Validate per-bucket prefix lists: reject empty-string prefixes with a warning.
+        // An empty string matches every key (zero-length prefix), which is equivalent to
+        // bucket-level attribution — the caller should simply omit the prefix list entry.
+        // Design Error Handling table.
+        for (bucket, prefixes) in config.metrics.per_bucket.bucket_prefixes.iter_mut() {
+            let before = prefixes.len();
+            prefixes.retain(|p| {
+                if p.is_empty() {
+                    warn!(
+                        "Empty string in metrics.per_bucket.bucket_prefixes[\"{}\"] removed \
+                         (an empty prefix matches all keys and is equivalent to bucket-level \
+                         attribution — omit the entry instead)",
+                        bucket
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            let removed = before - prefixes.len();
+            if removed > 0 {
+                debug!(
+                    "Removed {} empty prefix(es) from bucket_prefixes[\"{}\"]",
+                    removed, bucket
+                );
+            }
+        }
 
         // Log deprecation warnings for dead config fields (Req 20.5)
         config.log_deprecated_fields();
@@ -6406,6 +6477,118 @@ logging:
             err
         );
     }
+
+    // --- Per-bucket metrics config tests (per-bucket-metrics spec, Req 6.3, 6.5) ---
+
+    #[test]
+    fn test_per_bucket_metrics_defaults_when_all_fields_omitted() {
+        // Config-compatibility regression (Req 6.3): a config that omits every
+        // per-bucket field must parse, apply correct defaults, and the proxy
+        // config must build. A binary-only upgrade never changes behavior.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml)
+            .expect("config omitting all per-bucket fields must parse (config-compatibility)");
+
+        // Export gate defaults to disabled (Req 6.1)
+        assert!(
+            !config.metrics.otlp.per_bucket_enabled,
+            "metrics.otlp.per_bucket_enabled must default to false"
+        );
+        // Cardinality cap defaults to 100 (Req 7.1)
+        assert_eq!(
+            config.metrics.per_bucket.max_series, 100,
+            "metrics.per_bucket.max_series must default to 100"
+        );
+        // Prefix map defaults to empty (bucket-level only, Req 5.1)
+        assert!(
+            config.metrics.per_bucket.bucket_prefixes.is_empty(),
+            "metrics.per_bucket.bucket_prefixes must default to empty HashMap"
+        );
+    }
+
+    #[test]
+    fn test_per_bucket_metrics_explicit_config_parsed() {
+        // Req 6.5: when the export gate and prefix lists are configured, assert
+        // the gate is read from metrics.otlp.* and the knobs from
+        // metrics.per_bucket.*.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 9090
+  collection_interval: "60s"
+  otlp:
+    enabled: true
+    endpoint: "http://localhost:4318"
+    export_interval: "60s"
+    timeout: "10s"
+    compression: "none"
+    headers: {}
+    per_bucket_enabled: true
+  per_bucket:
+    max_series: 50
+    bucket_prefixes:
+      my-bucket:
+        - "logs/"
+        - "data/raw/"
+      other-bucket:
+        - "prefix-a/"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml)
+            .expect("config with explicit per-bucket fields must parse");
+
+        // Export gate read from metrics.otlp.per_bucket_enabled
+        assert!(
+            config.metrics.otlp.per_bucket_enabled,
+            "metrics.otlp.per_bucket_enabled must be true when explicitly set"
+        );
+        // Cardinality cap read from metrics.per_bucket.max_series
+        assert_eq!(
+            config.metrics.per_bucket.max_series, 50,
+            "metrics.per_bucket.max_series must be 50 when explicitly set"
+        );
+        // Prefix map read from metrics.per_bucket.bucket_prefixes
+        assert_eq!(
+            config.metrics.per_bucket.bucket_prefixes.len(),
+            2,
+            "bucket_prefixes must contain 2 buckets"
+        );
+        let my_bucket_prefixes = config
+            .metrics
+            .per_bucket
+            .bucket_prefixes
+            .get("my-bucket")
+            .expect("my-bucket must be present in bucket_prefixes");
+        assert_eq!(
+            my_bucket_prefixes,
+            &vec!["logs/".to_string(), "data/raw/".to_string()],
+            "my-bucket prefixes must match configured values"
+        );
+        let other_bucket_prefixes = config
+            .metrics
+            .per_bucket
+            .bucket_prefixes
+            .get("other-bucket")
+            .expect("other-bucket must be present in bucket_prefixes");
+        assert_eq!(
+            other_bucket_prefixes,
+            &vec!["prefix-a/".to_string()],
+            "other-bucket prefixes must match configured values"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7103,6 +7286,7 @@ mod rolling_validation_config_property_tests {
             timeout: Duration::from_secs(5),
             headers,
             compression: OtlpCompression::None,
+            per_bucket_enabled: false,
         };
 
         let debug_output = format!("{:?}", cfg);

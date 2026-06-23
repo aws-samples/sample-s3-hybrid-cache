@@ -312,6 +312,12 @@ async fn main() -> Result<()> {
     metrics_manager.set_cache_manager(cache_manager_ref.clone());
     metrics_manager.set_connection_pool(connection_pool_ref.clone());
     metrics_manager.set_compression_handler(compression_handler_ref.clone());
+    // Wire per-bucket accounting knobs from config.
+    // Spec: per-bucket-metrics. Requirements: 5.1, 7.1
+    metrics_manager.set_per_bucket_config(
+        config.metrics.per_bucket.max_series,
+        config.metrics.per_bucket.bucket_prefixes.clone(),
+    );
 
     // Initialize OTLP if enabled
     if let Err(e) = metrics_manager
@@ -319,6 +325,13 @@ async fn main() -> Result<()> {
         .await
     {
         error!("Failed to initialize OTLP metrics exporter: {}", e);
+    }
+
+    // Enable per-bucket OTLP observable counters when the flag is set.
+    // Must be called after initialize_otlp and before the Arc wrapping.
+    // Spec: per-bucket-metrics. Requirements: 4.1, 4.3
+    if config.metrics.otlp.per_bucket_enabled {
+        metrics_manager.enable_per_bucket_otlp().await;
     }
 
     let metrics_manager = Arc::new(RwLock::new(metrics_manager));

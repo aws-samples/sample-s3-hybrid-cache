@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2021"
 # MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
 # Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
@@ -110,6 +110,7 @@ quickcheck_macros = "1.0"
 rcgen = "0.13"
 hex = "0.4"
 ureq = "2.9"  # For health check HTTP requests in tests
+opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio", "testing"] }  # testing enables InMemoryMetricExporter
 
 [[example]]
 name = "compression_demo"
@@ -130,3 +131,34 @@ path = "examples/presigned_url_demo.rs"
 [[example]]
 name = "resolve_settings_bench"
 path = "examples/resolve_settings_bench.rs"
+
+# ─── Profile tuning: reduce peak linker memory during test builds ───
+# The lib-test binary links the entire crate + heavy deps (tokio-full, hyper-full,
+# rustls, opentelemetry, rayon, hickory-resolver). With the default 16 codegen-units
+# in release, each link spikes RSS and OOM-kills the process on machines with ≤32 GB.
+# Raising codegen-units to 256 for tests produces smaller object files that link with
+# less peak RSS. opt-level=1 further shrinks intermediate artifacts vs opt-level=3.
+# This does NOT affect `cargo build --release` (the shipping binary) — only test/bench.
+
+[profile.test]
+opt-level = 1
+codegen-units = 256
+lto = false
+# Cut link-time memory for the lib-test binary (whole crate + heavy dep graph +
+# dev-deps + ~1300 inline tests statically linked). Full debuginfo=2 is the single
+# biggest contributor to the link's peak RSS and was OOM-SIGKILLing the link on
+# memory-constrained machines. line-tables-only keeps panic backtraces with
+# file:line while dropping the heavy variable/type DWARF. Pair with
+# CARGO_INCREMENTAL=0 for local runs (see .kiro/steering/testing.md).
+debug = "line-tables-only"
+
+[profile.bench]
+opt-level = 2
+codegen-units = 256
+lto = false
+
+# Release profile: disable LTO for faster links with lower peak memory.
+# The proxy is network-bound, not CPU-bound — LTO gains are negligible.
+[profile.release]
+lto = false
+codegen-units = 16

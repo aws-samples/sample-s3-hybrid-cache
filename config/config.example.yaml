@@ -597,6 +597,18 @@ metrics:
     timeout: "10s"
     compression: "none"
     headers: {}
+    # Per-bucket traffic metrics (always tracked in memory; OTLP export is gated separately)
+    # per_bucket_enabled: false      # Export per-bucket counters via OTLP (default: false)
+
+  # Per-bucket metrics accounting knobs (always-on; feed /metrics and the dashboard).
+  # The OTLP export gate is metrics.otlp.per_bucket_enabled (above).
+  # per_bucket:
+  #   max_series: 100              # Max distinct bucket[+prefix] series (default: 100)
+  #                                # Beyond this, traffic folds into an "__other__" entry.
+  #   bucket_prefixes:             # Optional per-bucket prefix lists for prefix-level attribution.
+  #     my-bucket:                 # Key: bucket name. Value: list of prefix strings.
+  #       - "logs/"
+  #       - "data/raw/"
 
 dashboard:
   enabled: true

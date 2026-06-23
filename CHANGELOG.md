@@ -5,7 +5,30 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.0] - 2026-06-23
+## [2.2.1] - 2026-07-01
+
+Per-bucket traffic metrics: the proxy now tracks cumulative GET/PUT bandwidth and request counts per bucket (and optionally per prefix), surfacing them in the `/metrics` JSON endpoint, the operational dashboard, and optionally via OTLP export. Every new config field has a serde default, so existing config files parse unchanged on upgrade.
+
+### Added
+
+- **Per-bucket traffic metrics**: The proxy accumulates cumulative counters per bucket for object reads and object/part writes — `bytes_served`, `bytes_uploaded`, `get_requests`, and `put_requests`. Counters mirror S3's `BytesDownloaded`, `BytesUploaded`, `GetRequests`, and `PutRequests`, making them directly comparable to S3 CloudWatch metrics for cache-savings inference. Scope is intentionally limited to GET (object reads) and PUT (PutObject and UploadPart); HEAD, DELETE, LIST, and the multipart lifecycle POSTs are not counted. A GET is counted only when it carries an object key, so bucket-level list-objects GETs are excluded. Each request is recorded exactly once: GET at the HTTP/TLS request-completion site, PUT/UploadPart in the signed write-through handler (where the request-body byte count is available).
+
+- **`/metrics` JSON** now includes a `bucket_traffic` section with four counter fields per bucket (`bytes_served`, `bytes_uploaded`, `get_requests`, `put_requests`). Key format: `"bucket"` (no prefix) or `"bucket/prefix"` (prefix attribution active).
+
+- **Dashboard `/api/bucket-traffic` endpoint** and a new "Per-Bucket Traffic" table in the operational dashboard, with an overflow indicator when the series cap is reached.
+
+- **OTLP per-bucket observable counters** (opt-in via `metrics.otlp.per_bucket_enabled: true`): four `ObservableCounter<u64>` instruments (`s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, `s3proxy.put_requests`) with `bucket` attribute always present and `prefix` attribute when prefix attribution is active. In-memory accounting and local observability are always active regardless of this flag. The SDK reports cumulative temporality; no manual delta map.
+
+- **Optional prefix dimension** (`metrics.per_bucket.bucket_prefixes`): assigns object keys to the longest matching configured prefix within their bucket. When no prefix matches, traffic is attributed at the bucket level. Resolves using longest-prefix-match.
+
+- **Bounded cardinality** (`metrics.per_bucket.max_series`, default `100`): once the series cap is reached, new bucket+prefix combinations are folded into a `__other__` overflow series. Total traffic is conserved (no counts dropped); series count is bounded at `max_series + 1`. A `warn!` is logged once on first overflow activation.
+
+- **New config fields** (all `#[serde(default)]`, backward compatible):
+  - `metrics.otlp.per_bucket_enabled` (bool, default `false`) — OTLP export gate for per-bucket counters
+  - `metrics.per_bucket.max_series` (usize, default `100`) — cardinality cap
+  - `metrics.per_bucket.bucket_prefixes` (map, default `{}`) — per-bucket prefix lists for prefix-level attribution
+
+## [2.2.0] - 2026-06-22
 
 A security-hardening pass, cache-metadata-resilience changes, RAM cache sharding
 for throughput, cross-region throughput fixes, and a fix that makes conditional
@@ -91,7 +114,8 @@ unchanged on upgrade.
   arrived in order, the proxy now commits the received prefix as a smaller valid range
   `[start, start + received - 1]` instead of discarding the whole range. This lets a
   single high-throughput download (notably the AWS CLI CRT client, which opens many
-  parallel range connections and closes each as soon as it has the bytes it needs)
+  parallel range connections — any of which can be cut short by the proxy's idle
+  watchdog or CRT's adaptive part cancellation)
   populate the cache even when some part requests are cut short. The salvaged prefix is
   recorded with its true bounds, so it is never served as a complete range — a later
   request for the missing tail fetches it from S3 and merges. `1.0` keeps the legacy
