@@ -100,7 +100,7 @@ src/
 ├── cache_validator.rs   # Cache integrity validation and file scanning
 ├── capacity_manager.rs  # Cache capacity checks and bypass decisions
 ├── disk_cache.rs        # Disk cache with streaming support
-├── ram_cache.rs         # RAM cache with TinyLFU for range data
+├── ram_cache.rs         # Sharded RAM cache (Arc<Bytes>, per-shard tokio RwLock, TinyLFU)
 ├── metadata_cache.rs    # RAM cache for NewCacheMetadata objects
 ├── write_cache_manager.rs # Write-cache capacity, eviction, and incomplete upload cleanup
 │
@@ -235,6 +235,10 @@ fn get_sharded_path(base_dir: &Path, cache_key: &str, suffix: &str) -> Result<Pa
 - Frequency-based eviction
 - Configurable size limits
 - Streaming path checks RAM before disk, promotes to RAM after disk hits
+- Sharded into `ram_cache_shard_count` independent `tokio::sync::RwLock` partitions (default 64), keyed by `blake3(cache_key) % shard_count`, so concurrent reads of different keys do not contend
+- Stores data as `Arc<Bytes>` for O(1) zero-copy reads; the shard lock is released before decompression and response construction
+- Access counters (`last_accessed`, `access_count`, hit/miss) are atomics updated under a shared read lock; LRU/TinyLFU reorder is deferred to the next `put()`
+- See [CACHING.md → RAM Cache Concurrency Model](CACHING.md#ram-cache-concurrency-model)
 
 **Disk Cache (LZ4 Compressed)**:
 - All object data stored as ranges
@@ -542,7 +546,31 @@ Mitigations at the bucket/client layer (not the proxy):
 - Public-facing or untrusted network deployments
 - Environments requiring per-object access control between clients (unless using TTL=0)
 
+### Destination Policy (SSRF Protection)
+
+The proxy includes a destination policy engine that prevents SSRF attacks by validating upstream destinations before forwarding. When enabled, it blocks requests to prohibited IP ranges (IMDS 169.254.169.254, loopback, private networks, link-local).
+
+**Coverage**: The policy applies to all forwarding paths:
+- **HTTPS (CONNECT/SNI)**: Port 443 enforcement, hostname allowlist, IP classification
+- **TLS proxy listener**: Same checks as HTTPS path
+- **HTTP forwarding path**: IP classification with configurable port, hostname allowlist
+
+**Gating**: The HTTP-path destination policy is active when `connect_allowlist` is configured in the TLS section of the config. Without an allowlist, the HTTP path skips the policy check — this allows operators who rely on the proxy as a general forward proxy to opt out.
+
+**IP ranges blocked** (all paths):
+- `0.0.0.0/8`, `127.0.0.0/8` (loopback), `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (private)
+- `169.254.0.0/16` (link-local / IMDS)
+- IPv6 equivalents: `::`, `::1`, `fe80::/10`, `fc00::/7`, `::ffff:` IPv4-mapped
+
+**Endpoint override carve-out**: IPs listed in `connection_pool.endpoint_overrides` are exempted from the prohibited-range check, allowing PrivateLink ENIs in private address space.
+
+**S3 endpoints**: All public S3 IPs pass the policy. The check has no impact on normal S3 traffic.
+
 ## Observability
+
+### Dashboard
+
+A lightweight web dashboard (port 8081, configurable) provides real-time cache statistics, application log viewer, and system information. The dashboard is **unauthenticated and read-only** — it exposes no write operations or credentials. The code default bind address is `127.0.0.1` (localhost only); binding to `0.0.0.0` requires network-layer access restriction (security groups, firewall). See [DASHBOARD.md](DASHBOARD.md) for configuration and security guidance.
 
 ### Metrics
 - Cache hit/miss rates

@@ -110,6 +110,11 @@ fn create_test_cache_config() -> CacheConfig {
         bucket_settings_staleness_threshold: Duration::from_secs(60),
         download_coordination: s3_proxy::config::DownloadCoordinationConfig::default(),
         evaluate_conditions_from_cache: false,
+        ram_cache_shard_count: 64,
+        max_complete_body_bytes: 10 * 1024 * 1024, // 10 MiB
+        max_metadata_file_bytes: 4 * 1024 * 1024,  // 4 MiB
+        metadata_io_concurrency: 32,
+        partial_range_commit_ratio: 0.5,
     }
 }
 

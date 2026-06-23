@@ -36,6 +36,7 @@ pub mod metadata_lock_manager;
 pub mod metrics;
 pub mod orphaned_range_recovery;
 pub mod otlp;
+pub mod path_safety;
 pub mod permissions;
 pub mod presigned_url;
 pub mod ram_cache;

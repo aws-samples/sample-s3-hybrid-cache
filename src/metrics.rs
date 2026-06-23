@@ -404,6 +404,19 @@ pub struct ErrorStats {
     read_cache_disabled_invalidations_total: u64,
     // TTL-driven revalidation counter — freshness expired, conditional GET/HEAD to S3
     ttl_revalidations_total: u64,
+    // Metadata corruption by reason (oversize, legacy, parse_failure)
+    // Spec: cache-metadata-resilience Req 3, Task 6
+    corruption_metadata_by_reason: HashMap<String, u64>,
+    // Metadata heal overwrite counter — successful overwrite-in-place heals
+    // Spec: cache-metadata-resilience Req 3, Task 6
+    metadata_heal_overwrite_total: u64,
+    // Upstream idle abort counters — mid-stream and pre-stream watchdog aborts
+    // Spec: cache-metadata-resilience Req 5, Task 11
+    upstream_idle_abort_total_mid_stream: u64,
+    upstream_idle_abort_total_pre_stream: u64,
+    // Upstream idle retry counter — pre-stream retries before giving up
+    // Spec: cache-metadata-resilience Req 5, Task 10/11
+    upstream_idle_retry_total: u64,
 }
 
 /// Internal range storage metrics tracking
@@ -1628,6 +1641,60 @@ impl MetricsManager {
     pub async fn record_corrupted_metadata_simple(&self) {
         self.record_corrupted_metadata("unknown", "unknown", "unknown")
             .await;
+    }
+
+    /// Record corrupted metadata with a specific reason label (oversize, legacy, parse_failure).
+    /// Spec: cache-metadata-resilience Req 3, Task 6
+    pub async fn record_corrupted_metadata_with_reason(
+        &self,
+        cache_key: &str,
+        file_path: &str,
+        reason: &str,
+    ) {
+        let mut stats = self.error_stats.write().await;
+        stats.corruption_metadata_total += 1;
+        *stats
+            .corruption_metadata_by_reason
+            .entry(reason.to_string())
+            .or_insert(0) += 1;
+
+        warn!(
+            cache_key = %cache_key,
+            file_path = %file_path,
+            reason = %reason,
+            total_corruptions = stats.corruption_metadata_total,
+            "Metadata corruption detected (classified)"
+        );
+    }
+
+    /// Record a successful metadata heal overwrite-in-place.
+    /// Spec: cache-metadata-resilience Req 3, Task 6
+    pub async fn record_metadata_heal_overwrite(&self) {
+        let mut stats = self.error_stats.write().await;
+        stats.metadata_heal_overwrite_total += 1;
+
+        info!(
+            total_heals = stats.metadata_heal_overwrite_total,
+            "Metadata heal overwrite completed"
+        );
+    }
+
+    /// Record an upstream idle abort (mid-stream or pre-stream).
+    /// Spec: cache-metadata-resilience Req 5, Task 11
+    pub async fn record_upstream_idle_abort(&self, phase: &str) {
+        let mut stats = self.error_stats.write().await;
+        match phase {
+            "mid_stream" => stats.upstream_idle_abort_total_mid_stream += 1,
+            "pre_stream" => stats.upstream_idle_abort_total_pre_stream += 1,
+            _ => stats.upstream_idle_abort_total_mid_stream += 1,
+        }
+    }
+
+    /// Record an upstream idle retry (pre-stream retry before giving up).
+    /// Spec: cache-metadata-resilience Req 5, Task 10/11
+    pub async fn record_upstream_idle_retry(&self) {
+        let mut stats = self.error_stats.write().await;
+        stats.upstream_idle_retry_total += 1;
     }
     /// Record part cache hit event
     /// Requirement 8.1: Track part cache hits for monitoring

@@ -106,6 +106,7 @@ async fn make_cache_infra(
         config.cache.compression_batch_size,
         config.cache.evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
@@ -702,6 +703,7 @@ async fn launch_part_concurrent(
                 s3_client,
                 inflight_tracker,
                 range_handler,
+                std::sync::Arc::new(s3_proxy::config::Config::default()),
                 true,
                 wait_timeout,
                 3,
@@ -741,6 +743,7 @@ async fn launch_part_concurrent(
                 s3_client,
                 inflight_tracker,
                 range_handler,
+                std::sync::Arc::new(s3_proxy::config::Config::default()),
                 true,
                 wait_timeout,
                 3,

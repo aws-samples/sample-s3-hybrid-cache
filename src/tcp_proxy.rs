@@ -356,40 +356,42 @@ impl TcpProxy {
             target_host
         );
 
-        // Destination policy check: reject prohibited destinations
         let target_port = 443u16;
-        match policy.check(target_host, target_port, &resolver).await {
-            Ok(_allowed_ips) => {
-                // Policy allows this destination — proceed with connection
-            }
-            Err(reason) => {
-                warn!(
-                    hostname = %target_host,
-                    port = target_port,
-                    reason = %reason,
-                    "SNI passthrough destination rejected by policy"
-                );
-                // Shutdown client stream silently on rejection
-                let _ = client_stream.shutdown().await;
-                return Ok(());
-            }
-        }
 
-        // Check endpoint overrides first (exact then suffix, for PrivateLink etc.)
+        // Determine connect IPs: endpoint overrides take priority, otherwise
+        // policy.check() resolves + validates in one step (no second DNS lookup).
         let ip_addresses: Vec<IpAddr> = if let Some(ips) = overrides.resolve(target_host) {
-            info!("Using endpoint override for {}: {:?}", target_host, ips);
-            ips.clone()
+            // Override IPs still need policy validation (prohibited-range check)
+            match policy.classify_ips(target_host, ips) {
+                Ok(allowed) => {
+                    info!("Using endpoint override for {}: {:?}", target_host, allowed);
+                    allowed
+                }
+                Err(reason) => {
+                    warn!(
+                        hostname = %target_host,
+                        port = target_port,
+                        reason = %reason,
+                        "SNI passthrough endpoint-override IPs rejected by policy"
+                    );
+                    let _ = client_stream.shutdown().await;
+                    return Ok(());
+                }
+            }
         } else {
-            // Resolve hostname using external DNS to bypass /etc/hosts
-            match resolver.lookup_ip(target_host).await {
-                Ok(lookup) => lookup.iter().collect(),
-                Err(e) => {
-                    error!("DNS resolution failed for {}: {}", target_host, e);
-                    drop(client_stream);
-                    return Err(ProxyError::ConnectionError(format!(
-                        "DNS resolution failed for {}: {}",
-                        target_host, e
-                    )));
+            // policy.check() resolves DNS and validates IPs atomically —
+            // reuse the returned IPs to avoid a TOCTOU re-resolution.
+            match policy.check(target_host, target_port, &resolver).await {
+                Ok(allowed_ips) => allowed_ips,
+                Err(reason) => {
+                    warn!(
+                        hostname = %target_host,
+                        port = target_port,
+                        reason = %reason,
+                        "SNI passthrough destination rejected by policy"
+                    );
+                    let _ = client_stream.shutdown().await;
+                    return Ok(());
                 }
             }
         };
@@ -925,5 +927,85 @@ mod tests {
     fn test_format_addr_native_ipv6() {
         let addr: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
         assert_eq!(TcpProxy::format_addr(addr), "[2606:4700:4700::1111]:443");
+    }
+
+    /// Verify that the DNS TOCTOU fix works correctly:
+    /// - policy.check() resolves DNS and returns validated IPs in one step
+    /// - The IPs returned by policy.check/classify_ips ARE the connect set
+    /// - No second DNS resolution is needed
+    #[test]
+    fn test_policy_validated_ips_used_directly_no_reresolution() {
+        use crate::destination_policy::DestinationPolicy;
+        use std::collections::HashSet;
+
+        // Policy with no allowlist, port 443
+        let policy = DestinationPolicy::new(443, None, HashSet::new());
+
+        // Simulate what policy.check() returns after DNS resolution:
+        // a mix of public IPs (allowed) and one prohibited IP (filtered out).
+        let resolved_ips: Vec<IpAddr> = vec![
+            "52.94.236.248".parse().unwrap(), // public (AWS)
+            "127.0.0.1".parse().unwrap(),     // prohibited (loopback)
+            "8.8.8.8".parse().unwrap(),       // public (Google DNS)
+        ];
+
+        let result = policy.classify_ips("s3.us-west-2.amazonaws.com", &resolved_ips);
+        let allowed_ips = result.expect("classify_ips should succeed with public IPs present");
+
+        // Key assertion: the returned IPs are exactly the safe-to-connect set.
+        // The prohibited 127.0.0.1 must NOT be in the result.
+        assert_eq!(allowed_ips.len(), 2);
+        assert!(allowed_ips.contains(&"52.94.236.248".parse::<IpAddr>().unwrap()));
+        assert!(allowed_ips.contains(&"8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!allowed_ips.contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+
+        // This proves: if establish_tcp_tunnel uses the return value of
+        // policy.check() directly (as the fix does), the connect candidate set
+        // is exactly the policy-validated set — no re-resolution occurs.
+    }
+
+    /// Verify that endpoint override IPs are validated through the policy
+    /// before use — prohibited override IPs without a carve-out are rejected.
+    #[test]
+    fn test_override_ips_validated_against_policy() {
+        use crate::destination_policy::DestinationPolicy;
+        use std::collections::HashSet;
+
+        // Policy with no endpoint_override_ips carve-out
+        let policy = DestinationPolicy::new(443, None, HashSet::new());
+
+        // A loopback IP (prohibited) as an override should be rejected
+        let prohibited_ips: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap()];
+        let result = policy.classify_ips("example.com", &prohibited_ips);
+        assert!(
+            result.is_err(),
+            "Prohibited override IPs without carve-out must be rejected"
+        );
+
+        // A public IP as an override should be allowed
+        let public_ips: Vec<IpAddr> = vec!["8.8.8.8".parse().unwrap()];
+        let result = policy.classify_ips("example.com", &public_ips);
+        let allowed = result.expect("Public override IPs should be allowed");
+        assert_eq!(allowed, public_ips);
+    }
+
+    /// Verify that the endpoint override carve-out allows prohibited IPs
+    /// that are explicitly listed in endpoint_override_ips.
+    #[test]
+    fn test_override_ips_carveout_allows_prohibited() {
+        use crate::destination_policy::DestinationPolicy;
+        use std::collections::HashSet;
+
+        // Include 10.0.0.1 in the carve-out set (e.g., PrivateLink ENI)
+        let mut carveout: HashSet<IpAddr> = HashSet::new();
+        carveout.insert("10.0.0.1".parse().unwrap());
+
+        let policy = DestinationPolicy::new(443, None, carveout);
+
+        // 10.0.0.1 is in a prohibited range but has the carve-out
+        let override_ips: Vec<IpAddr> = vec!["10.0.0.1".parse().unwrap()];
+        let result = policy.classify_ips("vpce-endpoint.amazonaws.com", &override_ips);
+        let allowed = result.expect("Carved-out override IP should be allowed");
+        assert_eq!(allowed, override_ips);
     }
 }

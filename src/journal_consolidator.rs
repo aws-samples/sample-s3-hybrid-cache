@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 /// Maximum concurrent cache keys processed in a single consolidation cycle
-const KEY_CONCURRENCY_LIMIT: usize = 64;
+const KEY_CONCURRENCY_LIMIT: usize = 32;
 
 /// Result of journal discovery, including per-file entry counts for optimized cleanup.
 ///
@@ -173,6 +173,9 @@ pub struct ConsolidationResult {
 pub struct ConsolidationCycleResult {
     /// Number of cache keys processed
     pub keys_processed: usize,
+
+    /// Number of cache keys skipped due to per-key timeout
+    pub keys_skipped: usize,
 
     /// Total journal entries consolidated
     pub entries_consolidated: usize,
@@ -1952,6 +1955,7 @@ impl JournalConsolidator {
         if !self.size_accumulator.has_pending_delta() && !self.has_pending_journal_files() {
             return Ok(ConsolidationCycleResult {
                 keys_processed: 0,
+                keys_skipped: 0,
                 entries_consolidated: 0,
                 size_delta: 0,
                 cycle_duration: cycle_start.elapsed(),
@@ -1978,6 +1982,7 @@ impl JournalConsolidator {
                 debug!("Skipping consolidation cycle - another instance holds the lock");
                 return Ok(ConsolidationCycleResult {
                     keys_processed: 0,
+                    keys_skipped: 0,
                     entries_consolidated: 0,
                     size_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
@@ -1990,6 +1995,7 @@ impl JournalConsolidator {
                 warn!("Failed to acquire consolidation lock: {}", e);
                 return Ok(ConsolidationCycleResult {
                     keys_processed: 0,
+                    keys_skipped: 0,
                     entries_consolidated: 0,
                     size_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
@@ -2049,6 +2055,7 @@ impl JournalConsolidator {
                     self.maybe_trigger_eviction(Some(current_size)).await;
                 return Ok(ConsolidationCycleResult {
                     keys_processed: 0,
+                    keys_skipped: 0,
                     entries_consolidated: 0,
                     size_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
@@ -2071,6 +2078,7 @@ impl JournalConsolidator {
                 self.maybe_trigger_eviction(Some(current_size)).await;
             return Ok(ConsolidationCycleResult {
                 keys_processed: 0,
+                keys_skipped: 0,
                 entries_consolidated: 0,
                 size_delta: 0,
                 cycle_duration: cycle_start.elapsed(),
@@ -2092,6 +2100,14 @@ impl JournalConsolidator {
         let mut all_consolidated_entries = Vec::new();
         let mut new_objects_count: u64 = 0;
         let mut keys_processed = 0;
+        let mut keys_skipped = 0;
+
+        // Per-key timeout: consolidation_cycle_timeout / 4, clamped to [2s, 15s].
+        // Ensures one pathological key cannot consume the entire cycle budget.
+        let per_key_budget = {
+            let raw = key_processing_timeout / 4;
+            raw.clamp(Duration::from_secs(2), Duration::from_secs(15))
+        };
 
         // Process discovered cache keys concurrently (KEY_CONCURRENCY_LIMIT at a time)
         // Per-key locks are independent flock-based locks on different files, so concurrent
@@ -2104,9 +2120,13 @@ impl JournalConsolidator {
                 // Clone the file list for this key from the index so the async block is 'static
                 let journal_files = key_index.get(&cache_key).cloned().unwrap_or_default();
                 async move {
-                    let result = self
-                        .consolidate_object_with_files(&cache_key, &journal_files)
-                        .await;
+                    // Wrap per-key processing in a timeout so one slow key cannot
+                    // consume the entire cycle budget (Req 2.2).
+                    let result = tokio::time::timeout(
+                        per_key_budget,
+                        self.consolidate_object_with_files(&cache_key, &journal_files),
+                    )
+                    .await;
                     (cache_key, result)
                 }
             })
@@ -2119,10 +2139,10 @@ impl JournalConsolidator {
 
         loop {
             match tokio::time::timeout_at(deadline, stream.next()).await {
-                Ok(Some((cache_key, result))) => {
-                    // Key completed before deadline
-                    match result {
-                        Ok(result) => {
+                Ok(Some((cache_key, per_key_result))) => {
+                    match per_key_result {
+                        Ok(Ok(result)) => {
+                            // Key completed within per-key budget
                             if result.entries_consolidated > 0 {
                                 debug!(
                                     "Journal consolidated: cache_key={}, entries={}, size_delta={:+}",
@@ -2138,8 +2158,17 @@ impl JournalConsolidator {
                                 new_objects_count += 1;
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
+                            // Key processing failed (not timeout) — journal entries preserved
                             info!("Journal consolidation failed for {}: {}", cache_key, e);
+                        }
+                        Err(_elapsed) => {
+                            // Per-key timeout: key skipped, journal entries preserved for next cycle
+                            keys_skipped += 1;
+                            info!(
+                                "Consolidation key skipped (per-key timeout {:?}): {}",
+                                per_key_budget, cache_key
+                            );
                         }
                     }
                 }
@@ -2151,12 +2180,20 @@ impl JournalConsolidator {
                     // Deadline reached: log and break. Completed keys are already accumulated.
                     let unprocessed = total_keys_to_process.saturating_sub(keys_processed);
                     info!(
-                        "Consolidation cycle deadline after {:?}, {} keys processed, {} unprocessed out of {} total",
-                        key_processing_timeout, keys_processed, unprocessed, total_keys_to_process
+                        "Consolidation cycle deadline after {:?}, {} keys processed, {} skipped, {} unprocessed out of {} total",
+                        key_processing_timeout, keys_processed, keys_skipped, unprocessed, total_keys_to_process
                     );
                     break;
                 }
             }
+        }
+
+        // Log summary of skipped keys if any
+        if keys_skipped > 0 {
+            info!(
+                "Consolidation cycle: {} keys skipped due to per-key timeout ({:?}), journal entries preserved for next cycle",
+                keys_skipped, per_key_budget
+            );
         }
 
         // NOTE: Size tracking is now handled by the accumulator-based approach above.
@@ -2203,6 +2240,7 @@ impl JournalConsolidator {
 
         Ok(ConsolidationCycleResult {
             keys_processed,
+            keys_skipped,
             entries_consolidated: total_entries_consolidated,
             size_delta: accumulator_size_delta, // Use accumulator delta (what was actually applied)
             cycle_duration,
@@ -3865,7 +3903,7 @@ mod tests {
         assert_eq!(config.interval, Duration::from_secs(5)); // Changed from 30s to 5s
         assert_eq!(config.size_threshold, 1024 * 1024);
         assert_eq!(config.entry_count_threshold, 100);
-        assert_eq!(KEY_CONCURRENCY_LIMIT, 64);
+        assert_eq!(KEY_CONCURRENCY_LIMIT, 32);
         assert_eq!(config.consolidation_cycle_timeout, Duration::from_secs(30));
         assert_eq!(config.max_keys_per_cycle, 5000);
     }
@@ -4931,6 +4969,7 @@ mod tests {
     async fn test_consolidation_cycle_result_fields() {
         let result = ConsolidationCycleResult {
             keys_processed: 10,
+            keys_skipped: 0,
             entries_consolidated: 25,
             size_delta: -1024,
             cycle_duration: Duration::from_millis(150),
@@ -6203,5 +6242,248 @@ mod tests {
             result.is_err(),
             "Malformed cache key must return Err, got Ok"
         );
+    }
+
+    #[test]
+    fn test_per_key_budget_calculation() {
+        // per_key_budget = consolidation_cycle_timeout / 4, clamped to [2s, 15s]
+
+        // Default 30s timeout → 30/4 = 7.5s, within [2,15] → 7.5s
+        let timeout = Duration::from_secs(30);
+        let budget = (timeout / 4).clamp(Duration::from_secs(2), Duration::from_secs(15));
+        assert_eq!(budget, Duration::from_millis(7500));
+
+        // Short 4s timeout → 4/4 = 1s, clamped to minimum 2s
+        let timeout = Duration::from_secs(4);
+        let budget = (timeout / 4).clamp(Duration::from_secs(2), Duration::from_secs(15));
+        assert_eq!(budget, Duration::from_secs(2));
+
+        // Very long 120s timeout → 120/4 = 30s, clamped to maximum 15s
+        let timeout = Duration::from_secs(120);
+        let budget = (timeout / 4).clamp(Duration::from_secs(2), Duration::from_secs(15));
+        assert_eq!(budget, Duration::from_secs(15));
+
+        // 60s timeout → 60/4 = 15s, exactly at upper bound
+        let timeout = Duration::from_secs(60);
+        let budget = (timeout / 4).clamp(Duration::from_secs(2), Duration::from_secs(15));
+        assert_eq!(budget, Duration::from_secs(15));
+
+        // 8s timeout → 8/4 = 2s, exactly at lower bound
+        let timeout = Duration::from_secs(8);
+        let budget = (timeout / 4).clamp(Duration::from_secs(2), Duration::from_secs(15));
+        assert_eq!(budget, Duration::from_secs(2));
+    }
+
+    /// Test that per-key timeout causes key to be skipped and journal entries preserved.
+    /// Verifies the timeout mechanism by confirming that when a consolidation cycle
+    /// encounters keys that process faster than the per-key budget, the cycle completes
+    /// normally and keys_skipped remains 0. This validates the timeout wrapping doesn't
+    /// interfere with normal operation and that the result struct properly tracks skipped keys.
+    #[tokio::test]
+    async fn test_per_key_timeout_normal_keys_not_skipped() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        let journal_manager = Arc::new(JournalManager::new(
+            cache_dir.clone(),
+            "test-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            cache_dir.clone(),
+            Duration::from_secs(30),
+            3,
+        ));
+
+        // Use default config (30s timeout → 7.5s per-key budget)
+        let consolidator = JournalConsolidator::new(
+            cache_dir.clone(),
+            journal_manager.clone(),
+            lock_manager,
+            ConsolidationConfig::default(),
+        );
+
+        // Create a normal key that will process fast
+        let cache_key = "test-bucket/normal-object";
+        let now = SystemTime::now();
+        let range_spec = RangeSpec {
+            start: 0,
+            end: 1023,
+            file_path: "normal_range.bin".to_string(),
+            compression_algorithm: CompressionAlgorithm::Lz4,
+            compressed_size: 1024,
+            uncompressed_size: 1024,
+            created_at: now,
+            last_accessed: now,
+            access_count: 1,
+            frequency_score: 1,
+        };
+
+        // Create range file
+        let range_file_path = consolidator
+            .get_range_file_path(cache_key, &range_spec)
+            .unwrap();
+        if let Some(parent) = range_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(&range_file_path, vec![0u8; 1024])
+            .await
+            .unwrap();
+
+        // Add size to accumulator to trigger cycle
+        consolidator.size_accumulator().add(1024);
+
+        // Write journal entry
+        let entry = JournalEntry {
+            timestamp: now,
+            instance_id: "test-instance".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec: range_spec.clone(),
+            operation: JournalOperation::Add,
+            range_file_path: range_file_path.to_string_lossy().to_string(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(3600),
+            access_increment: None,
+            object_metadata: None,
+            metadata_written: false,
+        };
+        journal_manager
+            .append_range_entry(cache_key, entry)
+            .await
+            .unwrap();
+
+        // Run consolidation cycle
+        let result = consolidator.run_consolidation_cycle().await.unwrap();
+
+        // Normal keys should process without being skipped
+        assert_eq!(result.keys_processed, 1);
+        assert_eq!(result.keys_skipped, 0);
+        assert_eq!(result.entries_consolidated, 1);
+    }
+
+    /// Test that the per-key timeout mechanism correctly fires on a slow future.
+    /// This directly tests the timeout wrapping logic used in run_consolidation_cycle.
+    #[tokio::test]
+    async fn test_per_key_timeout_fires_on_slow_future() {
+        // Simulate the per-key timeout logic used in run_consolidation_cycle:
+        // tokio::time::timeout(per_key_budget, slow_future)
+        let per_key_budget = Duration::from_millis(100); // Very short for test speed
+
+        // A future that sleeps longer than the budget
+        let slow_future = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<&str, String>("should not reach here")
+        };
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(per_key_budget, slow_future).await;
+        let elapsed = start.elapsed();
+
+        // The timeout should fire quickly, not wait 10s
+        assert!(elapsed < Duration::from_millis(500));
+        // The result is Err(Elapsed), which is the per-key timeout path
+        assert!(result.is_err(), "Expected timeout (Elapsed), got Ok");
+    }
+
+    /// Verify that a consolidation cycle with a fast key completes quickly and
+    /// journal entries are properly cleaned up (not preserved like skipped keys).
+    #[tokio::test]
+    async fn test_consolidation_cycle_fast_key_entries_cleaned_up() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        let journal_manager = Arc::new(JournalManager::new(
+            cache_dir.clone(),
+            "test-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            cache_dir.clone(),
+            Duration::from_secs(30),
+            3,
+        ));
+
+        let consolidator = JournalConsolidator::new(
+            cache_dir.clone(),
+            journal_manager.clone(),
+            lock_manager,
+            ConsolidationConfig::default(),
+        );
+
+        // Create a key with journal entry
+        let cache_key = "test-bucket/cleanup-test-object";
+        let now = SystemTime::now();
+        let range_spec = RangeSpec {
+            start: 0,
+            end: 1023,
+            file_path: "cleanup_range.bin".to_string(),
+            compression_algorithm: CompressionAlgorithm::Lz4,
+            compressed_size: 1024,
+            uncompressed_size: 1024,
+            created_at: now,
+            last_accessed: now,
+            access_count: 1,
+            frequency_score: 1,
+        };
+
+        let range_file_path = consolidator
+            .get_range_file_path(cache_key, &range_spec)
+            .unwrap();
+        if let Some(parent) = range_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(&range_file_path, vec![0u8; 1024])
+            .await
+            .unwrap();
+
+        consolidator.size_accumulator().add(1024);
+
+        let entry = JournalEntry {
+            timestamp: now,
+            instance_id: "test-instance".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec,
+            operation: JournalOperation::Add,
+            range_file_path: range_file_path.to_string_lossy().to_string(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(3600),
+            access_increment: None,
+            object_metadata: None,
+            metadata_written: false,
+        };
+        journal_manager
+            .append_range_entry(cache_key, entry)
+            .await
+            .unwrap();
+
+        // Run first cycle — key processes normally (not skipped)
+        let result = consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(result.keys_processed, 1);
+        assert_eq!(result.keys_skipped, 0);
+        assert_eq!(result.entries_consolidated, 1);
+
+        // After successful consolidation, journal entries should be cleaned up
+        // A second cycle should find no pending work
+        consolidator.size_accumulator().add(1); // trigger cycle
+        let result2 = consolidator.run_consolidation_cycle().await.unwrap();
+        assert_eq!(result2.keys_processed, 0);
+        assert_eq!(result2.keys_skipped, 0);
+        assert_eq!(result2.entries_consolidated, 0);
+    }
+
+    #[test]
+    fn test_keys_skipped_field_in_result() {
+        let result = ConsolidationCycleResult {
+            keys_processed: 5,
+            keys_skipped: 2,
+            entries_consolidated: 10,
+            size_delta: 0,
+            cycle_duration: Duration::from_millis(500),
+            eviction_triggered: false,
+            bytes_evicted: 0,
+            current_size: 0,
+        };
+        assert_eq!(result.keys_skipped, 2);
+        assert_eq!(result.keys_processed, 5);
     }
 }

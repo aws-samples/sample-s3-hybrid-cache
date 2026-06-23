@@ -189,7 +189,7 @@ Endpoints:
 
 > **Your Responsibility**: You are responsible for restricting network access to the proxy to only clients authorized to access all objects that may be cached, and for securing file system access to the shared cache volume. This is the same security model as any shared cache — the proxy does not weaken S3's security, but depending on [TTL configuration](docs/CONFIGURATION.md#time-to-live-ttl-configuration), cached data may be accessible without S3 authorization checks.
 
-**Network access**: With [TTL](docs/CACHING.md#time-to-live-ttl-configuration) > 0, cache hits bypass S3 entirely — any client that can reach the proxy over the network can read any cached object without IAM authorization checks. Restrict proxy access using security groups, firewalls, or network segmentation. The proxy listens on ports 80 (HTTP with caching), 443 (HTTPS passthrough), 3128/3129 (TLS proxy), 8080 (health), 8081 (dashboard), and 9090 (metrics). The admin endpoints (8080, 8081, 9090) are unauthenticated and bind to `127.0.0.1` by default; they require the same network restriction as the data endpoints if exposed beyond localhost. When an operator overrides the dashboard bind address to `0.0.0.0`, the operator is responsible for restricting access via firewall, security group, or reverse proxy.
+**Network access**: With [TTL](docs/CACHING.md#time-to-live-ttl-configuration) > 0, cache hits bypass S3 entirely — any client that can reach the proxy over the network can read any cached object without IAM authorization checks. Restrict proxy access using security groups, firewalls, or network segmentation. The proxy listens on ports 80 (HTTP with caching), 443 (HTTPS passthrough), 3128 (HTTP forward proxy, proxy_only mode), 3129 (TLS proxy), 8080 (health), 8081 (dashboard), and 9090 (metrics). The admin endpoints (8080, 8081, 9090) are unauthenticated and bind to `127.0.0.1` by default; they require the same network restriction as the data endpoints if exposed beyond localhost. When an operator overrides the dashboard bind address to `0.0.0.0`, the operator is responsible for restricting access via firewall, security group, or reverse proxy.
 
 **Outbound destination restrictions**: The proxy restricts CONNECT tunnels (TLS proxy listener) and SNI passthrough (HTTPS listener) to port 443 only. Destinations resolving to link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), or private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) IP ranges are rejected. IPv6 equivalents (`::1`, `fe80::/10`, `fc00::/7`) are also rejected. This prevents clients from using the proxy as a relay to IMDS, internal services, or arbitrary network destinations. IPs listed in `endpoint_overrides` are exempt from the IP-range restriction, allowing PrivateLink ENIs, on-premises object stores, and other explicitly configured endpoints to function normally. An optional `server.tls.connect_allowlist` can further restrict allowed hostnames via glob patterns (e.g., `*.amazonaws.com`); when configured, only hostnames matching a pattern are permitted.
 
@@ -229,21 +229,35 @@ See [this article](https://repost.aws/articles/ARRnpZ4QYrS9CtnYyTleS5bg/storage-
 
 ### Multi-Client Request Time And Efficiency Testing
 
-100 clients (c7gn.large) each sequentially downloading the same 100 (0.1–100 MB) files, i.e. 'thundering herd'. 3 proxies (m6in.2xlarge) with shared EFS cache. Cross-region (eu-west-1 bucket, us-west-2 proxies):
+100 clients (c7gn.large, 25 Gbps) each sequentially downloading the same 100 files (0.1–100 MB), i.e. 'thundering herd'. 3 proxies (m6in.2xlarge) with shared EFS cache. Cross-region: eu-west-1 bucket, us-west-2 clients and proxies (~116 ms RTT to S3). "Request time" is the **total per-file download time** (request start to last byte received), not time-to-first-byte.
 
-| Scenario | p50 | p95 | p99 | Throughput |
-|----------|-----|-----|-----|------------|
-| Direct to S3 (no proxy) | 659 ms | 1,407 ms | 1,620 ms | 1.5 GiB/s |
-| Proxy, cold cache | 712 ms | 2,551 ms | 4,005 ms | 1.2 GiB/s |
-| Proxy, warm cache | 578 ms | 839 ms | 1,247 ms | 1.9 GiB/s |
+| Scenario | p50 | p95 | p99 | Aggregate throughput | Errors |
+|----------|-----|-----|-----|----------------------|--------|
+| Direct to S3 (no proxy) | 1,736 ms | 4,247 ms | 4,929 ms | 3.8 Gbps | 0 |
+| Via proxy (cache starts cold) | 570 ms | 1,373 ms | 2,433 ms | 17.1 Gbps | 0 |
 
-Warm cache delivered 27% higher throughput and 1.7× lower p95 latency than direct S3 access. Download coordination coalesces concurrent cache-miss requests — only one client fetches from S3 while others wait for the cached result.
+Against a cross-region bucket the proxy is **3× faster at p50** and delivers **4.5× the aggregate throughput** of direct S3 access, with zero errors across 10,000 requests per run. Two mechanisms combine: the download coordinator collapses the 100 concurrent first-touch requests for each file into a single S3 fetch — the other 99 wait and serve from the freshly-cached copy — and every subsequent read is served from the sharded RAM/disk cache without the ~116 ms cross-region round-trip. Even though the cache starts empty, only ~1% of requests (one per file) actually reach S3; the rest are cache hits. Same-region deployments see even lower request times, since the single coordinated fetch per file also avoids the cross-region RTT.
+
+### Single-Proxy Bandwidth Ceiling
+
+One proxy and one client (both `c6in.16xlarge`, 100 Gbps NIC), same Availability Zone, intra-region bucket, 64 MiB objects over a boto3 connection sweep (1–200 connections). This isolates the per-proxy ceiling for each cache tier.
+
+| Scenario | Best avg throughput |
+|----------|---------------------|
+| Direct S3 (no proxy) | 4.6 GiB/s |
+| Cache miss (proxy → S3 → client + disk write) | 3.6 GiB/s |
+| Cache hit — disk (io2, 100K IOPS) | 4.2 GiB/s |
+| Cache hit — RAM | 7.1 GiB/s |
+
+RAM cache-hit throughput scales approximately linearly with connection count — 0.31 GiB/s at 1 connection, 2.5 GiB/s at 10, and 7.1 GiB/s at 50 — then tapers as the single client's NIC saturates (the proxy still has headroom). The sharded RAM cache, zero-copy `Arc<Bytes>` reads, and a lock-free read path introduced in v2.2.0 are what let RAM hits scale this way.
+
+Cache-miss throughput is proxy-limited (S3 fetch + TLS + LZ4 compression + cache write). Disk cache hits scale well with concurrency and are not the bottleneck at this scale.
 
 ## FAQ
 
 **Q: Why HTTP instead of HTTPS for caching?**
 
-A: The HTTP listener (port 80) uses plaintext HTTP so the proxy can read and cache request/response content. The HTTPS listener (port 443) uses TCP passthrough because the proxy cannot present a trusted certificate for the S3 endpoint — it can only relay encrypted bytes. For encrypted client-to-proxy traffic with caching, the optional TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, then processes the decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com` — the SDK signs against the real S3 hostname at the HTTP level, and the proxy decrypts, caches, and forwards to S3 over HTTPS. All proxy-to-S3 communication uses HTTPS regardless of client connection protocol.
+A: The HTTP listener (port 80) uses plaintext HTTP so the proxy can read and cache request/response content. The HTTPS listener (port 443) uses TCP passthrough because the proxy cannot present a trusted certificate for the S3 endpoint — it can only relay encrypted bytes. For encrypted client-to-proxy traffic with caching, the optional TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, then processes the decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com` — the SDK signs against the real S3 hostname at the HTTP level, and the proxy decrypts, caches, and forwards to S3 over HTTPS. By default all proxy-to-S3 communication uses verified TLS (HTTPS) regardless of client connection protocol, except where a destination is configured with a protection-waiving [`upstream_overrides`](docs/CONFIGURATION.md#upstream-transport-overrides) mode (plaintext HTTP, or HTTPS with certificate validation disabled), which is intended for local development or trusted networks only.
 
 **Q: How does load balancing and failover work?**
 

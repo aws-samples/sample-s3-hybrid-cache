@@ -55,10 +55,9 @@ fn create_cache_manager_get_ttl_zero(
         1_048_576,
         false,
         Duration::from_secs(10),
+        64, // ram_cache_shard_count
     )
 }
-
-/// Store a write-cached object (simulates a write-through PUT).
 async fn store_write_cached_object(cache_manager: &CacheManager, cache_key: &str) {
     let test_data = b"Test data for write-cache TTL exploration.";
     let mut response_headers = HashMap::new();

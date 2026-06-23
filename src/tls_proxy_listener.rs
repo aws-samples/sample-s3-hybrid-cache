@@ -226,6 +226,8 @@ impl TlsProxyListener {
                                             logger_manager,
                                             inflight_tracker,
                                             proxy_referer,
+                                            Some(destination_policy),
+                                            Some(resolver),
                                         )
                                         .await
                                     }

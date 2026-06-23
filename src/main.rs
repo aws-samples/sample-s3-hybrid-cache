@@ -576,11 +576,15 @@ async fn main() -> Result<()> {
     // Start health and metrics servers if enabled
     let _health_task = if config.health.enabled {
         info!(
-            "Starting health check server on port {}",
-            config.health.port
+            "Starting health check server on {}:{}",
+            config.health.bind_address, config.health.port
         );
-        // Bind to [::] for IPv6 dual-stack (accepts both IPv4 and IPv6)
-        let health_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.health.port));
+        let health_bind: std::net::IpAddr = config
+            .health
+            .bind_address
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let health_addr = SocketAddr::from((health_bind, config.health.port));
         let health_manager_clone = health_manager.clone();
         let health_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
 
@@ -596,9 +600,16 @@ async fn main() -> Result<()> {
     };
 
     let _metrics_task = if config.metrics.enabled {
-        info!("Starting metrics server on port {}", config.metrics.port);
-        // Bind to [::] for IPv6 dual-stack (accepts both IPv4 and IPv6)
-        let metrics_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.metrics.port));
+        info!(
+            "Starting metrics server on {}:{}",
+            config.metrics.bind_address, config.metrics.port
+        );
+        let metrics_bind: std::net::IpAddr = config
+            .metrics
+            .bind_address
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let metrics_addr = SocketAddr::from((metrics_bind, config.metrics.port));
         let metrics_manager_clone = metrics_manager.clone();
         let metrics_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
 

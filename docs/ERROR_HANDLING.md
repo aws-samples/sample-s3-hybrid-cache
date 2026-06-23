@@ -74,6 +74,50 @@ let result = cache_manager.get_metadata(cache_key).await?;
 - Monitor disk health to prevent I/O errors
 - Regular backups of critical cache metadata (for disaster recovery)
 
+#### Self-Healing via Overwrite-in-Place (cache-metadata-resilience Req 3)
+
+When a `.meta` file is classified as **confidently corrupt** (not a transient
+mid-write condition), the proxy heals it automatically:
+
+**Classification — three signals, in order:**
+
+1. **Oversize**: file exceeds `max_metadata_file_bytes` (default 4 MiB) — rejected
+   without reading the body.
+2. **Legacy schema**: the content matches the old `CacheEntry` format (inline
+   `body`, no `object_metadata`) from a pre-upgrade proxy version.
+3. **Stable parse failure**: parse fails after bounded retries AND the file size
+   is unchanged across the retry window (not actively being written).
+
+Files that don't meet any of these criteria remain on the "treat as miss, do not
+delete" path, preserving tolerance for concurrent mid-write reads on shared storage
+(NFS/EFS).
+
+**Heal mechanism:**
+
+- **GET path**: the normal cache-miss handling fetches the object from S3 and calls
+  `store_range`, which writes a fresh `.meta` via atomic tmp+rename — overwriting
+  the corrupt file at the same sharded path. No special action needed beyond
+  detecting corruption.
+- **HEAD-only path**: HEAD responses don't persist a fresh `.meta` (they only cache
+  in the HEAD cache). For these paths, the corrupt `.meta` is explicitly removed so
+  subsequent requests don't re-read it.
+
+**Invariant**: the heal overwrite is always backed by a real S3 fetch. The proxy
+never fabricates metadata from internal state alone.
+
+**Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| `corruption_metadata_total` | Total corrupt metadata detections (all reasons) |
+| `corruption_metadata_by_reason{reason}` | Per-reason breakdown: `Oversize`, `Legacy`, `ParseFailure` |
+| `metadata_heal_overwrite_total` | Successful heal overwrites (GET path store or HEAD path removal) |
+
+**Concurrency safety**: the atomic tmp+rename write cannot race against the
+consolidator because both paths acquire the per-key metadata lock before writing.
+Transient (mid-write) files are never healed — only confident corruption triggers
+the destructive overwrite.
+
 ### 2. Missing Range Binary Files (Requirement 8.2)
 
 **Detection**: File not found when loading range data
@@ -281,6 +325,33 @@ let stats = cache_manager.perform_cache_cleanup().await?;
 - Regular cache validation
 - Monitoring of orphaned file metrics
 
+### 7. Stalled Upstream Responses (Mid-Stream Idle Watchdog)
+
+**Detection**: No bytes received from the upstream within `upstream_idle_timeout` (default 5s) while the proxy is actively trying to read. Backpressure from a slow client does not count as upstream idle.
+
+**Recovery Strategy**:
+- **Pre-first-byte**: Retry up to `upstream_idle_retries` (default 2) using connection pool failover. After exhausting retries, return 504 Gateway Timeout.
+- **Mid-stream**: Terminate the client connection (abort the body stream). The client's own retry logic engages. No partial body is ever committed to cache.
+
+**Key Behaviors**:
+- The idle timer is "no bytes for T", not "total transfer > T". A slow-but-progressing transfer is never aborted.
+- During backpressure (cache writer can't keep up), the idle timer is paused — the proxy isn't asking the upstream for more data, so the upstream isn't stalling.
+- An aborted mid-stream fetch never finalizes a partial `.bin` or `.meta`. The incremental writer detects the size mismatch and cleans up the temporary file.
+- The watchdog does NOT apply to download-coordinator wait time (coalesced waiters have their own coordination timeout).
+
+**Metrics**:
+- `upstream_idle_abort_total{phase=mid_stream}`: Mid-stream idle aborts
+- `upstream_idle_abort_total{phase=pre_stream}`: Pre-stream timeout exhaustions
+- `upstream_idle_retry_total`: Pre-stream retry attempts
+
+**Configuration**:
+```yaml
+connection_pool:
+  upstream_first_byte_timeout: "5s"
+  upstream_idle_timeout: "5s"
+  upstream_idle_retries: 2
+```
+
 ## Error Metrics
 
 All error events are tracked via metrics for monitoring and alerting:
@@ -380,6 +451,8 @@ tokio::spawn(async move {
 ## Error Handling Best Practices
 
 ### 1. Always Check Return Values
+
+All internal helpers that can fail return `Result` rather than panicking. For example, `WriteCacheManager::get_metadata_path` returns `Result<PathBuf>` — callers propagate the error through a `match` (log a warning, skip the eviction candidate). This ensures a single corrupted cache key in the eviction queue cannot crash the process.
 
 ```rust
 // Good

@@ -198,6 +198,7 @@ async fn test_store_multipart_part_capacity_bypass() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await?;

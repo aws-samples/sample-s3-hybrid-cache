@@ -612,7 +612,7 @@ impl WriteCacheManager {
     /// Evict a single write-cached object
     async fn evict_write_cached_object(&self, cache_key: &str) -> Result<u64> {
         // Read metadata to get range files
-        let metadata_path = self.get_metadata_path(cache_key);
+        let metadata_path = self.get_metadata_path(cache_key)?;
 
         if !metadata_path.exists() {
             return Err(ProxyError::CacheError(format!(
@@ -655,22 +655,18 @@ impl WriteCacheManager {
 
     /// Get metadata file path for a cache key
     ///
-    /// # Panics
-    /// Panics if cache_key is malformed (missing bucket/object separator).
-    fn get_metadata_path(&self, cache_key: &str) -> PathBuf {
+    /// Returns an error if `cache_key` is malformed (missing bucket/object separator).
+    fn get_metadata_path(&self, cache_key: &str) -> Result<PathBuf> {
         use crate::disk_cache::get_sharded_path;
 
         let base_dir = self.cache_dir.join("metadata");
 
-        match get_sharded_path(&base_dir, cache_key, ".meta") {
-            Ok(path) => path,
-            Err(e) => {
-                panic!(
-                    "Malformed cache key '{}': {}. Cache keys must be in 'bucket/object' format.",
-                    cache_key, e
-                );
-            }
-        }
+        get_sharded_path(&base_dir, cache_key, ".meta").map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Malformed cache key '{}': {}. Cache keys must be in 'bucket/object' format.",
+                cache_key, e
+            ))
+        })
     }
 
     /// Evict incomplete multipart uploads older than TTL

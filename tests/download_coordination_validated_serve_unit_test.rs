@@ -122,6 +122,7 @@ async fn make_cache_infra(
         config.cache.compression_batch_size,
         config.cache.evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
@@ -892,6 +893,7 @@ async fn part_validated_serve_304_serves_cached_part() {
         Arc::clone(&cache_manager),
         Arc::clone(&range_handler),
         s3_client,
+        std::sync::Arc::new(s3_proxy::config::Config::default()),
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
@@ -961,6 +963,7 @@ async fn part_validated_serve_200_serves_s3_body() {
         Arc::clone(&cache_manager),
         Arc::clone(&range_handler),
         s3_client,
+        std::sync::Arc::new(s3_proxy::config::Config::default()),
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
@@ -1028,6 +1031,7 @@ async fn part_validated_serve_403_returns_s3_response() {
         Arc::clone(&cache_manager),
         Arc::clone(&range_handler),
         s3_client,
+        std::sync::Arc::new(s3_proxy::config::Config::default()),
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
@@ -1093,6 +1097,7 @@ async fn part_validated_serve_500_falls_back_to_cache() {
         Arc::clone(&cache_manager),
         Arc::clone(&range_handler),
         s3_client,
+        std::sync::Arc::new(s3_proxy::config::Config::default()),
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
@@ -1142,6 +1147,7 @@ async fn part_validated_serve_metadata_missing_delegates_to_forward() {
         Arc::clone(&cache_manager),
         Arc::clone(&range_handler),
         s3_client,
+        std::sync::Arc::new(s3_proxy::config::Config::default()),
         None,
         &ResolvedSettings::default(),
         &None,
@@ -1405,6 +1411,7 @@ async fn part_fetcher_branch_completes_success_on_2xx() {
         s3_client,
         Arc::clone(&inflight_tracker),
         Arc::clone(&range_handler),
+        std::sync::Arc::new(s3_proxy::config::Config::default()),
         true,
         wait_timeout,
         3,
@@ -1452,6 +1459,7 @@ async fn part_fetcher_branch_completes_error_on_non_2xx() {
         s3_client,
         Arc::clone(&inflight_tracker),
         Arc::clone(&range_handler),
+        std::sync::Arc::new(s3_proxy::config::Config::default()),
         true,
         wait_timeout,
         3,

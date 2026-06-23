@@ -1270,8 +1270,8 @@ function renderLogs(data) {
     const rows = data.entries.map(entry => `
         <tr>
             <td>${formatTimestamp(entry.timestamp)}</td>
-            <td><span class="log-level ${entry.level}">${entry.level}</span></td>
-            <td>${entry.target || ''}</td>
+            <td><span class="log-level ${escapeHtml(entry.level)}">${escapeHtml(entry.level)}</span></td>
+            <td>${escapeHtml(entry.target || '')}</td>
             <td>${escapeHtml(entry.message)}</td>
         </tr>
     `).join('');
@@ -2715,5 +2715,36 @@ mod tests {
 
         assert_eq!(params.limit, Some(50));
         assert_eq!(params.level_filter, Some("ERROR".to_string()));
+    }
+
+    #[test]
+    fn test_dashboard_html_escapes_log_level_and_target() {
+        let handler = StaticFileHandler::new();
+        let js = handler.get_script_js();
+
+        // entry.level must be escaped in both the CSS class and text content
+        assert!(
+            js.contains("${escapeHtml(entry.level)}"),
+            "entry.level must be wrapped in escapeHtml to prevent XSS"
+        );
+        // entry.target must be escaped
+        assert!(
+            js.contains("${escapeHtml(entry.target || '')}"),
+            "entry.target must be wrapped in escapeHtml to prevent XSS"
+        );
+        // entry.message should already be escaped (pre-existing)
+        assert!(
+            js.contains("${escapeHtml(entry.message)}"),
+            "entry.message must remain wrapped in escapeHtml"
+        );
+        // Ensure no raw unescaped entry.level or entry.target in template literals
+        assert!(
+            !js.contains("${entry.level}"),
+            "entry.level must not appear unescaped in the template"
+        );
+        assert!(
+            !js.contains("${entry.target}") && !js.contains("${entry.target ||"),
+            "entry.target must not appear unescaped in the template"
+        );
     }
 }

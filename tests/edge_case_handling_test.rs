@@ -161,6 +161,7 @@ async fn test_bin_file_deletion_on_eviction() {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     // Create a range with .bin file
@@ -254,6 +255,7 @@ async fn test_meta_file_deletion_on_last_range_eviction() {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     // Create a range with .bin file
@@ -347,6 +349,7 @@ async fn test_stale_eviction_lock_handling() {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     // Create a stale eviction lock
@@ -421,6 +424,7 @@ async fn test_multiple_range_eviction_meta_deletion() {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     // Create multiple ranges

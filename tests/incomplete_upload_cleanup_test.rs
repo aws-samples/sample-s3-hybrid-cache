@@ -38,6 +38,7 @@ async fn test_cleanup_incomplete_uploads_basic() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     let path = "/test-bucket/test-object";
@@ -111,6 +112,7 @@ async fn test_cleanup_incomplete_uploads_preserves_recent() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     let path = "/test-bucket/recent-upload";
@@ -168,6 +170,7 @@ async fn test_cleanup_incomplete_uploads_with_parts() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     let path = "/test-bucket/upload-with-parts";
@@ -250,6 +253,7 @@ async fn test_cleanup_incomplete_uploads_preserves_completed() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     let path = "/test-bucket/completed-upload";
@@ -326,6 +330,7 @@ async fn test_cleanup_incomplete_uploads_multiple() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     // Create multiple incomplete uploads
@@ -403,6 +408,7 @@ async fn test_cleanup_incomplete_uploads_integrated_with_maintenance() -> Result
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     let path = "/test-bucket/maintenance-test";
@@ -478,6 +484,7 @@ async fn test_cleanup_incomplete_uploads_bypassed_state() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     let path = "/test-bucket/bypassed-upload";

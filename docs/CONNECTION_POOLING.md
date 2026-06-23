@@ -25,7 +25,7 @@ connection_pool:
   keepalive_idle_secs: 15        # TCP_KEEPIDLE — seconds idle before first probe (default: 15)
   keepalive_interval_secs: 5     # TCP_KEEPINTVL — seconds between probes (default: 5)
   keepalive_retries: 3           # TCP_KEEPCNT — failed probes before dead (default: 3)
-  tcp_recv_buffer_size: 262144   # SO_RCVBUF hint in bytes, null for kernel default (default: 256KB)
+  tcp_recv_buffer_size: null     # SO_RCVBUF hint in bytes; null = kernel auto-tune (default: null)
   ip_failure_threshold: 3        # Consecutive failures before IP exclusion (default: 3)
 ```
 
@@ -39,7 +39,7 @@ connection_pool:
 #### 2. TCP Socket Options (socket2)
 Applied after TCP connect, before TLS handshake on every new connection:
 - **SO_KEEPALIVE**: Detects dead connections at the TCP layer before hyper tries to reuse them. Configured via `keepalive_idle_secs`, `keepalive_interval_secs`, `keepalive_retries`.
-- **SO_RCVBUF**: 256KB receive buffer improves throughput for large object downloads. Configurable via `tcp_recv_buffer_size`.
+- **SO_RCVBUF**: Left unset by default (`tcp_recv_buffer_size: null`) so the Linux kernel auto-tunes the TCP receive window (up to `net.core.rmem_max`). Auto-tuning is required for full single-stream throughput on high-RTT cross-region paths: with a fixed window the bandwidth-delay product caps throughput (e.g. a 256KB window over a 116ms RTT limits a single stream to ~3.9 Mbps, vs ~132 Mbps auto-tuned). Setting an explicit `tcp_recv_buffer_size` pins `SO_RCVBUF`, which **disables** the kernel's dynamic receive-window auto-tuning (DRS) — only override if you have a specific reason.
 - Failures log a warning and continue — socket options are best-effort.
 
 #### 3. IP Health Tracking
@@ -133,3 +133,34 @@ This sets `pool_idle_timeout` and `pool_max_idle_per_host` to 0 in hyper, creati
 - **IP Health Tracking**: Failing IPs excluded from round-robin, auto-recovered on DNS refresh
 - **Streaming**: Connections stay active during streaming, returned to pool after
 - **Retry Logic**: Connection errors trigger retries without counting against limit
+
+### Upstream Idle Watchdog
+
+The proxy detects stalled upstream connections and terminates them rather than waiting for the client's read-timeout (typically 60s). This prevents a single slow or dead upstream from blocking the client indefinitely.
+
+#### Two-phase detection
+
+1. **Pre-first-byte** (`upstream_first_byte_timeout`, default 5s): After the proxy sends a request to S3 (or another upstream), if no response byte arrives within the timeout, the attempt is aborted and retried up to `upstream_idle_retries` times. After exhausting retries, the proxy returns a 504 Gateway Timeout.
+
+2. **Mid-stream** (`upstream_idle_timeout`, default 5s): Once the upstream has started delivering bytes, if no new chunk arrives within the timeout, the proxy terminates the client connection (the body stream ends prematurely). The client's own retry logic engages. A partial response is never committed to cache.
+
+#### Backpressure exclusion
+
+The mid-stream watchdog measures idle time at the upstream-read boundary. When the proxy is not reading from the upstream because the client write half is applying backpressure (slow client → cache channel full), the idle timer is paused. This prevents false aborts on transfers that are making progress on the client side but where the proxy hasn't asked the upstream for more data yet.
+
+#### Configuration
+
+```yaml
+connection_pool:
+  upstream_first_byte_timeout: "5s"  # Connect→first-byte (default: 5s)
+  upstream_idle_timeout: "5s"        # Mid-stream no-bytes watchdog (default: 5s)
+  upstream_idle_retries: 2           # Pre-stream retry budget (default: 2)
+```
+
+#### Coordination wait exclusion
+
+The watchdog timers are armed only after the proxy owns the upstream byte stream. Requests waiting on the download coordinator for another request's in-flight fetch are governed by the coordination wait timeout (~30s), not the idle watchdog.
+
+#### Cache safety
+
+An aborted mid-stream fetch never commits a *truncated full range* to cache — partial bytes are never served as if they satisfied a larger request. As of v2.2.0, however, the proxy does commit the received bytes as a **smaller valid sub-range** when at least `cache.partial_range_commit_ratio` (default `0.5`) of the requested bytes arrived in order before the abort. The incremental writer detects the size shortfall: if the received fraction meets the threshold it renames the temp file with clamped bounds and journals it as a valid sub-range `[start, start + received - 1]`; if it falls below the threshold the temp file is deleted and nothing is cached. See `cache.partial_range_commit_ratio` in `CONFIGURATION.md`.

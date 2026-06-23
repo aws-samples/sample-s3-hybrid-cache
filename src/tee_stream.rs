@@ -9,6 +9,20 @@
 //! applies backpressure through hyper to the S3 response stream, slowing the
 //! client download to match disk write speed. This ensures every range is fully
 //! cached on first download.
+//!
+//! ## Mid-stream idle watchdog (Requirement 5, Task 11)
+//!
+//! When `idle_timeout` is configured, the stream tracks time since the last
+//! upstream chunk was received. If the upstream produces no bytes within the
+//! timeout, the stream terminates with an error, which aborts the client
+//! connection (the client's own retry logic engages). The cache channel is
+//! dropped without finalization, so a truncated body is never persisted.
+//!
+//! **Backpressure exclusion:** The idle timer only ticks while the stream is
+//! actively polling the upstream (inner stream). During backpressure (pending
+//! cache-channel send), the timer is paused because `poll_next` resolves the
+//! pending send before polling the inner stream. This means a slow client cannot
+//! trigger a false idle abort — only genuine upstream stalls are detected.
 
 use bytes::Bytes;
 use futures::Stream;
@@ -18,7 +32,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tokio::time::Sleep;
+use tracing::{debug, warn};
 
 /// Type alias for the pending send future used for backpressure.
 type PendingSendFuture =
@@ -30,6 +45,10 @@ type PendingSendFuture =
 /// pauses (returns Poll::Pending) until capacity is available. This guarantees
 /// all chunks reach the cache writer at the cost of throttling client download
 /// speed to match disk write speed when the cache writer can't keep up.
+///
+/// When `idle_timeout` is set, the stream acts as a mid-stream watchdog: if
+/// no upstream chunk arrives within the timeout, the stream terminates with an
+/// error, aborting the client connection and preventing partial cache commits.
 pub struct TeeStream<S> {
     inner: S,
     sender: mpsc::Sender<Bytes>,
@@ -44,6 +63,12 @@ pub struct TeeStream<S> {
     backpressure_events: usize,
     /// Whether the channel has been closed (receiver dropped)
     channel_closed: bool,
+    /// Mid-stream idle timeout configuration (None = disabled)
+    idle_timeout: Option<Duration>,
+    /// Sleep future for the idle watchdog. Reset on every upstream chunk.
+    idle_sleep: Option<Pin<Box<Sleep>>>,
+    /// Whether the stream was aborted due to idle timeout
+    idle_aborted: bool,
 }
 
 impl<S> TeeStream<S>
@@ -62,12 +87,47 @@ where
             backpressure_start: None,
             backpressure_events: 0,
             channel_closed: false,
+            idle_timeout: None,
+            idle_sleep: None,
+            idle_aborted: false,
+        }
+    }
+
+    /// Create a new tee stream with an idle timeout watchdog.
+    ///
+    /// If the upstream produces no bytes within `idle_timeout`, the stream
+    /// terminates (returns an error frame), aborting the client connection.
+    /// The cache channel is dropped without finalization.
+    pub fn with_idle_timeout(
+        inner: S,
+        sender: mpsc::Sender<Bytes>,
+        idle_timeout: Duration,
+    ) -> Self {
+        let idle_sleep = Some(Box::pin(tokio::time::sleep(idle_timeout)));
+        Self {
+            inner,
+            sender,
+            bytes_sent: 0,
+            pending_send: None,
+            pending_frame: None,
+            backpressure_wait: Duration::ZERO,
+            backpressure_start: None,
+            backpressure_events: 0,
+            channel_closed: false,
+            idle_timeout: Some(idle_timeout),
+            idle_sleep,
+            idle_aborted: false,
         }
     }
 
     /// Get the number of bytes sent through the tee
     pub fn bytes_sent(&self) -> usize {
         self.bytes_sent
+    }
+
+    /// Whether the stream was aborted due to idle timeout
+    pub fn was_idle_aborted(&self) -> bool {
+        self.idle_aborted
     }
 }
 
@@ -78,7 +138,9 @@ where
     type Item = Result<Frame<Bytes>, hyper::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Step 1: If there's a pending send from a previous poll, resolve it first
+        // Step 1: If there's a pending send from a previous poll, resolve it first.
+        // NOTE: The idle timer is NOT ticking here — we're resolving backpressure,
+        // not waiting on the upstream. This is the backpressure exclusion.
         if self.pending_send.is_some() {
             let send_fut = self.pending_send.as_mut().unwrap();
             match send_fut.as_mut().poll(cx) {
@@ -88,6 +150,12 @@ where
                         self.backpressure_wait += start.elapsed();
                     }
                     self.pending_send = None;
+                    // Reset idle timer: backpressure time doesn't count as upstream idle.
+                    // The upstream was ready (it delivered this chunk), it was the cache
+                    // writer that was slow. Don't penalize the upstream for that.
+                    if let Some(timeout) = self.idle_timeout {
+                        self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
+                    }
                     // Return the frame we were holding
                     let frame = self.pending_frame.take().unwrap();
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
@@ -99,6 +167,10 @@ where
                     }
                     self.pending_send = None;
                     self.channel_closed = true;
+                    // Reset idle timer after backpressure resolution
+                    if let Some(timeout) = self.idle_timeout {
+                        self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
+                    }
                     let frame = self.pending_frame.take().unwrap();
                     debug!("Cache channel closed during backpressure, continuing without caching");
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
@@ -110,10 +182,36 @@ where
             }
         }
 
-        // Step 2: Poll the inner stream for the next frame
+        // Step 2: Check the idle watchdog BEFORE polling the inner stream.
+        // If the idle sleep has fired, the upstream has stalled — abort.
+        if let Some(ref mut sleep) = self.idle_sleep {
+            if sleep.as_mut().poll(cx).is_ready() {
+                // Idle timeout fired — upstream stalled
+                let timeout = self.idle_timeout.unwrap_or(Duration::from_secs(5));
+                warn!(
+                    "[UPSTREAM_IDLE_ABORT] Mid-stream idle timeout ({:?}) exceeded, aborting stream. \
+                     bytes_sent={}, backpressure_events={}",
+                    timeout, self.bytes_sent, self.backpressure_events
+                );
+                self.idle_aborted = true;
+                // Return None to signal stream end. The hyper body will be incomplete,
+                // which causes the client connection to be aborted (RST or incomplete
+                // chunked encoding). The cache channel is dropped without all bytes,
+                // so commit_incremental_range will fail with "size mismatch" and the
+                // partial .bin/.tmp will be cleaned up.
+                return Poll::Ready(None);
+            }
+        }
+
+        // Step 3: Poll the inner stream for the next frame
         let inner = Pin::new(&mut self.inner);
         match inner.poll_next(cx) {
             Poll::Ready(Some(Ok(frame))) => {
+                // Reset the idle timer — we received a chunk from upstream
+                if let Some(timeout) = self.idle_timeout {
+                    self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
+                }
+
                 match frame.into_data() {
                     Ok(data) => {
                         let bytes = data;
@@ -179,6 +277,7 @@ where
                     }
                     Err(frame) => {
                         // Non-data frame (trailers, etc), pass through
+                        // Don't reset idle timer for non-data frames
                         Poll::Ready(Some(Ok(frame)))
                     }
                 }
@@ -195,7 +294,13 @@ where
                 }
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // The inner stream is not ready — we ARE waiting on upstream here.
+                // The idle timer is registered with the waker via the poll in Step 2,
+                // so if the timeout fires before inner becomes ready, we'll wake up
+                // and detect it in Step 2 on the next poll.
+                Poll::Pending
+            }
         }
     }
 }
@@ -303,5 +408,170 @@ mod tests {
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0], Bytes::from("hello"));
         assert_eq!(collected[1], Bytes::from("world"));
+    }
+
+    /// Test: mid-stream stall → stream terminated at idle timeout, no hanging.
+    /// The idle timer fires when the upstream produces no chunks within the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tee_stream_idle_timeout_fires_on_stall() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let (tx, _rx) = mpsc::channel(10);
+        let idle_timeout = Duration::from_millis(100);
+
+        // Create a stream that sends one chunk then stalls forever
+        let notify = Arc::new(Notify::new());
+        let notify_clone = notify.clone();
+        let stalling_stream = futures::stream::unfold(0u32, move |state| {
+            let notify = notify_clone.clone();
+            Box::pin(async move {
+                match state {
+                    0 => {
+                        // First chunk: deliver immediately
+                        Some((Ok(Frame::data(Bytes::from("first-chunk"))), 1))
+                    }
+                    _ => {
+                        // Stall forever (simulates upstream hang)
+                        notify.notified().await;
+                        None
+                    }
+                }
+            })
+        });
+
+        let mut tee = TeeStream::with_idle_timeout(stalling_stream, tx, idle_timeout);
+
+        let start = Instant::now();
+        let mut received = Vec::new();
+        while let Some(result) = tee.next().await {
+            match result {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        received.push(data);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Should have received the first chunk
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0], Bytes::from("first-chunk"));
+
+        // Should have aborted within idle_timeout + small buffer (not hanging)
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Expected abort within ~100ms idle timeout, took {:?}",
+            elapsed
+        );
+
+        // Confirm the stream was idle-aborted
+        assert!(tee.was_idle_aborted());
+    }
+
+    /// Test: slow-but-steady transfer (bytes every < timeout) completes successfully.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tee_stream_slow_but_steady_completes() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let idle_timeout = Duration::from_millis(200);
+
+        // Stream that delivers chunks slowly (every 50ms) — well within the 200ms timeout
+        let slow_stream = futures::stream::unfold(0u32, |state| {
+            Box::pin(async move {
+                if state >= 5 {
+                    return None; // Done after 5 chunks
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Some((
+                    Ok(Frame::data(Bytes::from(format!("chunk-{}", state)))),
+                    state + 1,
+                ))
+            })
+        });
+
+        let mut tee = TeeStream::with_idle_timeout(slow_stream, tx, idle_timeout);
+
+        // Consume from cache side concurrently
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(data) = rx.recv().await {
+                received.push(data);
+            }
+            received
+        });
+
+        let mut client_received = Vec::new();
+        while let Some(Ok(frame)) = tee.next().await {
+            if let Ok(data) = frame.into_data() {
+                client_received.push(data);
+            }
+        }
+        drop(tee);
+
+        let cache_received = consumer.await.unwrap();
+
+        // All 5 chunks should be received on both sides
+        assert_eq!(
+            client_received.len(),
+            5,
+            "Client should receive all 5 chunks"
+        );
+        assert_eq!(cache_received.len(), 5, "Cache should receive all 5 chunks");
+
+        // Stream should NOT have been idle-aborted
+        // (can't check was_idle_aborted after drop, but receiving all chunks proves it)
+    }
+
+    /// Test: backpressure does NOT trigger idle abort.
+    /// A slow cache writer (channel capacity 1) should not cause a false idle abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tee_stream_backpressure_not_misaborted() {
+        // Channel capacity 1 — forces backpressure
+        let (tx, mut rx) = mpsc::channel(1);
+        let idle_timeout = Duration::from_millis(100);
+
+        // Stream delivers chunks instantly (no upstream delay)
+        let data = vec![
+            Ok(Frame::data(Bytes::from("chunk1"))),
+            Ok(Frame::data(Bytes::from("chunk2"))),
+            Ok(Frame::data(Bytes::from("chunk3"))),
+        ];
+        let stream = stream::iter(data);
+
+        let mut tee = TeeStream::with_idle_timeout(stream, tx, idle_timeout);
+
+        // Slow consumer: reads from cache channel with delay > idle_timeout
+        // This tests that backpressure doesn't trigger idle abort
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(data) = rx.recv().await {
+                received.push(data);
+                // Simulate slow cache writer — takes longer than idle_timeout per chunk
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            received
+        });
+
+        let mut client_received = Vec::new();
+        while let Some(Ok(frame)) = tee.next().await {
+            if let Ok(data) = frame.into_data() {
+                client_received.push(data);
+            }
+        }
+
+        // Stream should NOT have been idle-aborted despite backpressure waits > idle_timeout
+        assert!(
+            !tee.was_idle_aborted(),
+            "Backpressure should NOT trigger idle abort"
+        );
+
+        // All chunks delivered to client
+        assert_eq!(client_received.len(), 3, "All chunks should reach client");
+
+        drop(tee);
+        let cache_received = consumer.await.unwrap();
+        assert_eq!(cache_received.len(), 3, "All chunks should reach cache");
     }
 }

@@ -5,6 +5,170 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-06-23
+
+A security-hardening pass, cache-metadata-resilience changes, RAM cache sharding
+for throughput, cross-region throughput fixes, and a fix that makes conditional
+ranged-GET downloads — notably the AWS CLI CRT transfer client — populate and serve
+from the cache. The proxy now serves `If-Match` requests from cache by default
+(`evaluate_conditions_from_cache` defaults to `true`). Every config addition has a
+serde default, and the single default change is backward compatible (an explicit
+setting in an existing config is preserved), so existing config files parse and run
+unchanged on upgrade.
+
+### Security
+
+- **[Critical] Multipart uploadId path-traversal prevention**: All three multipart
+  handlers validate the client-supplied `uploadId` with `is_safe_path_component`
+  before any filesystem path construction. A malicious `uploadId` (path separators,
+  `..`, NUL, or control characters) is rejected — the request is forwarded to S3
+  unmodified and all local cache filesystem work is skipped.
+- **[High] systemd unit hardening**: `config/s3-proxy.service` adds sandbox directives
+  (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+  `PrivateDevices`, `ProtectKernelTunables`, `ProtectKernelModules`,
+  `ProtectControlGroups`, `RestrictAddressFamilies`) and a `ReadWritePaths` allowlist
+  scoped to the cache and log directories. The service still runs as `User=root` for
+  port 80/443 binding; see `docs/GETTING_STARTED.md` for the privilege-drop option.
+- **[High] Presigned URL masking in logs**: All `uri` references in log macros are
+  wrapped with `mask_presigned_params()`, so `X-Amz-Credential`, `X-Amz-Signature`,
+  and `X-Amz-Security-Token` are never logged in cleartext. The masking fast-path now
+  also detects percent-encoded leading characters (`%58`/`%78`).
+- **[High] Pre-epoch presigned date rejection**: `parse_amz_date` rejects negative
+  timestamps (dates before 1970-01-01) before the `as u64` cast that would otherwise
+  wrap to a far-future expiry.
+- **[High] Destination policy IP gaps closed**: Block `0.0.0.0/8`, IPv4-mapped IPv6
+  (`::ffff:x.x.x.x`, routed to the IPv4 classifier), and the IPv6 unspecified address
+  (`::`). Closes IMDS/loopback reachability via IPv4-mapped notation or the zero
+  network range.
+- **[High] DNS TOCTOU elimination in TCP proxy**: The SNI passthrough path reuses the
+  policy-validated IPs from `DestinationPolicy::check()` for the outbound connect
+  instead of re-resolving, closing a check-to-connect window. Endpoint-override IPs
+  are also validated before use.
+- **[High] Bounded CompleteMultipartUpload body**: New `cache.max_complete_body_bytes`
+  (default 10 MiB) caps the Complete XML body before buffering; oversized bodies are
+  rejected with HTTP 413.
+- **[High] HTTP-path destination policy**: The HTTP forwarding path applies the same
+  `DestinationPolicy::check` as the CONNECT/SNI paths, blocking SSRF to IMDS,
+  loopback, and private ranges. Gated by `connect_allowlist` — skipped when no
+  allowlist is configured, so general forward-proxy use can opt out. S3 public
+  endpoints always pass.
+- **[Low] Additional hardening**: dashboard log XSS escaping (`level`/`target`);
+  `get_metadata_path` returns `Result` instead of panicking on malformed keys; OTLP
+  headers redacted in config `Debug` output; symlink-safe filesystem writes
+  (`create_new` / `symlink_metadata` checks); range-file path-traversal validation on
+  deserialized metadata; `connection_pool.max_registered_endpoints` cap (default
+  10,000); and access-log CR/LF/quote escaping for `referer`/`user_agent`.
+
+### Added
+
+- **Non-blocking metadata I/O**: `get_metadata` runs filesystem reads and JSON parsing
+  in `spawn_blocking` under a concurrency semaphore (`cache.metadata_io_concurrency`,
+  default 32). This fixes the synchronized 60-second warm-cache stalls where one slow
+  or large NFS `.meta` read pinned worker threads, starving request-serving tasks and
+  preventing the consolidation-cycle timeout from firing. The consolidator's key
+  concurrency is reduced from 64 to 32 to match.
+- **Metadata resilience**: a size cap (`cache.max_metadata_file_bytes`, default 4 MiB)
+  rejects oversized `.meta` files in O(stat) without reading them; confidently-corrupt
+  `.meta` files (oversize, legacy schema, or stable parse failure) self-heal on the
+  GET miss path via atomic tmp+rename (HEAD-only paths remove them). New metrics:
+  `metadata_heal_overwrite_total`, `corruption_metadata_by_reason`.
+- **Per-key consolidation timeout**: each key in a consolidation cycle is bounded by
+  `tokio::time::timeout` so one pathological key cannot consume the whole cycle budget;
+  skipped keys retry on the next cycle.
+- **Mid-stream idle watchdog**: TeeStream enforces `connection_pool.upstream_idle_timeout`
+  (default 5s) — if the upstream produces no bytes within the window the stream is
+  aborted so the client's retry logic engages. Cache-writer backpressure does not trip
+  it, and a partial body is never committed. Metrics:
+  `upstream_idle_abort_total{phase=mid_stream}`, `upstream_idle_retry_total`.
+- **`bind_address` for the health and metrics servers** (default `"0.0.0.0"`): set
+  `"127.0.0.1"` to restrict these endpoints to loopback.
+- **`cache.ram_cache_shard_count`** (default 8, range 1–256): number of independent RAM
+  cache shards. Per-shard capacity = `max_ram_cache_size / ram_cache_shard_count`;
+  objects larger than the per-shard capacity are dropped.
+- **Partial range prefix salvage (`cache.partial_range_commit_ratio`, default 0.5)**:
+  when a streamed range cache write ends early — the client cancelled or the mid-stream
+  idle watchdog aborted the stream — but at least this fraction of the requested bytes
+  arrived in order, the proxy now commits the received prefix as a smaller valid range
+  `[start, start + received - 1]` instead of discarding the whole range. This lets a
+  single high-throughput download (notably the AWS CLI CRT client, which opens many
+  parallel range connections and closes each as soon as it has the bytes it needs)
+  populate the cache even when some part requests are cut short. The salvaged prefix is
+  recorded with its true bounds, so it is never served as a complete range — a later
+  request for the missing tail fetches it from S3 and merges. `1.0` keeps the legacy
+  exact-only behaviour; `0.0` commits any non-empty prefix. This is an intentional
+  refinement of the `cache-metadata-resilience` Req 5 contract: the read path may now
+  persist a *smaller* valid range, but never a truncated range labelled with the full
+  requested length. The write-through PUT path is unchanged — a truncated upload is
+  never cached.
+
+### Performance
+
+- **RAM cache sharding**: replaced the single global mutex with a per-shard
+  `tokio::sync::RwLock` and `Arc<Bytes>` zero-copy reads — `get()` is an O(1) refcount
+  bump and the shard lock is released before decompression. Per-entry `last_accessed`
+  and `access_count` are atomics updated under a read lock, with LRU/TinyLFU reordering
+  deferred to `put()`. In a single-proxy same-AZ benchmark (`c6in.16xlarge` proxy and
+  client, 16 GiB RAM cache, 64 MiB objects), RAM cache-hit throughput rose from ~6.3
+  Gbps to ~56.9 Gbps at 50 concurrent connections (~9×) and now scales approximately
+  linearly with connection count up to the client NIC limit, rather than plateauing at
+  ~6 Gbps from 10 connections onward.
+
+### Changed
+
+- **`evaluate_conditions_from_cache` default changed to `true`**: The proxy now serves `If-Match` requests from cache by default when the cached ETag matches and the data is fully cached. This is the optimal setting for the AWS CLI CRT client (which stamps `If-Match` on every ranged GET) and reduces S3 round trips on cache-warm downloads. Operators who want strict S3-authoritative condition evaluation for every request can opt out with `evaluate_conditions_from_cache: false`. **Backward compatible:** if the field is explicitly set in an existing `config.yaml` or `cache_rules.json`, the explicit value is preserved — only omitted-field installs adopt the new default.
+
+### Fixed
+
+- **Cross-region single-stream throughput cap (TCP receive-window auto-tuning)**: the
+  default `connection_pool.tcp_recv_buffer_size` is now `None`, leaving `SO_RCVBUF`
+  unset so the Linux kernel auto-tunes the TCP receive window (DRS) up to
+  `net.core.rmem_max`. Pinning `SO_RCVBUF` (the old 256 KB default) disabled
+  auto-tuning, freezing the window at ~56 KB and capping a single high-RTT stream at
+  ~3.9 Mbps over a 116 ms RTT; auto-tuning restores ~150 Mbps. Backward compatible —
+  the field remains `Option<usize>` and an explicit value still pins `SO_RCVBUF`.
+- **Download coordination: flight key held until cache commit**: the coordination
+  guard for full-object and range requests is now held until the cache write commits,
+  not released on response construction. Eliminates redundant S3 fetches (and potential
+  502s under CRT load) when a request arrives during the ~1–2s commit window.
+- **Conditional (`If-Match`/`If-None-Match`) requests now populate the cache**: a
+  conditional GET, HEAD, or ranged GET was routed to a non-caching forward path
+  (introduced in ~v1.14.0 with conditional-request handling), so from that release on it
+  was answered from S3 but never written to the cache. The AWS CLI CRT client stamps
+  `If-Match` on every ranged GET of a multi-part download — pinning every part to the
+  single object version it learned from its initial HeadObject, so the download never
+  mixes bytes across versions — so for CRT, the recommended high-throughput client, every
+  ranged GET was conditional and therefore uncached: repeated large-object downloads all
+  ran at the cache-miss rate. Conditional requests are now
+  dispatched by header class. `evaluate_conditions_from_cache = false`:
+  every conditional is forwarded to S3 with all headers intact (SigV4 signature
+  preserved); `200`/`206` is cached; `304`/`412` are forwarded without caching.
+  `evaluate_conditions_from_cache = true`: an `If-Match` request where the cached ETag
+  matches and the data is fully cached is served from cache (the CRT fast path — no S3
+  call, TTL refreshed); `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since`
+  always forward to S3. TTL/version reconciliation: a `200`/`206` is cached under S3's
+  response ETag — if that ETag differs from a stale cached entry, the cache lookup
+  invalidates the old ranges and replaces them with the fresh content; a `304` refreshes
+  the cached entry's TTL only when the `304`'s ETag matches the cached ETag (otherwise
+  the stale entry is invalidated on the next non-conditional miss). Resolves the "CRT
+  large-object caching" known issue.
+
+### Removed
+
+- **Dead inline-body disk write path**: removed `store_cache_entry` and
+  `atomic_write_cache_entry` (and the `compress_cache_entry`, `decompress_cache_entry`,
+  `get_cache_entry`, and `extract_file_extension` helpers used only by them). These
+  serialized the entire `CacheEntry` — including its `body: Option<Vec<u8>>` — into the
+  `.meta` file, the root cause of the 5.4 MB `.meta` files found in the 2026-06-17
+  investigation. Only test code called them; the live write path (`store_range`) writes
+  separate LZ4 `.bin` files and small (~2 KB) `NewCacheMetadata` `.meta` files.
+
+### Documentation
+
+- Dashboard documented as unauthenticated and read-only, with the network-restriction
+  requirement for non-loopback binds and the `127.0.0.1` + SSH-tunnel option for secure
+  remote monitoring (`docs/DASHBOARD.md`, `docs/ARCHITECTURE.md`,
+  `config/config.example.yaml`). No behavior or default change.
+
 ## [2.1.0] - 2026-06-12
 
 ### Added

@@ -124,6 +124,7 @@ async fn make_cache_infra(
         config.cache.compression_batch_size,
         config.cache.evaluate_conditions_from_cache,
         Duration::from_secs(10),
+        64, // ram_cache_shard_count
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
@@ -215,6 +216,8 @@ async fn spawn_proxy_server(
                                     None, // logger_manager
                                     inflight_tracker,
                                     None, // proxy_referer
+                                    None, // destination_policy
+                                    None, // policy_resolver
                                 )
                                 .await
                             }

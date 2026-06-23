@@ -109,9 +109,35 @@ impl PermissionValidator {
             )));
         }
 
-        // Validate write permission by attempting to create a test file
+        // Validate write permission by attempting to create a test file.
+        // Defense-in-depth: refuse if the probe path is a symlink (prevents an
+        // attacker who controls a symlink from redirecting our write outside the
+        // intended directory). Uses create_new semantics so pre-existing files
+        // (including symlinks) cause a failure rather than being followed.
         let test_file = path.join(".permission_test");
-        if let Err(e) = fs::write(&test_file, b"test") {
+
+        // Pre-check: if the path already exists as a symlink, remove it before
+        // probing. A symlink here is unexpected (we control the name) and would
+        // cause create_new to fail — but we want the write probe to succeed on
+        // healthy directories, so we clean up defensively.
+        if let Ok(meta) = fs::symlink_metadata(&test_file) {
+            if meta.file_type().is_symlink() {
+                warn!(
+                    "Symlink detected at permission test path {:?} — removing (defense-in-depth)",
+                    test_file
+                );
+                let _ = fs::remove_file(&test_file);
+            }
+        }
+
+        // Use create_new (O_CREAT|O_EXCL) which refuses to follow symlinks
+        // and fails if the file already exists — no TOCTOU window.
+        let probe_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&test_file);
+
+        if let Err(e) = probe_result {
             error!("{} directory is not writable: {}", dir_type, dir_path_str);
             return Err(ProxyError::ConfigError(format!(
                 "Cannot write to {} directory '{}': {}\n\n\
@@ -123,9 +149,19 @@ impl PermissionValidator {
             )));
         }
 
-        // Clean up test file
-        if let Err(e) = fs::remove_file(&test_file) {
-            warn!("Failed to remove permission test file: {}", e);
+        // Clean up test file — check for symlink before removing (belt and suspenders)
+        match fs::symlink_metadata(&test_file) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                warn!(
+                    "Symlink appeared at permission test path after creation {:?} — skipping removal",
+                    test_file
+                );
+            }
+            _ => {
+                if let Err(e) = fs::remove_file(&test_file) {
+                    warn!("Failed to remove permission test file: {}", e);
+                }
+            }
         }
 
         info!(
@@ -279,5 +315,37 @@ mod tests {
 
         // Run property test with 100 iterations
         quickcheck(property as fn(bool) -> TestResult);
+    }
+
+    /// Symlink planted at the permission-test path must not be followed.
+    /// The write probe uses create_new semantics, so a pre-existing symlink is
+    /// detected and removed rather than written through. The sentinel target file
+    /// must remain untouched.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_not_followed_in_write_probe() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("test_dir");
+        fs::create_dir_all(&dir_path).unwrap();
+
+        // Create a sentinel file outside the test directory
+        let sentinel = temp_dir.path().join("sentinel.txt");
+        fs::write(&sentinel, b"original content").unwrap();
+
+        // Plant a symlink at the exact path the write probe will use
+        let symlink_path = dir_path.join(".permission_test");
+        std::os::unix::fs::symlink(&sentinel, &symlink_path).unwrap();
+
+        // Run validation — it should succeed (directory is writable) and the
+        // symlink should be safely handled
+        let result = PermissionValidator::validate_directory(&dir_path, "Test", false);
+        assert!(result.is_ok(), "validate_directory should succeed");
+
+        // Sentinel must still have its original content — never written through
+        let content = fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(
+            content, "original content",
+            "Sentinel file must not be modified through symlink"
+        );
     }
 }

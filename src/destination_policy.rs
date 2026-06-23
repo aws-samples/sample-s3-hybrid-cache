@@ -60,11 +60,14 @@ impl fmt::Display for RejectionReason {
 /// Classifies whether an IP address falls into a prohibited range.
 ///
 /// Prohibited ranges (per Requirement 1.2):
+/// - 0.0.0.0/8 ("this network" / unspecified)
 /// - 127.0.0.0/8 (loopback)
 /// - 10.0.0.0/8 (private)
 /// - 172.16.0.0/12 (private)
 /// - 192.168.0.0/16 (private)
 /// - 169.254.0.0/16 (link-local)
+/// - ::ffff:0:0/96 (IPv4-mapped — delegates to IPv4 check)
+/// - ::/128 (IPv6 unspecified)
 /// - ::1/128 (IPv6 loopback)
 /// - fe80::/10 (IPv6 link-local)
 /// - fc00::/7 (IPv6 unique local / private)
@@ -78,6 +81,10 @@ pub fn is_prohibited(ip: IpAddr) -> bool {
 /// Check if an IPv4 address is in a prohibited range.
 fn is_prohibited_v4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
+    // 0.0.0.0/8 — "this network" (includes the unspecified address)
+    if octets[0] == 0 {
+        return true;
+    }
     // 127.0.0.0/8 — loopback
     if octets[0] == 127 {
         return true;
@@ -103,6 +110,16 @@ fn is_prohibited_v4(ip: Ipv4Addr) -> bool {
 
 /// Check if an IPv6 address is in a prohibited range.
 fn is_prohibited_v6(ip: Ipv6Addr) -> bool {
+    // IPv4-mapped addresses (::ffff:x.x.x.x) — delegate to IPv4 classification.
+    // Uses `to_ipv4_mapped()` (stable since Rust 1.75) which only matches the
+    // ::ffff:0:0/96 form, NOT the deprecated ::x.x.x.x compat form.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_prohibited_v4(v4);
+    }
+    // :: — unspecified address
+    if ip == Ipv6Addr::UNSPECIFIED {
+        return true;
+    }
     // ::1/128 — loopback
     if ip == Ipv6Addr::LOCALHOST {
         return true;
@@ -157,6 +174,11 @@ impl DestinationPolicy {
             connect_allowlist,
             endpoint_override_ips,
         }
+    }
+
+    /// Returns the allowed port for this policy.
+    pub fn allowed_port(&self) -> u16 {
+        self.allowed_port
     }
 
     /// Check whether a destination (host:port) is allowed.
@@ -357,7 +379,6 @@ mod tests {
     fn test_public_v6_allowed() {
         assert!(!is_prohibited("2001:db8::1".parse().unwrap()));
         assert!(!is_prohibited("2600:1f18::1".parse().unwrap())); // AWS
-        assert!(!is_prohibited("::".parse().unwrap())); // unspecified, not prohibited
     }
 
     // =========================================================================
@@ -532,6 +553,43 @@ mod tests {
     }
 
     // =========================================================================
+    // Destination-policy IP gap closure tests (Req 3)
+    // =========================================================================
+
+    #[test]
+    fn test_zero_network_v4_prohibited() {
+        // 0.0.0.0/8 — "this network" range
+        assert!(is_prohibited("0.0.0.0".parse().unwrap()));
+        assert!(is_prohibited("0.1.2.3".parse().unwrap()));
+        assert!(is_prohibited("0.255.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_v6_prohibited() {
+        // ::ffff:169.254.169.254 — IPv4-mapped link-local (IMDS)
+        assert!(is_prohibited("::ffff:169.254.169.254".parse().unwrap()));
+        // ::ffff:127.0.0.1 — IPv4-mapped loopback
+        assert!(is_prohibited("::ffff:127.0.0.1".parse().unwrap()));
+        // ::ffff:10.0.0.1 — IPv4-mapped private
+        assert!(is_prohibited("::ffff:10.0.0.1".parse().unwrap()));
+        // ::ffff:0.0.0.0 — IPv4-mapped "this network"
+        assert!(is_prohibited("::ffff:0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_v6_public_allowed() {
+        // ::ffff:52.216.100.1 — IPv4-mapped public IP should pass
+        assert!(!is_prohibited("::ffff:52.216.100.1".parse().unwrap()));
+        assert!(!is_prohibited("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_unspecified_v6_prohibited() {
+        // :: — the IPv6 unspecified address
+        assert!(is_prohibited("::".parse().unwrap()));
+    }
+
+    // =========================================================================
     // Property-based tests (quickcheck)
     // =========================================================================
     //
@@ -547,7 +605,7 @@ mod tests {
     impl Arbitrary for ArbitraryIpAddr {
         fn arbitrary(g: &mut Gen) -> Self {
             // Generate a mix of IPv4 and IPv6, biased toward interesting ranges
-            let choice = u8::arbitrary(g) % 10;
+            let choice = u8::arbitrary(g) % 13;
             let ip = match choice {
                 // Prohibited IPv4 ranges (generate more of these to exercise the boundary)
                 0 => IpAddr::V4(Ipv4Addr::new(
@@ -570,16 +628,25 @@ mod tests {
                 )),
                 3 => IpAddr::V4(Ipv4Addr::new(192, 168, u8::arbitrary(g), u8::arbitrary(g))),
                 4 => IpAddr::V4(Ipv4Addr::new(169, 254, u8::arbitrary(g), u8::arbitrary(g))),
+                // 0.0.0.0/8 — "this network"
+                5 => IpAddr::V4(Ipv4Addr::new(
+                    0,
+                    u8::arbitrary(g),
+                    u8::arbitrary(g),
+                    u8::arbitrary(g),
+                )),
                 // Public IPv4
-                5 | 6 => IpAddr::V4(Ipv4Addr::new(
+                6 | 7 => IpAddr::V4(Ipv4Addr::new(
                     u8::arbitrary(g),
                     u8::arbitrary(g),
                     u8::arbitrary(g),
                     u8::arbitrary(g),
                 )),
                 // Prohibited IPv6
-                7 => IpAddr::V6(Ipv6Addr::LOCALHOST),
-                8 => {
+                8 => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                // :: unspecified
+                9 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                10 => {
                     // fe80::/10 or fc00::/7
                     let prefix = if bool::arbitrary(g) {
                         0xFE80
@@ -596,6 +663,16 @@ mod tests {
                         u16::arbitrary(g),
                         u16::arbitrary(g),
                     ))
+                }
+                // IPv4-mapped IPv6 (::ffff:x.x.x.x)
+                11 => {
+                    let v4 = Ipv4Addr::new(
+                        u8::arbitrary(g),
+                        u8::arbitrary(g),
+                        u8::arbitrary(g),
+                        u8::arbitrary(g),
+                    );
+                    IpAddr::V6(v4.to_ipv6_mapped())
                 }
                 // Public IPv6
                 _ => IpAddr::V6(Ipv6Addr::new(

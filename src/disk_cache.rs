@@ -4,15 +4,14 @@
 //! Supports shared cache coordination for multi-instance deployments.
 
 use crate::cache_hit_update_buffer::CacheHitUpdateBuffer;
-use crate::cache_types::{CacheEntry, CacheMetadata, CompressionInfo};
 use crate::compression::CompressionHandler;
 use crate::hybrid_metadata_writer::{HybridMetadataWriter, WriteMode};
+use crate::path_safety::is_safe_relative_file_path;
 use crate::{ProxyError, Result};
 use fs2::FileExt;
 use futures::stream;
 use futures::StreamExt;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
@@ -20,6 +19,243 @@ use tracing::{debug, error, info, warn};
 
 /// Maximum concurrent file deletes within a single batch_delete_ranges() call
 const FILE_CONCURRENCY_LIMIT: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Metadata read outcome types (Task 1: non-blocking metadata read+parse)
+// ---------------------------------------------------------------------------
+
+/// Reason a `.meta` file is classified as confidently corrupt (safe to heal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CorruptReason {
+    /// File exceeds `max_metadata_file_bytes` — rejected without reading the body.
+    Oversize,
+    /// File matches the legacy `CacheEntry` schema (inline body, no `object_metadata`).
+    /// Detected when JSON has `body` + `is_put_cached` keys but no `object_metadata`.
+    Legacy,
+    /// File fails to parse as `NewCacheMetadata` after bounded retries and the file
+    /// size is stable (not actively being written).
+    ParseFailure,
+}
+
+/// Outcome of a synchronous metadata read+parse attempt.
+#[derive(Debug)]
+pub enum MetadataReadOutcome {
+    /// Successfully parsed a valid `NewCacheMetadata`.
+    Parsed(Box<crate::cache_types::NewCacheMetadata>),
+    /// File does not exist on disk.
+    Missing,
+    /// File is empty or unreadable after bounded retries — likely a transient
+    /// mid-write on shared storage. Do NOT heal (next request will likely succeed).
+    TransientMiss,
+    /// File is confidently corrupt and should be healed via the Req 3 path.
+    Corrupt { reason: CorruptReason },
+}
+
+/// Result of a classified metadata lookup.
+///
+/// Exposes the corruption flag so callers (e.g. the GET miss path in `cache.rs`)
+/// can trigger the overwrite-in-place heal when `corrupt == true`.
+///
+/// Spec: cache-metadata-resilience Req 3, Task 6
+#[derive(Debug)]
+pub struct MetadataLookup {
+    /// Parsed metadata, or `None` on miss/corrupt.
+    pub meta: Option<crate::cache_types::NewCacheMetadata>,
+    /// `true` when the `.meta` file was classified as confidently corrupt
+    /// (oversize, legacy, or stable parse failure). The caller should ensure
+    /// the corrupt file is overwritten after a successful S3 fetch.
+    pub corrupt: bool,
+    /// The specific corruption reason, if `corrupt == true`.
+    pub corrupt_reason: Option<CorruptReason>,
+}
+
+/// Synchronous, blocking metadata read+parse helper.
+///
+/// Designed to run inside `tokio::task::spawn_blocking` so that filesystem I/O
+/// and CPU-bound JSON deserialization stay off the async worker threads.
+///
+/// # Classification logic
+///
+/// 1. `stat` the file; if missing → `Missing`.
+/// 2. If `len > cap` → `Corrupt{Oversize}` (no read).
+/// 3. Read with bounded retries for empty/stale-handle conditions.
+/// 4. If still empty after retries → `TransientMiss`.
+/// 5. Parse as `NewCacheMetadata` with bounded retries (re-read on failure).
+/// 6. If parse fails and file size is stable across retries → `Corrupt{ParseFailure}`.
+/// 7. If parse fails but file size changed → `TransientMiss` (mid-write).
+///
+/// Legacy detection (`Corrupt{Legacy}`) detects files matching the old `CacheEntry` schema
+/// (has `body` + `is_put_cached`, lacks `object_metadata`). This is bounded because oversize
+/// files are already rejected by the cap before any parse attempt.
+pub fn read_and_parse_metadata_blocking(path: &Path, cap: u64) -> MetadataReadOutcome {
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY_MS: u64 = 50;
+
+    // Step 1: stat the file
+    let file_metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return MetadataReadOutcome::Missing;
+            }
+            // Other stat errors (permission, etc.) — treat as transient
+            warn!(
+                "[METADATA_BLOCKING] Failed to stat metadata file: path={:?}, error={}",
+                path, e
+            );
+            return MetadataReadOutcome::TransientMiss;
+        }
+    };
+
+    let initial_size = file_metadata.len();
+
+    // Step 2: size cap check
+    if initial_size > cap {
+        warn!(
+            "[METADATA_BLOCKING] Metadata file exceeds size cap: path={:?}, size={}, cap={}",
+            path, initial_size, cap
+        );
+        return MetadataReadOutcome::Corrupt {
+            reason: CorruptReason::Oversize,
+        };
+    }
+
+    // Step 3: read with bounded retries for empty/stale-handle
+    let content: String;
+    let mut read_attempts = 0u32;
+
+    loop {
+        read_attempts += 1;
+        match std::fs::read_to_string(path) {
+            Ok(c) => {
+                if c.is_empty() && read_attempts <= MAX_RETRIES {
+                    // Empty file — likely transient mid-write on shared storage
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        RETRY_DELAY_MS * read_attempts as u64,
+                    ));
+                    continue;
+                }
+                content = c;
+                break;
+            }
+            Err(e) => {
+                // Check for stale file handle (ESTALE) or NotFound (deleted between stat and read)
+                let is_stale = e.raw_os_error() == Some(116)
+                    || e.to_string().contains("stale file handle")
+                    || e.to_string().contains("ESTALE");
+                let is_not_found = e.kind() == std::io::ErrorKind::NotFound;
+
+                if is_not_found {
+                    return MetadataReadOutcome::Missing;
+                }
+
+                if is_stale && read_attempts <= MAX_RETRIES {
+                    warn!(
+                        "[METADATA_BLOCKING] Stale file handle, retrying: path={:?}, attempt={}/{}, error={}",
+                        path, read_attempts, MAX_RETRIES, e
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        RETRY_DELAY_MS * read_attempts as u64,
+                    ));
+                    continue;
+                }
+
+                // Exhausted retries or non-stale error — transient miss
+                warn!(
+                    "[METADATA_BLOCKING] Failed to read metadata file after retries: path={:?}, error={}",
+                    path, e
+                );
+                return MetadataReadOutcome::TransientMiss;
+            }
+        }
+    }
+
+    // Step 4: still empty after retries
+    if content.is_empty() {
+        warn!(
+            "[METADATA_BLOCKING] Metadata file still empty after retries: path={:?}",
+            path
+        );
+        return MetadataReadOutcome::TransientMiss;
+    }
+
+    // Step 5+6: parse with bounded retries
+    let mut parse_attempts = 0u32;
+    let mut current_content = content;
+
+    loop {
+        parse_attempts += 1;
+        match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&current_content) {
+            Ok(meta) => {
+                return MetadataReadOutcome::Parsed(Box::new(meta));
+            }
+            Err(_e) => {
+                if parse_attempts < MAX_RETRIES {
+                    // Might be a partial read during in-progress write — retry
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        RETRY_DELAY_MS * parse_attempts as u64,
+                    ));
+
+                    // Re-read the file
+                    match std::fs::read_to_string(path) {
+                        Ok(new_content) => {
+                            current_content = new_content;
+                            continue;
+                        }
+                        Err(_) => {
+                            // Can't re-read; continue with old content for next attempt
+                            continue;
+                        }
+                    }
+                }
+
+                // All retries exhausted. Classify based on file size stability.
+                // If the file size is unchanged, the parse failure is stable → corrupt.
+                // If the file size changed, it's likely mid-write → transient.
+                let current_size = std::fs::metadata(path)
+                    .map(|m| m.len())
+                    .unwrap_or(initial_size);
+
+                if current_size == initial_size {
+                    // Size stable across retry window → confident corruption.
+                    // Before returning ParseFailure, check for legacy CacheEntry schema.
+                    // Legacy markers: has "body" + "is_put_cached", lacks "object_metadata".
+                    if let Ok(serde_json::Value::Object(ref obj)) =
+                        serde_json::from_str::<serde_json::Value>(&current_content)
+                    {
+                        if obj.contains_key("body")
+                            && obj.contains_key("is_put_cached")
+                            && !obj.contains_key("object_metadata")
+                        {
+                            warn!(
+                                "[METADATA_BLOCKING] Legacy CacheEntry detected: path={:?}, size={}",
+                                path, current_size
+                            );
+                            return MetadataReadOutcome::Corrupt {
+                                reason: CorruptReason::Legacy,
+                            };
+                        }
+                    }
+
+                    warn!(
+                        "[METADATA_BLOCKING] Stable parse failure (size unchanged): path={:?}, size={}",
+                        path, current_size
+                    );
+                    return MetadataReadOutcome::Corrupt {
+                        reason: CorruptReason::ParseFailure,
+                    };
+                } else {
+                    // Size changed — file is being written; treat as transient
+                    warn!(
+                        "[METADATA_BLOCKING] Parse failure but size changed (mid-write?): path={:?}, initial_size={}, current_size={}",
+                        path, initial_size, current_size
+                    );
+                    return MetadataReadOutcome::TransientMiss;
+                }
+            }
+        }
+    }
+}
 
 /// State for an in-progress incremental range write to disk cache.
 /// Created by `begin_incremental_range_write()`, consumed by `commit_incremental_range()` or `abort_incremental_range()`.
@@ -99,6 +335,22 @@ pub struct DiskCacheManager {
     /// LZ4 frame once the buffer reaches this size. Plumbed from `CacheConfig::compression_batch_size`.
     /// See the `cache-miss-throughput` spec, Requirement 5.1.
     compression_batch_size: usize,
+    /// Semaphore bounding concurrent blocking metadata I/O operations.
+    /// Shared across both request-path and consolidation-path metadata reads.
+    /// Spec: cache-metadata-resilience Req 1
+    metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Maximum .meta file size before classifying as corrupt/oversized.
+    /// Plumbed from `CacheConfig::max_metadata_file_bytes`.
+    /// Spec: cache-metadata-resilience Req 3/4
+    max_metadata_file_bytes: u64,
+    /// Minimum received fraction (0.0–1.0) of an incomplete range to salvage as a
+    /// clamped sub-range on the read/GET commit path. `1.0` = exact-only (the
+    /// default for an unconfigured manager, preserving legacy behaviour); the
+    /// configured path sets it from `CacheConfig::partial_range_commit_ratio`
+    /// (default 0.5). Only consulted by `commit_incremental_range`; the PUT
+    /// write-cache path passes `None` to `finalize_incremental_range`.
+    /// Spec: crt-conditional-range-caching Req 2
+    partial_range_commit_ratio: f64,
 }
 
 impl DiskCacheManager {
@@ -123,7 +375,41 @@ impl DiskCacheManager {
             cache_hit_update_buffer: None,
             journal_consolidator: None,
             compression_batch_size,
+            metadata_io_semaphore: Arc::new(tokio::sync::Semaphore::new(32)),
+            max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default
+            partial_range_commit_ratio: 1.0,          // exact-only until configured (legacy)
         }
+    }
+
+    /// Configure the partial-range commit ratio (read/GET path) from CacheConfig.
+    /// `1.0` = exact-only; lower allows salvaging a received prefix of an
+    /// incomplete range. Called by `CacheManager::create_configured_disk_cache_manager`.
+    /// Spec: crt-conditional-range-caching Req 2
+    pub fn set_partial_range_commit_ratio(&mut self, ratio: f64) {
+        self.partial_range_commit_ratio = ratio;
+    }
+
+    /// Configure metadata I/O limits from CacheConfig.
+    ///
+    /// Sets the size cap and concurrency semaphore for metadata reads.
+    /// Called by `CacheManager::create_configured_disk_cache_manager`.
+    pub fn set_metadata_config(
+        &mut self,
+        max_metadata_file_bytes: u64,
+        metadata_io_concurrency: usize,
+    ) {
+        self.max_metadata_file_bytes = max_metadata_file_bytes;
+        self.metadata_io_semaphore = Arc::new(tokio::sync::Semaphore::new(metadata_io_concurrency));
+    }
+
+    /// Get the metadata I/O semaphore (for use by the consolidator path).
+    pub fn metadata_io_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.metadata_io_semaphore
+    }
+
+    /// Get the max metadata file bytes cap.
+    pub fn max_metadata_file_bytes(&self) -> u64 {
+        self.max_metadata_file_bytes
     }
 
     /// Set metrics manager for recording metrics
@@ -380,119 +666,6 @@ impl DiskCacheManager {
         Ok(())
     }
 
-    /// Store cache entry to disk with compression
-    pub async fn store_cache_entry(
-        &mut self,
-        cache_key: &str,
-        response: &[u8],
-        metadata: CacheMetadata,
-    ) -> Result<()> {
-        debug!("Storing cache entry to disk for key: {}", cache_key);
-
-        // Create cache entry
-        let now = SystemTime::now();
-        let mut cache_entry = CacheEntry {
-            cache_key: cache_key.to_string(),
-            headers: HashMap::new(),
-            body: Some(response.to_vec()),
-            ranges: Vec::new(),
-            metadata,
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600), // 1 hour default
-            metadata_expires_at: now + std::time::Duration::from_secs(3600), // 1 hour default
-            compression_info: CompressionInfo::default(),
-        };
-
-        // Apply compression
-        self.compress_cache_entry(&mut cache_entry)?;
-
-        // Get file paths
-        let cache_file_path = self.get_cache_file_path(cache_key);
-        let metadata_file_path = self.get_metadata_file_path(cache_key);
-
-        // Perform atomic write
-        self.atomic_write_cache_entry(&cache_entry, &cache_file_path, &metadata_file_path)
-            .await?;
-
-        info!(
-            "Successfully stored cache entry to disk for key: {}",
-            cache_key
-        );
-        Ok(())
-    }
-
-    /// Retrieve cache entry from disk with decompression
-    pub async fn get_cache_entry(&self, cache_key: &str) -> Result<Option<CacheEntry>> {
-        debug!("Retrieving cache entry from disk for key: {}", cache_key);
-
-        let cache_file_path = self.get_cache_file_path(cache_key);
-        let metadata_file_path = self.get_metadata_file_path(cache_key);
-
-        // Try to read metadata directly (no .exists() check to avoid NFS directory caching)
-        let _content = match std::fs::read_to_string(&metadata_file_path) {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                debug!(
-                    "Cache miss for key: {} (metadata file not found)",
-                    cache_key
-                );
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(ProxyError::CacheError(format!(
-                    "Failed to read metadata: {}",
-                    e
-                )));
-            }
-        };
-
-        // Read metadata
-        let metadata_content = match std::fs::read_to_string(&metadata_file_path) {
-            Ok(content) => content,
-            Err(e) => {
-                warn!("Failed to read metadata file for key {}: {}", cache_key, e);
-                return Ok(None);
-            }
-        };
-
-        let mut cache_entry: CacheEntry = match serde_json::from_str(&metadata_content) {
-            Ok(entry) => entry,
-            Err(e) => {
-                warn!(
-                    "Failed to deserialize metadata for key {}: {}",
-                    cache_key, e
-                );
-                return Ok(None);
-            }
-        };
-
-        // Check expiration
-        if SystemTime::now() > cache_entry.expires_at {
-            debug!("Cache entry expired for key: {}", cache_key);
-            let _ = self.invalidate_cache_entry(cache_key).await;
-            return Ok(None);
-        }
-
-        // Read cache data
-        if cache_entry.body.is_some() {
-            match std::fs::read(&cache_file_path) {
-                Ok(cache_data) => {
-                    cache_entry.body = Some(cache_data);
-                }
-                Err(e) => {
-                    warn!("Failed to read cache file for key {}: {}", cache_key, e);
-                    return Ok(None);
-                }
-            }
-        }
-
-        // Decompress
-        self.decompress_cache_entry(&mut cache_entry)?;
-
-        debug!("Cache hit on disk for key: {}", cache_key);
-        Ok(Some(cache_entry))
-    }
-
     /// Invalidate cache entry by removing files
     ///
     /// This method removes both metadata and all associated range files for a cache entry.
@@ -684,42 +857,6 @@ impl DiskCacheManager {
         Ok(())
     }
 
-    /// Compress cache entry data
-    fn compress_cache_entry(&mut self, entry: &mut CacheEntry) -> Result<()> {
-        if let Some(body) = &entry.body {
-            let path = self.extract_path_from_cache_key(&entry.cache_key);
-            let result = self
-                .compression_handler
-                .compress_content_aware_with_metadata(body, &path);
-
-            entry.body = Some(result.data);
-            entry.compression_info.body_algorithm = result.algorithm;
-            entry.compression_info.original_size = Some(result.original_size);
-            entry.compression_info.compressed_size = Some(result.compressed_size);
-            entry.compression_info.file_extension = Some(self.extract_file_extension(&path));
-        }
-        Ok(())
-    }
-
-    /// Decompress cache entry data
-    fn decompress_cache_entry(&self, entry: &mut CacheEntry) -> Result<()> {
-        if let Some(body) = &entry.body {
-            match self
-                .compression_handler
-                .decompress_with_algorithm(body, entry.compression_info.body_algorithm.clone())
-            {
-                Ok(decompressed_body) => {
-                    entry.body = Some(decompressed_body);
-                }
-                Err(e) => {
-                    error!("Failed to decompress cache entry body: {}", e);
-                    return Err(e);
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Get cache file path for a given cache key
     fn get_cache_file_path(&self, cache_key: &str) -> PathBuf {
         let cache_type = self.determine_cache_type(cache_key);
@@ -756,56 +893,6 @@ impl DiskCacheManager {
         self.sanitize_cache_key_new(cache_key)
     }
 
-    /// Perform atomic write operation for cache entry
-    async fn atomic_write_cache_entry(
-        &self,
-        cache_entry: &CacheEntry,
-        cache_file_path: &PathBuf,
-        metadata_file_path: &PathBuf,
-    ) -> Result<()> {
-        // Create parent directories if they don't exist
-        if let Some(parent) = cache_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create cache directory: {}", e))
-            })?;
-        }
-
-        // Also create parent directories for metadata file
-        if let Some(parent) = metadata_file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create metadata directory: {}", e))
-            })?;
-        }
-
-        // Write to temporary files first for atomic operation
-        let temp_cache_file = cache_file_path.with_extension("cache.tmp");
-        let temp_metadata_file = metadata_file_path.with_extension("meta.tmp");
-
-        // Write cache data
-        if let Some(body) = &cache_entry.body {
-            std::fs::write(&temp_cache_file, body).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to write cache file: {}", e))
-            })?;
-        }
-
-        // Write metadata
-        let metadata_json = serde_json::to_string_pretty(cache_entry).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to serialize cache metadata: {}", e))
-        })?;
-        std::fs::write(&temp_metadata_file, metadata_json)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to write metadata file: {}", e)))?;
-
-        // Atomic rename operations
-        std::fs::rename(&temp_cache_file, cache_file_path)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to rename cache file: {}", e)))?;
-        std::fs::rename(&temp_metadata_file, metadata_file_path).map_err(|e| {
-            ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
-        })?;
-
-        debug!("Atomically wrote cache entry to: {:?}", cache_file_path);
-        Ok(())
-    }
-
     /// Extract path from cache key for content-aware compression
     fn extract_path_from_cache_key(&self, cache_key: &str) -> String {
         // Cache keys are in new format: path or path:version:id or path:part:num etc.
@@ -816,16 +903,6 @@ impl DiskCacheManager {
         } else {
             cache_key.to_string()
         }
-    }
-
-    /// Extract file extension from path
-    fn extract_file_extension(&self, path: &str) -> String {
-        if let Some(last_segment) = path.split('/').next_back() {
-            if let Some(dot_pos) = last_segment.rfind('.') {
-                return last_segment[dot_pos + 1..].to_lowercase();
-            }
-        }
-        String::new()
     }
 
     // ============================================================================
@@ -1397,17 +1474,24 @@ impl DiskCacheManager {
                             }
                         }
                         Err(e) => {
-                            error!(
-                                "Failed to parse existing metadata: key={}, path={:?}, error={}",
+                            // Spec: cache-metadata-resilience Req 3, Task 6
+                            // Existing .meta is corrupt — create fresh metadata instead of
+                            // failing. This is the heal path: store_range will overwrite
+                            // the corrupt file with a valid one via atomic tmp+rename below.
+                            warn!(
+                                "[METADATA_HEAL] Existing metadata unparseable during store_range, creating fresh: key={}, path={:?}, error={}",
                                 cache_key, metadata_file_path, e
                             );
-                            // Clean up temp range file and release lock
-                            let _ = lock_file.unlock();
-                            let _ = std::fs::remove_file(&range_tmp_path);
-                            return Err(ProxyError::CacheError(format!(
-                                "Corrupted metadata file: {}",
-                                e
-                            )));
+                            let now = SystemTime::now();
+                            NewCacheMetadata {
+                                cache_key: cache_key.to_string(),
+                                object_metadata: object_metadata.clone(),
+                                ranges: Vec::new(),
+                                created_at: now,
+                                expires_at: now + ttl,
+                                compression_info: crate::cache_types::CompressionInfo::default(),
+                                ..Default::default()
+                            }
                         }
                     }
                 }
@@ -1627,12 +1711,16 @@ impl DiskCacheManager {
         let tmp_filename = format!("{}.{:08x}.tmp", stem, random_suffix);
         let tmp_path = range_file_path.with_file_name(tmp_filename);
 
-        let file = std::fs::File::create(&tmp_path).map_err(|e| {
-            ProxyError::CacheError(format!(
-                "Failed to create incremental tmp file {:?}: {}",
-                tmp_path, e
-            ))
-        })?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_CREAT|O_EXCL — refuses symlinks and pre-existing files
+            .open(&tmp_path)
+            .map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to create incremental tmp file {:?}: {}",
+                    tmp_path, e
+                ))
+            })?;
 
         let content_path = self.extract_path_from_cache_key(cache_key);
 
@@ -1760,8 +1848,12 @@ impl DiskCacheManager {
 
         // Finalize the bytes (flush residual batch, validate length, publish the
         // `.bin`). Shared with the no-journal write-cache path so both produce
-        // byte-identical range files.
-        let (range_spec, range_already_existed) = self.finalize_incremental_range(writer)?;
+        // byte-identical range files. The read/GET path passes the configured
+        // partial-range commit ratio so a received prefix of an incomplete range is
+        // salvaged as a clamped sub-range (crt-conditional-range-caching Req 2);
+        // the PUT write-cache path passes `None` (exact-only).
+        let (range_spec, range_already_existed) =
+            self.finalize_incremental_range(writer, Some(self.partial_range_commit_ratio))?;
         let (start, end, compressed_size) =
             (range_spec.start, range_spec.end, range_spec.compressed_size);
 
@@ -1813,6 +1905,18 @@ impl DiskCacheManager {
     /// the published file and whether the final `.bin` already existed (so a
     /// size-tracking caller can avoid double-counting an overwrite).
     ///
+    /// `min_commit_ratio` controls partial-prefix salvage on the read/GET path
+    /// (crt-conditional-range-caching Req 2):
+    /// - `None` → exact-only: a byte count `!= end - start + 1` is an error and the
+    ///   `.tmp` is discarded. Used by the PUT write-cache path (a truncated upload
+    ///   must never be cached as object content).
+    /// - `Some(r)` → if the received byte count is in `[r * expected, expected)` and
+    ///   `> 0`, the contiguous prefix is committed as a **clamped** sub-range
+    ///   `[start, start + received - 1]` (range file renamed + `RangeSpec` built with
+    ///   the clamped end). Bytes arrive in order on a single upstream connection, so
+    ///   the prefix is exactly the object's bytes for the clamped range. Below the
+    ///   ratio (or zero), the `.tmp` is discarded and an error is returned.
+    ///
     /// `commit_incremental_range` uses this for the byte-finalize step and then
     /// writes the journal entry + size deltas. The write-cache PUT path
     /// (`CacheManager::store_put_as_write_cached_range_with_ttl` via
@@ -1823,6 +1927,7 @@ impl DiskCacheManager {
     pub(crate) fn finalize_incremental_range(
         &self,
         mut writer: IncrementalRangeWriter,
+        min_commit_ratio: Option<f64>,
     ) -> Result<(crate::cache_types::RangeSpec, bool)> {
         use crate::cache_types::RangeSpec;
         use std::io::Write;
@@ -1840,12 +1945,39 @@ impl DiskCacheManager {
 
         let expected_size = writer.end - writer.start + 1;
         if writer.bytes_written != expected_size {
-            // Size mismatch — clean up and return error
-            let _ = std::fs::remove_file(&writer.tmp_path);
-            return Err(ProxyError::CacheError(format!(
-                "Incremental write size mismatch: expected {} bytes, got {} (likely caused by cache channel backpressure — disk I/O slower than S3 download)",
-                expected_size, writer.bytes_written
-            )));
+            // Incomplete range. Decide whether to salvage the received contiguous
+            // prefix as a clamped sub-range (read/GET path) or discard it (exact-only).
+            let salvage_prefix = match min_commit_ratio {
+                Some(ratio) if writer.bytes_written > 0 && writer.bytes_written < expected_size => {
+                    (writer.bytes_written as f64) >= ratio * (expected_size as f64)
+                }
+                _ => false,
+            };
+
+            if !salvage_prefix {
+                // Below threshold, zero bytes, or exact-only caller — clean up and error.
+                let _ = std::fs::remove_file(&writer.tmp_path);
+                return Err(ProxyError::CacheError(format!(
+                    "Incremental write size mismatch: expected {} bytes, got {} (likely caused by cache channel backpressure — disk I/O slower than S3 download)",
+                    expected_size, writer.bytes_written
+                )));
+            }
+
+            // Salvage: clamp the range end to the contiguous prefix actually
+            // received. The bytes are in order (single upstream connection), so the
+            // first `bytes_written` bytes are exactly the object's bytes for
+            // [start, clamped_end]. Recompute the final path so the `.bin` filename
+            // encodes the clamped end (the read path locates ranges by filename).
+            let clamped_end = writer.start + writer.bytes_written - 1;
+            let clamped_final_path =
+                self.get_new_range_file_path(&writer.cache_key, writer.start, clamped_end);
+            info!(
+                "Partial range commit: salvaging prefix {}/{} bytes for key={}, requested range {}-{} clamped to {}-{}",
+                writer.bytes_written, expected_size, writer.cache_key,
+                writer.start, writer.end, writer.start, clamped_end
+            );
+            writer.end = clamped_end;
+            writer.final_path = clamped_final_path;
         }
 
         // Flush file to ensure all buffered data reaches the NFS write cache.
@@ -2066,11 +2198,14 @@ impl DiskCacheManager {
     ///
     /// This method:
     /// 1. Reads only the metadata file (no range data loaded)
-    /// 2. Parses JSON to NewCacheMetadata structure
+    /// 2. Parses JSON to NewCacheMetadata structure via spawn_blocking (off async runtime)
     /// 3. Handles corrupted metadata gracefully (returns None, logs error)
     /// 4. Returns None if metadata file doesn't exist
     /// 5. Checks expiration and returns None if expired
     /// 6. Records metrics for corruption events
+    ///
+    /// Spec: cache-metadata-resilience Req 1 — blocking I/O runs in spawn_blocking
+    /// with a semaphore-bounded concurrency limit.
     pub async fn get_metadata(
         &self,
         cache_key: &str,
@@ -2085,14 +2220,13 @@ impl DiskCacheManager {
 
         let metadata_file_path = self.get_new_metadata_file_path(cache_key);
 
-        // Requirement 1.3: Log cache key, computed path, and file existence check result
+        // Fast path: check if metadata file exists before acquiring semaphore
         let file_exists = metadata_file_path.exists();
         debug!(
             "[METADATA_LOOKUP] Checking metadata file: cache_key={}, sanitized_key={}, path={:?}, exists={}",
             cache_key, sanitized_key, metadata_file_path, file_exists
         );
 
-        // Check if metadata file exists
         if !file_exists {
             debug!(
                 "[METADATA_LOOKUP] Metadata file not found: cache_key={}, sanitized_key={}, path={:?}, result=cache_miss",
@@ -2101,244 +2235,255 @@ impl DiskCacheManager {
             return Ok(None);
         }
 
-        // Record metadata file size
-        let file_size = if let Ok(metadata_file_metadata) = std::fs::metadata(&metadata_file_path) {
-            let size = metadata_file_metadata.len();
-            if let Some(metrics_manager) = &self.metrics_manager {
-                metrics_manager
-                    .read()
-                    .await
-                    .record_metadata_file_size(size)
-                    .await;
-            }
-            debug!(
-                "Metadata file size: key={}, path={:?}, size={} bytes",
-                cache_key, metadata_file_path, size
-            );
-            size
-        } else {
-            0
-        };
+        // Acquire semaphore permit to bound concurrent blocking metadata ops
+        let _permit = self.metadata_io_semaphore.acquire().await.map_err(|_| {
+            crate::ProxyError::CacheError("Metadata I/O semaphore closed unexpectedly".to_string())
+        })?;
 
-        // Start timing metadata parse
-        let parse_start = std::time::Instant::now();
+        // Run blocking read+parse off the async runtime
+        let path_clone = metadata_file_path.clone();
+        let cap = self.max_metadata_file_bytes;
+        let cache_key_owned = cache_key.to_string();
 
-        // Read metadata file with retry for empty files (transient write in progress on shared storage)
-        const MAX_EMPTY_FILE_RETRIES: u32 = 3;
-        const EMPTY_FILE_RETRY_DELAY_MS: u64 = 50;
-
-        let metadata_content = {
-            let mut attempts = 0u32;
-
-            loop {
-                attempts += 1;
-                match std::fs::read_to_string(&metadata_file_path) {
-                    Ok(content) => {
-                        // Check if file is empty (transient state during write on shared storage)
-                        if content.is_empty() && attempts <= MAX_EMPTY_FILE_RETRIES {
-                            debug!(
-                                "[METADATA_LOOKUP] Metadata file is empty (transient write?): cache_key={}, attempt={}/{}, retrying...",
-                                cache_key, attempts, MAX_EMPTY_FILE_RETRIES
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                EMPTY_FILE_RETRY_DELAY_MS * attempts as u64,
-                            ));
-                            continue;
-                        }
-
-                        if attempts > 1 {
-                            debug!(
-                                "[METADATA_LOOKUP] Metadata file read after {} attempts: cache_key={}, size={} bytes",
-                                attempts, cache_key, content.len()
-                            );
-                        } else {
-                            debug!(
-                                "[METADATA_LOOKUP] Metadata file read successfully: cache_key={}, sanitized_key={}, size={} bytes",
-                                cache_key, sanitized_key, content.len()
-                            );
-                        }
-
-                        break content;
-                    }
-                    Err(e) => {
-                        // Check for stale file handle (ESTALE) - retry
-                        let is_stale = e.raw_os_error() == Some(116)
-                            || e.to_string().contains("stale file handle")
-                            || e.to_string().contains("ESTALE");
-
-                        if is_stale && attempts <= MAX_EMPTY_FILE_RETRIES {
-                            warn!(
-                                "[METADATA_LOOKUP] Stale file handle, retrying: cache_key={}, attempt={}/{}, error={}",
-                                cache_key, attempts, MAX_EMPTY_FILE_RETRIES, e
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                EMPTY_FILE_RETRY_DELAY_MS * attempts as u64,
-                            ));
-                            continue;
-                        }
-
-                        // After retries, treat as cache miss but DON'T delete
-                        // The file may be in a transient state; next request will likely succeed
-                        warn!(
-                            "[METADATA_LOOKUP] Failed to read metadata file after retries, treating as cache miss (not deleting): cache_key={}, path={:?}, error={}",
-                            cache_key, metadata_file_path, e
-                        );
-                        // Record metric for monitoring
-                        if let Some(metrics_manager) = &self.metrics_manager {
-                            metrics_manager
-                                .read()
-                                .await
-                                .record_corrupted_metadata_simple()
-                                .await;
-                        }
-                        return Ok(None);
-                    }
-                }
-            }
-        };
-
-        // Final check for empty content after retries
-        if metadata_content.is_empty() {
-            // Treat as cache miss but DON'T delete - file may be mid-write
-            warn!(
-                "[METADATA_LOOKUP] Metadata file still empty after retries, treating as cache miss (not deleting): cache_key={}, path={:?}",
-                cache_key, metadata_file_path
-            );
-            // Record metric for monitoring
-            if let Some(metrics_manager) = &self.metrics_manager {
-                metrics_manager
-                    .read()
-                    .await
-                    .record_corrupted_metadata_simple()
-                    .await;
-            }
-            return Ok(None);
-        }
-
-        // Parse JSON with retry for partial reads on shared storage
-        // On NFS/EFS, we may read a file mid-write and get truncated JSON
-        const MAX_PARSE_RETRIES: u32 = 3;
-        const PARSE_RETRY_DELAY_MS: u64 = 50;
-
-        let metadata = {
-            let mut parse_attempts = 0u32;
-            let mut current_content = metadata_content;
-
-            loop {
-                parse_attempts += 1;
-                match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&current_content)
-                {
-                    Ok(meta) => {
-                        if parse_attempts > 1 {
-                            debug!(
-                                "[METADATA_LOOKUP] Metadata JSON parsed after {} attempts: cache_key={}, ranges={}",
-                                parse_attempts, cache_key, meta.ranges.len()
-                            );
-                        } else {
-                            debug!(
-                                "[METADATA_LOOKUP] Metadata JSON parsed successfully: cache_key={}, sanitized_key={}, ranges={}, etag={}",
-                                cache_key, sanitized_key, meta.ranges.len(), meta.object_metadata.etag
-                            );
-                        }
-                        break meta;
-                    }
-                    Err(e) => {
-                        if parse_attempts < MAX_PARSE_RETRIES {
-                            // Likely a partial read during in-progress write - retry
-                            debug!(
-                                "[METADATA_LOOKUP] JSON parse failed (partial read?), retrying: cache_key={}, attempt={}/{}, error={}",
-                                cache_key, parse_attempts, MAX_PARSE_RETRIES, e
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                PARSE_RETRY_DELAY_MS * parse_attempts as u64,
-                            ));
-
-                            // Re-read the file - it may have been completed
-                            match std::fs::read_to_string(&metadata_file_path) {
-                                Ok(new_content) => {
-                                    current_content = new_content;
-                                    continue;
-                                }
-                                Err(read_err) => {
-                                    debug!(
-                                        "[METADATA_LOOKUP] Failed to re-read metadata file during parse retry: cache_key={}, error={}",
-                                        cache_key, read_err
-                                    );
-                                    // Continue with old content for next parse attempt
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // After all retries, treat as cache miss but DON'T delete
-                        // The file may be mid-write by consolidator; next request will likely succeed
-                        warn!(
-                            "[METADATA_LOOKUP] JSON parse failed after {} retries, treating as cache miss (not deleting): cache_key={}, path={:?}, error={}",
-                            MAX_PARSE_RETRIES, cache_key, metadata_file_path, e
-                        );
-                        // Record metric for monitoring
-                        if let Some(metrics_manager) = &self.metrics_manager {
-                            metrics_manager
-                                .read()
-                                .await
-                                .record_corrupted_metadata_simple()
-                                .await;
-                        }
-                        return Ok(None);
-                    }
-                }
-            }
-        };
-
-        // Record parse duration
-        let parse_duration = parse_start.elapsed();
-        if let Some(metrics_manager) = &self.metrics_manager {
-            metrics_manager
-                .read()
-                .await
-                .record_metadata_parse_duration(parse_duration.as_secs_f64() * 1000.0)
-                .await;
-        }
-
-        // Record range file count
-        if let Some(metrics_manager) = &self.metrics_manager {
-            metrics_manager
-                .read()
-                .await
-                .record_range_file_count(metadata.ranges.len() as u64)
-                .await;
-        }
-
-        // NOTE: Object-level expires_at is NOT checked here
-        // The .meta file lives as long as it has valid ranges
-        // Individual ranges have their own TTL checked in find_cached_ranges()
-        // Object-level expiration only applies to write cache (checked below)
-
-        // Check write cache expiration (lazy expiration - Requirements 5.3, 5.4)
-        // If this is a write-cached object and it's expired, treat as cache miss
-        if metadata.object_metadata.is_write_cached
-            && metadata.object_metadata.is_write_cache_expired()
+        let outcome = match tokio::task::spawn_blocking(move || {
+            read_and_parse_metadata_blocking(&path_clone, cap)
+        })
+        .await
         {
-            info!(
-                "Write cache entry expired (lazy expiration): key={}, write_cache_expires_at={:?}, result=cache_miss",
-                cache_key, metadata.object_metadata.write_cache_expires_at
-            );
-            // Note: The actual cleanup of range files will be done by the caller or background scan
-            // Here we just return None to indicate cache miss
-            return Ok(None);
-        }
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                // JoinError means the blocking task panicked or was cancelled
+                warn!(
+                    "[METADATA_LOOKUP] spawn_blocking JoinError for metadata read: cache_key={}, error={}",
+                    cache_key_owned, join_err
+                );
+                MetadataReadOutcome::TransientMiss
+            }
+        };
 
-        let total_duration = operation_start.elapsed();
+        // Act on the outcome — async metrics recording happens here, outside the blocking closure
+        match outcome {
+            MetadataReadOutcome::Missing => {
+                debug!(
+                    "[METADATA_LOOKUP] Metadata file missing (raced with delete?): cache_key={}, path={:?}",
+                    cache_key, metadata_file_path
+                );
+                Ok(None)
+            }
+            MetadataReadOutcome::TransientMiss => {
+                warn!(
+                    "[METADATA_LOOKUP] Transient miss (empty/partial after retries), treating as cache miss (not deleting): cache_key={}, path={:?}",
+                    cache_key, metadata_file_path
+                );
+                if let Some(metrics_manager) = &self.metrics_manager {
+                    metrics_manager
+                        .read()
+                        .await
+                        .record_corrupted_metadata_simple()
+                        .await;
+                }
+                Ok(None)
+            }
+            MetadataReadOutcome::Corrupt { reason } => {
+                warn!(
+                    "[METADATA_LOOKUP] Metadata classified as corrupt: cache_key={}, path={:?}, reason={:?}",
+                    cache_key, metadata_file_path, reason
+                );
+                if let Some(metrics_manager) = &self.metrics_manager {
+                    metrics_manager
+                        .read()
+                        .await
+                        .record_corrupted_metadata_simple()
+                        .await;
+                }
+                Ok(None)
+            }
+            MetadataReadOutcome::Parsed(metadata) => {
+                // Record metadata file size
+                if let Ok(file_meta) = std::fs::metadata(&metadata_file_path) {
+                    let size = file_meta.len();
+                    if let Some(metrics_manager) = &self.metrics_manager {
+                        metrics_manager
+                            .read()
+                            .await
+                            .record_metadata_file_size(size)
+                            .await;
+                    }
+                }
+
+                // Record parse duration
+                let parse_duration = operation_start.elapsed();
+                if let Some(metrics_manager) = &self.metrics_manager {
+                    metrics_manager
+                        .read()
+                        .await
+                        .record_metadata_parse_duration(parse_duration.as_secs_f64() * 1000.0)
+                        .await;
+                }
+
+                // Record range file count
+                if let Some(metrics_manager) = &self.metrics_manager {
+                    metrics_manager
+                        .read()
+                        .await
+                        .record_range_file_count(metadata.ranges.len() as u64)
+                        .await;
+                }
+
+                // Check write cache expiration (lazy expiration - Requirements 5.3, 5.4)
+                if metadata.object_metadata.is_write_cached
+                    && metadata.object_metadata.is_write_cache_expired()
+                {
+                    info!(
+                        "Write cache entry expired (lazy expiration): key={}, write_cache_expires_at={:?}, result=cache_miss",
+                        cache_key, metadata.object_metadata.write_cache_expires_at
+                    );
+                    return Ok(None);
+                }
+
+                let total_duration = operation_start.elapsed();
+                debug!(
+                    "Metadata retrieval completed: key={}, ranges={}, parse_duration={:.2}ms, total_duration={:.2}ms, result=cache_hit",
+                    cache_key,
+                    metadata.ranges.len(),
+                    parse_duration.as_secs_f64() * 1000.0,
+                    total_duration.as_secs_f64() * 1000.0
+                );
+
+                Ok(Some(*metadata))
+            }
+        }
+    }
+
+    /// Classified metadata lookup — exposes the corruption flag.
+    ///
+    /// Same logic as `get_metadata` but returns a `MetadataLookup` so the caller
+    /// can trigger the overwrite-in-place heal (Req 3) when `corrupt == true`.
+    ///
+    /// Spec: cache-metadata-resilience Req 3, Task 6
+    pub async fn get_metadata_classified(&self, cache_key: &str) -> Result<MetadataLookup> {
+        let operation_start = std::time::Instant::now();
+        let sanitized_key = self.sanitize_cache_key_new(cache_key);
+
         debug!(
-            "Metadata retrieval completed: key={}, ranges={}, file_size={} bytes, parse_duration={:.2}ms, total_duration={:.2}ms, result=cache_hit",
-            cache_key,
-            metadata.ranges.len(),
-            file_size,
-            parse_duration.as_secs_f64() * 1000.0,
-            total_duration.as_secs_f64() * 1000.0
+            "Starting classified metadata retrieval: key={}, sanitized_key={}",
+            cache_key, sanitized_key
         );
 
-        Ok(Some(metadata))
+        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
+
+        // Fast path: check if metadata file exists before acquiring semaphore
+        if !metadata_file_path.exists() {
+            return Ok(MetadataLookup {
+                meta: None,
+                corrupt: false,
+                corrupt_reason: None,
+            });
+        }
+
+        // Acquire semaphore permit to bound concurrent blocking metadata ops
+        let _permit = self.metadata_io_semaphore.acquire().await.map_err(|_| {
+            crate::ProxyError::CacheError("Metadata I/O semaphore closed unexpectedly".to_string())
+        })?;
+
+        // Run blocking read+parse off the async runtime
+        let path_clone = metadata_file_path.clone();
+        let cap = self.max_metadata_file_bytes;
+        let cache_key_owned = cache_key.to_string();
+
+        let outcome = match tokio::task::spawn_blocking(move || {
+            read_and_parse_metadata_blocking(&path_clone, cap)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                warn!(
+                    "[METADATA_CLASSIFIED] spawn_blocking JoinError: cache_key={}, error={}",
+                    cache_key_owned, join_err
+                );
+                MetadataReadOutcome::TransientMiss
+            }
+        };
+
+        // Map outcome to MetadataLookup
+        match outcome {
+            MetadataReadOutcome::Missing => Ok(MetadataLookup {
+                meta: None,
+                corrupt: false,
+                corrupt_reason: None,
+            }),
+            MetadataReadOutcome::TransientMiss => {
+                warn!(
+                    "[METADATA_CLASSIFIED] Transient miss, not healing: cache_key={}, path={:?}",
+                    cache_key, metadata_file_path
+                );
+                if let Some(metrics_manager) = &self.metrics_manager {
+                    metrics_manager
+                        .read()
+                        .await
+                        .record_corrupted_metadata_simple()
+                        .await;
+                }
+                Ok(MetadataLookup {
+                    meta: None,
+                    corrupt: false,
+                    corrupt_reason: None,
+                })
+            }
+            MetadataReadOutcome::Corrupt { reason } => {
+                warn!(
+                    "[METADATA_CLASSIFIED] Corrupt metadata detected, flagging for heal: cache_key={}, path={:?}, reason={:?}",
+                    cache_key, metadata_file_path, reason
+                );
+                if let Some(metrics_manager) = &self.metrics_manager {
+                    metrics_manager
+                        .read()
+                        .await
+                        .record_corrupted_metadata_with_reason(
+                            cache_key,
+                            &metadata_file_path.to_string_lossy(),
+                            &format!("{:?}", reason),
+                        )
+                        .await;
+                }
+                Ok(MetadataLookup {
+                    meta: None,
+                    corrupt: true,
+                    corrupt_reason: Some(reason),
+                })
+            }
+            MetadataReadOutcome::Parsed(metadata) => {
+                // Check write cache expiration (lazy expiration)
+                if metadata.object_metadata.is_write_cached
+                    && metadata.object_metadata.is_write_cache_expired()
+                {
+                    info!(
+                        "Write cache entry expired (lazy expiration): key={}, write_cache_expires_at={:?}",
+                        cache_key, metadata.object_metadata.write_cache_expires_at
+                    );
+                    return Ok(MetadataLookup {
+                        meta: None,
+                        corrupt: false,
+                        corrupt_reason: None,
+                    });
+                }
+
+                let total_duration = operation_start.elapsed();
+                debug!(
+                    "Classified metadata retrieval completed: key={}, ranges={}, duration={:.2}ms",
+                    cache_key,
+                    metadata.ranges.len(),
+                    total_duration.as_secs_f64() * 1000.0
+                );
+
+                Ok(MetadataLookup {
+                    meta: Some(*metadata),
+                    corrupt: false,
+                    corrupt_reason: None,
+                })
+            }
+        }
     }
 
     /// Validate cached GET data against HEAD metadata
@@ -3284,6 +3429,18 @@ impl DiskCacheManager {
         // Construct full path to range binary file
         // range_spec.file_path is relative to ranges directory, including bucket/XX/YYY directories
         // e.g., "bucket/XX/YYY/filename.bin"
+        // Security (Req 10): reject file_path if it is absolute, contains ".." traversal,
+        // or would escape cache_dir/ranges/. Treat as cache miss.
+        if !is_safe_relative_file_path(&range_spec.file_path) {
+            warn!(
+                "Range read: rejected unsafe file_path={:?} (path traversal attempt), treating as cache miss",
+                range_spec.file_path
+            );
+            return Err(ProxyError::CacheError(format!(
+                "Range file path rejected (unsafe): {} (cache miss - will fetch from S3)",
+                range_spec.file_path
+            )));
+        }
         let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
         debug!(
@@ -3491,6 +3648,18 @@ impl DiskCacheManager {
         range_spec: &crate::cache_types::RangeSpec,
         chunk_size: usize,
     ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes>>> {
+        // Security (Req 10): reject file_path if it is absolute, contains ".." traversal,
+        // or would escape cache_dir/ranges/. Treat as cache miss.
+        if !is_safe_relative_file_path(&range_spec.file_path) {
+            warn!(
+                "Range stream: rejected unsafe file_path={:?} (path traversal attempt), treating as cache miss",
+                range_spec.file_path
+            );
+            return Err(ProxyError::CacheError(format!(
+                "Range file path rejected (unsafe): {} (cache miss - will fetch from S3)",
+                range_spec.file_path
+            )));
+        }
         let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
         debug!(
@@ -3878,6 +4047,14 @@ impl DiskCacheManager {
         );
 
         for range_spec in &metadata.ranges {
+            // Security (Req 10): reject file_path if unsafe. Skip delete silently.
+            if !is_safe_relative_file_path(&range_spec.file_path) {
+                warn!(
+                    "Range delete: rejected unsafe file_path={:?} for key={}, skipping delete",
+                    range_spec.file_path, cache_key
+                );
+                continue;
+            }
             let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
             if range_file_path.exists() {
@@ -4065,6 +4242,15 @@ impl DiskCacheManager {
                 .any(|(start, end)| range_spec.start == *start && range_spec.end == *end);
 
             if should_delete {
+                // Security (Req 10): reject file_path if unsafe. Skip delete silently.
+                if !is_safe_relative_file_path(&range_spec.file_path) {
+                    warn!(
+                        "Range delete: rejected unsafe file_path={:?} for key={}, skipping delete",
+                        range_spec.file_path, cache_key
+                    );
+                    ranges_to_keep.push(range_spec.clone());
+                    continue;
+                }
                 // Delete the range binary file
                 let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
@@ -4504,6 +4690,15 @@ impl DiskCacheManager {
 
         // Check each range file
         for range_spec in &metadata.ranges {
+            // Security (Req 10): reject file_path if unsafe. Treat as missing (don't keep).
+            if !is_safe_relative_file_path(&range_spec.file_path) {
+                warn!(
+                    "Range verify: rejected unsafe file_path={:?} for key={}, treating as missing",
+                    range_spec.file_path, cache_key
+                );
+                missing_count += 1;
+                continue;
+            }
             let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
             if range_file_path.exists() {
@@ -6034,6 +6229,14 @@ impl DiskCacheManager {
 
         // Remove each range file
         for range_spec in &metadata.ranges {
+            // Security (Req 10): reject file_path if unsafe. Skip delete silently.
+            if !is_safe_relative_file_path(&range_spec.file_path) {
+                warn!(
+                    "Range delete: rejected unsafe file_path={:?} for key={}, skipping delete",
+                    range_spec.file_path, cache_key
+                );
+                continue;
+            }
             let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
             debug!(
@@ -6515,6 +6718,15 @@ impl DiskCacheManager {
                     "Empty file path for range {}",
                     i
                 )));
+            }
+
+            // Security (Req 10): reject file_path if unsafe
+            if !is_safe_relative_file_path(&range_spec.file_path) {
+                warn!(
+                    "[METADATA_VALIDATION] Unsafe range file path: cache_key={}, range_index={}, path={:?}",
+                    cache_key, i, range_spec.file_path
+                );
+                return Ok(false);
             }
 
             // Validate that the range file exists
@@ -7729,54 +7941,6 @@ mod tests {
         // Filename should not contain bucket name
         assert!(!filename.contains("my-bucket"));
         assert!(filename.contains("file.txt"));
-    }
-
-    #[tokio::test]
-    async fn test_disk_cache_basic_operations() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut cache_manager =
-            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
-
-        // Initialize
-        cache_manager.initialize().await.unwrap();
-
-        // Test data
-        let cache_key = "test-bucket/test-object";
-        let test_data = b"This is test data for caching";
-        let metadata = CacheMetadata {
-            etag: "test-etag".to_string(),
-            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-            content_length: test_data.len() as u64,
-            part_number: None,
-            cache_control: None,
-            access_count: 0,
-            last_accessed: SystemTime::now(),
-        };
-
-        // Store cache entry
-        cache_manager
-            .store_cache_entry(cache_key, test_data, metadata.clone())
-            .await
-            .unwrap();
-
-        // Retrieve cache entry
-        let retrieved = cache_manager.get_cache_entry(cache_key).await.unwrap();
-        assert!(retrieved.is_some());
-
-        let entry = retrieved.unwrap();
-        assert_eq!(entry.cache_key, cache_key);
-        assert_eq!(entry.body.as_ref().unwrap(), test_data);
-        assert_eq!(entry.metadata.etag, metadata.etag);
-
-        // Invalidate cache entry
-        cache_manager
-            .invalidate_cache_entry(cache_key)
-            .await
-            .unwrap();
-
-        // Verify it's gone
-        let retrieved_after_invalidation = cache_manager.get_cache_entry(cache_key).await.unwrap();
-        assert!(retrieved_after_invalidation.is_none());
     }
 
     #[tokio::test]
@@ -13101,6 +13265,7 @@ mod tests {
     /// Validates Requirement 2.1: async file deletes work correctly for multiple ranges.
     #[tokio::test]
     async fn test_batch_delete_ranges_multiple_files() {
+        use crate::cache_types::CompressionInfo;
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
             DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
@@ -13233,6 +13398,7 @@ mod tests {
     /// Validates Requirement 2.4: failed deletes log warning and continue processing.
     #[tokio::test]
     async fn test_batch_delete_ranges_missing_files() {
+        use crate::cache_types::CompressionInfo;
         let temp_dir = TempDir::new().unwrap();
         let cache_manager =
             DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
@@ -13684,6 +13850,153 @@ mod tests {
             leftover_files.is_empty(),
             "No .tmp or .bin files should remain after size mismatch, found: {:?}",
             leftover_files
+        );
+    }
+
+    /// Req 2: a received prefix at or above `partial_range_commit_ratio` of an
+    /// incomplete range is salvaged as a clamped sub-range instead of discarded.
+    /// 768/1024 bytes (75%) with ratio 0.5 → commit succeeds, a `.bin` for the
+    /// clamped range 0-767 exists (NOT the requested 0-1023), no `.tmp` remains.
+    #[tokio::test]
+    async fn test_partial_range_commit_salvages_prefix_above_threshold() {
+        use crate::cache_types::ObjectMetadata;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.set_partial_range_commit_ratio(0.5);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/partial-salvage-object";
+        let (start, end) = (0u64, 1023u64); // expected 1024 bytes
+
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+        // Write 768 bytes (75% of 1024) in order.
+        DiskCacheManager::write_range_chunk(&mut writer, &vec![0xABu8; 768]).unwrap();
+
+        let object_metadata = ObjectMetadata {
+            etag: "etag-partial".to_string(),
+            content_length: 4096,
+            upload_state: crate::cache_types::UploadState::Complete,
+            cumulative_size: 4096,
+            ..Default::default()
+        };
+        let result = cache_manager
+            .commit_incremental_range(writer, object_metadata, Duration::from_secs(3600))
+            .await;
+        assert!(
+            result.is_ok(),
+            "Commit should salvage a 75% prefix when ratio=0.5: {:?}",
+            result.err()
+        );
+
+        // The clamped .bin (0-767) must exist; the requested-end .bin (0-1023) must not.
+        fn collect_bins(dir: &std::path::Path) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        out.extend(collect_bins(&p));
+                    } else if p.extension().is_some_and(|x| x == "bin") {
+                        out.push(p.file_name().unwrap().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            out
+        }
+        let bins = collect_bins(&temp_dir.path().join("ranges"));
+        assert!(
+            bins.iter().any(|n| n.ends_with("_0-767.bin")),
+            "expected a clamped .bin ending in _0-767.bin, found: {:?}",
+            bins
+        );
+        assert!(
+            !bins.iter().any(|n| n.ends_with("_0-1023.bin")),
+            "must NOT publish the requested-end range as complete, found: {:?}",
+            bins
+        );
+    }
+
+    /// Req 2: a received prefix below `partial_range_commit_ratio` is discarded
+    /// (legacy behaviour). 256/1024 bytes (25%) with ratio 0.5 → commit errors,
+    /// no `.bin`/`.tmp` remain.
+    #[tokio::test]
+    async fn test_partial_range_commit_discards_below_threshold() {
+        use crate::cache_types::ObjectMetadata;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.set_partial_range_commit_ratio(0.5);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/partial-discard-object";
+        let (start, end) = (0u64, 1023u64);
+
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &vec![0xCDu8; 256]).unwrap();
+
+        let result = cache_manager
+            .commit_incremental_range(writer, ObjectMetadata::default(), Duration::from_secs(3600))
+            .await;
+        assert!(result.is_err(), "25% prefix below ratio 0.5 must error");
+        assert!(format!("{}", result.unwrap_err()).contains("size mismatch"));
+
+        let ranges_dir = temp_dir.path().join("ranges");
+        fn any_file(dir: &std::path::Path) -> bool {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten().any(|e| {
+                        let p = e.path();
+                        if p.is_dir() {
+                            any_file(&p)
+                        } else {
+                            true
+                        }
+                    })
+                })
+                .unwrap_or(false)
+        }
+        assert!(
+            !any_file(&ranges_dir),
+            "no .bin/.tmp should remain when prefix is below threshold"
+        );
+    }
+
+    /// Req 2: ratio 1.0 (the unconfigured default) is exact-only — a 75% prefix is
+    /// discarded, matching legacy behaviour and the PUT write-cache path.
+    #[tokio::test]
+    async fn test_partial_range_commit_exact_only_when_ratio_one() {
+        use crate::cache_types::ObjectMetadata;
+
+        let temp_dir = TempDir::new().unwrap();
+        // Default ratio is 1.0 (exact-only); do NOT call set_partial_range_commit_ratio.
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/exact-only-object";
+        let (start, end) = (0u64, 1023u64);
+
+        let mut writer = cache_manager
+            .begin_incremental_range_write(cache_key, start, end, true)
+            .await
+            .unwrap();
+        DiskCacheManager::write_range_chunk(&mut writer, &vec![0xEEu8; 768]).unwrap();
+
+        let result = cache_manager
+            .commit_incremental_range(writer, ObjectMetadata::default(), Duration::from_secs(3600))
+            .await;
+        assert!(
+            result.is_err(),
+            "with ratio 1.0 a 75% prefix must error (exact-only)"
         );
     }
 
@@ -14147,5 +14460,270 @@ mod tests {
             ".tmp file must be removed after abort, still present at {:?}",
             tmp_path
         );
+    }
+
+    // ============================================================================
+    // Tests for range_spec.file_path path traversal rejection (Req 10)
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_range_spec_file_path_traversal_rejected_on_read() {
+        use crate::cache_types::RangeSpec;
+        use crate::compression::CompressionAlgorithm;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        // Create a sentinel file outside ranges/ to prove it won't be read
+        let sentinel_path = temp_dir.path().join("secret.txt");
+        std::fs::write(&sentinel_path, b"sensitive data").unwrap();
+
+        // Construct a RangeSpec with a traversal file_path
+        let malicious_paths = vec![
+            "../secret.txt",
+            "../../etc/passwd",
+            "bucket/../../../secret.txt",
+            "/etc/passwd",
+            "bucket/..\\secret.txt",
+        ];
+
+        for malicious_path in malicious_paths {
+            let range_spec = RangeSpec {
+                start: 0,
+                end: 1023,
+                file_path: malicious_path.to_string(),
+                compression_algorithm: CompressionAlgorithm::None,
+                compressed_size: 14,
+                uncompressed_size: 14,
+                created_at: SystemTime::now(),
+                last_accessed: SystemTime::now(),
+                access_count: 0,
+                frequency_score: 0,
+            };
+
+            // load_range_data should return an error (cache miss) for unsafe paths
+            let result = cache_manager.load_range_data(&range_spec).await;
+            assert!(
+                result.is_err(),
+                "Expected error for traversal path {:?}, but got Ok",
+                malicious_path
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("unsafe"),
+                "Error for {:?} should mention 'unsafe', got: {}",
+                malicious_path,
+                err_msg
+            );
+        }
+
+        // Verify the sentinel file was never touched
+        assert!(sentinel_path.exists(), "Sentinel file should still exist");
+    }
+
+    #[tokio::test]
+    async fn test_range_spec_file_path_traversal_rejected_on_delete() {
+        use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
+        use crate::compression::CompressionAlgorithm;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        // Create a sentinel file outside ranges/ that should NOT be deleted
+        let sentinel_path = temp_dir.path().join("do_not_delete.txt");
+        std::fs::write(&sentinel_path, b"important data").unwrap();
+
+        // Also create one inside the traversal target to prove it's not reached
+        let ranges_dir = temp_dir.path().join("ranges");
+        std::fs::create_dir_all(&ranges_dir).unwrap();
+        let target_file = ranges_dir.join("legitimate.bin");
+        std::fs::write(&target_file, b"range data").unwrap();
+
+        let cache_key = "test-bucket/test-object-delete";
+
+        // Store metadata with a malicious file_path, then try to delete
+        let malicious_range = RangeSpec {
+            start: 0,
+            end: 1023,
+            file_path: "../do_not_delete.txt".to_string(),
+            compression_algorithm: CompressionAlgorithm::None,
+            compressed_size: 14,
+            uncompressed_size: 14,
+            created_at: SystemTime::now(),
+            last_accessed: SystemTime::now(),
+            access_count: 0,
+            frequency_score: 0,
+        };
+
+        // We need metadata on disk for delete_cache_entry to read it.
+        // Write metadata directly.
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                content_length: 1024,
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Thu, 01 Jan 2025 00:00:00 GMT".to_string(),
+                ..Default::default()
+            },
+            ranges: vec![malicious_range],
+            created_at: SystemTime::now(),
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: None,
+            head_last_accessed: None,
+            head_access_count: 0,
+        };
+
+        // Write the metadata file so delete_cache_entry can read it
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        if let Some(parent) = metadata_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let metadata_json = serde_json::to_string(&metadata).unwrap();
+        std::fs::write(&metadata_path, &metadata_json).unwrap();
+
+        // Now delete_cache_entry should skip the malicious path without deleting the sentinel
+        let result = cache_manager.delete_cache_entry(cache_key).await;
+        assert!(
+            result.is_ok(),
+            "delete_cache_entry should succeed (skip unsafe paths gracefully)"
+        );
+
+        // The sentinel file outside ranges/ must still exist
+        assert!(
+            sentinel_path.exists(),
+            "Sentinel file should NOT have been deleted by traversal path"
+        );
+    }
+
+    // ============================================================================
+    // Tests for Task 2: spawn_blocking metadata read with concurrency bound
+    // ============================================================================
+
+    /// Runtime-starvation regression test: a 10ms tokio::time::interval counter must
+    /// keep advancing while a slow/oversize .meta read is in flight. On a 2-worker
+    /// runtime, blocking the workers would stall the counter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_metadata_read_does_not_starve_runtime() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+
+        // Create a .meta file that exceeds the 4 MiB cap — triggers Corrupt{Oversize}
+        let meta_dir = cache_dir
+            .join("metadata")
+            .join("test-bucket")
+            .join("ab")
+            .join("cde");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        let meta_file = meta_dir.join("large-object.meta");
+
+        // Write a 5 MiB file (exceeds default 4 MiB cap)
+        let junk = vec![b'x'; 5 * 1024 * 1024];
+        std::fs::write(&meta_file, &junk).unwrap();
+
+        // Create a DiskCacheManager with default semaphore
+        let dcm = DiskCacheManager::new(cache_dir.clone(), true, 1024, true, 1_048_576);
+
+        // Start a counter that ticks every 10ms
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter_clone = counter.clone();
+
+        let ticker_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            for _ in 0..50 {
+                interval.tick().await;
+                counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        // Issue get_metadata — since the file is oversize, the blocking helper
+        // returns Corrupt{Oversize} quickly, but the key assertion is that the
+        // ticker keeps running.
+        let result = dcm.get_metadata("test-bucket/large-object").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none()); // Oversize → cache miss
+
+        // Wait for ticker to finish
+        ticker_handle.await.unwrap();
+
+        // The counter must have advanced (proves runtime was NOT starved)
+        let ticks = counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ticks >= 5,
+            "Expected ticker to advance (got {} ticks), runtime may have been starved",
+            ticks
+        );
+    }
+
+    /// Existing behavior: valid .meta files are parsed correctly through spawn_blocking.
+    #[tokio::test]
+    async fn test_get_metadata_valid_file_through_spawn_blocking() {
+        use crate::cache_types::CompressionInfo;
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+
+        let now = std::time::SystemTime::now();
+        let meta = crate::cache_types::NewCacheMetadata {
+            cache_key: "test-bucket/valid-object.txt".to_string(),
+            object_metadata: crate::cache_types::ObjectMetadata {
+                content_length: 1024,
+                etag: "\"abc123\"".to_string(),
+                content_type: Some("application/octet-stream".to_string()),
+                last_modified: "Thu, 01 Jan 2026 00:00:00 GMT".to_string(),
+                ..Default::default()
+            },
+            ranges: vec![],
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let mut dcm = DiskCacheManager::new(cache_dir.clone(), true, 1024, true, 1_048_576);
+        dcm.set_metadata_config(4 * 1024 * 1024, 32);
+
+        // Write the metadata using the standard path layout
+        let meta_path = dcm.get_new_metadata_file_path("test-bucket/valid-object.txt");
+        if let Some(parent) = meta_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        std::fs::write(&meta_path, &json).unwrap();
+
+        // Read it through the new get_metadata (spawn_blocking path)
+        let result = dcm.get_metadata("test-bucket/valid-object.txt").await;
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert!(parsed.is_some());
+        let parsed_meta = parsed.unwrap();
+        assert_eq!(parsed_meta.object_metadata.etag, "\"abc123\"");
+        assert_eq!(parsed_meta.object_metadata.content_length, 1024);
+    }
+
+    /// Minimal config test: omitting metadata_io_concurrency and max_metadata_file_bytes
+    /// still starts (defaults apply via serde).
+    #[test]
+    fn test_minimal_config_without_metadata_io_fields() {
+        // A minimal YAML that omits the new fields entirely
+        let yaml = r#"
+cache:
+  cache_dir: /tmp/test-cache
+logging:
+  access_log_dir: /tmp/test-logs/access
+  app_log_dir: /tmp/test-logs/app
+"#;
+        let config: std::result::Result<crate::config::Config, _> = serde_yaml_ng::from_str(yaml);
+        assert!(
+            config.is_ok(),
+            "Minimal config should parse: {:?}",
+            config.err()
+        );
+        let config = config.unwrap();
+        assert_eq!(config.cache.metadata_io_concurrency, 32);
+        assert_eq!(config.cache.max_metadata_file_bytes, 4 * 1024 * 1024);
     }
 }

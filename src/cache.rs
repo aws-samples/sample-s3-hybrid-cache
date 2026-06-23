@@ -7,16 +7,18 @@
 use crate::cache_types::safe_expiry;
 use crate::cache_types::CacheMetadata;
 use crate::compression::{CompressionAlgorithm, CompressionHandler};
-use crate::ram_cache::RamCache;
+use crate::ram_cache::ShardedRamCache;
 use crate::{ProxyError, Result};
 
+use bytes::Bytes;
 use fs2::FileExt;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -478,14 +480,23 @@ pub struct CacheUsageBreakdown {
 }
 
 /// RAM cache entry for in-memory caching
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct RamCacheEntry {
     pub cache_key: String,
-    pub data: Vec<u8>,
+    pub data: Arc<Bytes>,
     pub metadata: CacheMetadata,
     pub created_at: SystemTime,
-    pub last_accessed: SystemTime,
-    pub access_count: u64,
+    pub last_accessed: AtomicU64, // unix millis
+    pub access_count: AtomicU64,
+    pub compressed: bool,
+    pub compression_algorithm: crate::compression::CompressionAlgorithm,
+}
+
+/// Lightweight read-view returned by RamCache::get() — no whole-entry clone.
+#[derive(Debug, Clone)]
+pub struct RamCacheRead {
+    pub data: Arc<Bytes>,
+    pub metadata: CacheMetadata,
     pub compressed: bool,
     pub compression_algorithm: crate::compression::CompressionAlgorithm,
 }
@@ -608,11 +619,28 @@ pub struct CacheManager {
     // `DiskCacheManager` in `create_configured_disk_cache_manager`.
     // See the `cache-miss-throughput` spec, Requirement 5.1.
     compression_batch_size: usize,
+    // Maximum .meta file size before classifying as corrupt/oversized (Req 3/4)
+    // Forwarded to DiskCacheManager in create_configured_disk_cache_manager.
+    // Spec: cache-metadata-resilience Req 3, 4
+    max_metadata_file_bytes: u64,
+    // Semaphore permit count for concurrent blocking metadata reads (Req 1)
+    // Forwarded to DiskCacheManager in create_configured_disk_cache_manager.
+    // Spec: cache-metadata-resilience Req 1
+    metadata_io_concurrency: usize,
+    // Minimum received fraction of an incomplete range to salvage as a clamped
+    // sub-range on the read/GET path. Forwarded to DiskCacheManager in
+    // create_configured_disk_cache_manager. Defaults to 1.0 (exact-only); the
+    // production builder sets it from CacheConfig::partial_range_commit_ratio
+    // before Arc-wrapping. Spec: crt-conditional-range-caching Req 2
+    partial_range_commit_ratio: f64,
     // Bucket-level settings manager for per-bucket/prefix cache configuration
     bucket_settings_manager: Arc<crate::bucket_settings::BucketSettingsManager>,
     // RAM cache flush interval for cross-instance access visibility (Req 19)
     // Used by is_cache_entry_active to determine the journal scan window (2× this value)
     ram_cache_flush_interval: std::time::Duration,
+    // Sharded RAM cache — extracted from CacheManagerInner so reads don't need the global lock.
+    // None when ram_cache_enabled is false or max_ram_cache_size is 0.
+    ram_cache: Option<Arc<ShardedRamCache>>,
     // Use Arc<Mutex<>> for thread-safe interior mutability
     inner: Arc<Mutex<CacheManagerInner>>,
 }
@@ -623,7 +651,6 @@ struct CacheManagerInner {
     write_cache_tracker: WriteCacheSizeTracker,
     ram_cache_manager: RamCacheManager,
     compression_handler: CompressionHandler,
-    ram_cache: Option<RamCache>,
 }
 
 impl CacheManager {
@@ -727,6 +754,7 @@ impl CacheManager {
             1_048_576,                                     // Default 1 MiB compression batch size
             false,                              // Default: don't evaluate conditions from cache
             std::time::Duration::from_secs(10), // Default 10s flush interval (Req 19)
+            64,                                 // Default 64 shards
         )
     }
 
@@ -756,6 +784,7 @@ impl CacheManager {
         compression_batch_size: usize,
         evaluate_conditions_from_cache: bool,
         ram_cache_flush_interval: std::time::Duration,
+        ram_cache_shard_count: usize,
     ) -> Self {
         let ram_cache_manager = RamCacheManager {
             max_size: max_ram_cache_size,
@@ -763,15 +792,32 @@ impl CacheManager {
             ..RamCacheManager::default()
         };
 
-        // Create RAM cache if enabled with the specified eviction algorithm
-        let ram_cache = if ram_cache_enabled && max_ram_cache_size > 0 {
-            Some(RamCache::new(
-                max_ram_cache_size,
-                eviction_algorithm.clone(),
-            ))
-        } else {
-            None
-        };
+        // Create ShardedRamCache if enabled with the specified eviction algorithm.
+        // Warn if per-shard capacity is small — objects larger than the per-shard limit are
+        // silently dropped. Each shard gets max_ram_cache_size / shard_count bytes.
+        let sharded_ram_cache: Option<Arc<ShardedRamCache>> =
+            if ram_cache_enabled && max_ram_cache_size > 0 {
+                let per_shard = max_ram_cache_size as usize / ram_cache_shard_count;
+                const WARN_THRESHOLD: usize = 1024 * 1024; // 1 MiB
+                if per_shard < WARN_THRESHOLD {
+                    tracing::warn!(
+                    "RAM cache per-shard capacity is only {} bytes ({} shards, {} bytes total). \
+                        Objects larger than {} bytes will be silently dropped from RAM cache. \
+                        Consider lowering ram_cache_shard_count or increasing max_ram_cache_size.",
+                    per_shard,
+                    ram_cache_shard_count,
+                    max_ram_cache_size,
+                    per_shard,
+                );
+                }
+                Some(Arc::new(ShardedRamCache::new(
+                    max_ram_cache_size as usize,
+                    ram_cache_shard_count,
+                    eviction_algorithm.clone(),
+                )))
+            } else {
+                None
+            };
 
         let write_cache_tracker = WriteCacheSizeTracker {
             max_percent: write_cache_percent,
@@ -791,7 +837,6 @@ impl CacheManager {
                 compression_threshold,
                 compression_enabled,
             ),
-            ram_cache,
         };
 
         // Initialize BucketSettingsManager with global defaults from config
@@ -839,7 +884,11 @@ impl CacheManager {
             eviction_lock_file: Arc::new(Mutex::new(None)),
             eviction_uuid: Arc::new(Mutex::new(None)),
             compression_batch_size,
+            max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default; overridden by config in http_proxy.rs
+            metadata_io_concurrency: 32, // default; overridden by config in http_proxy.rs
+            partial_range_commit_ratio: 1.0, // exact-only; production sets from config
             ram_cache_flush_interval,
+            ram_cache: sharded_ram_cache,
             inner: Arc::new(Mutex::new(inner)),
         }
     }
@@ -853,6 +902,12 @@ impl CacheManager {
             self.write_cache_enabled,
             self.compression_batch_size,
         );
+
+        // Configure metadata I/O limits (cache-metadata-resilience Req 1, 3, 4)
+        disk_cache.set_metadata_config(self.max_metadata_file_bytes, self.metadata_io_concurrency);
+
+        // Configure partial-range commit ratio (crt-conditional-range-caching Req 2)
+        disk_cache.set_partial_range_commit_ratio(self.partial_range_commit_ratio);
 
         // Set metrics manager if available
         if let Ok(metrics_manager_guard) = self.metrics_manager.try_read() {
@@ -1123,7 +1178,12 @@ impl CacheManager {
             compression_batch_size: 1_048_576, // 1 MiB
             read_cache_enabled: true,     // Default enabled
             bucket_settings_staleness_threshold: std::time::Duration::from_secs(60), // Default 60s
-            evaluate_conditions_from_cache: false, // Default: strict always-forward
+            evaluate_conditions_from_cache: true, // Default: serve If-Match from cache when ETag matches
+            ram_cache_shard_count: 8,             // Default shard count
+            max_complete_body_bytes: 10 * 1024 * 1024, // 10 MiB default
+            max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default
+            metadata_io_concurrency: 32,          // Default concurrency
+            partial_range_commit_ratio: 1.0,      // exact-only; production sets from config
         };
 
         // Create coordinator
@@ -1604,7 +1664,7 @@ impl CacheManager {
             if let Some(ram_entry) = self.get_from_ram_cache(cache_key).await? {
                 debug!("Cache hit (RAM) for key: {}", cache_key);
                 self.update_ram_cache_hit_statistics();
-                let cache_entry = self.convert_ram_entry_to_cache_entry(ram_entry)?;
+                let cache_entry = self.convert_ram_entry_to_cache_entry(cache_key, ram_entry)?;
                 return Ok(Some(cache_entry));
             }
         }
@@ -2828,6 +2888,27 @@ impl CacheManager {
         let mut mm = self.metrics_manager.write().await;
         *mm = Some(metrics_manager);
     }
+
+    /// Configure metadata I/O limits from CacheConfig.
+    ///
+    /// Must be called before `create_configured_disk_cache_manager` so the
+    /// DiskCacheManager inherits the correct limits.
+    /// Spec: cache-metadata-resilience Req 1, 3, 4
+    pub fn set_metadata_io_config(
+        &mut self,
+        max_metadata_file_bytes: u64,
+        metadata_io_concurrency: usize,
+    ) {
+        self.max_metadata_file_bytes = max_metadata_file_bytes;
+        self.metadata_io_concurrency = metadata_io_concurrency;
+    }
+
+    /// Set the partial-range commit ratio forwarded to the DiskCacheManager
+    /// (read/GET path). Called by the production builder before Arc-wrapping.
+    /// Spec: crt-conditional-range-caching Req 2
+    pub fn set_partial_range_commit_ratio(&mut self, ratio: f64) {
+        self.partial_range_commit_ratio = ratio;
+    }
     /// Update cache statistics
     pub fn update_statistics(&self, hit: bool, entry_size: u64, is_head: bool) {
         let mut inner = self.inner.lock().unwrap();
@@ -2932,34 +3013,35 @@ impl CacheManager {
 
         // First tier: Check RAM cache if enabled
         if self.ram_cache_enabled {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(ref mut ram_cache) = inner.ram_cache {
-                if let Some(ram_entry) = ram_cache.get(&range_cache_key) {
-                    // Clone the data we need before any further borrows
-                    let compressed = ram_entry.compressed;
-                    let entry_data = ram_entry.data;
-
-                    // Record access for disk metadata flush
-                    ram_cache.record_disk_access(&range_cache_key);
-
-                    // RAM cache stores compressed data, decompress if needed
-                    let data = if compressed {
-                        debug!(
-                            "Decompressing RAM cache data for {}-{}",
-                            range.start, range.end
-                        );
-                        inner
-                            .compression_handler
-                            .decompress_data_with_fallback(&entry_data)?
-                    } else {
-                        entry_data
-                    };
-
-                    drop(inner); // Release lock before updating statistics
-                    debug!("Range cache hit (RAM) for {}-{}", range.start, range.end);
-                    self.update_ram_cache_hit_statistics();
-                    return Ok((data, true));
+            let ram_read = {
+                if let Some(ram_cache) = &self.ram_cache {
+                    ram_cache.get(&range_cache_key).await
+                } else {
+                    None
                 }
+            };
+
+            if let Some(ram_read) = ram_read {
+                let compressed = ram_read.compressed;
+                let entry_data = ram_read.data.clone();
+
+                // RAM cache stores compressed data, decompress if needed
+                let data = if compressed {
+                    debug!(
+                        "Decompressing RAM cache data for {}-{}",
+                        range.start, range.end
+                    );
+                    let inner = self.inner.lock().unwrap();
+                    inner
+                        .compression_handler
+                        .decompress_data_with_fallback(&entry_data)?
+                } else {
+                    entry_data.to_vec()
+                };
+
+                debug!("Range cache hit (RAM) for {}-{}", range.start, range.end);
+                self.update_ram_cache_hit_statistics();
+                return Ok((data, true));
             }
         }
 
@@ -2995,9 +3077,13 @@ impl CacheManager {
             } else {
                 // Create a RAM cache entry for the range data
                 // Note: Data from disk cache is already decompressed, so store as uncompressed in RAM
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
                 let ram_entry = RamCacheEntry {
                     cache_key: range_cache_key,
-                    data: range_data.clone(),
+                    data: Arc::new(Bytes::from(range_data.clone())),
                     metadata: CacheMetadata {
                         etag: range.etag.clone(),
                         last_modified: range.last_modified.clone(),
@@ -3008,22 +3094,16 @@ impl CacheManager {
                         last_accessed: SystemTime::now(),
                     },
                     created_at: SystemTime::now(),
-                    last_accessed: SystemTime::now(),
-                    access_count: 1,
+                    last_accessed: AtomicU64::new(now_ms),
+                    access_count: AtomicU64::new(1),
                     compressed: false, // Data from disk cache is already decompressed
                     compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
                 };
 
-                let mut inner = self.inner.lock().unwrap();
-                let CacheManagerInner {
-                    ref mut ram_cache,
-                    ref mut compression_handler,
-                    ..
-                } = *inner;
-                if let Some(ref mut cache) = ram_cache {
+                if let Some(ref ram_cache) = self.ram_cache {
                     // RAM cache put is best-effort; eviction from RAM only means
                     // the entry will be served from disk on next access.
-                    let _ = cache.put(ram_entry, compression_handler);
+                    let _ = ram_cache.put(ram_entry).await;
                 }
             }
         }
@@ -3173,6 +3253,28 @@ impl CacheManager {
         let mut inner = self.inner.lock().unwrap();
         Self::decompress_cache_entry_with_handler(&mut inner.compression_handler, entry)
     }
+    /// Decompress RAM cache read data, returning the raw decompressed bytes.
+    pub fn decompress_ram_cache_read(&self, read: &RamCacheRead) -> Result<Vec<u8>> {
+        if read.compressed {
+            let inner = self.inner.lock().unwrap();
+            match inner
+                .compression_handler
+                .decompress_with_algorithm(&read.data, read.compression_algorithm.clone())
+            {
+                Ok(decompressed_data) => Ok(decompressed_data),
+                Err(e) => {
+                    error!(
+                        "Failed to decompress RAM cache entry with algorithm {:?}: {}",
+                        read.compression_algorithm, e
+                    );
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(read.data.to_vec())
+        }
+    }
+
     /// Decompress RAM cache entry data
     pub fn decompress_ram_cache_entry(&self, entry: &mut RamCacheEntry) -> Result<()> {
         if entry.compressed {
@@ -3182,7 +3284,7 @@ impl CacheManager {
                 .decompress_with_algorithm(&entry.data, entry.compression_algorithm.clone())
             {
                 Ok(decompressed_data) => {
-                    entry.data = decompressed_data;
+                    entry.data = Arc::new(Bytes::from(decompressed_data));
                     entry.compressed = false;
                     entry.compression_algorithm = crate::compression::CompressionAlgorithm::Lz4;
                     Ok(())
@@ -3370,17 +3472,20 @@ impl CacheManager {
             return Ok(0);
         }
 
-        let mut evicted_count = 0u64;
+        let evicted_count = 0u64;
 
         // Check if RAM cache is over limit
         let (mut current_size, max_size, utilization) = {
-            let inner = self.inner.lock().unwrap();
-            if let Some(ram_cache) = &inner.ram_cache {
-                let stats = ram_cache.get_stats();
+            if let Some(ram_cache) = &self.ram_cache {
+                let stats = ram_cache.stats().await;
                 (
                     stats.current_size,
                     stats.max_size,
-                    ram_cache.get_utilization(),
+                    if stats.max_size > 0 {
+                        (stats.current_size as f32 / stats.max_size as f32) * 100.0
+                    } else {
+                        0.0
+                    },
                 )
             } else {
                 return Ok(0);
@@ -3398,48 +3503,24 @@ impl CacheManager {
 
         // Target size after eviction (aim for 80% of limit to avoid frequent evictions)
         let target_size = (max_size as f32 * 0.8) as u64;
+        let _ = target_size; // ShardedRamCache evicts internally on put(); standalone
+                             // evict_entry() will be wired in future tasks.
 
-        // Evict entries until we reach target size
-        loop {
-            if current_size <= target_size {
-                break;
+        // Update current size for next iteration
+        let new_current_size = {
+            if let Some(ram_cache) = &self.ram_cache {
+                ram_cache.stats().await.current_size
+            } else {
+                0
             }
+        };
 
-            let evicted = {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(ram_cache) = &mut inner.ram_cache {
-                    match ram_cache.evict_entry() {
-                        Ok(_) => {
-                            evicted_count += 1;
-                            true
-                        }
-                        Err(_) => false, // No more entries to evict
-                    }
-                } else {
-                    false
-                }
-            };
-
-            if !evicted {
-                break; // No more entries to evict
-            }
-
-            // Update current size for next iteration
-            let new_current_size = {
-                let inner = self.inner.lock().unwrap();
-                if let Some(ram_cache) = &inner.ram_cache {
-                    ram_cache.get_stats().current_size
-                } else {
-                    0
-                }
-            };
-
-            if new_current_size >= current_size {
-                break; // Size not decreasing, avoid infinite loop
-            }
-
-            current_size = new_current_size;
+        if new_current_size >= current_size {
+            // noop
         }
+
+        current_size = new_current_size;
+        let _ = current_size; // suppress unused warning
 
         if evicted_count > 0 {
             info!(
@@ -4950,6 +5031,139 @@ impl CacheManager {
                 Err(e)
             }
         }
+    }
+
+    /// Classified metadata lookup that exposes the corruption flag.
+    ///
+    /// Returns a `MetadataLookup` so the caller can detect when a `.meta` file
+    /// is confidently corrupt and trigger the overwrite-in-place heal after
+    /// fetching from S3 (Req 3).
+    ///
+    /// This method checks MetadataCache (RAM) first; on a RAM miss it runs the
+    /// blocking `read_and_parse_metadata_blocking` helper under `spawn_blocking`
+    /// to classify the file.
+    ///
+    /// Spec: cache-metadata-resilience Req 3, Task 6
+    pub async fn get_metadata_classified(
+        &self,
+        cache_key: &str,
+    ) -> Result<crate::disk_cache::MetadataLookup> {
+        // First, try RAM cache — if present, it's valid (not corrupt)
+        if let Some(metadata) = self.metadata_cache.get(cache_key).await {
+            debug!(
+                "Metadata cache hit (RAM) for classified lookup: {}",
+                cache_key
+            );
+            return Ok(crate::disk_cache::MetadataLookup {
+                meta: Some(metadata),
+                corrupt: false,
+                corrupt_reason: None,
+            });
+        }
+
+        // RAM miss — read from disk with classification
+        let metadata_path = self.get_new_metadata_file_path(cache_key);
+        if !metadata_path.exists() {
+            return Ok(crate::disk_cache::MetadataLookup {
+                meta: None,
+                corrupt: false,
+                corrupt_reason: None,
+            });
+        }
+
+        // Use the blocking helper (same as DiskCacheManager::get_metadata) to classify
+        let path_clone = metadata_path.clone();
+        let cap = self.max_metadata_file_bytes;
+        let cache_key_owned = cache_key.to_string();
+
+        let outcome = match tokio::task::spawn_blocking(move || {
+            crate::disk_cache::read_and_parse_metadata_blocking(&path_clone, cap)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                warn!(
+                    "[METADATA_CLASSIFIED] spawn_blocking JoinError: cache_key={}, error={}",
+                    cache_key_owned, join_err
+                );
+                crate::disk_cache::MetadataReadOutcome::TransientMiss
+            }
+        };
+
+        match outcome {
+            crate::disk_cache::MetadataReadOutcome::Missing => {
+                Ok(crate::disk_cache::MetadataLookup {
+                    meta: None,
+                    corrupt: false,
+                    corrupt_reason: None,
+                })
+            }
+            crate::disk_cache::MetadataReadOutcome::TransientMiss => {
+                Ok(crate::disk_cache::MetadataLookup {
+                    meta: None,
+                    corrupt: false,
+                    corrupt_reason: None,
+                })
+            }
+            crate::disk_cache::MetadataReadOutcome::Corrupt { reason } => {
+                warn!(
+                    "[METADATA_CLASSIFIED] Corrupt metadata flagged for heal: cache_key={}, reason={:?}",
+                    cache_key, reason
+                );
+                Ok(crate::disk_cache::MetadataLookup {
+                    meta: None,
+                    corrupt: true,
+                    corrupt_reason: Some(reason),
+                })
+            }
+            crate::disk_cache::MetadataReadOutcome::Parsed(metadata) => {
+                // Cache in RAM for future lookups
+                if !metadata.ranges.is_empty() {
+                    self.metadata_cache
+                        .put(cache_key, (*metadata).clone())
+                        .await;
+                }
+                self.metadata_cache.record_disk_hit();
+                Ok(crate::disk_cache::MetadataLookup {
+                    meta: Some(*metadata),
+                    corrupt: false,
+                    corrupt_reason: None,
+                })
+            }
+        }
+    }
+
+    /// Remove a corrupt `.meta` file atomically (for HEAD-only paths that don't
+    /// persist a fresh `.meta` via `store_range`).
+    ///
+    /// Uses atomic rename to avoid races with the consolidator: writes an empty
+    /// marker first, then removes the file. Guarded by the caller acquiring the
+    /// metadata lock if shared storage is enabled.
+    ///
+    /// Spec: cache-metadata-resilience Req 3, Task 6
+    pub async fn remove_corrupt_metadata(&self, cache_key: &str) -> Result<()> {
+        let metadata_path = self.get_new_metadata_file_path(cache_key);
+        if metadata_path.exists() {
+            // Remove the corrupt file — safe because the caller has already
+            // served the response from S3 and this path is only taken when
+            // the file was classified as confidently corrupt (not transient).
+            if let Err(e) = tokio::fs::remove_file(&metadata_path).await {
+                warn!(
+                    "[METADATA_HEAL] Failed to remove corrupt .meta: cache_key={}, path={:?}, error={}",
+                    cache_key, metadata_path, e
+                );
+                // Non-fatal — worst case, next request re-detects and re-heals
+            } else {
+                info!(
+                    "[METADATA_HEAL] Removed corrupt .meta for HEAD-only heal: cache_key={}, path={:?}",
+                    cache_key, metadata_path
+                );
+            }
+        }
+        // Also invalidate RAM cache entry for this key
+        self.metadata_cache.invalidate(cache_key).await;
+        Ok(())
     }
 
     /// Invalidate metadata in both MetadataCache and optionally on disk
@@ -6665,18 +6879,13 @@ impl CacheManager {
         }
     }
     /// Get cached entry from RAM cache
-    async fn get_from_ram_cache(&self, cache_key: &str) -> Result<Option<RamCacheEntry>> {
+    async fn get_from_ram_cache(&self, cache_key: &str) -> Result<Option<RamCacheRead>> {
         if !self.ram_cache_enabled {
             return Ok(None);
         }
 
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ram_cache) = &mut inner.ram_cache {
-            let result = ram_cache.get(cache_key);
-            if result.is_some() {
-                // Record access for disk metadata flush
-                ram_cache.record_disk_access(cache_key);
-            }
+        if let Some(ram_cache) = &self.ram_cache {
+            let result = ram_cache.get(cache_key).await;
             Ok(result)
         } else {
             Ok(None)
@@ -6692,26 +6901,9 @@ impl CacheManager {
         // Convert CacheEntry to RamCacheEntry
         let ram_entry = self.convert_cache_entry_to_ram_entry(cache_entry)?;
 
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.ram_cache.is_some() {
-                // Extract the compression handler temporarily
-                let mut compression_handler = std::mem::replace(
-                    &mut inner.compression_handler,
-                    CompressionHandler::new(1024, true), // Temporary placeholder
-                );
-
-                // Now we can safely borrow ram_cache mutably
-                if let Some(ram_cache) = &mut inner.ram_cache {
-                    let result = ram_cache.put(ram_entry, &mut compression_handler);
-
-                    // Restore the compression handler
-                    inner.compression_handler = compression_handler;
-
-                    result?;
-                    debug!("Stored entry in RAM cache: {}", cache_entry.cache_key);
-                }
-            }
+        if let Some(ram_cache) = &self.ram_cache {
+            ram_cache.put(ram_entry).await?;
+            debug!("Stored entry in RAM cache: {}", cache_entry.cache_key);
         }
 
         Ok(())
@@ -6724,12 +6916,12 @@ impl CacheManager {
             return Ok(());
         }
 
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ram_cache) = &mut inner.ram_cache {
-            // Invalidate the exact entry and all range entries for this cache key
-            ram_cache.invalidate_entry(cache_key)?;
+        if let Some(ram_cache) = &self.ram_cache {
+            // Invalidate the exact entry
+            ram_cache.invalidate(cache_key).await?;
+            // Invalidate all range entries for this cache key
             let range_prefix = format!("{}:range:", cache_key);
-            let removed = ram_cache.invalidate_by_prefix(&range_prefix)?;
+            let removed = ram_cache.invalidate_by_prefix(&range_prefix).await?;
             if removed > 0 {
                 debug!(
                     "Unified RAM cache invalidation: removed {} range entries for key: {}",
@@ -6741,36 +6933,30 @@ impl CacheManager {
         Ok(())
     }
 
-    /// Convert RAM cache entry to regular cache entry
-    fn convert_ram_entry_to_cache_entry(&self, mut ram_entry: RamCacheEntry) -> Result<CacheEntry> {
-        // Decompress RAM cache entry if needed
-        if ram_entry.compressed {
-            self.decompress_ram_cache_entry(&mut ram_entry)?;
-        }
-
-        // Create compression info based on RAM cache entry
-        let compression_info = if ram_entry.compressed {
-            CompressionInfo {
-                body_algorithm: ram_entry.compression_algorithm.clone(),
-                original_size: None, // We don't track original size in RAM cache
-                compressed_size: Some(ram_entry.data.len() as u64),
-                file_extension: None,
-            }
+    /// Convert RAM cache read-view to regular cache entry
+    fn convert_ram_entry_to_cache_entry(
+        &self,
+        cache_key: &str,
+        ram_read: RamCacheRead,
+    ) -> Result<CacheEntry> {
+        // Decompress if needed — returns owned Vec<u8>
+        let data = if ram_read.compressed {
+            self.decompress_ram_cache_read(&ram_read)?
         } else {
-            CompressionInfo::default()
+            ram_read.data.to_vec()
         };
 
         Ok(CacheEntry {
-            cache_key: ram_entry.cache_key,
+            cache_key: cache_key.to_string(),
             headers: HashMap::new(), // RAM cache doesn't store headers separately
-            body: Some(ram_entry.data),
+            body: Some(data),
             ranges: Vec::new(),
-            metadata: ram_entry.metadata,
-            created_at: ram_entry.created_at,
-            expires_at: safe_expiry(ram_entry.created_at, std::time::Duration::from_secs(3600)), // Default 1 hour
-            metadata_expires_at: safe_expiry(ram_entry.created_at, self.head_ttl),
-            compression_info,
-            is_put_cached: false, // RAM cache entries are not PUT-cached
+            metadata: ram_read.metadata.clone(),
+            created_at: SystemTime::now(),
+            expires_at: safe_expiry(SystemTime::now(), std::time::Duration::from_secs(3600)),
+            metadata_expires_at: safe_expiry(SystemTime::now(), self.head_ttl),
+            compression_info: CompressionInfo::default(),
+            is_put_cached: false,
         })
     }
 
@@ -6818,13 +7004,18 @@ impl CacheManager {
             )
         };
 
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         Ok(RamCacheEntry {
             cache_key: cache_entry.cache_key.clone(),
-            data,
+            data: Arc::new(Bytes::from(data)),
             metadata: cache_entry.metadata.clone(),
             created_at: cache_entry.created_at,
-            last_accessed: SystemTime::now(),
-            access_count: 0,
+            last_accessed: AtomicU64::new(now_ms),
+            access_count: AtomicU64::new(0),
             compressed: is_compressed,
             compression_algorithm,
         })
@@ -7578,18 +7769,11 @@ impl CacheManager {
         }
 
         // Use unified expiration method that handles both GET and HEAD entries
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ram_cache) = &mut inner.ram_cache {
-            let evicted_count = ram_cache.evict_expired_entries()?;
-
-            if evicted_count > 0 {
-                debug!(
-                    "Unified expiration: evicted {} expired entries (GET and HEAD) from RAM cache",
-                    evicted_count
-                );
-            }
-
-            Ok(evicted_count)
+        // NOTE: ShardedRamCache does not expose evict_expired_entries() yet —
+        // that wiring is deferred to tasks 4.2–4.7. Return 0 for now.
+        if self.ram_cache.is_some() {
+            // Expiration handled internally by ShardedRamCache on future puts.
+            Ok(0)
         } else {
             Ok(0)
         }
@@ -7600,8 +7784,20 @@ impl CacheManager {
             return None;
         }
 
-        let inner = self.inner.lock().unwrap();
-        inner.ram_cache.as_ref().map(|cache| cache.get_stats())
+        // ShardedRamCache::stats() is async; use a blocking call here.
+        // Tasks 4.2–4.7 will refactor callers to async where needed.
+        if let Some(ram_cache) = &self.ram_cache {
+            let handle = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = handle {
+                Some(tokio::task::block_in_place(|| {
+                    handle.block_on(ram_cache.stats())
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
     /// Get RAM cache utilization percentage
     pub fn get_ram_cache_utilization(&self) -> f32 {
@@ -7609,12 +7805,23 @@ impl CacheManager {
             return 0.0;
         }
 
-        let inner = self.inner.lock().unwrap();
-        inner
-            .ram_cache
-            .as_ref()
-            .map(|cache| cache.get_utilization())
-            .unwrap_or(0.0)
+        // ShardedRamCache does not expose get_utilization() directly.
+        // Compute from stats. Uses block_on since this is a sync fn.
+        if let Some(ram_cache) = &self.ram_cache {
+            let handle = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = handle {
+                let stats = tokio::task::block_in_place(|| handle.block_on(ram_cache.stats()));
+                if stats.max_size > 0 {
+                    (stats.current_size as f32 / stats.max_size as f32) * 100.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
     }
 
     /// Check if RAM cache is enabled
@@ -7635,37 +7842,41 @@ impl CacheManager {
 
         let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
 
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ref mut ram_cache) = inner.ram_cache {
-            if let Some(ram_entry) = ram_cache.get(&range_cache_key) {
-                let compressed = ram_entry.compressed;
-                let entry_data = ram_entry.data;
-
-                let data = if compressed {
-                    debug!("Decompressing RAM cache range data for {}-{}", start, end);
-                    match inner
-                        .compression_handler
-                        .decompress_data_with_fallback(&entry_data)
-                    {
-                        Ok(decompressed) => decompressed,
-                        Err(e) => {
-                            error!(
-                                "Failed to decompress RAM cache range data for {}-{}: {}",
-                                start, end, e
-                            );
-                            return None;
-                        }
-                    }
-                } else {
-                    entry_data
-                };
-
-                drop(inner);
-                self.update_ram_cache_hit_statistics();
-                Some(data)
+        let ram_read = {
+            if let Some(ram_cache) = &self.ram_cache {
+                let handle = tokio::runtime::Handle::try_current().ok()?;
+                tokio::task::block_in_place(|| handle.block_on(ram_cache.get(&range_cache_key)))
             } else {
                 None
             }
+        };
+
+        if let Some(ram_read) = ram_read {
+            let compressed = ram_read.compressed;
+            let entry_data = ram_read.data.clone();
+
+            let data = if compressed {
+                debug!("Decompressing RAM cache range data for {}-{}", start, end);
+                let inner = self.inner.lock().unwrap();
+                match inner
+                    .compression_handler
+                    .decompress_data_with_fallback(&entry_data)
+                {
+                    Ok(decompressed) => decompressed,
+                    Err(e) => {
+                        error!(
+                            "Failed to decompress RAM cache range data for {}-{}: {}",
+                            start, end, e
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                entry_data.to_vec()
+            };
+
+            self.update_ram_cache_hit_statistics();
+            Some(data)
         } else {
             None
         }
@@ -7695,9 +7906,13 @@ impl CacheManager {
             return;
         }
 
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let ram_entry = RamCacheEntry {
             cache_key: range_cache_key,
-            data: data.to_vec(),
+            data: Arc::new(Bytes::from(data.to_vec())),
             metadata: CacheMetadata {
                 etag,
                 last_modified: String::new(),
@@ -7708,20 +7923,26 @@ impl CacheManager {
                 last_accessed: SystemTime::now(),
             },
             created_at: SystemTime::now(),
-            last_accessed: SystemTime::now(),
-            access_count: 1,
+            last_accessed: AtomicU64::new(now_ms),
+            access_count: AtomicU64::new(1),
             compressed: false,
             compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
         };
 
-        let mut inner = self.inner.lock().unwrap();
-        let CacheManagerInner {
-            ref mut ram_cache,
-            ref mut compression_handler,
-            ..
-        } = *inner;
-        if let Some(ref mut cache) = ram_cache {
-            if let Err(e) = cache.put(ram_entry, compression_handler) {
+        if let Some(ram_cache) = &self.ram_cache {
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => {
+                    warn!(
+                        "No Tokio runtime for RAM cache promotion of range {}-{}",
+                        start, end
+                    );
+                    return;
+                }
+            };
+            if let Err(e) =
+                tokio::task::block_in_place(|| handle.block_on(ram_cache.put(ram_entry)))
+            {
                 warn!(
                     "Failed to promote range {}-{} to RAM cache: {}",
                     start, end, e
@@ -7736,9 +7957,13 @@ impl CacheManager {
             return;
         }
 
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ram_cache) = &inner.ram_cache {
-            let ram_stats = ram_cache.get_stats();
+        if let Some(ram_cache) = &self.ram_cache {
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            let ram_stats = tokio::task::block_in_place(|| handle.block_on(ram_cache.stats()));
+            let mut inner = self.inner.lock().unwrap();
             inner.statistics.ram_cache_size = ram_stats.current_size;
             inner.statistics.ram_cache_hit_rate = ram_stats.hit_rate;
         }
@@ -7746,13 +7971,16 @@ impl CacheManager {
 
     /// Update RAM cache hit statistics
     fn update_ram_cache_hit_statistics(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ram_cache) = &inner.ram_cache {
-            let ram_stats = ram_cache.get_stats();
+        if let Some(ram_cache) = &self.ram_cache {
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            let ram_stats = tokio::task::block_in_place(|| handle.block_on(ram_cache.stats()));
+            let mut inner = self.inner.lock().unwrap();
             inner.ram_cache_manager.hit_count = ram_stats.hit_count;
             inner.ram_cache_manager.miss_count = ram_stats.miss_count;
-            inner.ram_cache_manager.eviction_count = ram_stats.eviction_count;
-            inner.ram_cache_manager.last_eviction = ram_stats.last_eviction;
+            // eviction_count and last_eviction not tracked by ShardedRamCache yet
         }
     }
     /// Store PUT request in write-through cache with compression - Requirement 10.1
@@ -8924,7 +9152,7 @@ impl CacheManager {
             if let Some(ram_entry) = self.get_from_ram_cache(cache_key).await? {
                 debug!("Write cache hit (RAM) for key: {}", cache_key);
                 self.record_write_cache_hit();
-                let write_entry = self.convert_ram_entry_to_write_entry(ram_entry)?;
+                let write_entry = self.convert_ram_entry_to_write_entry(cache_key, ram_entry)?;
                 return Ok(Some(write_entry));
             }
         }
@@ -9264,73 +9492,56 @@ impl CacheManager {
         let algorithm = write_entry.compression_info.body_algorithm.clone();
         let is_compressed = true; // All data uses frame format now
 
+        let last_accessed_ms = write_entry
+            .last_accessed
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         Ok(RamCacheEntry {
             cache_key: write_entry.cache_key.clone(),
-            data: write_entry.body.clone(),
+            data: Arc::new(Bytes::from(write_entry.body.clone())),
             metadata: write_entry.metadata.clone(),
             created_at: write_entry.created_at,
-            last_accessed: write_entry.last_accessed,
-            access_count: 0,
+            last_accessed: AtomicU64::new(last_accessed_ms),
+            access_count: AtomicU64::new(0),
             compressed: is_compressed,
             compression_algorithm: algorithm,
         })
     }
 
-    /// Convert RAM cache entry to write cache entry
+    /// Convert RAM cache read-view to write cache entry
     fn convert_ram_entry_to_write_entry(
         &self,
-        mut ram_entry: RamCacheEntry,
+        cache_key: &str,
+        ram_read: RamCacheRead,
     ) -> Result<WriteCacheEntry> {
-        // Decompress RAM cache entry if needed
-        if ram_entry.compressed {
-            self.decompress_ram_cache_entry(&mut ram_entry)?;
-        }
-
-        // Create compression info based on RAM cache entry state
-        let compression_info = if ram_entry.compressed {
-            CompressionInfo {
-                body_algorithm: ram_entry.compression_algorithm.clone(),
-                original_size: None, // We don't track original size in RAM cache
-                compressed_size: Some(ram_entry.data.len() as u64),
-                file_extension: None,
-            }
+        // Decompress if needed
+        let body = if ram_read.compressed {
+            self.decompress_ram_cache_read(&ram_read)?
         } else {
-            CompressionInfo::default()
+            ram_read.data.to_vec()
         };
 
         Ok(WriteCacheEntry {
-            cache_key: ram_entry.cache_key,
+            cache_key: cache_key.to_string(),
             headers: HashMap::new(), // RAM cache doesn't store headers separately
-            body: ram_entry.data,
-            metadata: ram_entry.metadata,
-            created_at: ram_entry.created_at,
-            put_ttl_expires_at: safe_expiry(ram_entry.created_at, self.put_ttl),
-            last_accessed: ram_entry.last_accessed,
-            compression_info,
+            body,
+            metadata: ram_read.metadata.clone(),
+            created_at: SystemTime::now(),
+            put_ttl_expires_at: safe_expiry(SystemTime::now(), self.put_ttl),
+            last_accessed: SystemTime::now(),
+            compression_info: CompressionInfo::default(),
             is_put_cached: true, // Write cache entries are PUT-cached
         })
     }
 
     /// Store RAM cache entry from write entry
-    async fn store_in_ram_cache_from_write_entry(&self, ram_entry: &RamCacheEntry) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.ram_cache.is_some() {
-            // Extract the compression handler temporarily
-            let mut compression_handler = std::mem::replace(
-                &mut inner.compression_handler,
-                CompressionHandler::new(1024, true), // Temporary placeholder
-            );
-
-            // Now we can safely borrow ram_cache mutably
-            if let Some(ram_cache) = &mut inner.ram_cache {
-                let result = ram_cache.put(ram_entry.clone(), &mut compression_handler);
-
-                // Restore the compression handler
-                inner.compression_handler = compression_handler;
-
-                result?;
-                debug!("Stored write entry in RAM cache: {}", ram_entry.cache_key);
-            }
+    async fn store_in_ram_cache_from_write_entry(&self, ram_entry: RamCacheEntry) -> Result<()> {
+        if let Some(ram_cache) = &self.ram_cache {
+            let key = ram_entry.cache_key.clone();
+            ram_cache.put(ram_entry).await?;
+            debug!("Stored write entry in RAM cache: {}", key);
         }
 
         Ok(())
@@ -9347,7 +9558,7 @@ impl CacheManager {
             write_entry.cache_key
         );
         let ram_entry = self.convert_write_entry_to_ram_entry(write_entry)?;
-        self.store_in_ram_cache_from_write_entry(&ram_entry).await
+        self.store_in_ram_cache_from_write_entry(ram_entry).await
     }
 
     /// Clean up expired write cache entries - Requirement 10.6
@@ -9736,39 +9947,9 @@ impl CacheManager {
             return Ok(0);
         }
 
-        let mut evicted_count = 0u64;
-        let mut inner = self.inner.lock().unwrap();
-
-        if let Some(ram_cache) = &mut inner.ram_cache {
-            // Get current stats before eviction
-            let stats_before = ram_cache.get_stats();
-
-            // Force eviction if cache is over utilization threshold (e.g., 90%)
-            let utilization_threshold = 90.0;
-            if ram_cache.get_utilization() > utilization_threshold {
-                // Evict entries until we're under threshold
-                let target_utilization = 80.0; // Target 80% after eviction
-                let target_size = (ram_cache.max_size as f32 * target_utilization / 100.0) as u64;
-
-                while ram_cache.current_size > target_size && !ram_cache.entries.is_empty() {
-                    if ram_cache.evict_entry().is_ok() {
-                        evicted_count += 1;
-                    } else {
-                        break; // No more entries to evict
-                    }
-                }
-
-                let stats_after = ram_cache.get_stats();
-                info!("RAM cache eviction completed: evicted {} entries, size reduced from {} to {} bytes",
-                      evicted_count, stats_before.current_size, stats_after.current_size);
-
-                // Update statistics
-                inner.ram_cache_manager.eviction_count += evicted_count;
-                inner.statistics.evicted_entries += evicted_count;
-            }
-        }
-
-        Ok(evicted_count)
+        // ShardedRamCache handles eviction internally on put().
+        // Standalone per-entry eviction is wired in tasks 4.2–4.7.
+        Ok(0)
     }
     /// Store range data in cache with compression - Requirements 3.1, 3.2, 3.3, 3.4, 12.7
     ///
@@ -10641,7 +10822,7 @@ impl WriteCacheRangeSink {
             ))
         })?;
         let (range_spec, _range_already_existed) =
-            self.disk_cache.finalize_incremental_range(writer)?;
+            self.disk_cache.finalize_incremental_range(writer, None)?;
         Ok(range_spec)
     }
 
@@ -13481,6 +13662,7 @@ mod ram_cache_range_property_tests {
     use quickcheck::TestResult;
     use quickcheck_macros::quickcheck;
     use tempfile::TempDir;
+    use tokio::runtime::Runtime;
 
     /// **Feature: ram-cache-range-fix, Property 1: Range RAM cache round-trip**
     /// For any valid cache_key (non-empty string), start offset, end offset (where start <= end),
@@ -13507,31 +13689,35 @@ mod ram_cache_range_property_tests {
             return TestResult::discard();
         }
 
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager = CacheManager::new(
-            temp_dir.path().to_path_buf(),
-            true,               // ram_cache_enabled
-            max_ram_cache_size, // max_ram_cache_size = 1 MiB
-            1024,               // compression_threshold
-            true,               // compression_enabled
-        );
+        // promote/get use block_in_place which requires a multi-threaded runtime.
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let cache_manager = CacheManager::new(
+                temp_dir.path().to_path_buf(),
+                true,               // ram_cache_enabled
+                max_ram_cache_size, // max_ram_cache_size = 1 MiB
+                1024,               // compression_threshold
+                true,               // compression_enabled
+            );
 
-        let etag = format!("\"etag-{}\"", etag_seed);
+            let etag = format!("\"etag-{}\"", etag_seed);
 
-        // Promote range data to RAM cache
-        cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag);
+            // Promote range data to RAM cache
+            cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag);
 
-        // Look up the range from RAM cache
-        match cache_manager.get_range_from_ram_cache(&cache_key, start, end) {
-            Some(retrieved_data) => {
-                if retrieved_data == data {
-                    TestResult::passed()
-                } else {
-                    TestResult::failed()
+            // Look up the range from RAM cache
+            match cache_manager.get_range_from_ram_cache(&cache_key, start, end) {
+                Some(retrieved_data) => {
+                    if retrieved_data == data {
+                        TestResult::passed()
+                    } else {
+                        TestResult::failed()
+                    }
                 }
+                None => TestResult::failed(),
             }
-            None => TestResult::failed(),
-        }
+        })
     }
 
     /// **Feature: ram-cache-range-fix, Property 2: Promotion preserves metadata**
@@ -13558,41 +13744,44 @@ mod ram_cache_range_property_tests {
             return TestResult::discard();
         }
 
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager = CacheManager::new(
-            temp_dir.path().to_path_buf(),
-            true,               // ram_cache_enabled
-            max_ram_cache_size, // max_ram_cache_size = 1 MiB
-            1024,               // compression_threshold
-            true,               // compression_enabled
-        );
+        // promote/get use block_in_place which requires a multi-threaded runtime.
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let cache_manager = CacheManager::new(
+                temp_dir.path().to_path_buf(),
+                true,               // ram_cache_enabled
+                max_ram_cache_size, // max_ram_cache_size = 1 MiB
+                1024,               // compression_threshold
+                true,               // compression_enabled
+            );
 
-        let etag = format!("\"etag-{}\"", etag_seed);
-        let expected_content_length = data.len() as u64;
+            let etag = format!("\"etag-{}\"", etag_seed);
+            let expected_content_length = data.len() as u64;
 
-        // Promote range data to RAM cache
-        cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag.clone());
+            // Promote range data to RAM cache
+            cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag.clone());
 
-        // Inspect the stored RamCacheEntry directly via the inner lock
-        let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
-        let inner = cache_manager.inner.lock().unwrap();
-        if let Some(ref ram_cache) = inner.ram_cache {
-            match ram_cache.entries.get(&range_cache_key) {
-                Some(entry) => {
-                    let etag_matches = entry.metadata.etag == etag;
-                    let content_length_matches =
-                        entry.metadata.content_length == expected_content_length;
-                    if etag_matches && content_length_matches {
-                        TestResult::passed()
-                    } else {
-                        TestResult::failed()
-                    }
+            // Inspect the stored RamCacheEntry directly via the sharded RAM cache.
+            let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
+            let ram_read = if let Some(rc) = &cache_manager.ram_cache {
+                rc.get(&range_cache_key).await
+            } else {
+                None
+            };
+            if let Some(read) = ram_read {
+                let etag_matches = read.metadata.etag == etag;
+                let content_length_matches =
+                    read.metadata.content_length == expected_content_length;
+                if etag_matches && content_length_matches {
+                    TestResult::passed()
+                } else {
+                    TestResult::failed()
                 }
-                None => TestResult::failed(),
+            } else {
+                TestResult::failed()
             }
-        } else {
-            TestResult::failed()
-        }
+        })
     }
 
     /// Represents an operation in a random sequence of promote/get calls.
@@ -13669,72 +13858,76 @@ mod ram_cache_range_property_tests {
             return TestResult::discard();
         }
 
-        let max_ram_cache_size: u64 = 1024 * 1024; // 1 MiB
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager = CacheManager::new(
-            temp_dir.path().to_path_buf(),
-            true,               // ram_cache_enabled
-            max_ram_cache_size, // max_ram_cache_size = 1 MiB
-            1024,               // compression_threshold
-            true,               // compression_enabled
-        );
+        // promote/get/stats use block_in_place which requires a multi-threaded runtime.
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let max_ram_cache_size: u64 = 1024 * 1024; // 1 MiB
+            let temp_dir = TempDir::new().unwrap();
+            let cache_manager = CacheManager::new(
+                temp_dir.path().to_path_buf(),
+                true,               // ram_cache_enabled
+                max_ram_cache_size, // max_ram_cache_size = 1 MiB
+                1024,               // compression_threshold
+                true,               // compression_enabled
+            );
 
-        // Small pool of cache keys to increase hit probability
-        let key_pool: Vec<&str> = vec![
-            "bucket/obj-a",
-            "bucket/obj-b",
-            "bucket/obj-c",
-            "bucket/obj-d",
-        ];
+            // Small pool of cache keys to increase hit probability
+            let key_pool: Vec<&str> = vec![
+                "bucket/obj-a",
+                "bucket/obj-b",
+                "bucket/obj-c",
+                "bucket/obj-d",
+            ];
 
-        let mut expected_hits: u64 = 0;
-        let mut expected_misses: u64 = 0;
+            let mut expected_hits: u64 = 0;
+            let mut expected_misses: u64 = 0;
 
-        for op in &ops {
-            match op {
-                CacheOp::Promote {
-                    key_idx,
-                    start,
-                    end,
-                    data,
-                    etag_seed,
-                } => {
-                    let key = key_pool[(*key_idx as usize) % key_pool.len()];
-                    let s = *start as u64;
-                    let e = s + (*end as u64); // ensure end >= start
-                    let etag = format!("\"etag-{}\"", etag_seed);
-                    cache_manager.promote_range_to_ram_cache(key, s, e, data, etag);
-                }
-                CacheOp::Get {
-                    key_idx,
-                    start,
-                    end,
-                } => {
-                    let key = key_pool[(*key_idx as usize) % key_pool.len()];
-                    let s = *start as u64;
-                    let e = s + (*end as u64); // ensure end >= start
-                    match cache_manager.get_range_from_ram_cache(key, s, e) {
-                        Some(_) => expected_hits += 1,
-                        None => expected_misses += 1,
+            for op in &ops {
+                match op {
+                    CacheOp::Promote {
+                        key_idx,
+                        start,
+                        end,
+                        data,
+                        etag_seed,
+                    } => {
+                        let key = key_pool[(*key_idx as usize) % key_pool.len()];
+                        let s = *start as u64;
+                        let e = s + (*end as u64); // ensure end >= start
+                        let etag = format!("\"etag-{}\"", etag_seed);
+                        cache_manager.promote_range_to_ram_cache(key, s, e, data, etag);
+                    }
+                    CacheOp::Get {
+                        key_idx,
+                        start,
+                        end,
+                    } => {
+                        let key = key_pool[(*key_idx as usize) % key_pool.len()];
+                        let s = *start as u64;
+                        let e = s + (*end as u64); // ensure end >= start
+                        match cache_manager.get_range_from_ram_cache(key, s, e) {
+                            Some(_) => expected_hits += 1,
+                            None => expected_misses += 1,
+                        }
                     }
                 }
             }
-        }
 
-        // Compare with stats
-        let stats = cache_manager
-            .get_ram_cache_stats()
-            .expect("RAM cache should be enabled");
+            // Compare with stats
+            let stats = cache_manager
+                .get_ram_cache_stats()
+                .expect("RAM cache should be enabled");
 
-        if stats.hit_count == expected_hits && stats.miss_count == expected_misses {
-            TestResult::passed()
-        } else {
-            eprintln!(
-                "Hit/miss mismatch: expected hits={} misses={}, got hits={} misses={}",
-                expected_hits, expected_misses, stats.hit_count, stats.miss_count
-            );
-            TestResult::failed()
-        }
+            if stats.hit_count == expected_hits && stats.miss_count == expected_misses {
+                TestResult::passed()
+            } else {
+                eprintln!(
+                    "Hit/miss mismatch: expected hits={} misses={}, got hits={} misses={}",
+                    expected_hits, expected_misses, stats.hit_count, stats.miss_count
+                );
+                TestResult::failed()
+            }
+        })
     }
 
     /// A promotion operation with varying data sizes for the size invariant test.
@@ -13798,49 +13991,53 @@ mod ram_cache_range_property_tests {
             return TestResult::discard();
         }
 
-        let max_ram_cache_size: u64 = 128 * 1024; // 128 KiB — small to exercise eviction aggressively
-        let temp_dir = TempDir::new().unwrap();
-        let cache_manager = CacheManager::new(
-            temp_dir.path().to_path_buf(),
-            true,               // ram_cache_enabled
-            max_ram_cache_size, // max_ram_cache_size = 128 KiB
-            1024,               // compression_threshold
-            true,               // compression_enabled
-        );
+        // promote/stats use block_in_place which requires a multi-threaded runtime.
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let max_ram_cache_size: u64 = 128 * 1024; // 128 KiB — small to exercise eviction aggressively
+            let temp_dir = TempDir::new().unwrap();
+            let cache_manager = CacheManager::new(
+                temp_dir.path().to_path_buf(),
+                true,               // ram_cache_enabled
+                max_ram_cache_size, // max_ram_cache_size = 128 KiB
+                1024,               // compression_threshold
+                true,               // compression_enabled
+            );
 
-        // Small pool of cache keys to increase key reuse and exercise replacement paths
-        let key_pool: Vec<&str> = vec![
-            "bucket/obj-a",
-            "bucket/obj-b",
-            "bucket/obj-c",
-            "bucket/obj-d",
-            "bucket/obj-e",
-            "bucket/obj-f",
-        ];
+            // Small pool of cache keys to increase key reuse and exercise replacement paths
+            let key_pool: Vec<&str> = vec![
+                "bucket/obj-a",
+                "bucket/obj-b",
+                "bucket/obj-c",
+                "bucket/obj-d",
+                "bucket/obj-e",
+                "bucket/obj-f",
+            ];
 
-        for (i, op) in ops.iter().enumerate() {
-            let key = key_pool[(op.key_idx as usize) % key_pool.len()];
-            let s = op.start as u64;
-            let e = s + (op.end as u64); // ensure end >= start
-            let etag = format!("\"etag-{}\"", op.etag_seed);
+            for (i, op) in ops.iter().enumerate() {
+                let key = key_pool[(op.key_idx as usize) % key_pool.len()];
+                let s = op.start as u64;
+                let e = s + (op.end as u64); // ensure end >= start
+                let etag = format!("\"etag-{}\"", op.etag_seed);
 
-            cache_manager.promote_range_to_ram_cache(key, s, e, &op.data, etag);
+                cache_manager.promote_range_to_ram_cache(key, s, e, &op.data, etag);
 
-            // Check size invariant after each promotion
-            let stats = cache_manager
-                .get_ram_cache_stats()
-                .expect("RAM cache should be enabled");
+                // Check size invariant after each promotion
+                let stats = cache_manager
+                    .get_ram_cache_stats()
+                    .expect("RAM cache should be enabled");
 
-            if stats.current_size > max_ram_cache_size {
-                eprintln!(
-                    "Size invariant violated at operation {}: current_size={} > max_size={} (data_len={}, entries={})",
-                    i, stats.current_size, max_ram_cache_size, op.data.len(), stats.entries_count
-                );
-                return TestResult::failed();
+                if stats.current_size > max_ram_cache_size {
+                    eprintln!(
+                        "Size invariant violated at operation {}: current_size={} > max_size={} (data_len={}, entries={})",
+                        i, stats.current_size, max_ram_cache_size, op.data.len(), stats.entries_count
+                    );
+                    return TestResult::failed();
+                }
             }
-        }
 
-        TestResult::passed()
+            TestResult::passed()
+        })
     }
 }
 
@@ -13877,8 +14074,8 @@ mod ram_cache_range_unit_tests {
 
     /// After promote_range_to_ram_cache, get_range_from_ram_cache returns the exact data.
     /// **Validates: Requirements 3.1, 2.2**
-    #[test]
-    fn test_promote_then_get_returns_data() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_promote_then_get_returns_data() {
         let (cm, _dir) = create_ram_cache_manager(1024 * 1024); // 1 MiB
 
         let cache_key = "my-bucket/my-object.bin";

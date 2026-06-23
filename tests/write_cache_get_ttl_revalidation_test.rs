@@ -43,6 +43,7 @@ fn create_cache_manager(
         1_048_576,
         false,
         Duration::from_secs(10),
+        64, // ram_cache_shard_count
     )
 }
 

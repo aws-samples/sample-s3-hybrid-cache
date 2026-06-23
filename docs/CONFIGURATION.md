@@ -221,12 +221,25 @@ cache:
   max_cache_size: 10737418240     # 10GB in bytes
   ram_cache_enabled: true
   max_ram_cache_size: 268435456   # 256MB in bytes
+  ram_cache_shard_count: 8        # Number of independent RAM cache shards (default: 8, range: 1–256)
   eviction_algorithm: "tinylfu"   # Options: lru, tinylfu
 ```
 
 **Sizing `max_cache_size`**: Set `max_cache_size` to no more than 90% of available storage capacity. The cache is designed to temporarily exceed the configured limit during high load — writes are non-blocking and eviction runs asynchronously, so burst traffic can push usage above the limit before eviction reclaims space. A 10% headroom buffer prevents disk exhaustion during these transient spikes. For example, on a 100 GB volume, set `max_cache_size` to 90 GB or less.
 
 **Cache Directory**: See [CACHING.md](CACHING.md) for detailed directory structure
+
+**`ram_cache_shard_count`** (`usize`, default `8`, range `1–256`)
+
+Divides the RAM cache into this many independent shards, each with its own lock. Concurrent requests targeting different shards proceed in parallel without contention. Per-shard capacity is `max_ram_cache_size / ram_cache_shard_count` — for example, 256 MB / 8 shards = 32 MB per shard.
+
+Objects larger than the per-shard capacity are silently dropped from the RAM cache. The proxy logs a warning at startup if per-shard capacity falls below 1 MB.
+
+Tuning:
+- Higher values (e.g. 32, 64) — lower contention under extreme concurrency (hundreds of parallel requests hitting distinct keys). Most deployments see no additional gain beyond 8–16 shards.
+- Lower values (e.g. 1, 2) — larger per-shard capacity per bucket; useful for very small caches or workloads dominated by a few large objects.
+
+Skew caveat: each shard evicts independently. When a shard reaches capacity it evicts regardless of free space in other shards, so effective RAM cache utilization may be lower than the configured maximum for workloads with uneven key distributions or very large objects.
 
 **Eviction Algorithms**
 
@@ -408,6 +421,15 @@ cache:
 - CompleteMultipartUpload: Parts assembled with final byte offsets, object metadata created
 - AbortMultipartUpload: All cached parts and tracking metadata deleted
 
+**`max_complete_body_bytes`** (`usize`, default `10485760` = 10 MiB)
+
+Maximum size of the `CompleteMultipartUpload` request body the proxy will buffer before forwarding. Bodies exceeding this limit are rejected with HTTP 413. The Complete XML normally lists at most 10,000 parts and is well under 1 MiB in practice; the cap prevents unbounded memory consumption from oversized or malicious payloads.
+
+```yaml
+cache:
+  # max_complete_body_bytes: 10485760  # 10 MiB (default)
+```
+
 **TTL Transition on First Read**:
 - When a write-cached object is first accessed via GET, the proxy performs a
   one-time transition: it clears the `is_write_cached` flag and resets `expires_at`
@@ -446,6 +468,21 @@ cache:
 - Uses file modification time to detect recent activity
 - Uploads with recent UploadPart activity are not evicted
 - AbortMultipartUpload immediately removes all cached parts
+
+### CompleteMultipartUpload Body Limit
+
+The CompleteMultipartUpload XML body (listing parts and ETags) is bounded to prevent
+unbounded memory consumption from oversized or malicious payloads:
+
+```yaml
+cache:
+  max_complete_body_bytes: 10485760  # Default: 10 MiB
+```
+
+Bodies exceeding this limit are rejected with HTTP 413 before forwarding to S3. The
+S3 maximum of 10,000 parts results in a body well under 1 MiB in practice, so the
+10 MiB default is conservative. Operators on memory-constrained instances may lower
+this value.
 
 ### Storage Location
 
@@ -500,12 +537,11 @@ cache:
   # an "allowlist" pattern where only keys matched by an enabling rule are cached.
   read_cache_enabled: true
 
-  # Default conditional-header evaluation (default: false).
-  # When true, the proxy decides 304 / 412 / 200 locally using cached ETag + Last-Modified
-  # and does not forward the conditional request to S3 (unless cache is expired or the
-  # required validators are missing). Default false preserves strict RFC 7232 consistency.
+  # Default true: If-Match requests are served from cache when the cached ETag matches and
+  # data is fully cached (no S3 round trip). All other conditionals still forward to S3.
+  # Set false to forward every conditional to S3 for strict S3-authoritative evaluation.
   # See CACHING.md "Conditional Headers Handling" for full semantics.
-  evaluate_conditions_from_cache: false
+  evaluate_conditions_from_cache: true
 
   # How long a loaded rule set is considered fresh before cache_rules.json is re-read from disk
   # (default: 60s). Controls lazy reload — rule edits take effect on the next request after this
@@ -773,6 +809,52 @@ Size of compression batches during cache writes. Incoming S3 bytes are accumulat
 
 Set lower for memory-constrained environments with many concurrent writers. Set higher if memory is abundant and you want to maximize compression ratio on highly compressible content.
 
+### Metadata File Size Cap
+
+```yaml
+cache:
+  # max_metadata_file_bytes: 4194304  # 4 MiB (default)
+```
+
+Maximum size of a `.meta` file the proxy will read from disk. Files exceeding this cap are classified as corrupt (oversize) without being read, preventing pathologically large metadata files — such as legacy inline-body entries — from consuming unbounded memory or blocking the runtime.
+
+A normal range-based `.meta` file is ~2 KB. The 4 MiB default leaves ample headroom for legitimate metadata while catching the legacy inline-body files that caused the production stall (5+ MB). Operators should not need to change this unless they have unusual object-key structures that produce very large metadata.
+
+### Metadata I/O Concurrency
+
+```yaml
+cache:
+  # metadata_io_concurrency: 32  # (default)
+```
+
+Maximum number of concurrent blocking metadata I/O operations (`spawn_blocking` tasks) allowed process-wide. A semaphore with this capacity is acquired before each blocking metadata read; excess callers wait asynchronously rather than spawning unbounded blocking tasks.
+
+This prevents the Tokio blocking thread pool and the underlying filesystem (especially NFS) from being overwhelmed during high-concurrency bursts or consolidation cycles. The default of 32 provides good throughput on most deployments without saturating NFS.
+
+Tuning:
+- Lower (e.g. 16) on constrained NFS mounts or instances with limited I/O bandwidth
+- Higher (e.g. 64) on local SSD-backed caches with high core counts
+
+### Partial Range Commit Ratio
+
+```yaml
+cache:
+  # partial_range_commit_ratio: 0.5  # (default)
+```
+
+Minimum received fraction (`0.0`–`1.0`) of an incomplete range that the proxy will salvage as a smaller valid range on the read/GET cache-write path. Default `0.5`.
+
+When a streamed range cache write ends with fewer bytes than the requested range — because the client cancelled the transfer or the mid-stream idle watchdog (`connection_pool.upstream_idle_timeout`) aborted the stream — but at least this fraction of the expected bytes were received **in order**, the proxy commits the received prefix as a clamped range `[start, start + received - 1]` instead of discarding the whole range. This lets a single high-throughput download (for example the AWS CLI CRT client, which opens many parallel range connections and closes them as soon as it has the bytes it needs) populate the cache even when some part requests are cut short.
+
+Behavior at the bounds:
+- `1.0` — only a fully-received range is committed (legacy behavior; any short range is discarded).
+- `0.0` — any non-empty received prefix is committed.
+- Below the configured ratio, nothing is committed and the partial bytes are dropped.
+
+A salvaged prefix is recorded with its true byte bounds, so it is never served as if it were the full requested range — a later request for the missing tail fetches it from S3 and merges. The write-through **PUT** cache path is unaffected: it always requires the exact byte count, so a truncated upload is never cached.
+
+**Valid range**: `0.0` to `1.0` inclusive (`NaN` is rejected at startup).
+
 ### Consolidation Cycle Timeout
 
 ```yaml
@@ -1023,9 +1105,44 @@ connection_pool:
   max_lifetime: "300s"
   pool_check_interval: "10s"
   
+  # Endpoint registration cap
+  # max_registered_endpoints: 10000
+  
+  # Upstream timeout (stalled-response fast-fail)
+  # upstream_first_byte_timeout: "5s"
+  # upstream_idle_timeout: "5s"
+  # upstream_idle_retries: 2
+  
   # Custom DNS servers (optional)
   # dns_servers: ["8.8.8.8", "1.1.1.1"]
 ```
+
+**`max_registered_endpoints`** (`usize`, default `10000`)
+
+Maximum number of DNS-resolved endpoints the connection pool will track. When the cap is reached, new endpoint registrations are rejected with a warning log; existing endpoints continue operating normally. This prevents unbounded memory growth from excessive unique hostnames in forward-proxy mode. Normal S3 usage (a small set of regional endpoints) is well under the default cap.
+
+### Upstream Timeout (Stalled-Response Fast-Fail)
+
+These settings control how quickly the proxy detects and recovers from a stalled upstream S3 connection. They apply only after download-coordinator acquisition — coordination waits (coalesced requests waiting for another request's fetch) are unaffected.
+
+```yaml
+connection_pool:
+  # upstream_first_byte_timeout: "5s"
+  # upstream_idle_timeout: "5s"
+  # upstream_idle_retries: 2
+```
+
+**`upstream_first_byte_timeout`** (`Duration`, default `"5s"`)
+
+How long the proxy waits after connecting before receiving the first response byte from upstream. On timeout (before any bytes are sent to the client), the fetch is retried up to `upstream_idle_retries` times using connection-pool/IP failover. After exhausting retries, an error is returned. Set above cross-region TTFB tails (~3s) but well below the 60s client read-timeout so the proxy recovers before the client gives up.
+
+**`upstream_idle_timeout`** (`Duration`, default `"5s"`)
+
+Mid-stream idle watchdog: if no bytes are received from upstream for this duration after data has started flowing, the proxy terminates the client connection so the client's own retry logic engages. A slow-but-steady transfer (bytes arriving within the timeout window) is never aborted — the criterion is "no bytes for T", not "transfer took longer than T". The timer is paused under client backpressure (when the proxy is not reading from upstream because the client write half is slow).
+
+**`upstream_idle_retries`** (`usize`, default `2`)
+
+Pre-stream retry budget. Number of times to retry the upstream fetch when `upstream_first_byte_timeout` fires before any bytes have been sent to the client. Uses the existing connection-pool IP failover for each retry. After exhausting retries, the proxy returns an error response rather than hanging.
 
 ### Connection Keepalive
 
@@ -1343,6 +1460,7 @@ metrics:
   enabled: true
   endpoint: "/metrics"
   port: 9090
+  bind_address: "0.0.0.0"   # Default: all interfaces. Use "127.0.0.1" for loopback-only.
   collection_interval: "60s"
   include_cache_stats: true
   include_compression_stats: true
@@ -1535,6 +1653,7 @@ health:
   enabled: true
   endpoint: "/health"
   port: 8080
+  bind_address: "0.0.0.0"   # Default: all interfaces. Use "127.0.0.1" for loopback-only.
   check_interval: "30s"
 ```
 

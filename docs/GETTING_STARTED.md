@@ -134,27 +134,54 @@ The proxy starts on:
 
 #### Running as a systemd Service (Recommended for Production)
 
-Create `/etc/systemd/system/s3-proxy.service`:
+Copy the provided unit file (or create `/etc/systemd/system/s3-proxy.service`):
 
-```ini
-[Unit]
-Description=S3 Proxy Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/s3-proxy -c /etc/s3-proxy/config.yaml
-Restart=on-failure
-RestartSec=5
-User=root
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo cp config/s3-proxy.service /etc/systemd/system/s3-proxy.service
 ```
 
-Enable and start:
+The unit file includes systemd sandbox directives that restrict the proxy's filesystem and kernel access. Key hardening features:
+
+- `NoNewPrivileges=true` — prevents privilege escalation via setuid/setgid binaries
+- `ProtectSystem=strict` — mounts the entire filesystem read-only except explicit `ReadWritePaths`
+- `ProtectHome=true` — hides `/home`, `/root`, `/run/user`
+- `PrivateTmp=true` — isolates `/tmp` and `/var/tmp`
+- `PrivateDevices=true` — removes access to physical devices
+- `ProtectKernelTunables=true` — read-only `/proc/sys`, `/sys`
+- `ProtectKernelModules=true` — blocks kernel module loading
+- `ProtectControlGroups=true` — read-only cgroup filesystem
+- `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` — only TCP/UDP and Unix sockets
+- `ReadWritePaths=/var/cache/s3-proxy /var/log/s3-proxy` — explicit allowlist for writable directories
+
+##### Directory prerequisites
+
+Before starting the service, create the cache and log directories:
+
+```bash
+sudo mkdir -p /var/cache/s3-proxy /var/log/s3-proxy
+```
+
+If your `config.yaml` uses different paths for `cache_dir` or log directories, adjust the `ReadWritePaths=` line in the unit file to match. The proxy cannot write outside these paths when `ProtectSystem=strict` is active.
+
+##### Privilege tradeoff (User=root)
+
+The shipped unit runs as `User=root` because binding ports 80 and 443 requires either root or `CAP_NET_BIND_SERVICE`. If your deployment uses proxy-only mode (port 3128) or places a load balancer in front that owns 80/443, you can drop to a dedicated user for stronger isolation:
+
+```ini
+User=s3proxy
+Group=s3proxy
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+When switching to a non-root user, transfer ownership of the cache and log directories:
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin s3proxy
+sudo chown -R s3proxy:s3proxy /var/cache/s3-proxy /var/log/s3-proxy
+```
+
+##### Enable and start
 
 ```bash
 sudo systemctl daemon-reload
@@ -162,7 +189,7 @@ sudo systemctl enable s3-proxy
 sudo systemctl start s3-proxy
 ```
 
-Verify:
+##### Verify
 
 ```bash
 sudo systemctl status s3-proxy
@@ -170,7 +197,7 @@ journalctl -u s3-proxy --no-pager | tail -20
 curl -s http://localhost:8080/health
 ```
 
-The service runs as root (required for binding ports 80/443) and restarts automatically on failure. Logs go to the systemd journal and are accessible via `journalctl -u s3-proxy`.
+The service restarts automatically on failure. Logs go to the systemd journal and are accessible via `journalctl -u s3-proxy`.
 
 #### Proxy-Only Mode (No sudo Required)
 

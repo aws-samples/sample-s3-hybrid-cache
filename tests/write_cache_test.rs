@@ -41,6 +41,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     )
 }
 

@@ -5,6 +5,7 @@
 - [Overview](#overview)
 - [Cache Architecture](#cache-architecture)
   - [Two-Tier Cache System](#two-tier-cache-system)
+  - [RAM Cache Concurrency Model](#ram-cache-concurrency-model)
   - [RAM-Disk Cache Coherency](#ram-disk-cache-coherency)
   - [RAM Metadata Cache](#ram-metadata-cache)
   - [Streaming Response Architecture](#streaming-response-architecture)
@@ -65,6 +66,7 @@ Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access 
    - **RAM Metadata Cache**: Caches `NewCacheMetadata` objects to reduce disk I/O for both HEAD and GET requests
    - **Range data caching**: Both streaming and buffered paths check RAM cache before disk and promote disk hits to RAM cache (key format: `{cache_key}:range:{start}:{end}`)
    - Note: PUT-cached objects are NOT stored in RAM cache (disk only)
+   - **Sharded for concurrency**: The RAM cache is partitioned into `ram_cache_shard_count` independent shards (default 8), each guarded by its own `tokio::sync::RwLock`. A key maps to a shard via `blake3(cache_key) % shard_count`. Reads for keys in different shards proceed in parallel with no contention, and concurrent reads of the same key share a read lock. Per-shard capacity is `max_ram_cache_size / ram_cache_shard_count`. See [Concurrency Model](#ram-cache-concurrency-model) below and [`ram_cache_shard_count`](CONFIGURATION.md) for tuning.
 
 2. **Disk Cache** (Second Tier)
    - File-based persistent cache
@@ -73,6 +75,20 @@ Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access 
    - Range-level eviction granularity for optimal cache utilization
    - LZ4 compression for space efficiency
    - Range storage architecture: `.meta` (lightweight metadata) + `.bin` (range data)
+
+### RAM Cache Concurrency Model
+
+The RAM cache read path is designed to scale with concurrent connections rather than serialize all reads through one lock.
+
+**Sharding**: The cache is split into `ram_cache_shard_count` shards (default 8). Each shard owns a disjoint subset of keys and its own `tokio::sync::RwLock`, eviction state, and capacity budget (`max_ram_cache_size / ram_cache_shard_count`). A key is routed to its shard with `blake3(cache_key) % shard_count` — reusing the BLAKE3 hash already computed for disk-path sharding, so routing adds no extra hashing cost. GETs and PUTs lock only the target shard; operations on keys in different shards never contend.
+
+**Zero-copy reads**: Cached bytes are stored as `Arc<Bytes>`. A `get()` returns a reference-count increment (O(1)), not a copy of the object data. The shard lock is released before any LZ4 decompression or HTTP response-body construction, so the lock is held only for the pointer clone. Peak per-request memory for a cache hit is bounded by one copy of the decompressed object, not two.
+
+**Async-aware locking**: Each shard uses `tokio::sync::RwLock`, so a read yields to the Tokio runtime instead of blocking the OS worker thread under contention. Reads acquire the lock in shared mode; PUTs and eviction acquire it in exclusive mode. Unlike `std::sync::Mutex`, this lock does not poison on a panic in a request handler.
+
+**Read-only access tracking**: Per-entry `last_accessed` and `access_count`, plus the cache-wide hit/miss counters, are `AtomicU64` fields updated through the shared read lock. The read path never needs a write lock to record an access. LRU/TinyLFU ordering is updated approximately: reads push to a sampled `pending_accesses` buffer that the next `put()` drains under the write lock. Exact ordering on every read is not maintained — eviction only needs to favor cold entries, and a one-`put()`-delayed reorder is sufficient for steady-state hot-set workloads.
+
+**Shard skew caveat**: Because each shard evicts against its own capacity slice, an uneven key distribution or a few very large objects can fill one shard while others stay underused, lowering effective cache utilization below the configured maximum. BLAKE3 distributes keys uniformly, so skew is small across many keys; workloads dominated by a handful of very large hot objects should size `max_ram_cache_size` with headroom or lower `ram_cache_shard_count`. See [`ram_cache_shard_count`](CONFIGURATION.md) for tuning guidance.
 
 ### RAM-Disk Cache Coherency
 
@@ -322,6 +338,14 @@ Read attempt → ESTALE error → Retry with backoff (up to 3 times)
 - `stale_handle_max_retries`: Maximum retry attempts (default: 3)
 - Exponential backoff between retries (10ms, 20ms, 30ms)
 
+#### Metadata File Size Cap and Self-Heal
+
+The proxy enforces a maximum `.meta` file size (`max_metadata_file_bytes`, default 4 MiB) to prevent pathologically large metadata files — such as legacy inline-body entries from pre-upgrade proxy versions — from blocking the runtime or consuming unbounded memory. Files exceeding the cap are rejected in O(stat) without being read.
+
+When a `.meta` file is classified as confidently corrupt (oversize, legacy schema, or stable parse failure after bounded retries), the proxy heals it automatically: the S3 refetch writes a fresh valid `.meta` via atomic tmp+rename, overwriting the corrupt file. Transient/partial reads (mid-write on NFS) remain on the existing "do not delete" tolerance path. See `docs/ERROR_HANDLING.md` for the full classification and heal mechanism.
+
+All metadata reads run inside `spawn_blocking` with a concurrency semaphore (`metadata_io_concurrency`, default 32), so one slow or large `.meta` file cannot starve the async runtime.
+
 #### Configuration
 
 ```yaml
@@ -531,6 +555,12 @@ All cached data uses the same storage format, regardless of source:
 3. **Simplified Code**: Single storage format for all cache types
 4. **Efficient Metadata**: Metadata files remain <100KB even with hundreds of ranges
 5. **Fast Transitions**: TTL transitions complete in <10ms (metadata-only update)
+
+#### Partial range prefix salvage
+
+A streamed range cache write can end before the full requested range arrives — the client cancelled the transfer, or the mid-stream idle watchdog (`connection_pool.upstream_idle_timeout`) aborted a stalled upstream. By default such a range was discarded entirely. With `cache.partial_range_commit_ratio` (default `0.5`), the proxy instead commits the received prefix as a smaller valid range `[start, start + received - 1]` when at least that fraction of the requested bytes arrived **in order**.
+
+This matters for high-throughput clients like the AWS CLI CRT transfer client, which opens many parallel range connections — any of which can be cut short by the proxy's mid-stream idle watchdog or by CRT's adaptive part reassignment. Without salvage, the received bytes from those interrupted ranges are discarded entirely. The salvaged range is recorded with its true byte bounds, so it is never served as if it were the full requested range: a later request for the missing tail fetches it from S3 and merges with the cached prefix (see [Range Merging](#range-merging)). `1.0` keeps the exact-only behavior (any short range discarded); `0.0` commits any non-empty prefix. The write-through PUT path is unaffected — a truncated upload is never cached. See [Partial Range Commit Ratio](CONFIGURATION.md#partial-range-commit-ratio) for tuning.
 
 ### Cache Entry Structure
 
@@ -809,31 +839,39 @@ When an expired entry is accessed in lazy mode, the proxy uses HTTP conditional 
 
 This approach minimizes bandwidth usage while ensuring cache freshness and consistency.
 
-The proxy handles conditional headers in three semantically distinct ways, configurable via `cache.evaluate_conditions_from_cache` (default `false`).
+The proxy handles conditional headers in three semantically distinct ways, configurable via `cache.evaluate_conditions_from_cache` (default `true`).
 
-### Default: always forward to S3 (`evaluate_conditions_from_cache = false`)
+### Opt-out: always forward to S3 for condition evaluation (`evaluate_conditions_from_cache = false`)
 
-Requests on the GET/HEAD path that carry `If-Match`, `If-None-Match`, `If-Modified-Since`, or `If-Unmodified-Since` are forwarded to S3 with the client's headers intact, regardless of whether they also carry a `Range` header. S3 is the sole judge. The proxy takes cache action based only on S3's response:
+Requests on the GET/HEAD path that carry `If-Match`, `If-None-Match`, `If-Modified-Since`, or `If-Unmodified-Since` are forwarded to S3 with the client's headers intact, regardless of whether they also carry a `Range` header. The SigV4 signature is preserved, so the conditional reaches S3 exactly as the client signed it. S3 is the sole judge (forward-and-cache). The proxy takes cache action based only on S3's response:
 
-- **S3 returns 200 OK** → return data to client, invalidate old cache, cache new data
-- **S3 returns 304 Not Modified** → return 304 to client, refresh cache TTL
+- **S3 returns 200 OK / 206 Partial Content** → return the data to the client and cache the fresh response (full object or range). This is the path the AWS CLI CRT client takes — every CRT ranged GET of a multi-part download carries `If-Match` — so CRT downloads of large objects now populate the cache. If the object changed, the stale cached ranges/entry are dropped by ETag-mismatch invalidation during the cache lookup, not by a blanket purge.
+- **S3 returns 304 Not Modified** → return 304 to the client, cache unchanged. TTL is refreshed only if S3's response ETag equals the cached ETag; if the ETags differ, the cached copy is stale and is invalidated on the next non-conditional miss (a `304` has no body to replace it with now).
 - **S3 returns 412 Precondition Failed** → return 412 to client, cache unchanged
 - **S3 returns 403 / 401** → return error to client, cache unchanged (credentials issue is not a data change)
 
-Strict RFC 7232 compliance and strongest consistency — the proxy cannot serve stale data based on a stale cached ETag. Costs one S3 round trip per conditional request.
+> Before v2.2.0 a conditional request was forwarded on a non-caching path, so it was answered from S3 but never written to the cache — which is why CRT large-object downloads never cached. The forward-and-cache path above is the fix.
 
-### Opt-in: cache evaluates conditions locally (`evaluate_conditions_from_cache = true`)
+Strict RFC 7232 compliance and strongest consistency — the proxy cannot serve stale data based on a stale cached ETag. Costs one S3 round trip per conditional request. If you prefer strict S3-authoritative condition evaluation for every request, set `evaluate_conditions_from_cache: false`.
 
-Configured globally or per-bucket/prefix. When enabled and the cached object is unexpired AND cached metadata has the validator the client referenced (ETag for `If-Match` / `If-None-Match`, Last-Modified for `If-Modified-Since` / `If-Unmodified-Since`), the proxy evaluates the client's conditional headers against cached metadata and returns 304 / 412 / 200 locally without contacting S3. Precedence follows RFC 7232 §6:
+### Default: serve `If-Match` hits from cache (`evaluate_conditions_from_cache = true`)
 
-1. `If-Match` (strong compare against cached ETag) → 412 on mismatch, else continue
-2. `If-Unmodified-Since` (only if `If-Match` absent) → 412 if cached Last-Modified is later
-3. `If-None-Match` (weak compare) → 304 for GET/HEAD, 412 for others, on match
-4. `If-Modified-Since` (only if `If-None-Match` absent, GET/HEAD only) → 304 if cached Last-Modified ≤ provided
+When `If-Match` is the only conditional header on a GET or range request, and the proxy holds the requested data in cache with a matching ETag, the proxy serves the response directly from cache without contacting S3. The client's `If-Match` value is the freshness assertion — if the proxy has that exact ETag cached, it is the correct version by definition. TTL is refreshed on serve.
 
-If required validators are missing from cache, or if the cached object is expired, the proxy falls back to the always-forward path for that request. Client cache-bypass headers (`Cache-Control: no-cache/no-store`, `Pragma: no-cache`) also force forward.
+For `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` — in any combination, or combined with `If-Match` — the proxy always forwards the full conditional request to S3. These headers are caller-supplied negative-match or timestamp assertions that only S3 can answer authoritatively; a local answer could be based on a stale cached validator.
 
-Trades strict freshness for lower latency. The proxy can serve a 412 or 304 based on a cached ETag that is no longer current on S3 if the cached TTL has not expired. Appropriate when the operator trusts TTL to bound staleness. Not recommended with `get_ttl: "0s"` — every request would fall back to forward anyway, defeating the purpose.
+| Conditional | Has full cache hit with matching ETag | Action |
+|---|---|---|
+| `If-Match` only | Yes | Serve from cache, refresh TTL — no S3 call |
+| `If-Match` only | No (miss / ETag mismatch / partial cache) | Forward to S3 → `412` or `200`/`206` (cached) |
+| `If-None-Match` | Any | Always forward to S3 |
+| `If-Modified-Since` | Any | Always forward to S3 |
+| `If-Unmodified-Since` | Any | Always forward to S3 |
+| Mixed (`If-Match` + any other) | Any | Forward to S3 |
+
+This is the recommended setting for the AWS CLI CRT client: CRT stamps `If-Match` on every ranged GET to pin parts to the same object version, so with the default `true` a warm CRT download is served from cache with no S3 round trips. With `evaluate_conditions_from_cache: false`, every CRT ranged GET re-contacts S3.
+
+> **v2.2.0 change:** the previous `true` behavior evaluated all four conditional headers locally — local `304` for `If-None-Match` match, local `412` for `If-Unmodified-Since` violations, etc. That full local evaluation was removed because it could serve verdicts based on a stale cached ETag/Last-Modified. The new behavior is strictly safer: only `If-Match` (the client's positive ETag assertion) is answered locally; the ambiguous temporal and negative-match headers always go to S3.
 
 ### Proxy-internal conditional injection (independent of the above)
 
@@ -1359,18 +1397,26 @@ aws s3api get-object --bucket my-bucket --key test.txt \
 
 The proxy handles conditional headers in three semantically distinct ways. The first is pure pass-through; the other two are narrow proxy-internal optimizations that never leak conditional behavior back to the client.
 
-#### 1. Client-supplied conditional headers (pass-through)
+#### 1. Client-supplied conditional headers (forward-and-cache)
 
-Requests on the GET/HEAD path without a `Range` header that carry `If-Match`, `If-None-Match`, `If-Modified-Since`, or `If-Unmodified-Since` are forwarded to S3 with the client's headers intact. S3 is the sole judge. The proxy takes cache action based only on S3's response:
+Conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) are dispatched by header class and by the `evaluate_conditions_from_cache` setting:
+
+**`evaluate_conditions_from_cache = false`:** Every conditional request is forwarded to S3 with all headers intact (SigV4 signature preserved). S3 evaluates the precondition. `200`/`206` success is cached via the normal caching pipeline. `304`/`412` are forwarded to the client without caching. No conditional is served from a cache hit with this setting.
+
+**`evaluate_conditions_from_cache = true` (default):** An `If-Match` request where the cached ETag matches the `If-Match` value AND the data is fully cached is served from cache (TTL refreshed, no S3 call). `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` always forward to S3, exactly as the `false` setting.
+
+**TTL/version reconciliation:** When a forwarded conditional returns `200`/`206`, the body is cached under S3's response ETag; if that ETag differs from a stale cached entry, the cache lookup invalidates all of the old ranges and **replaces** the object with the fresh content (ETag-mismatch invalidation, `range_handler.rs`). When it returns `304` (no body to cache), the cached entry's TTL is refreshed only if the `304`'s ETag equals the cached ETag; if they differ, the TTL is not refreshed and the stale entry is invalidated on the next non-conditional miss.
+
+The proxy takes cache action based only on S3's response when forwarding:
 
 | S3 response | Action | Cache |
 |---|---|---|
 | 200 OK | Stream data to client, cache new data | Old data invalidated |
-| 304 Not Modified | Return 304 to client, refresh TTL | Valid |
+| 304 Not Modified | Return 304 to client; refresh TTL only if S3 response ETag = cached ETag | Valid only if ETag unchanged |
 | 412 Precondition Failed | Return 412 to client | Unchanged |
 | 403 / 401 | Return error to client | Unchanged (credentials ≠ data change) |
 
-Range requests with client conditional headers are handled by the range-merge path, which preserves the client's conditional headers exactly on every outbound S3 fetch.
+Range requests with client conditional headers are handled by the range-merge path, which preserves the client's conditional headers exactly on every outbound S3 fetch. With `evaluate_conditions_from_cache = true`, an `If-Match` range request whose ETag and full range are cached is served from cache instead of forwarded.
 
 #### 2. TTL-expired revalidation (proxy-injected `If-None-Match` + `If-Modified-Since`)
 
@@ -2208,7 +2254,7 @@ Client GET/HEAD → Proxy → S3 → Stream response directly to client (no cach
 - Existing cached data for the affected keys is eagerly deleted on the first GET/HEAD after the rule takes effect (range `.bin` files + `.meta` metadata, including HEAD `head_expires_at`)
 - Bounded cost: at most one delete per key per instance; subsequent requests find nothing to delete
 - In shared-storage mode, eager deletion writes one journal `Remove` entry (same as DELETE)
-- Conditional requests (Mode B) also honour `read_cache_enabled=false`: they do not answer from cache and trigger the same eager invalidation
+- Conditional requests (`evaluate_conditions_from_cache = true`) also honour `read_cache_enabled=false`: they do not answer from cache and trigger the same eager invalidation
 
 ## Cache Bypass for Non-Cacheable Operations
 

@@ -31,6 +31,7 @@ async fn test_get_write_cache_capacity_default() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
 
     // With no total cache size set, should use 1GB default
@@ -68,6 +69,7 @@ async fn test_get_write_cache_capacity_with_total_size() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await?;
@@ -108,6 +110,7 @@ async fn test_get_write_cache_capacity_different_percentages() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
     cache_manager.update_total_cache_size(1024 * 1024 * 1024); // 1GB
 
@@ -144,6 +147,7 @@ async fn test_get_write_cache_capacity_consistency() -> Result<()> {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     );
     let _disk_cache = cache_manager.create_configured_disk_cache_manager();
     cache_manager.initialize().await?;

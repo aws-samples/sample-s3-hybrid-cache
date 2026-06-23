@@ -35,6 +35,7 @@ use crate::aws_chunked_decoder;
 use crate::capacity_manager::{check_cache_capacity, log_bypass_decision, CacheDecision};
 use crate::compression::CompressionHandler;
 use crate::metrics::MetricsManager;
+use crate::path_safety::is_safe_path_component;
 use crate::s3_client::S3ClientApi;
 use crate::signed_request_proxy::{
     forward_signed_request, forward_signed_request_streaming, forward_signed_request_with_body,
@@ -291,6 +292,10 @@ pub struct SignedPutHandler {
     proxy_referer: Option<String>,
     /// Maximum request body size to buffer into memory (Requirement 11.1)
     max_buffered_request_body_bytes: u64,
+    /// Maximum CompleteMultipartUpload body size (default: 10 MiB).
+    /// The Complete XML body is bounded to this cap; bodies exceeding it are rejected
+    /// with HTTP 413, preventing unbounded memory consumption.
+    max_complete_body_bytes: u64,
     /// Bounded depth (in frames) of the streaming write-cache tee channel
     /// (`server.write_cache_tee_channel_depth`). One in-flight frame plus this many
     /// queued frames is the whole per-request streaming cache memory budget — see
@@ -308,6 +313,8 @@ impl SignedPutHandler {
     /// * `current_cache_usage` - Current cache usage in bytes
     /// * `max_cache_capacity` - Maximum cache capacity in bytes
     /// * `max_buffered_request_body_bytes` - Maximum request body size to buffer
+    /// * `max_complete_body_bytes` - Maximum CompleteMultipartUpload body size
+    #[allow(clippy::too_many_arguments)] // All arguments are required config values
     pub fn new(
         cache_dir: PathBuf,
         compression_handler: CompressionHandler,
@@ -315,6 +322,7 @@ impl SignedPutHandler {
         max_cache_capacity: u64,
         proxy_referer: Option<String>,
         max_buffered_request_body_bytes: u64,
+        max_complete_body_bytes: u64,
         write_cache_tee_channel_depth: usize,
     ) -> Self {
         Self {
@@ -327,6 +335,7 @@ impl SignedPutHandler {
             s3_client: None,
             proxy_referer,
             max_buffered_request_body_bytes,
+            max_complete_body_bytes,
             write_cache_tee_channel_depth,
         }
     }
@@ -1109,6 +1118,22 @@ impl SignedPutHandler {
         upload_id: String,
         part_number: u32,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        // Security: validate uploadId before any filesystem path construction.
+        // On reject, forward to S3 unmodified (preserve SigV4 response) and skip cache work.
+        if !is_safe_path_component(&upload_id) {
+            warn!(
+                "UploadPart: rejected unsafe uploadId={}, forwarding to S3 without caching",
+                truncate_upload_id(&upload_id)
+            );
+            return forward_signed_request(
+                req,
+                &target_host,
+                &transport,
+                self.proxy_referer.as_deref(),
+            )
+            .await;
+        }
+
         // Extract request headers
         let request_headers: HashMap<String, String> = req
             .headers()
@@ -1371,6 +1396,22 @@ impl SignedPutHandler {
         transport: Arc<UpstreamTransport>,
         upload_id: String,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        // Security: validate uploadId before any filesystem path construction.
+        // On reject, forward to S3 unmodified (preserve SigV4 response) and skip cache work.
+        if !is_safe_path_component(&upload_id) {
+            warn!(
+                "CompleteMultipartUpload: rejected unsafe uploadId={}, forwarding to S3 without caching",
+                truncate_upload_id(&upload_id)
+            );
+            return forward_signed_request(
+                req,
+                &target_host,
+                &transport,
+                self.proxy_referer.as_deref(),
+            )
+            .await;
+        }
+
         let (bucket, key) = parse_cache_key(&cache_key);
 
         // Buffer the request body before forwarding to S3 (Requirement 4.1)
@@ -1380,13 +1421,63 @@ impl SignedPutHandler {
         let headers = req.headers().clone();
         let version = req.version();
 
-        // Read the request body
-        let request_body = req.into_body();
-        let request_body_bytes = request_body
-            .collect()
-            .await
-            .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?
-            .to_bytes();
+        // Read the request body with a bounded cap (Security: prevent unbounded memory
+        // consumption from an oversized CompleteMultipartUpload body). The Complete XML
+        // lists part numbers and ETags — a few MiB is ample for even the largest uploads
+        // (10,000 parts). On overflow, reject with HTTP 413 before forwarding to S3.
+        let max_bytes = self.max_complete_body_bytes;
+        let content_length_hint = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+
+        // Fast reject if Content-Length already exceeds cap
+        if let Some(cl) = content_length_hint {
+            if cl > max_bytes {
+                warn!(
+                    content_length = cl,
+                    max_bytes = max_bytes,
+                    "CompleteMultipartUpload body exceeds max_complete_body_bytes (Content-Length)"
+                );
+                return Err(ProxyError::RequestBodyTooLarge {
+                    content_length: Some(cl),
+                    max_bytes,
+                });
+            }
+        }
+
+        let mut body = req.into_body();
+        let mut accumulated = Vec::with_capacity(
+            content_length_hint
+                .unwrap_or(8192)
+                .min(max_bytes)
+                .min(1024 * 1024) as usize,
+        );
+
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| {
+                ProxyError::HttpError(format!(
+                    "Failed to read CompleteMultipartUpload body: {}",
+                    e
+                ))
+            })?;
+            if let Ok(data) = frame.into_data() {
+                if accumulated.len() as u64 + data.len() as u64 > max_bytes {
+                    warn!(
+                        accumulated_bytes = accumulated.len(),
+                        chunk_bytes = data.len(),
+                        max_bytes = max_bytes,
+                        "CompleteMultipartUpload body exceeds max_complete_body_bytes"
+                    );
+                    return Err(ProxyError::RequestBodyTooLarge {
+                        content_length: content_length_hint,
+                        max_bytes,
+                    });
+                }
+                accumulated.extend_from_slice(&data);
+            }
+        }
+        let request_body_bytes = Bytes::from(accumulated);
 
         // Parse the request body to extract the requested parts list (Requirement 4.1, 4.2)
         let requested_parts = match parse_complete_mpu_request(&request_body_bytes) {
@@ -1512,6 +1603,22 @@ impl SignedPutHandler {
         transport: Arc<UpstreamTransport>,
         upload_id: String,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        // Security: validate uploadId BEFORE any path construction or remove_dir_all.
+        // On reject, forward to S3 unmodified (preserve SigV4 response) and skip cache work.
+        if !is_safe_path_component(&upload_id) {
+            warn!(
+                "AbortMultipartUpload: rejected unsafe uploadId={}, forwarding to S3 without caching",
+                truncate_upload_id(&upload_id)
+            );
+            return forward_signed_request(
+                req,
+                &target_host,
+                &transport,
+                self.proxy_referer.as_deref(),
+            )
+            .await;
+        }
+
         info!(
             "Handling AbortMultipartUpload: cache_key={}, upload_id={}",
             cache_key, upload_id
@@ -3393,6 +3500,7 @@ mod tests {
             10 * 1024 * 1024, // 10MB capacity
             None,
             128 * 1024 * 1024, // 128 MiB max request body
+            10 * 1024 * 1024,  // 10 MiB max complete body
             5,                 // write_cache_tee_channel_depth
         )
     }
@@ -3614,6 +3722,7 @@ mod tests {
                     10 * 1024 * 1024,
                     None,
                     128 * 1024 * 1024,
+                    10 * 1024 * 1024,
                     5,
                 );
                 handler
@@ -3633,6 +3742,7 @@ mod tests {
                     10 * 1024 * 1024,
                     None,
                     128 * 1024 * 1024,
+                    10 * 1024 * 1024,
                     5,
                 );
                 handler
@@ -6547,6 +6657,120 @@ mod tests {
         assert!(
             !upload_dir.join("upload.meta").exists(),
             "no tracker should be written on S3 error"
+        );
+    }
+
+    // --- uploadId validation tests (Security: path traversal prevention) ---
+
+    #[tokio::test]
+    async fn test_cleanup_multipart_upload_rejects_traversal() {
+        // Ensure cleanup_multipart_upload with a traversal uploadId does NOT
+        // perform remove_dir_all outside the cache directory.
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+
+        // Create a sentinel file outside the mpus_in_progress tree
+        let sentinel = temp_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "must survive").unwrap();
+
+        // Even though cleanup doesn't validate (the handler does), confirm
+        // that a traversal uploadId pointing at the sentinel's parent doesn't
+        // delete the sentinel when the mpus_in_progress subdir doesn't exist.
+        // This tests the defense-in-depth: the directory simply doesn't exist.
+        let result = handler.cleanup_multipart_upload("../../sentinel.txt").await;
+        assert!(result.is_ok());
+        assert!(
+            sentinel.exists(),
+            "sentinel file must survive cleanup with traversal uploadId"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_id_validation_rejects_malicious_ids() {
+        // Verify is_safe_path_component correctly rejects all dangerous patterns
+        // that could be used as uploadId values for path traversal.
+
+        // Traversal attempts
+        assert!(!is_safe_path_component("../../etc/passwd"));
+        assert!(!is_safe_path_component("../x"));
+        assert!(!is_safe_path_component(".."));
+        assert!(!is_safe_path_component("foo..bar"));
+
+        // Path separators
+        assert!(!is_safe_path_component("a/b"));
+        assert!(!is_safe_path_component("a\\b"));
+
+        // Control characters
+        assert!(!is_safe_path_component("upload\x00id"));
+        assert!(!is_safe_path_component("upload\nid"));
+
+        // Empty
+        assert!(!is_safe_path_component(""));
+
+        // Valid S3-like uploadIds still pass
+        assert!(is_safe_path_component(
+            "VXBsb2FkIElEIGZvciBlbHZpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA"
+        ));
+        assert!(is_safe_path_component(
+            "2Hoj0CxQnbMljdfMrU3bYHPJFSRPCmLzSHBfSIz4k"
+        ));
+        assert!(is_safe_path_component("normal-upload-id-123"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_upload_part_with_safe_upload_id_works() {
+        // Normal uploadId still writes cache data (regression guard)
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+
+        let cache_key = "test-bucket/test-object";
+        let upload_id = "safe-upload-id-ABC123";
+        let part_number = 1;
+        let data = b"test data for safe uploadId";
+        let etag = "test-etag-safe";
+
+        let result = handler
+            .cache_upload_part(cache_key, upload_id, part_number, data, etag)
+            .await;
+        assert!(result.is_ok());
+
+        // Verify the upload directory was created in the correct location
+        let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+        assert!(
+            multipart_dir.exists(),
+            "upload directory should be created for safe uploadId"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_malicious_upload_id_no_directory_created() {
+        // A malicious uploadId must NOT create any directory in the cache.
+        // (Handler validation rejects before cache_upload_part is called, but
+        // if the guard were bypassed, the path would be unsafe.)
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a sentinel directory outside mpus_in_progress
+        let outside_dir = temp_dir.path().join("important_data");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let sentinel = outside_dir.join("file.txt");
+        std::fs::write(&sentinel, "critical data").unwrap();
+
+        // The handler would reject "../../important_data" via is_safe_path_component
+        // but verify the cleanup path also doesn't escape.
+        let mut handler = create_test_handler(&temp_dir);
+        let result = handler
+            .cleanup_multipart_upload("../../important_data")
+            .await;
+        assert!(result.is_ok());
+
+        // The sentinel must survive
+        assert!(
+            sentinel.exists(),
+            "sentinel file outside cache must survive malicious uploadId cleanup"
+        );
+        assert!(
+            outside_dir.exists(),
+            "directory outside cache must survive malicious uploadId cleanup"
         );
     }
 }

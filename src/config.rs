@@ -291,6 +291,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Default bind address for health/metrics servers: all interfaces (preserves pre-2.1.1 behavior).
+fn default_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
 /// Default for deprecated max_log_entries field
 fn default_max_log_entries() -> usize {
     100
@@ -1147,14 +1152,58 @@ fn default_read_cache_enabled() -> bool {
 }
 
 fn default_evaluate_conditions_from_cache() -> bool {
-    // Disabled by default — strict RFC 7232 semantics, proxy forwards all conditional
-    // requests to S3. Opt in via config to let the cache answer conditional headers
-    // locally from unexpired metadata.
-    false
+    // Enabled by default — serves If-Match requests directly from cache when the
+    // cached ETag matches (no S3 round trip needed; the client's If-Match asserts the
+    // version it wants). If-None-Match / If-Modified-Since / If-Unmodified-Since always
+    // forward to S3. Set false to forward all conditionals to S3 unconditionally.
+    true
 }
 
 fn default_bucket_settings_staleness_threshold() -> Duration {
     Duration::from_secs(60) // 60 seconds
+}
+
+fn default_ram_cache_shard_count() -> usize {
+    8
+}
+
+/// Default maximum .meta file size before classifying as corrupt/oversized: 4 MiB.
+///
+/// A normal range-based .meta is ~2 KB; 4 MiB leaves ample headroom while catching
+/// pathological legacy inline-body files (which can be 5+ MB).
+fn default_max_metadata_file_bytes() -> u64 {
+    4 * 1024 * 1024 // 4 MiB
+}
+
+/// Default concurrent blocking metadata I/O operations: 32.
+///
+/// Metadata reads run in spawn_blocking to avoid starving the async runtime; this
+/// semaphore caps how many are in-flight at once so the blocking thread pool and
+/// NFS are not overwhelmed under high concurrency or during consolidation.
+fn default_metadata_io_concurrency() -> usize {
+    32
+}
+
+/// Default minimum received fraction of an incomplete range to salvage as a
+/// clamped sub-range: 0.5 (50%).
+///
+/// When a range cache write on the read/GET path ends with fewer bytes than the
+/// requested range (client cancel / mid-stream idle abort) but at least this
+/// fraction of the expected bytes were received in order, the received prefix is
+/// committed as a smaller valid sub-range instead of being discarded. 1.0 = only
+/// commit a fully-received range (legacy behaviour); 0.0 = commit any non-empty
+/// prefix. The write-through PUT path is unaffected (always requires exact bytes).
+fn default_partial_range_commit_ratio() -> f64 {
+    0.5
+}
+
+/// Default maximum CompleteMultipartUpload body size: 10 MiB.
+///
+/// The Complete XML lists part numbers and ETags — a few MiB is ample for the
+/// S3 maximum of 10,000 parts. This prevents unbounded memory consumption from
+/// an oversized or malicious body.
+fn default_max_complete_body_bytes() -> u64 {
+    10 * 1024 * 1024 // 10 MiB
 }
 
 /// Cache configuration
@@ -1313,6 +1362,56 @@ pub struct CacheConfig {
         deserialize_with = "duration_serde::deserialize"
     )]
     pub bucket_settings_staleness_threshold: Duration,
+    /// Number of independent shards for the RAM cache (default: 64)
+    /// Each shard is protected by its own `tokio::sync::RwLock`, allowing concurrent
+    /// reads for keys in different shards to proceed without contention.
+    /// Higher values reduce lock contention under concurrent load.
+    /// Lower values reduce per-shard metadata overhead for small caches.
+    /// Per-shard capacity = max_ram_cache_size / ram_cache_shard_count.
+    /// Valid range: 1–256.
+    /// Requirements: 1.2, 5.1, 5.2, 5.3
+    #[serde(default = "default_ram_cache_shard_count")]
+    pub ram_cache_shard_count: usize,
+    /// Maximum size in bytes for CompleteMultipartUpload request bodies (default: 10 MiB).
+    /// The Complete XML lists part numbers and ETags — a few MiB is ample for even the
+    /// largest uploads (10,000 parts). Bodies exceeding this limit are rejected with
+    /// HTTP 413 before forwarding to S3, preventing unbounded memory consumption.
+    #[serde(default = "default_max_complete_body_bytes")]
+    pub max_complete_body_bytes: u64,
+
+    /// Maximum size in bytes of a .meta file the proxy will read and parse (default: 4 MiB).
+    /// Files exceeding this cap are classified as corrupt/oversized without a full read,
+    /// then healed via cache-miss-and-refetch. Protects against legacy inline-body .meta
+    /// files (which can be MBs) and any other pathological metadata.
+    /// A normal range-based .meta is ~2 KB; default 4 MiB leaves ample headroom.
+    /// Spec: cache-metadata-resilience Req 3/4
+    #[serde(default = "default_max_metadata_file_bytes")]
+    pub max_metadata_file_bytes: u64,
+
+    /// Maximum number of concurrent blocking metadata I/O operations (default: 32).
+    /// Metadata reads run in spawn_blocking to avoid starving the async runtime; this
+    /// semaphore caps how many are in-flight at once so the blocking thread pool and
+    /// NFS are not overwhelmed under high concurrency or during consolidation.
+    /// Spec: cache-metadata-resilience Req 1
+    #[serde(default = "default_metadata_io_concurrency")]
+    pub metadata_io_concurrency: usize,
+
+    /// Minimum received fraction (0.0–1.0) of an incomplete range to salvage as a
+    /// clamped sub-range on the read/GET cache-write path (default: 0.5).
+    ///
+    /// When a streamed range cache write ends with fewer bytes than the requested
+    /// range — because the client cancelled or the mid-stream idle watchdog aborted
+    /// the stream — but at least this fraction of the expected bytes were received
+    /// (in order), the received prefix is committed as a smaller valid range
+    /// `[start, start + received - 1]` instead of being discarded. This lets a
+    /// single high-throughput (e.g. CRT) download populate the cache even when some
+    /// part requests are cut short. Below the threshold, nothing is committed.
+    /// `1.0` requires a fully-received range (legacy behaviour); `0.0` commits any
+    /// non-empty prefix. The write-through PUT cache path always requires the exact
+    /// byte count and is unaffected (a truncated upload is never cached).
+    /// Spec: crt-conditional-range-caching Req 2
+    #[serde(default = "default_partial_range_commit_ratio")]
+    pub partial_range_commit_ratio: f64,
 }
 
 impl Default for CacheConfig {
@@ -1350,6 +1449,11 @@ impl Default for CacheConfig {
             read_cache_enabled: default_read_cache_enabled(),
             evaluate_conditions_from_cache: default_evaluate_conditions_from_cache(),
             bucket_settings_staleness_threshold: default_bucket_settings_staleness_threshold(),
+            ram_cache_shard_count: default_ram_cache_shard_count(),
+            max_complete_body_bytes: default_max_complete_body_bytes(),
+            max_metadata_file_bytes: default_max_metadata_file_bytes(),
+            metadata_io_concurrency: default_metadata_io_concurrency(),
+            partial_range_commit_ratio: default_partial_range_commit_ratio(),
         }
     }
 }
@@ -1385,6 +1489,23 @@ impl CacheConfig {
         self.validate_ttl_field("cache.put_ttl", &self.put_ttl)?;
         self.validate_ttl_field("cache.head_ttl", &self.head_ttl)?;
         self.validate_ttl_field("cache.incomplete_upload_ttl", &self.incomplete_upload_ttl)?;
+
+        // Validate ram_cache_shard_count (1–256 inclusive)
+        // Requirements: 5.2, 5.3
+        if self.ram_cache_shard_count < 1 || self.ram_cache_shard_count > 256 {
+            return Err("cache.ram_cache_shard_count must be between 1 and 256".into());
+        }
+
+        // Validate partial_range_commit_ratio (0.0–1.0 inclusive)
+        // Spec: crt-conditional-range-caching Req 2.6
+        if !(0.0..=1.0).contains(&self.partial_range_commit_ratio)
+            || self.partial_range_commit_ratio.is_nan()
+        {
+            return Err(format!(
+                "cache.partial_range_commit_ratio must be between 0.0 and 1.0, got {}",
+                self.partial_range_commit_ratio
+            ));
+        }
 
         Ok(())
     }
@@ -1653,7 +1774,17 @@ pub struct ConnectionPoolConfig {
     /// TCP keepalive probe retry count (default: 3)
     #[serde(default = "default_keepalive_retries")]
     pub keepalive_retries: u32,
-    /// TCP receive buffer size hint in bytes (default: 256KB). None = kernel default.
+    /// TCP receive buffer size hint (`SO_RCVBUF`) in bytes. Default: `None`.
+    ///
+    /// `None` (the default) leaves the socket buffer unset so the Linux kernel
+    /// auto-tunes the TCP receive window dynamically (up to `net.core.rmem_max`).
+    /// Auto-tuning is required to reach full single-stream throughput on
+    /// high-RTT (cross-region) paths, where a small fixed window caps the
+    /// bandwidth-delay product.
+    ///
+    /// Setting an explicit `Some(bytes)` value pins `SO_RCVBUF`, which disables
+    /// the kernel's dynamic receive-window auto-tuning (DRS). Only set this if
+    /// you have a specific reason to override the kernel.
     #[serde(default = "default_tcp_recv_buffer_size")]
     pub tcp_recv_buffer_size: Option<usize>,
     /// Consecutive failures before excluding an IP from round-robin (default: 3)
@@ -1671,6 +1802,33 @@ pub struct ConnectionPoolConfig {
         deserialize_with = "duration_serde::deserialize"
     )]
     pub health_probe_max_cooldown: Duration,
+    /// Maximum number of endpoints that can be registered for DNS-based IP distribution
+    /// (default: 10000). Prevents unbounded growth from excessive unique hostnames.
+    /// Normal S3 usage is well under this cap.
+    #[serde(default = "default_max_registered_endpoints")]
+    pub max_registered_endpoints: usize,
+    /// Connect-to-first-byte timeout for the proxy's own S3 fetch (default: 5s).
+    /// Bounds how long the proxy waits after connecting before receiving the first
+    /// response byte from upstream. Above cross-region TTFB tails, well below the
+    /// 60s client read-timeout.
+    #[serde(
+        default = "default_upstream_first_byte_timeout",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub upstream_first_byte_timeout: Duration,
+    /// Mid-stream idle timeout: no bytes received from upstream for this duration
+    /// triggers connection termination (default: 5s). Only applies once the upstream
+    /// is actively delivering bytes; a multi-second gap after data has started is
+    /// abnormal.
+    #[serde(
+        default = "default_upstream_idle_timeout",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub upstream_idle_timeout: Duration,
+    /// Pre-stream retry budget (default: 2). Number of times to retry an upstream
+    /// fetch when first-byte timeout fires before any bytes are sent to the client.
+    #[serde(default = "default_upstream_idle_retries")]
+    pub upstream_idle_retries: usize,
 }
 
 fn default_dns_servers() -> Vec<String> {
@@ -1714,7 +1872,10 @@ fn default_keepalive_retries() -> u32 {
 }
 
 fn default_tcp_recv_buffer_size() -> Option<usize> {
-    Some(262144) // 256 KB
+    // None lets the Linux kernel auto-tune the TCP receive window. Setting an
+    // explicit SO_RCVBUF disables auto-tuning (DRS), which caps single-stream
+    // throughput on high-RTT cross-region paths.
+    None
 }
 
 fn default_ip_failure_threshold() -> u32 {
@@ -1727,6 +1888,22 @@ fn default_health_probe_initial_cooldown() -> Duration {
 
 fn default_health_probe_max_cooldown() -> Duration {
     Duration::from_secs(300)
+}
+
+fn default_max_registered_endpoints() -> usize {
+    10_000
+}
+
+fn default_upstream_first_byte_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_upstream_idle_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_upstream_idle_retries() -> usize {
+    2
 }
 
 impl Default for ConnectionPoolConfig {
@@ -1752,6 +1929,10 @@ impl Default for ConnectionPoolConfig {
             ip_failure_threshold: default_ip_failure_threshold(),
             health_probe_initial_cooldown: default_health_probe_initial_cooldown(),
             health_probe_max_cooldown: default_health_probe_max_cooldown(),
+            max_registered_endpoints: default_max_registered_endpoints(),
+            upstream_first_byte_timeout: default_upstream_first_byte_timeout(),
+            upstream_idle_timeout: default_upstream_idle_timeout(),
+            upstream_idle_retries: default_upstream_idle_retries(),
         }
     }
 }
@@ -1825,6 +2006,11 @@ pub struct HealthConfig {
     pub enabled: bool,
     pub endpoint: String,
     pub port: u16,
+    /// Address to bind the health check server to.
+    /// Default "0.0.0.0" listens on all interfaces (IPv4); use "127.0.0.1" or "::1"
+    /// to restrict to loopback only.
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub check_interval: Duration,
 }
@@ -1835,6 +2021,7 @@ impl Default for HealthConfig {
             enabled: true,
             endpoint: "/health".to_string(),
             port: 8080,
+            bind_address: default_bind_address(),
             check_interval: Duration::from_secs(30),
         }
     }
@@ -1846,6 +2033,11 @@ pub struct MetricsConfig {
     pub enabled: bool,
     pub endpoint: String,
     pub port: u16,
+    /// Address to bind the metrics server to.
+    /// Default "0.0.0.0" listens on all interfaces (IPv4); use "127.0.0.1" or "::1"
+    /// to restrict to loopback only.
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
     #[serde(deserialize_with = "duration_serde::deserialize")]
     pub collection_interval: Duration,
     /// DEPRECATED: This field is not read by any logic. All cache stats are always included.
@@ -1863,11 +2055,12 @@ pub struct MetricsConfig {
     /// Will be removed in a future release.
     #[serde(default = "default_true")]
     pub include_connection_stats: bool,
+    #[serde(default)]
     pub otlp: OtlpConfig,
 }
 
 /// OTLP (OpenTelemetry Protocol) configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OtlpConfig {
     pub enabled: bool,
     pub endpoint: String,
@@ -1877,6 +2070,23 @@ pub struct OtlpConfig {
     pub timeout: Duration,
     pub headers: std::collections::HashMap<String, String>,
     pub compression: OtlpCompression,
+}
+
+/// Manual Debug impl that redacts header values (may contain auth tokens/API keys).
+impl std::fmt::Debug for OtlpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtlpConfig")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("export_interval", &self.export_interval)
+            .field("timeout", &self.timeout)
+            .field(
+                "headers",
+                &format_args!("<{} redacted>", self.headers.len()),
+            )
+            .field("compression", &self.compression)
+            .finish()
+    }
 }
 
 /// OTLP compression options
@@ -1908,6 +2118,7 @@ impl Default for MetricsConfig {
             enabled: true,
             endpoint: "/metrics".to_string(),
             port: 9090,
+            bind_address: default_bind_address(),
             collection_interval: Duration::from_secs(60),
             include_cache_stats: true,
             include_compression_stats: true,
@@ -1964,7 +2175,12 @@ impl Default for Config {
                 compression_batch_size: 1_048_576,              // 1 MiB
                 read_cache_enabled: true,                       // Read caching enabled by default
                 bucket_settings_staleness_threshold: Duration::from_secs(60), // 60 seconds
-                evaluate_conditions_from_cache: false,          // Strict always-forward by default
+                evaluate_conditions_from_cache: true, // Default: serve If-Match from cache; If-None-Match/etc still forward
+                ram_cache_shard_count: default_ram_cache_shard_count(),
+                max_complete_body_bytes: default_max_complete_body_bytes(),
+                max_metadata_file_bytes: default_max_metadata_file_bytes(),
+                metadata_io_concurrency: default_metadata_io_concurrency(),
+                partial_range_commit_ratio: default_partial_range_commit_ratio(),
             },
             logging: LoggingConfig {
                 access_log_dir: PathBuf::from("/logs/access"),
@@ -2000,6 +2216,10 @@ impl Default for Config {
                 ip_failure_threshold: default_ip_failure_threshold(),
                 health_probe_initial_cooldown: default_health_probe_initial_cooldown(),
                 health_probe_max_cooldown: default_health_probe_max_cooldown(),
+                max_registered_endpoints: default_max_registered_endpoints(),
+                upstream_first_byte_timeout: default_upstream_first_byte_timeout(),
+                upstream_idle_timeout: default_upstream_idle_timeout(),
+                upstream_idle_retries: default_upstream_idle_retries(),
             },
             compression: CompressionConfig {
                 enabled: true,
@@ -2011,12 +2231,14 @@ impl Default for Config {
                 enabled: true,
                 endpoint: "/health".to_string(),
                 port: 8080,
+                bind_address: default_bind_address(),
                 check_interval: Duration::from_secs(30),
             },
             metrics: MetricsConfig {
                 enabled: true,
                 endpoint: "/metrics".to_string(),
                 port: 8080,
+                bind_address: default_bind_address(),
                 collection_interval: Duration::from_secs(60),
                 include_cache_stats: true,
                 include_compression_stats: true,
@@ -3792,6 +4014,84 @@ logging:
         assert!(config.logging.access_log_enabled);
         assert_eq!(config.logging.log_level, "info");
         assert_eq!(config.connection_pool.max_connections_per_ip, 10);
+        // bind_address defaults preserve all-interfaces behavior (Req 15).
+        assert_eq!(config.health.bind_address, "0.0.0.0");
+        assert_eq!(config.metrics.bind_address, "0.0.0.0");
+        // Metadata resilience defaults (cache-metadata-resilience spec).
+        assert_eq!(config.cache.max_metadata_file_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.cache.metadata_io_concurrency, 32);
+        // Upstream timeout defaults (cache-metadata-resilience spec, Req 5).
+        assert_eq!(
+            config.connection_pool.upstream_first_byte_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.connection_pool.upstream_idle_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(config.connection_pool.upstream_idle_retries, 2);
+    }
+
+    #[test]
+    fn test_bind_address_defaults_when_omitted() {
+        // Config-compat regression (Req 15): health/metrics bind_address fields
+        // omitted from the config file must default to "0.0.0.0" (all-interfaces),
+        // preserving pre-2.1.1 behavior.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  check_interval: "30s"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 9090
+  collection_interval: "60s"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("config must parse");
+        assert_eq!(
+            config.health.bind_address, "0.0.0.0",
+            "health bind_address must default to 0.0.0.0 when omitted"
+        );
+        assert_eq!(
+            config.metrics.bind_address, "0.0.0.0",
+            "metrics bind_address must default to 0.0.0.0 when omitted"
+        );
+    }
+
+    #[test]
+    fn test_bind_address_explicit_loopback() {
+        // Verify explicit bind_address values are honored.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  bind_address: "127.0.0.1"
+  check_interval: "30s"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 9090
+  bind_address: "127.0.0.1"
+  collection_interval: "60s"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("config must parse");
+        assert_eq!(config.health.bind_address, "127.0.0.1");
+        assert_eq!(config.metrics.bind_address, "127.0.0.1");
     }
 
     #[test]
@@ -3876,6 +4176,50 @@ logging:
         assert_eq!(
             config.server.write_cache_tee_channel_depth, 5,
             "omitted write_cache_tee_channel_depth must default to 5 frames"
+        );
+    }
+
+    #[test]
+    fn test_max_complete_body_bytes_defaults_when_omitted() {
+        // Config-compatibility regression (Requirement 6): a config file that
+        // omits `cache.max_complete_body_bytes` must still parse and fall back to
+        // the 10 MiB default. Guards the restart-free upgrade contract.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+
+        assert_eq!(
+            config.cache.max_complete_body_bytes,
+            10 * 1024 * 1024,
+            "omitted max_complete_body_bytes must default to 10 MiB"
+        );
+    }
+
+    #[test]
+    fn test_max_complete_body_bytes_explicit_override() {
+        // Verify that operators can override max_complete_body_bytes.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+  max_complete_body_bytes: 5242880
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("config with explicit field must parse");
+
+        assert_eq!(
+            config.cache.max_complete_body_bytes,
+            5 * 1024 * 1024,
+            "explicit max_complete_body_bytes must be respected"
         );
     }
 
@@ -4053,6 +4397,9 @@ metrics:
         assert_eq!(config.max_idle_per_host, 100);
         assert_eq!(config.max_lifetime, Duration::from_secs(300));
         assert_eq!(config.pool_check_interval, Duration::from_secs(10));
+        assert_eq!(config.upstream_first_byte_timeout, Duration::from_secs(5));
+        assert_eq!(config.upstream_idle_timeout, Duration::from_secs(5));
+        assert_eq!(config.upstream_idle_retries, 2);
     }
 
     #[test]
@@ -4180,6 +4527,53 @@ idle_timeout: "30s"
         assert_eq!(
             config.max_idle_per_ip, 10,
             "max_idle_per_ip should default to 10"
+        );
+    }
+
+    #[test]
+    fn test_tcp_recv_buffer_size_defaults_to_none_when_omitted() {
+        // Bugfix: the default must be None so the kernel auto-tunes the TCP
+        // receive window. A fixed SO_RCVBUF disables auto-tuning and caps
+        // single-stream throughput on high-RTT cross-region paths.
+        let yaml = r#"
+max_connections_per_ip: 10
+dns_refresh_interval: "60s"
+connection_timeout: "10s"
+idle_timeout: "30s"
+"#;
+
+        let config: ConnectionPoolConfig =
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+
+        assert_eq!(
+            config.tcp_recv_buffer_size, None,
+            "tcp_recv_buffer_size should default to None (kernel auto-tune) when omitted"
+        );
+        assert_eq!(
+            ConnectionPoolConfig::default().tcp_recv_buffer_size,
+            None,
+            "ConnectionPoolConfig::default() should leave tcp_recv_buffer_size as None"
+        );
+    }
+
+    #[test]
+    fn test_tcp_recv_buffer_size_explicit_value_parses_to_some() {
+        // Operators can still pin an explicit SO_RCVBUF if they have a reason to.
+        let yaml = r#"
+max_connections_per_ip: 10
+dns_refresh_interval: "60s"
+connection_timeout: "10s"
+idle_timeout: "30s"
+tcp_recv_buffer_size: 262144
+"#;
+
+        let config: ConnectionPoolConfig =
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse ConnectionPoolConfig");
+
+        assert_eq!(
+            config.tcp_recv_buffer_size,
+            Some(262_144),
+            "an explicit tcp_recv_buffer_size value should parse to Some(value)"
         );
     }
 
@@ -5948,6 +6342,70 @@ metrics:
         };
         assert!(cfg.validate().is_ok(), "TTL=0 should be accepted");
     }
+
+    // --- ram_cache_shard_count tests (Requirements 5.2, 5.3) ---
+
+    #[test]
+    fn test_ram_cache_shard_count_default() {
+        // Default shard count is 8.
+        let cfg = CacheConfig::default();
+        assert_eq!(cfg.ram_cache_shard_count, 8);
+    }
+
+    #[test]
+    fn test_ram_cache_shard_count_missing_from_yaml_uses_default() {
+        // Config-compatibility: a YAML that omits `ram_cache_shard_count` must
+        // fall back to the default of 8 so upgrading the binary never requires
+        // editing an existing config file.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+        assert_eq!(
+            config.cache.ram_cache_shard_count, 8,
+            "omitted ram_cache_shard_count must default to 8"
+        );
+    }
+
+    #[test]
+    fn test_ram_cache_shard_count_zero_rejected() {
+        // Requirement 5.3: shard count of 0 is outside the valid range (1–256)
+        // and must be rejected by validate().
+        let cfg = CacheConfig {
+            ram_cache_shard_count: 0,
+            ..CacheConfig::default()
+        };
+        let result = cfg.validate();
+        assert!(result.is_err(), "shard_count=0 must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ram_cache_shard_count"),
+            "error message must name the field, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ram_cache_shard_count_257_rejected() {
+        // Requirement 5.3: shard count of 257 is outside the valid range (1–256)
+        // and must be rejected by validate().
+        let cfg = CacheConfig {
+            ram_cache_shard_count: 257,
+            ..CacheConfig::default()
+        };
+        let result = cfg.validate();
+        assert!(result.is_err(), "shard_count=257 must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ram_cache_shard_count"),
+            "error message must name the field, got: {}",
+            err
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6472,7 +6930,7 @@ mod rolling_validation_config_property_tests {
         assert!(config.cache.cache_bypass_headers_enabled);
         assert_eq!(config.cache.full_object_check_threshold, 67_108_864);
         assert!(config.cache.read_cache_enabled);
-        assert!(!config.cache.evaluate_conditions_from_cache);
+        assert!(config.cache.evaluate_conditions_from_cache);
         assert_eq!(config.cache.disk_streaming_threshold, 1_048_576);
         assert_eq!(config.cache.compression_batch_size, 1_048_576);
 
@@ -6587,7 +7045,7 @@ mod rolling_validation_config_property_tests {
         assert_eq!(config.connection_pool.keepalive_idle_secs, 15);
         assert_eq!(config.connection_pool.keepalive_interval_secs, 5);
         assert_eq!(config.connection_pool.keepalive_retries, 3);
-        assert_eq!(config.connection_pool.tcp_recv_buffer_size, Some(262_144));
+        assert_eq!(config.connection_pool.tcp_recv_buffer_size, None);
         assert_eq!(config.connection_pool.ip_failure_threshold, 3);
 
         // --- compression section ---
@@ -6627,5 +7085,97 @@ mod rolling_validation_config_property_tests {
             config.dashboard.logs_refresh_interval,
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn otlp_config_debug_redacts_header_values() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer super-secret-token".to_string(),
+        );
+        headers.insert("X-Api-Key".to_string(), "ak_1234567890abcdef".to_string());
+
+        let cfg = OtlpConfig {
+            enabled: true,
+            endpoint: "http://collector:4318".to_string(),
+            export_interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(5),
+            headers,
+            compression: OtlpCompression::None,
+        };
+
+        let debug_output = format!("{:?}", cfg);
+
+        // Must NOT contain actual header values
+        assert!(
+            !debug_output.contains("super-secret-token"),
+            "Debug output must not contain header values, got: {}",
+            debug_output
+        );
+        assert!(
+            !debug_output.contains("ak_1234567890abcdef"),
+            "Debug output must not contain header values, got: {}",
+            debug_output
+        );
+
+        // Must contain the redaction placeholder with correct count
+        assert!(
+            debug_output.contains("<2 redacted>"),
+            "Debug output must contain '<2 redacted>' placeholder, got: {}",
+            debug_output
+        );
+
+        // Other fields should still be visible
+        assert!(debug_output.contains("http://collector:4318"));
+        assert!(debug_output.contains("enabled: true"));
+    }
+
+    #[test]
+    fn test_connection_pool_config_without_max_registered_endpoints_uses_default() {
+        // Config-compat: minimal config without max_registered_endpoints still parses
+        let yaml = r#"
+connection_pool:
+  dns_refresh_interval: "60s"
+  connection_timeout: "10s"
+  idle_timeout: "55s"
+"#;
+        let config: ConnectionPoolConfig =
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse connection_pool config");
+        assert_eq!(config.max_registered_endpoints, 10_000);
+    }
+
+    #[test]
+    fn test_connection_pool_config_upstream_timeout_defaults_when_omitted() {
+        // Config-compat: upstream timeout fields omitted → defaults apply
+        let yaml = r#"
+connection_pool:
+  dns_refresh_interval: "60s"
+  connection_timeout: "10s"
+  idle_timeout: "55s"
+"#;
+        let config: ConnectionPoolConfig =
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse connection_pool config");
+        assert_eq!(config.upstream_first_byte_timeout, Duration::from_secs(5));
+        assert_eq!(config.upstream_idle_timeout, Duration::from_secs(5));
+        assert_eq!(config.upstream_idle_retries, 2);
+    }
+
+    #[test]
+    fn test_connection_pool_config_upstream_timeout_explicit_values() {
+        // Explicit override of upstream timeout fields parses correctly
+        let yaml = r#"
+dns_refresh_interval: "60s"
+connection_timeout: "10s"
+idle_timeout: "55s"
+upstream_first_byte_timeout: "10s"
+upstream_idle_timeout: "3s"
+upstream_idle_retries: 5
+"#;
+        let config: ConnectionPoolConfig =
+            serde_yaml_ng::from_str(yaml).expect("Failed to parse connection_pool config");
+        assert_eq!(config.upstream_first_byte_timeout, Duration::from_secs(10));
+        assert_eq!(config.upstream_idle_timeout, Duration::from_secs(3));
+        assert_eq!(config.upstream_idle_retries, 5);
     }
 }

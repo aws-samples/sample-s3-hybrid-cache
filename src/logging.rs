@@ -421,6 +421,10 @@ impl AccessLogBuffer {
         // Mask presigned URL credentials before writing to log
         let masked_uri = mask_presigned_params(&entry.request_uri);
 
+        // Sanitize free-text fields to prevent log injection (CR/LF/quote escaping)
+        let referer = sanitize_log_field(entry.referer.as_deref().unwrap_or("-"));
+        let user_agent = sanitize_log_field(entry.user_agent.as_deref().unwrap_or("-"));
+
         // S3 Server Access Log format (version_id field removed)
         format!(
             "{} {} [{}] {} {} {} {} \"{}\" {} {} {} {} {} {} \"{}\" \"{}\" {} {} {} {} {} {} {} {} {}",
@@ -438,8 +442,8 @@ impl AccessLogBuffer {
             entry.object_size.map_or("-".to_string(), |s| s.to_string()),
             entry.total_time,
             entry.turn_around_time,
-            entry.referer.as_deref().unwrap_or("-"),
-            entry.user_agent.as_deref().unwrap_or("-"),
+            referer,
+            user_agent,
             entry.host_id,
             entry.signature_version.as_deref().unwrap_or("-"),
             entry.cipher_suite.as_deref().unwrap_or("-"),
@@ -882,6 +886,34 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "x-amz-security-token",
 ];
 
+/// Sanitize a free-text field for safe inclusion in access log lines.
+///
+/// Replaces characters that could break log line structure or enable log
+/// injection attacks:
+/// - `\r` (CR) → `\r` literal backslash-r
+/// - `\n` (LF) → `\n` literal backslash-n
+/// - `"` → `\"` backslash-escaped quote
+///
+/// Fields that contain none of these characters are returned as-is (fast path,
+/// no allocation).
+fn sanitize_log_field(field: &str) -> String {
+    // Fast path: if no dangerous characters present, avoid allocation
+    if !field.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'"') {
+        return field.to_string();
+    }
+
+    let mut out = String::with_capacity(field.len() + 8);
+    for ch in field.chars() {
+        match ch {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Mask sensitive presigned URL query parameters in a URI.
 ///
 /// Replaces the values of `X-Amz-Signature`, `X-Amz-Credential`, and
@@ -901,9 +933,17 @@ pub fn mask_presigned_params(uri: &str) -> String {
 
     // Fast path: check for likely presigned parameter substrings (case-insensitive).
     // Also check for percent-encoded hyphens (%2D or %2d) which appear in encoded
-    // parameter names like X%2DAmz%2DSignature.
+    // parameter names like X%2DAmz%2DSignature, and percent-encoded leading 'X'/'x'
+    // (%58/%78) which would appear as %58-Amz-... or %78-Amz-... in doubly-encoded URLs.
     let lower = query.to_ascii_lowercase();
-    if !lower.contains("x-amz-s") && !lower.contains("x-amz-c") && !lower.contains("x%2damz%2d") {
+    if !lower.contains("x-amz-s")
+        && !lower.contains("x-amz-c")
+        && !lower.contains("x%2damz%2d")
+        && !lower.contains("%58-amz-")
+        && !lower.contains("%78-amz-")
+        && !lower.contains("%58%2damz")
+        && !lower.contains("%78%2damz")
+    {
         return uri.to_string();
     }
 
@@ -1920,6 +1960,47 @@ mod mask_presigned_params_tests {
         let masked = mask_presigned_params(uri);
         assert_eq!(masked, uri);
     }
+
+    #[test]
+    fn encoded_leading_x_uppercase_masks_credential() {
+        // %58 is percent-encoded 'X' — must not bypass the fast-path
+        let uri = "/bucket/key?%58-Amz-Credential=AKID/scope&X-Amz-Date=20230101T000000Z";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?%58-Amz-Credential=REDACTED&X-Amz-Date=20230101T000000Z"
+        );
+    }
+
+    #[test]
+    fn encoded_leading_x_lowercase_masks_signature() {
+        // %78 is percent-encoded 'x' — must not bypass the fast-path
+        let uri = "/bucket/key?%78-Amz-Signature=secret&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?%78-Amz-Signature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn encoded_leading_x_with_encoded_hyphens() {
+        // %58%2DAmz%2DSignature — both leading X and hyphens encoded
+        let uri = "/bucket/key?%58%2DAmz%2DSignature=secret&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?%58%2DAmz%2DSignature=REDACTED&other=val"
+        );
+    }
+
+    #[test]
+    fn encoded_leading_x_security_token() {
+        // %58-Amz-Security-Token with encoded leading X
+        let uri = "/bucket/key?%58-Amz-Security-Token=session123&prefix=foo";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?%58-Amz-Security-Token=REDACTED&prefix=foo"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2597,17 +2678,24 @@ mod mask_presigned_params_property_tests {
         let masked = mask_presigned_params(&uri);
 
         // (a) Masked output must not contain any sensitive VALUES
-        // Only check non-trivial values (empty values become "REDACTED" which is fine)
+        // Only check non-trivial values (empty values become "REDACTED" which is fine).
+        // Skip if a non-sensitive param value happens to collide with the sensitive value
+        // (the function correctly preserves non-sensitive values, which may coincidentally
+        // match a sensitive value string).
         for (i, &(_, val)) in sensitive_params.iter().enumerate() {
             if include_mask & (1 << i) != 0
                 && !val.is_empty()
                 && val != "REDACTED"
                 && masked.contains(val)
             {
-                return TestResult::error(format!(
-                    "Masked output still contains sensitive value '{}' in: {}",
-                    val, masked
-                ));
+                // Check whether the match is actually a non-sensitive param value collision
+                let collision_with_safe = safe_params.iter().any(|(_, v)| v.contains(val));
+                if !collision_with_safe {
+                    return TestResult::error(format!(
+                        "Masked output still contains sensitive value '{}' in: {}",
+                        val, masked
+                    ));
+                }
             }
         }
 
@@ -2653,5 +2741,143 @@ mod mask_presigned_params_property_tests {
         }
 
         TestResult::passed()
+    }
+}
+
+#[cfg(test)]
+mod sanitize_log_field_tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn clean_field_unchanged() {
+        assert_eq!(sanitize_log_field("Mozilla/5.0"), "Mozilla/5.0");
+    }
+
+    #[test]
+    fn dash_unchanged() {
+        assert_eq!(sanitize_log_field("-"), "-");
+    }
+
+    #[test]
+    fn escapes_newline() {
+        assert_eq!(sanitize_log_field("line1\nline2"), "line1\\nline2");
+    }
+
+    #[test]
+    fn escapes_carriage_return() {
+        assert_eq!(sanitize_log_field("line1\rline2"), "line1\\rline2");
+    }
+
+    #[test]
+    fn escapes_double_quote() {
+        assert_eq!(sanitize_log_field("has\"quote"), "has\\\"quote");
+    }
+
+    #[test]
+    fn escapes_all_dangerous_chars() {
+        assert_eq!(sanitize_log_field("evil\r\n\"agent"), "evil\\r\\n\\\"agent");
+    }
+
+    #[test]
+    fn format_entry_user_agent_with_newline_quote_does_not_break_line() {
+        // A user agent containing \n and " must not produce multiple log lines
+        let entry = AccessLogEntry {
+            bucket_owner: "owner".to_string(),
+            bucket: "bucket".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-1".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "key".to_string(),
+            request_uri: "/bucket/key".to_string(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 1024,
+            object_size: Some(1024),
+            total_time: 100,
+            turn_around_time: 50,
+            referer: Some("http://evil.com/\ninjected".to_string()),
+            user_agent: Some("BadBot/1.0\n\"injected-field".to_string()),
+            host_id: "host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: None,
+            host_header: None,
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        };
+
+        let formatted = AccessLogBuffer::format_entry(&entry);
+
+        // The formatted entry must be a single line (no raw newlines)
+        assert_eq!(
+            formatted.lines().count(),
+            1,
+            "Log entry must be a single line, but got multiple lines: {:?}",
+            formatted
+        );
+
+        // The escaped sequences must be present
+        assert!(
+            formatted.contains("\\n"),
+            "Newline should be escaped as \\n"
+        );
+        assert!(
+            formatted.contains("\\\""),
+            "Quote should be escaped as \\\""
+        );
+
+        // Raw dangerous characters must NOT be present
+        assert!(!formatted.contains('\n'), "Raw newline must not appear");
+        assert!(
+            !formatted.contains('\r'),
+            "Raw carriage return must not appear"
+        );
+    }
+
+    #[test]
+    fn format_entry_referer_with_crlf_escaped() {
+        let entry = AccessLogEntry {
+            bucket_owner: "owner".to_string(),
+            bucket: "bucket".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-2".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "key".to_string(),
+            request_uri: "/bucket/key".to_string(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 512,
+            object_size: Some(512),
+            total_time: 50,
+            turn_around_time: 25,
+            referer: Some("http://attacker.com\r\nX-Injected: true".to_string()),
+            user_agent: Some("NormalAgent/1.0".to_string()),
+            host_id: "host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: None,
+            host_header: None,
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        };
+
+        let formatted = AccessLogBuffer::format_entry(&entry);
+
+        // Must be a single line
+        assert_eq!(formatted.lines().count(), 1);
+
+        // CR and LF must be escaped
+        assert!(!formatted.contains('\r'));
+        assert!(!formatted.contains('\n'));
+        assert!(formatted.contains("\\r\\n"));
     }
 }

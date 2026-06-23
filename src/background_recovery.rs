@@ -412,6 +412,26 @@ impl BackgroundRecoverySystem {
 
             if !metadata_path.exists() {
                 // Orphan .bin — no corresponding .meta
+                // Defense-in-depth: skip symlinks to avoid deleting a target
+                // outside the cache directory that an attacker pointed here.
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        warn!(
+                            "Skipping orphan removal — path is a symlink (defense-in-depth): {:?}",
+                            path
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Cannot stat orphan .bin file {:?}, skipping removal: {}",
+                            path, e
+                        );
+                        continue;
+                    }
+                    _ => {} // Regular file — safe to remove
+                }
+
                 match std::fs::remove_file(&path) {
                     Ok(_) => {
                         cleaned += 1;
@@ -1257,5 +1277,55 @@ mod tests {
 
         drop(rx2);
         assert_eq!(coordinator.subscriber_count(), 0);
+    }
+
+    /// Symlink planted as a .bin file must NOT be deleted by orphan cleanup.
+    /// Defense-in-depth: the symlink_metadata pre-check should cause the symlink
+    /// to be skipped, leaving the symlink target (sentinel) intact.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_not_deleted_by_orphan_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Set up shard directory structure: ranges/bucket/XX/YYY/
+        let shard_dir = base.join("ranges").join("mybucket").join("ab").join("cde");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Set up metadata directory (no .meta → file is "orphaned")
+        let metadata_dir = base.join("metadata");
+        let metadata_shard = metadata_dir.join("mybucket").join("ab").join("cde");
+        std::fs::create_dir_all(&metadata_shard).unwrap();
+
+        // Create a sentinel file that the symlink points to
+        let sentinel = base.join("sentinel_target.txt");
+        std::fs::write(&sentinel, b"important data").unwrap();
+
+        // Plant a symlink disguised as a .bin file
+        let symlink_bin = shard_dir.join("testkey_0-1023.bin");
+        std::os::unix::fs::symlink(&sentinel, &symlink_bin).unwrap();
+
+        // Run orphan cleanup — the .bin has no corresponding .meta, so it would
+        // normally be removed. But it's a symlink, so it should be skipped.
+        let cleaned = BackgroundRecoverySystem::cleanup_orphan_bin_in_shard(
+            &shard_dir,
+            &metadata_dir,
+            "mybucket",
+            "ab",
+            "cde",
+        );
+
+        // Symlink should NOT have been deleted (cleaned == 0)
+        assert_eq!(cleaned, 0, "Symlink .bin should not be deleted");
+
+        // The symlink itself should still exist
+        assert!(
+            symlink_bin.exists() || std::fs::symlink_metadata(&symlink_bin).is_ok(),
+            "Symlink should still be present"
+        );
+
+        // Sentinel target must be intact
+        let content = std::fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(content, "important data", "Sentinel must not be modified");
     }
 }

@@ -350,6 +350,8 @@ pub struct ConnectionPoolManager {
     resolved_ips: HashMap<String, Vec<IpAddr>>,
     /// Last DNS refresh time per endpoint
     last_dns_refresh: HashMap<String, std::time::SystemTime>,
+    /// Maximum number of registered endpoints (prevents unbounded growth)
+    max_registered_endpoints: usize,
 }
 
 impl ConnectionPoolManager {
@@ -383,6 +385,7 @@ impl ConnectionPoolManager {
             ip_distributors: HashMap::new(),
             resolved_ips: HashMap::new(),
             last_dns_refresh: HashMap::new(),
+            max_registered_endpoints: 10_000,
         })
     }
 
@@ -452,6 +455,7 @@ impl ConnectionPoolManager {
             ip_distributors,
             resolved_ips: HashMap::new(),
             last_dns_refresh: HashMap::new(),
+            max_registered_endpoints: config.max_registered_endpoints,
         })
     }
 
@@ -507,6 +511,15 @@ impl ConnectionPoolManager {
     pub async fn register_endpoint(&mut self, endpoint: &str) {
         // Skip if already registered or covered by a static override (exact or suffix)
         if self.resolved_ips.contains_key(endpoint) || self.resolve_override(endpoint).is_some() {
+            return;
+        }
+        // Cap: prevent unbounded growth of registered endpoints
+        if self.resolved_ips.len() >= self.max_registered_endpoints {
+            warn!(
+                endpoint = %endpoint,
+                cap = self.max_registered_endpoints,
+                "Endpoint registration cap reached; ignoring new endpoint"
+            );
             return;
         }
         info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
@@ -1232,5 +1245,51 @@ mod tests {
         );
         let eo2 = EndpointOverrides::from_config(&raw);
         assert!(!eo2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_register_endpoint_stops_at_cap() {
+        let config = crate::config::ConnectionPoolConfig {
+            max_registered_endpoints: 2,
+            ..crate::config::ConnectionPoolConfig::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        // Manually insert endpoints to simulate successful registration without DNS
+        manager
+            .resolved_ips
+            .insert("endpoint-a.example.com".to_string(), vec![]);
+        manager
+            .resolved_ips
+            .insert("endpoint-b.example.com".to_string(), vec![]);
+
+        // Cap is 2 — a third endpoint should be rejected
+        manager.register_endpoint("endpoint-c.example.com").await;
+        assert!(
+            !manager.resolved_ips.contains_key("endpoint-c.example.com"),
+            "third endpoint should be rejected when cap is reached"
+        );
+
+        // Existing endpoints are unaffected
+        assert!(manager.resolved_ips.contains_key("endpoint-a.example.com"));
+        assert!(manager.resolved_ips.contains_key("endpoint-b.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_register_endpoint_dedup_before_cap() {
+        let config = crate::config::ConnectionPoolConfig {
+            max_registered_endpoints: 2,
+            ..crate::config::ConnectionPoolConfig::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        // Pre-register one endpoint
+        manager
+            .resolved_ips
+            .insert("endpoint-a.example.com".to_string(), vec![]);
+
+        // Re-registering the same endpoint is a no-op (dedup), does not count toward cap
+        manager.register_endpoint("endpoint-a.example.com").await;
+        assert_eq!(manager.resolved_ips.len(), 1);
     }
 }

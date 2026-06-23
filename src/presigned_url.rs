@@ -219,6 +219,12 @@ fn parse_amz_date(date_str: &str) -> Option<SystemTime> {
     let datetime = DateTime::parse_from_rfc3339(&rfc3339).ok()?;
     let timestamp = datetime.timestamp();
 
+    // Reject pre-epoch dates to prevent wrapping on the `as u64` cast
+    if timestamp < 0 {
+        warn!("Pre-epoch X-Amz-Date rejected: {}", date_str);
+        return None;
+    }
+
     // Convert to SystemTime
     let system_time = SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp as u64);
 
@@ -247,6 +253,32 @@ mod tests {
         let date_str = "20240115T120000";
         let result = parse_amz_date(date_str);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_amz_date_rejects_pre_epoch() {
+        // Pre-epoch date (1969-01-01) must return None
+        let date_str = "19690101T000000Z";
+        let result = parse_amz_date(date_str);
+        assert!(result.is_none(), "Pre-epoch date must be rejected");
+
+        // Another pre-epoch date (1960-06-15)
+        let date_str = "19600615T120000Z";
+        let result = parse_amz_date(date_str);
+        assert!(result.is_none(), "Pre-epoch date must be rejected");
+
+        // Epoch exactly (1970-01-01T00:00:00Z, timestamp = 0) should be accepted
+        let date_str = "19700101T000000Z";
+        let result = parse_amz_date(date_str);
+        assert!(
+            result.is_some(),
+            "Epoch boundary (timestamp=0) must be accepted"
+        );
+
+        // Normal post-epoch date still works
+        let date_str = "20240115T120000Z";
+        let result = parse_amz_date(date_str);
+        assert!(result.is_some(), "Normal post-epoch date must still parse");
     }
 
     #[test]

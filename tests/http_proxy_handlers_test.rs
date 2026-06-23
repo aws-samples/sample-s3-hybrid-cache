@@ -43,6 +43,7 @@ async fn test_cache_manager_multipart_integration() {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     ));
 
     let path = "/test-bucket/test-object";
@@ -122,6 +123,7 @@ async fn test_regular_put_with_conflict_invalidation() {
         1_048_576,                          // compression_batch_size
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
+        64,                                 // ram_cache_shard_count
     ));
 
     let path = "/test-bucket/test-object";

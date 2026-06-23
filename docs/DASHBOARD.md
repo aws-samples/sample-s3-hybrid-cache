@@ -54,12 +54,13 @@ dashboard:
 
 ### Access Control
 
-**No Authentication**: Dashboard is designed as an internal monitoring tool.
+**No Authentication**: The dashboard is unauthenticated and read-only — it exposes cache statistics and log excerpts, not credentials or control operations. Access control is network-level.
 
 **Network Access**:
-- `bind_address: "0.0.0.0"` - All interfaces (default)
-- `bind_address: "127.0.0.1"` - Localhost only
-- Use firewall rules for additional access control
+- `bind_address: "127.0.0.1"` - Localhost only (code default; safest)
+- `bind_address: "0.0.0.0"` - All interfaces (requires network-layer restriction)
+- Use firewall rules or security groups to restrict access when non-loopback
+- SSH tunnel provides secure remote access without exposing the port
 
 ### Performance Settings
 
@@ -159,6 +160,27 @@ dashboard:
 
 ## Security Considerations
 
+### Unauthenticated, Read-Only Interface
+
+The dashboard is unauthenticated and read-only. It provides cache statistics, application log excerpts, and system information (hostname, version, uptime). It exposes no write operations, no credentials, and no control-plane actions. Presigned URL parameters are masked before they reach the log viewer (see Security Findings Remediation Req 5).
+
+The security posture depends entirely on who can reach the port:
+
+| `bind_address` | Who can reach it | When to use |
+|---|---|---|
+| `127.0.0.1` (code default) | Only the local host | Production — access via SSH tunnel |
+| `0.0.0.0` | Any host with network access | Only when security groups / firewall rules restrict the port to administrators |
+
+**Production recommendation**: bind to `127.0.0.1` and use an SSH tunnel for remote access:
+
+```bash
+ssh -L 8081:127.0.0.1:8081 proxy-host
+```
+
+Then open `http://localhost:8081` in your browser.
+
+If you bind to `0.0.0.0`, you **must** restrict access at the network layer (security groups, NACLs, firewall rules) to prevent unauthorized monitoring.
+
 ### Internal Use Only
 - Dashboard provides full access to cache statistics and logs
 - No authentication or authorization mechanisms
@@ -166,13 +188,13 @@ dashboard:
 - Should not be exposed to public networks
 
 ### Network Security
-- Use `bind_address: "127.0.0.1"` for localhost-only access
-- Configure firewall rules to restrict network access
+- Use `bind_address: "127.0.0.1"` for localhost-only access (code default)
+- Configure firewall rules to restrict network access when using `0.0.0.0`
 - Consider VPN or SSH tunneling for remote access
 - Monitor access logs for unexpected connections
 
 ### Data Exposure
 - Cache statistics may reveal usage patterns
-- Application logs may contain sensitive information
+- Application logs may contain sensitive information (presigned params are masked)
 - Log filtering helps reduce information exposure
 - Consider log sanitization for sensitive environments

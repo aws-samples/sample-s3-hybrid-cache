@@ -268,13 +268,12 @@ impl Default for ResolvedSettings {
             write_cache_enabled: true,
             compression_enabled: false,
             ram_cache_eligible: true,
-            evaluate_conditions_from_cache: false,
+            evaluate_conditions_from_cache: true,
             source: SettingsSource::Global,
         }
     }
 }
 
-/// Global config scalar defaults extracted from CacheConfig at startup.
 #[derive(Debug, Clone)]
 pub struct GlobalDefaults {
     pub get_ttl: Duration,
@@ -744,7 +743,7 @@ mod tests {
             write_cache_enabled: true,
             compression_enabled: true,
             ram_cache_enabled: true,
-            evaluate_conditions_from_cache: false,
+            evaluate_conditions_from_cache: true,
         }
     }
 
