@@ -5,7 +5,7 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.1] - 2026-07-01
+## [2.2.1] - 2026-06-23
 
 Per-bucket traffic metrics: the proxy now tracks cumulative GET/PUT bandwidth and request counts per bucket (and optionally per prefix), surfacing them in the `/metrics` JSON endpoint, the operational dashboard, and optionally via OTLP export. Every new config field has a serde default, so existing config files parse unchanged on upgrade.
 
