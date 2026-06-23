@@ -2606,7 +2606,7 @@ mod mask_presigned_params_property_tests {
         // params or the URL structure itself, causing false-positive assertions.
         let is_problematic_value = |v: &str| -> bool {
             v.is_empty()
-                || v.len() < 4
+                || v.chars().count() < 4  // character count, not byte length: U+10FFFF is 4 bytes but 1 char
                 || v.contains('&')
                 || v.contains('=')
                 || v.contains('?')
