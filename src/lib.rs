@@ -5,6 +5,7 @@
 
 pub mod aws_chunked_decoder;
 pub mod background_recovery;
+pub mod bandwidth_limiter;
 pub mod bucket_settings;
 pub mod cache;
 pub mod cache_hit_update_buffer;
@@ -47,6 +48,7 @@ pub mod signed_put_handler;
 pub mod signed_request_proxy;
 pub mod tcp_proxy;
 pub mod tee_stream;
+pub mod throttle_stream;
 pub mod tls_proxy_listener;
 pub mod tls_trust_store;
 pub mod upstream_overrides;

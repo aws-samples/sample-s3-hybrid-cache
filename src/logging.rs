@@ -896,7 +896,7 @@ const SENSITIVE_PARAMS: &[&str] = &[
 ///
 /// Fields that contain none of these characters are returned as-is (fast path,
 /// no allocation).
-fn sanitize_log_field(field: &str) -> String {
+pub(crate) fn sanitize_log_field(field: &str) -> String {
     // Fast path: if no dangerous characters present, avoid allocation
     if !field.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'"') {
         return field.to_string();

@@ -188,6 +188,9 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Download bandwidth QoS (fairness). Disabled by default (`max_bytes_per_sec = 0`).
+    #[serde(default)]
+    pub download_bandwidth: DownloadBandwidthConfig,
 }
 
 /// Server operating mode
@@ -2169,6 +2172,146 @@ impl Default for MetricsConfig {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Download Bandwidth QoS configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Caller-identity fairness key configuration.
+///
+/// When `enabled = true`, the proxy extracts the `app/<value>` token from the
+/// User-Agent header and uses it as the per-request fairness key.  Non-matching
+/// or absent tokens fall back to the S3 bucket key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallerIdConfig {
+    /// Use the User-Agent app-id (`app/<value>`) as the fairness key when present
+    /// and valid.  Default: `false` (every request keys on bucket).
+    pub enabled: bool,
+    /// Optional regex to validate the caller value extracted from the User-Agent.
+    /// A value that does not match falls back to the bucket key.
+    /// Compiled once at startup; an invalid regex is a startup error.
+    pub validation_regex: Option<String>,
+    /// Maximum character length for the caller value (default: 64).
+    /// Values longer than this are treated as absent (bucket fallback).
+    pub max_len: usize,
+}
+
+impl Default for CallerIdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            validation_regex: None,
+            max_len: 64,
+        }
+    }
+}
+
+/// Fleet sharing configuration for the `cap / N` fairness model.
+///
+/// The proxy derives the live instance count `N` from the per-instance journal
+/// files written to `cache_dir/metadata/_journals/`.  Each instance periodically
+/// refreshes `N` on a cold path; the hot request path only reads a single atomic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FleetSharingConfig {
+    /// Instance count used when the live count cannot be determined from shared
+    /// storage (e.g. storage unavailable at startup).  For a fleet deployment,
+    /// set this to the fleet size so the per-instance ceiling is
+    /// `cap / fallback_instance_count` under coordination loss (safe: throttles
+    /// more heavily, never unlimited).  Default: `1` (correct for single-instance;
+    /// fleet operators must override).
+    pub fallback_instance_count: u32,
+    /// Heartbeat staleness window: journal files older than this are excluded when
+    /// counting live instances `N`.  Default: 30 s.
+    #[serde(deserialize_with = "duration_serde::deserialize")]
+    pub instance_staleness: Duration,
+    /// Cold-path cadence for the heartbeat touch + `_journals/` readdir.
+    /// Floor: 10 s.  Default: 30 s.
+    #[serde(deserialize_with = "duration_serde::deserialize")]
+    pub refresh_interval: Duration,
+}
+
+impl Default for FleetSharingConfig {
+    fn default() -> Self {
+        Self {
+            fallback_instance_count: 1,
+            instance_staleness: Duration::from_secs(30),
+            refresh_interval: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Download bandwidth QoS (fairness) configuration.
+///
+/// Controls the aggregate rate limit on cache-miss origin downloads and the
+/// fairness scheduling across caller / bucket classes.
+///
+/// All fields have serde defaults: omitting the entire section leaves the feature
+/// **disabled** (`max_bytes_per_sec = 0`), so a binary-only upgrade never changes
+/// behaviour until the operator opts in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DownloadBandwidthConfig {
+    /// Aggregate cache-miss download ceiling in bytes per second.
+    ///
+    /// `0` (default) = unlimited / feature disabled.  When disabled the proxy
+    /// streaming path is byte-for-byte and latency-for-latency unchanged; the
+    /// only cost is a single relaxed atomic load per stream.
+    pub max_bytes_per_sec: u64,
+    /// Caller-identity fairness key configuration.
+    pub caller_id: CallerIdConfig,
+    /// Maximum number of retained per-class metric series (top-K cap).
+    /// Classes outside the top-K are folded into a single `residual` series;
+    /// they are still throttled and counted against the ceiling.  Default: 1024.
+    pub max_tracked_classes: usize,
+    /// Fleet sharing (`cap / N`) configuration.
+    pub fleet: FleetSharingConfig,
+}
+
+impl Default for DownloadBandwidthConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_sec: 0,
+            caller_id: CallerIdConfig::default(),
+            max_tracked_classes: 1024,
+            fleet: FleetSharingConfig::default(),
+        }
+    }
+}
+
+impl DownloadBandwidthConfig {
+    /// Validate the configuration.
+    ///
+    /// Compiles `caller_id.validation_regex` so that an invalid regex is caught
+    /// at startup rather than silently falling back to no validation at runtime.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if let Some(ref pattern) = self.caller_id.validation_regex {
+            regex::Regex::new(pattern).map_err(|e| {
+                format!(
+                    "download_bandwidth.caller_id.validation_regex is invalid: {}",
+                    e
+                )
+            })?;
+        }
+        if self.caller_id.max_len == 0 {
+            return Err("download_bandwidth.caller_id.max_len must be greater than 0".to_string());
+        }
+        if self.fleet.fallback_instance_count == 0 {
+            return Err(
+                "download_bandwidth.fleet.fallback_instance_count must be at least 1".to_string(),
+            );
+        }
+        let refresh_secs = self.fleet.refresh_interval.as_secs();
+        if refresh_secs < 10 {
+            return Err(format!(
+                "download_bandwidth.fleet.refresh_interval must be at least 10s, got {}s",
+                refresh_secs
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -2296,6 +2439,7 @@ impl Default for Config {
                 per_bucket: PerBucketMetricsConfig::default(),
             },
             dashboard: DashboardConfig::default(),
+            download_bandwidth: DownloadBandwidthConfig::default(),
         }
     }
 }
@@ -2355,6 +2499,14 @@ impl Config {
         if let Err(e) = config.dashboard.validate() {
             return Err(ProxyError::ConfigError(format!(
                 "Invalid dashboard configuration: {}",
+                e
+            )));
+        }
+
+        // Validate download bandwidth QoS configuration (compiles regex at startup)
+        if let Err(e) = config.download_bandwidth.validate() {
+            return Err(ProxyError::ConfigError(format!(
+                "Invalid download_bandwidth configuration: {}",
                 e
             )));
         }
@@ -4101,6 +4253,34 @@ logging:
             Duration::from_secs(5)
         );
         assert_eq!(config.connection_pool.upstream_idle_retries, 2);
+        // Download bandwidth QoS defaults (disabled by default).
+        assert_eq!(
+            config.download_bandwidth.max_bytes_per_sec, 0,
+            "download_bandwidth must default to disabled (max_bytes_per_sec=0)"
+        );
+        assert!(
+            !config.download_bandwidth.caller_id.enabled,
+            "caller_id must default to disabled"
+        );
+        assert!(
+            config
+                .download_bandwidth
+                .caller_id
+                .validation_regex
+                .is_none(),
+            "validation_regex must default to None"
+        );
+        assert_eq!(config.download_bandwidth.caller_id.max_len, 64);
+        assert_eq!(config.download_bandwidth.max_tracked_classes, 1024);
+        assert_eq!(config.download_bandwidth.fleet.fallback_instance_count, 1);
+        assert_eq!(
+            config.download_bandwidth.fleet.instance_staleness,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            config.download_bandwidth.fleet.refresh_interval,
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

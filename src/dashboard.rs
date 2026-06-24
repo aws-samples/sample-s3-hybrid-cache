@@ -265,6 +265,7 @@ impl DashboardServerClone {
             "/api/cache-stats" => self.api_handler.get_cache_stats().await,
             "/api/bucket-stats" => self.api_handler.get_bucket_stats().await,
             "/api/bucket-traffic" => self.api_handler.get_bucket_traffic().await,
+            "/api/bandwidth" => self.api_handler.get_bandwidth_metrics().await,
             "/api/system-info" => self.api_handler.get_system_info().await,
             "/api/logs" => {
                 let params = parse_log_query_params(uri);
@@ -2260,6 +2261,21 @@ impl ApiHandler {
             .map_err(|e| {
                 error!("Failed to build bucket traffic response: {}", e);
                 ProxyError::HttpError(format!("Failed to build bucket traffic response: {}", e))
+            })
+    }
+
+    /// Return download bandwidth QoS metrics as JSON (`/api/bandwidth`).
+    pub async fn get_bandwidth_metrics(&self) -> Result<Response<String>> {
+        debug!("Dashboard API: bandwidth metrics requested");
+        let snapshot = crate::bandwidth_limiter::global_limiter().snapshot();
+        let body = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .body(body)
+            .map_err(|e| {
+                ProxyError::HttpError(format!("Failed to build bandwidth response: {}", e))
             })
     }
 }

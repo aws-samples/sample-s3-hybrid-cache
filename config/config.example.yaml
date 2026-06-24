@@ -670,3 +670,51 @@ dashboard:
 #   aws s3 cp s3://bucket/key ./local \
 #     --endpoint-url http://s3.us-east-1.amazonaws.com
 # ==============================================================================
+
+# ==============================================================================
+# Download Bandwidth QoS (default: disabled)
+#
+# Limits the aggregate bytes/s the proxy pulls from S3 on cache misses and
+# divides that budget fairly across callers (User-Agent app-id) or buckets.
+# Cache hits are never throttled.  All fields have serde defaults — omitting
+# this section leaves the feature disabled.
+#
+# See docs/BANDWIDTH_QOS.md for the full tuning guide.
+# ==============================================================================
+download_bandwidth:
+  # Aggregate cache-miss download ceiling in bytes/s.  0 = unlimited (default).
+  # Example: 500000000 = 500 MB/s
+  max_bytes_per_sec: 0
+
+  # Caller-identity fairness key (off by default — bucket is the fairness key).
+  caller_id:
+    # When true, extract `app/<value>` from the User-Agent header as the key.
+    # Clients use AWS SDK env var AWS_SDK_UA_APP_ID (or sdk_ua_app_id in config)
+    # to append `app/<value>` to the UA string.  The proxy does not interpret the
+    # value — any per-UID or per-application convention is the operator's choice.
+    enabled: false
+    # Optional regex to validate the caller value.  Non-matching values fall back
+    # to the bucket key.  Compiled once at startup; an invalid regex is fatal.
+    # validation_regex: "^[a-z0-9_-]{1,32}$"
+    # Maximum character length for the caller value (default: 64).
+    max_len: 64
+
+  # Maximum number of distinct fairness-class metric series retained (top-K cap).
+  # Classes outside the top-K fold into a single "residual" series; they are still
+  # throttled and counted toward the ceiling.
+  max_tracked_classes: 1024
+
+  # Fleet sharing: per-instance ceiling = max_bytes_per_sec / live_instance_count.
+  # Only relevant for multi-instance deployments with shared storage.
+  fleet:
+    # Instance count used when shared storage is unavailable.
+    # IMPORTANT: set this to your fleet size on a fleet deployment so the proxy
+    # throttles safely (not unlimitedly) if the live-count read fails.
+    fallback_instance_count: 1
+    # How long a heartbeat file must be fresh to count toward the live instance
+    # count N.  Instances that haven't touched their heartbeat within this window
+    # are treated as stopped.
+    instance_staleness: "30s"
+    # How often the proxy reads the qos/heartbeats/ directory and updates the ceiling.
+    # Floor: 10s.  Values below 10s are clamped to 10s.
+    refresh_interval: "30s"

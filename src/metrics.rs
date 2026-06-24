@@ -262,6 +262,10 @@ pub struct SystemMetrics {
     /// Always present; empty map when no traffic has been recorded.
     /// Spec: per-bucket-metrics. Requirements: 3.1, 3.3
     pub bucket_traffic: HashMap<String, BucketTrafficStats>,
+    /// Download bandwidth QoS metrics.  Present when the feature is compiled in;
+    /// all sub-fields reflect the current state whether enabled or not.
+    /// Spec: download-bandwidth-qos. Requirements: 8.1, 8.2, 8.3, 8.4, 8.5
+    pub download_bandwidth: crate::bandwidth_limiter::BandwidthLimiterSnapshot,
 }
 
 /// Request processing metrics
@@ -833,6 +837,7 @@ impl MetricsManager {
             cache_rules: cache_rules_metrics,
             request_metrics,
             bucket_traffic,
+            download_bandwidth: crate::bandwidth_limiter::global_limiter().snapshot(),
         };
 
         // Cache the result
@@ -4253,5 +4258,45 @@ mod tests {
 
         // Only one bucket series exists (no overflow, no spurious keys).
         assert_eq!(snapshot.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod bandwidth_metrics_tests {
+    use super::*;
+
+    /// Assert that `collect_metrics()` includes the `download_bandwidth` section
+    /// with the expected shape (Req 8.5).
+    #[tokio::test]
+    async fn metrics_includes_download_bandwidth_section() {
+        let mm = MetricsManager::new();
+        let metrics = mm.collect_metrics().await;
+
+        // The field must be present (it is always populated, never None).
+        // When the feature is disabled, `enabled` is false and ceiling is 0.
+        assert!(
+            !metrics.download_bandwidth.enabled
+                || metrics.download_bandwidth.instance_ceiling_bps > 0,
+            "disabled limiter should have enabled=false and ceiling_bps=0"
+        );
+
+        // Serialize to JSON and verify the field is present.
+        let json = serde_json::to_string(&metrics).expect("metrics must serialize");
+        assert!(
+            json.contains("\"download_bandwidth\""),
+            "/metrics JSON must contain the download_bandwidth key"
+        );
+        assert!(
+            json.contains("\"instance_ceiling_bps\""),
+            "download_bandwidth must contain instance_ceiling_bps"
+        );
+        assert!(
+            json.contains("\"failopen_total\""),
+            "download_bandwidth must contain failopen_total"
+        );
+        assert!(
+            json.contains("\"class_bytes\""),
+            "download_bandwidth must contain class_bytes"
+        );
     }
 }

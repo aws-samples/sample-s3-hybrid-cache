@@ -121,6 +121,10 @@ struct Instruments {
     uptime_seconds: Gauge<u64>,
     // -- process --
     memory_usage_bytes: Gauge<u64>,
+    // -- download bandwidth QoS --
+    bw_instance_ceiling_bps: Gauge<u64>,
+    bw_failopen_total: Gauge<u64>,
+    bw_class_bytes: Gauge<u64>,
 }
 
 impl OtlpExporter {
@@ -262,6 +266,10 @@ impl OtlpExporter {
             // top-level
             uptime_seconds: g_u64!("uptime_seconds"),
             memory_usage_bytes: g_u64!("process.memory_usage_bytes"),
+            // download bandwidth QoS
+            bw_instance_ceiling_bps: g_u64!("download_bandwidth.instance_ceiling_bps"),
+            bw_failopen_total: g_u64!("download_bandwidth.failopen_total"),
+            bw_class_bytes: g_u64!("download_bandwidth.class_bytes"),
         };
 
         self.provider = Some(provider);
@@ -385,6 +393,20 @@ impl OtlpExporter {
 
         if let Ok(mem) = self.get_memory_usage() {
             i.memory_usage_bytes.record(mem, a);
+        }
+
+        // download bandwidth QoS
+        let bw = &metrics.download_bandwidth;
+        i.bw_instance_ceiling_bps.record(bw.instance_ceiling_bps, a);
+        i.bw_failopen_total.record(bw.failopen_total, a);
+        // Per-class bytes with sanitized label attributes.
+        for (label, bytes) in &bw.class_bytes {
+            let attrs = &[KeyValue::new("class", label.clone())];
+            i.bw_class_bytes.record(*bytes, attrs);
+        }
+        if bw.residual_bytes > 0 {
+            let attrs = &[KeyValue::new("class", "residual")];
+            i.bw_class_bytes.record(bw.residual_bytes, attrs);
         }
 
         debug!("OTLP metrics recorded (same fields as /metrics JSON)");

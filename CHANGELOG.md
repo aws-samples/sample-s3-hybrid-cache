@@ -5,6 +5,46 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] - 2026-06-24
+
+Download bandwidth QoS: operators can now cap the aggregate cache-miss origin download rate and share it fairly across callers or buckets using deficit round-robin scheduling. The feature is **disabled by default** (`max_bytes_per_sec = 0`); a binary-only upgrade changes no behavior until the operator opts in.
+
+### Added
+
+- **Download bandwidth QoS** (`download_bandwidth` config section): limits the aggregate bytes-per-second the proxy pulls from S3 on cache misses and divides that budget fairly across fairness classes using a deficit round-robin (DRR) scheduler. Cache hits are unaffected; only cache-miss origin downloads are throttled.
+
+- **Per-request fairness key** (caller XOR bucket): when `download_bandwidth.caller_id.enabled: true`, requests that carry a valid `app/<value>` token in the User-Agent header are keyed on that caller identity, regardless of which bucket they access. Requests without a valid app-id fall back to the S3 bucket as the fairness key. Caller- and bucket-derived keys are namespaced internally so a caller value equal to a bucket name never collides. The caller value is validated against an optional operator-configured regex and a configurable max-length (default 64); invalid values fall back silently to the bucket key. The feature defaults to **disabled** (bucket-only fairness).
+
+- **Streaming backpressure enforcement**: throttling is applied by withholding `Poll::Pending` from the cache-miss origin stream, so TCP flow control slows the S3 upstream connection. The throttle wrapper (`ThrottleStream`) is positioned downstream of `TeeStream` so the existing idle watchdog cannot be falsely triggered by throttle-induced pauses.
+
+- **Size-aware lease acquisition**: for known-length responses (`Content-Length` / `Content-Range`), the token-bucket lease is bounded by `min(1 MiB, remaining_bytes)`, so small requests never over-acquire budget from the shared pool. Unknown-length streams fall back to a cumulative-bytes heuristic. Unused lease balance is refunded on stream end or drop.
+
+- **Static `cap/N` fleet sharing**: each proxy instance divides the configured aggregate ceiling by the live instance count `N` derived from per-instance heartbeat files in a dedicated `cache_dir/qos/heartbeats/` directory (kept outside `metadata/`, so it is untouched by the cache-metadata consolidation/eviction/journal-cleanup sweeps and by a cache reset). A periodic cold-path task (default 30 s cadence) writes its `{instance_id}.qos` heartbeat, counts `.qos` files fresh within `instance_staleness` as `N`, and reaps clearly-dead heartbeats (past `max(instance_staleness × 10, 10 min)`, e.g. from a restarted PID) in the same pass. The per-instance ceiling is floored to ≥1 for any non-zero aggregate, so it never truncates to 0 (which would read as disabled). Coordination loss falls back to `fleet.fallback_instance_count` (default 1), never to unlimited. The share-computation function is isolated so demand-weighted reconciliation (Phase B) can replace it later without changing enforcement.
+
+- **Observability**: a `download_bandwidth` section is added to the `/metrics` JSON endpoint and the `/api/bandwidth` dashboard endpoint, containing `enabled`, `instance_ceiling_bps`, `failopen_total`, per-class byte counters (bounded by `max_tracked_classes`), and a `residual_bytes` overflow total. OTLP gauges `download_bandwidth.instance_ceiling_bps`, `download_bandwidth.failopen_total`, and `download_bandwidth.class_bytes` (with `class` attribute) are exported when OTLP is enabled.
+
+- **New config fields** (all `#[serde(default)]`, backward compatible; disabled by default):
+  - `download_bandwidth.max_bytes_per_sec` (u64, default `0` = unlimited/disabled)
+  - `download_bandwidth.caller_id.enabled` (bool, default `false`)
+  - `download_bandwidth.caller_id.validation_regex` (string, default `None`)
+  - `download_bandwidth.caller_id.max_len` (usize, default `64`)
+  - `download_bandwidth.max_tracked_classes` (usize, default `1024`)
+  - `download_bandwidth.fleet.fallback_instance_count` (u32, default `1`; **set to fleet size on a fleet**)
+  - `download_bandwidth.fleet.instance_staleness` (duration, default `"30s"`)
+  - `download_bandwidth.fleet.refresh_interval` (duration, default `"30s"`)
+
+### Fixed
+
+- **Journal flush now fdatasyncs** (`sync_data`) before returning, making buffered
+  cache-hit metadata updates durable on shared storage and fixing a CI
+  read-after-write flake on overlay2 storage drivers.  The failing test was
+  `cache_hit_update_buffer::tests::test_multiple_flushes_append`, which asserted 2
+  journal lines immediately after two sequential `force_flush` calls; the overlay2
+  driver returned a stale page-cache read with no intervening `fsync`.  Cost is one
+  `fdatasync` per 5 s flush interval per instance (off the request hot path — a
+  million cache hits in 5 s collapse to one batched write + one sync); the flush
+  interval must not be reduced to sub-second without revisiting this.
+
 ## [2.2.1] - 2026-06-23
 
 Per-bucket traffic metrics: the proxy now tracks cumulative GET/PUT bandwidth and request counts per bucket (and optionally per prefix), surfacing them in the `/metrics` JSON endpoint, the operational dashboard, and optionally via OTLP export. Every new config field has a serde default, so existing config files parse unchanged on upgrade.

@@ -1947,3 +1947,38 @@ dashboard:
 - [CONNECTION_POOLING.md](CONNECTION_POOLING.md) - Connection management
 - [OTLP_METRICS.md](OTLP_METRICS.md) - Metrics and observability
 - [config/config.example.yaml](../config/config.example.yaml) - Complete configuration with all options documented
+
+## Download Bandwidth QoS Configuration
+
+Controls the aggregate rate limit on cache-miss origin downloads and per-caller /
+per-bucket fairness scheduling.  All fields are optional and default to disabled.
+
+See [BANDWIDTH_QOS.md](BANDWIDTH_QOS.md) for the full guide.
+
+**`download_bandwidth.max_bytes_per_sec`** (u64, default `0`)
+- Aggregate cache-miss download ceiling in bytes/s.  `0` = unlimited (feature disabled).
+
+**`download_bandwidth.caller_id.enabled`** (bool, default `false`)
+- Use the User-Agent `app/<value>` token as the fairness key when present and valid.
+
+**`download_bandwidth.caller_id.validation_regex`** (string, default `null`)
+- Optional regex to validate the caller value; non-matching values fall back to bucket.
+- Compiled once at startup — an invalid regex is a fatal startup error.
+
+**`download_bandwidth.caller_id.max_len`** (usize, default `64`)
+- Maximum character length for the caller value; longer values fall back to bucket.
+
+**`download_bandwidth.max_tracked_classes`** (usize, default `1024`)
+- Top-K cardinality cap for per-class metric series.
+
+**`download_bandwidth.fleet.fallback_instance_count`** (u32, default `1`)
+- Instance count used when the live count cannot be determined from shared storage.
+- **Fleet operators must set this to the fleet size** to ensure safe throttling under
+  coordination loss.
+
+**`download_bandwidth.fleet.instance_staleness`** (duration, default `"30s"`)
+- Heartbeat staleness window: instances with files older than this are excluded from
+  the live-instance count `N`.
+
+**`download_bandwidth.fleet.refresh_interval`** (duration, default `"30s"`)
+- Cold-path cadence for the heartbeat touch and `qos/heartbeats/` readdir.  Floor: 10 s.

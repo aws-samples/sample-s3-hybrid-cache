@@ -61,6 +61,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Glob-based cache rules—configure TTLs, read/write caching, compression, and RAM cache eligibility for keys matching a glob pattern via a single hot-reloadable `cache_rules.json`
 - Flexible expiration modes—lazy (fixed capacity) or active (elastic storage)
 - Cache storage is flexible—a single proxy with local disk may be suitable on a hypervisor platform that provides high availability. Multi-proxy deployments use any NFS-compatible shared storage: a dedicated NAS appliance, a file server VM within the cluster, or file services built into a hypervisor platform
+- **Download bandwidth QoS**—cap the aggregate cache-miss origin download rate and share it fairly across callers (User-Agent app-id) or buckets using deficit round-robin scheduling; static `cap/N` fleet sharing; disabled by default
 
 ## Documentation
 
@@ -80,6 +81,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - **[Error Handling](docs/ERROR_HANDLING.md)** - Error handling patterns
 - **[Metrics](docs/METRICS.md)** - Per-bucket traffic metrics and cache savings inference
 - **[OTLP Metrics](docs/OTLP_METRICS.md)** - OpenTelemetry metrics export
+- **[Bandwidth QoS](docs/BANDWIDTH_QOS.md)** - Download bandwidth fairness and rate limiting
 
 ## Quick Start
 

@@ -19,6 +19,7 @@ use crate::{
         S3RequestContext, S3ResponseBody,
     },
     tee_stream::TeeStream,
+    throttle_stream::ThrottleStream,
     Result,
 };
 use bytes::Bytes;
@@ -569,6 +570,32 @@ pub fn detect_path_style_alias(host: &str, path: &str) -> Option<PathStyleAlias>
     None
 }
 
+/// Wrap the output of a `TeeStream` with download bandwidth throttling.
+///
+/// - When the global limiter is disabled (`max_bytes_per_sec == 0`), returns a
+///   stream with only a single relaxed atomic load per frame (zero overhead).
+/// - `known_len` should be set to the response's `Content-Length` or
+///   `Content-Range` byte count; pass `None` for chunked / unknown-length.
+/// - `request_headers` and `resolved_bucket` are used to resolve the fairness
+///   key (caller vs bucket).
+///
+/// **Placement**: call this after `TeeStream::with_idle_timeout` and before
+/// `StreamBody::new()`.  The idle watchdog lives inside TeeStream so it cannot
+/// be triggered by throttle-induced pauses.
+pub(crate) fn wrap_origin_stream<S>(
+    tee: S,
+    request_headers: &HashMap<String, String>,
+    resolved_bucket: Option<&str>,
+    known_len: Option<u64>,
+) -> ThrottleStream<S>
+where
+    S: futures::Stream<Item = std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>> + Unpin,
+{
+    let limiter = crate::bandwidth_limiter::global_limiter();
+    let key = limiter.resolve_key(request_headers, resolved_bucket);
+    ThrottleStream::new(tee, key, limiter, known_len)
+}
+
 /// HTTP Proxy server for S3 requests with caching
 pub struct HttpProxy {
     listen_addr: SocketAddr,
@@ -730,9 +757,16 @@ impl HttpProxy {
             }
         };
 
+        // Initialize global bandwidth QoS limiter (disabled by default when max_bytes_per_sec = 0).
+        // Pass cache_dir so the fleet cold-path task can write heartbeats and count live instances.
+        crate::bandwidth_limiter::init_global_limiter_with_fleet(
+            &config.download_bandwidth,
+            Some(config.cache.cache_dir.clone()),
+        );
+
         Ok(Self {
             listen_addr,
-            config,
+            config: Arc::clone(&config),
             cache_manager,
             s3_client,
             range_handler,
@@ -4587,8 +4621,21 @@ impl HttpProxy {
                 // Wrap with TeeStream + mid-stream idle watchdog (Req 5, Task 11)
                 let tee_stream = TeeStream::with_idle_timeout(frame_stream, cache_tx, idle_timeout);
 
+                // Wrap with download bandwidth QoS throttle (disabled by default).
+                // Bucket is extracted from cache_key; no request UA available here so
+                // caller-id always falls back to bucket fairness on the range path.
+                let range_bucket = cache_key.split('/').next();
+                // known_len from the range spec: we know exactly how many bytes this range contains.
+                let range_known_len = Some(range_spec.end - range_spec.start + 1);
+                let throttled = wrap_origin_stream(
+                    tee_stream,
+                    &std::collections::HashMap::new(), // no request headers on range path
+                    range_bucket,
+                    range_known_len,
+                );
+
                 // Convert to BoxBody - StreamBody already implements Body
-                BoxBody::new(StreamBody::new(tee_stream))
+                BoxBody::new(StreamBody::new(throttled))
             }
             Some(S3ResponseBody::Buffered(bytes)) => {
                 // Already buffered, just return it
@@ -9287,6 +9334,17 @@ impl HttpProxy {
                             let tee_stream =
                                 TeeStream::with_idle_timeout(frame_stream, cache_tx, idle_timeout);
 
+                            // Wrap with download bandwidth QoS throttle (disabled by default).
+                            // ThrottleStream sits downstream of TeeStream so the idle watchdog
+                            // in TeeStream cannot be triggered by throttle-induced pauses.
+                            let bucket = uri
+                                .path()
+                                .strip_prefix('/')
+                                .and_then(|p| p.split_once('/'))
+                                .map(|(b, _)| b);
+                            let throttled =
+                                wrap_origin_stream(tee_stream, &headers, bucket, content_length);
+
                             // Build streaming response
                             let mut response_builder = Response::builder().status(status);
                             for (key, value) in response_headers {
@@ -9294,7 +9352,7 @@ impl HttpProxy {
                             }
 
                             Ok(response_builder
-                                .body(BoxBody::new(StreamBody::new(tee_stream)))
+                                .body(BoxBody::new(StreamBody::new(throttled)))
                                 .unwrap())
                         } else {
                             // Non-success streaming response (error from S3) — forward without caching
@@ -9794,6 +9852,16 @@ impl HttpProxy {
                         let tee_stream =
                             TeeStream::with_idle_timeout(frame_stream, cache_tx, idle_timeout);
 
+                        // Wrap with download bandwidth QoS throttle.
+                        let range_bucket_sr = cache_key.split('/').next();
+                        let range_known_len_sr = Some(range_spec.end - range_spec.start + 1);
+                        let throttled = wrap_origin_stream(
+                            tee_stream,
+                            &std::collections::HashMap::new(),
+                            range_bucket_sr,
+                            range_known_len_sr,
+                        );
+
                         // Build streaming response
                         let mut response_builder = Response::builder().status(status);
                         for (key, value) in &s3_response.headers {
@@ -9815,7 +9883,7 @@ impl HttpProxy {
                         }
 
                         return Ok(response_builder
-                            .body(BoxBody::new(StreamBody::new(tee_stream)))
+                            .body(BoxBody::new(StreamBody::new(throttled)))
                             .unwrap());
                     }
 

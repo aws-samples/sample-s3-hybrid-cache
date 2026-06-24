@@ -322,6 +322,38 @@ impl CacheHitUpdateBuffer {
                         );
                         errors += entries_flushed;
                         entries_flushed = 0;
+                    } else {
+                        // fdatasync after every flush for shared-storage durability and
+                        // read-after-write visibility (fixes a CI flake on overlay2 storage
+                        // drivers that can return a stale page-cache read immediately after
+                        // an async append with no fsync between write and read).
+                        //
+                        // Cost analysis: flush() is a batched background task called on a
+                        // 5 s interval (see main.rs), not per-request. A million cache hits
+                        // in 5 s collapse to one write + one fdatasync. The flush mutex and
+                        // the fact that record_* never waits on flush_in_progress mean
+                        // request threads never block on this sync.
+                        //
+                        // The only inline-flush path (buffer_len >= 10 000 between ticks)
+                        // absorbs one sync per 10 000 entries — a p99.99 blip at most.
+                        //
+                        // On EFS/NFS (the production target), close() already forces a
+                        // COMMIT per flush, so sync_data mostly front-loads a round-trip
+                        // that was already being paid.
+                        //
+                        // ⚠ CAVEAT: this cost is proportional to the flush cadence.
+                        // Do NOT reduce the flush interval below 1 s or the buffer cap
+                        // below 1 000 without revisiting fdatasync overhead.
+                        if let Err(e) = file.sync_data().await {
+                            error!(
+                                "Failed to fdatasync journal file: path={:?}, error={} \
+                                 (bytes are in page cache and readable; sync is best-effort)",
+                                journal_path, e
+                            );
+                            // Do not roll back entries_flushed — data is in the page cache
+                            // and readable by this process. Durability loss on crash is
+                            // the worst case, not a correctness regression.
+                        }
                     }
                 }
                 Err(e) => {

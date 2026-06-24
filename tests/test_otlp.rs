@@ -126,6 +126,13 @@ fn test_system_metrics() -> SystemMetrics {
             max_concurrent_requests: 50,
         },
         bucket_traffic: HashMap::new(),
+        download_bandwidth: s3_proxy::bandwidth_limiter::BandwidthLimiterSnapshot {
+            enabled: false,
+            instance_ceiling_bps: 0,
+            failopen_total: 0,
+            class_bytes: HashMap::new(),
+            residual_bytes: 0,
+        },
     }
 }
 
@@ -256,6 +263,13 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
             max_concurrent_requests: 0,
         },
         bucket_traffic: HashMap::new(),
+        download_bandwidth: s3_proxy::bandwidth_limiter::BandwidthLimiterSnapshot {
+            enabled: false,
+            instance_ceiling_bps: 0,
+            failopen_total: 0,
+            class_bytes: HashMap::new(),
+            residual_bytes: 0,
+        },
     };
 
     let result = exporter.export_metrics(&metrics).await;

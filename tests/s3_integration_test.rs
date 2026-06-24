@@ -156,6 +156,7 @@ fn create_test_config() -> Config {
             per_bucket: PerBucketMetricsConfig::default(),
         },
         dashboard: DashboardConfig::default(),
+        download_bandwidth: s3_proxy::config::DownloadBandwidthConfig::default(),
     }
 }
 
