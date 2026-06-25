@@ -23,11 +23,11 @@ Dashboard improvements: per-bucket traffic table gains a dedicated "S3 Transfer 
 
 - **Dashboard: Application log message column is horizontally scrollable**: long messages no longer get clipped at the cell boundary. The log table is now `table-layout: fixed` with explicit column widths for Timestamp, Level, and Target, giving the Message column all remaining space. Messages are wrapped in a `div` with `overflow-x: auto` and `white-space: nowrap`, so the full text is always reachable by scrolling regardless of message length.
 
+- **Dashboard: "Cache Rules and Bucket Stats" renamed to "Cache Rules".** The per-bucket traffic rollup rows (showing hit/miss counts per bucket) have been removed from this section — that information is now covered by the Per-Bucket Traffic table's `bytes_saved` column, which is the more accurate and comprehensive signal. The section now only appears when `cache_rules.json` has at least one configured rule, and each row represents a single rule pattern with its settings and how often it has matched.
+
 ### Fixed
 
 - **Dashboard: global cache hit/miss counters now populated.** `Total Requests`, `Get Hits`, `Get Misses`, and `Cache Hit Rate` in the Overall Statistics card were stuck at 0 because `CacheManager.update_statistics()` was missing from the write-through full-object cache-hit path. Consolidated all scattered `update_statistics()` calls into a single exit-point call in `handle_request`, keyed on the `served_from_cache` flag derived from the `X-Cache: HIT` response header (the same source as the per-bucket `bytes_saved` counter). This single-site accounting relies on every cache-hit path setting `X-Cache: HIT`, including the metadata-only HEAD cache-hit path (see Added); without that header a HEAD cache hit is counted as a miss and `head_hits` stays 0.
-
-- **Dashboard: "Cache Rules and Bucket Stats" renamed to "Cache Rules".** The per-bucket traffic rollup rows (showing hit/miss counts per bucket) have been removed from this section — that information is now covered by the Per-Bucket Traffic table's `bytes_saved` column, which is the more accurate and comprehensive signal. The section now only appears when `cache_rules.json` has at least one configured rule, and each row represents a single rule pattern with its settings and how often it has matched.
 
 ## [2.2.2] - 2026-06-24
 
