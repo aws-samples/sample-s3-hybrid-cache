@@ -13,16 +13,14 @@ The dashboard provides a lightweight, browser-based interface for monitoring pro
 - **Auto-refresh**: Updates every 5 seconds (configurable)
 - **Human-readable formatting**: Displays sizes in KB, MB, GB units
 - **Eviction tracking**: Shows eviction counts and recently evicted items
-- **Effectiveness metrics**: Total requests served and cache effectiveness percentage
+- **Effectiveness metrics**: Overall Statistics card shows total requests served (GET + HEAD + PUT), GET hits, GET misses, and cache hit rate. The hit-rate denominator counts every GET/HEAD that flows through the proxy — including list-object GETs, conditional requests, and non-cacheable or error responses (e.g. 404/403) — so the displayed rate is the fraction of all GET/HEAD traffic served from cache, not of cacheable object reads alone. Per-bucket traffic table shows GET/PUT request counts, bytes downloaded to clients, bytes saved (S3 transfers avoided via cache), and bytes uploaded.
 
-### Cache Rules and Bucket Statistics
-- **Combined table**: Lists the active cache rules in evaluation order, each with the fields it sets and its HEAD/GET hit rate, followed by a per-bucket traffic rollup for every bucket with observed traffic
-- **Rule rows**: One row per rule in `cache_rules.json`, shown in first-match-per-field order. The "Rule / Scope" column holds the rule's glob pattern; HEAD and GET columns show per-rule hit summaries
-- **Per-bucket rollup rows**: One row per bucket that has cache traffic — all buckets, not only those a rule matches — labeled `(bucket total)` in the "Rule / Scope" column
-- **Pattern/bucket filter**: Client-side text filter that matches rule patterns and bucket names
+### Cache Rules
+- **Rules-only table**: Lists the active cache rules from `cache_rules.json` in evaluation order, each with its configured settings and HEAD/GET hit rate. Only appears when at least one rule is configured.
+- **Rule rows**: One row per rule, shown in first-match-per-field order. The "Rule / Pattern" column holds the glob pattern; HEAD and GET columns show per-rule hit summaries (e.g. `72.3% of 4 102`)
+- **Pattern filter**: Client-side text filter that matches rule patterns
 - **Top 20 display**: Shows the top 20 rows by default with a "Show all" toggle
 - **Expandable settings**: Click "Settings" on a rule row to view the fields that rule sets (GET/HEAD/PUT TTL, read/write/compression/RAM)
-- **Conditional rendering**: Table appears when at least one rule is defined or any bucket has cache traffic
 
 ### Application Log Viewer
 - **Recent entries**: Shows most recent 100 log entries by default (configurable)
@@ -96,7 +94,9 @@ dashboard:
 
 **JSON APIs**:
 - `GET /api/cache-stats` - Current cache statistics
-- `GET /api/bucket-stats` - Cache rules and per-bucket statistics. Returns `rules` (the ordered rule list, each with the fields it sets plus HEAD/GET hit and miss counts) and `buckets` (per-bucket traffic rollups with hit/miss counts and hit rate for every bucket that has cache traffic).
+- `GET /api/bucket-stats` - Cache rules and per-rule hit/miss stats. Returns `rules` (the ordered rule list, each with the fields it sets plus HEAD/GET hit and miss counts). Only populated when `cache_rules.json` has at least one rule.
+- `GET /api/bucket-traffic` - Per-bucket traffic counters. Returns `bucket_traffic` map keyed by `bucket` or `bucket/prefix`, each entry with `get_requests`, `put_requests`, `bytes_served` (all GET bytes to clients), `bytes_saved` (GET bytes served from cache, i.e. S3 transfers avoided), and `bytes_uploaded` (PUT/UploadPart bytes from clients).
+- `GET /api/cache-stats` - Global cache hit/miss counters. Returns `overall` with `total_requests` (GET + HEAD + PUT), `get_hits`, `get_misses`, `get_total`, `head_hits`, `head_misses`, `head_total`, `put_total`, `cache_hit_rate`, `s3_requests_saved`, and `bytes_served_from_cache`.
 - `GET /api/logs` - Recent application log entries
 - `GET /api/system-info` - System information
 

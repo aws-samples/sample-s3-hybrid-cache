@@ -386,17 +386,16 @@ impl StaticFileHandler {
         <div id="cache-stats" class="tab-content active">
             <div id="cache-stats-content">Loading...</div>
             <div id="bucket-stats-section" style="display:none;">
-                <h2>Cache Rules and Bucket Stats</h2>
+                <h2>Cache Rules</h2>
                 <div class="bucket-stats-controls">
-                    <input type="text" id="bucket-filter" placeholder="Filter by pattern or bucket..." />
+                    <input type="text" id="bucket-filter" placeholder="Filter by pattern..." />
                     <span id="bucket-stats-toggle"></span>
                 </div>
                 <div class="bucket-stats-table">
                     <table id="bucket-stats-table">
                         <thead>
                             <tr>
-                                <th>Bucket</th>
-                                <th>Rule / Scope</th>
+                                <th>Rule / Pattern</th>
                                 <th>HEAD</th>
                                 <th>GET</th>
                                 <th></th>
@@ -420,8 +419,9 @@ impl StaticFileHandler {
                                 <th>Bucket</th>
                                 <th>Get</th>
                                 <th>Put</th>
-                                <th>Bytes Served</th>
-                                <th>Bytes Uploaded</th>
+                                <th title="Bytes sent to the client for GET requests (cache + S3 fetch). Mirrors S3 BytesDownloaded.">Bytes Downloaded</th>
+                                <th title="Bytes served from cache, not fetched from S3 (GET cache hits only).">S3 Transfer Saved</th>
+                                <th title="Bytes received from the client for PUT/multipart requests. Mirrors S3 BytesUploaded.">Bytes Uploaded</th>
                             </tr>
                         </thead>
                         <tbody id="bucket-traffic-body"></tbody>
@@ -670,7 +670,13 @@ main {
 .logs-table table {
     width: 100%;
     border-collapse: collapse;
+    table-layout: fixed;
 }
+
+/* Fixed widths for the first three columns; message column takes the rest */
+.logs-table th:nth-child(1), .logs-table td:nth-child(1) { width: 140px; }
+.logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 72px; }
+.logs-table th:nth-child(3), .logs-table td:nth-child(3) { width: 240px; }
 
 .logs-table th {
     background: #34495e;
@@ -682,6 +688,28 @@ main {
 .logs-table td {
     padding: 0.75rem 1rem;
     border-bottom: 1px solid #eee;
+}
+
+.log-message {
+    overflow-x: auto;
+    white-space: nowrap;
+    padding-bottom: 4px; /* room for the scrollbar track */
+}
+
+/* Persistent, easy-to-click scrollbar on the message column */
+.log-message::-webkit-scrollbar {
+    height: 8px;
+}
+.log-message::-webkit-scrollbar-track {
+    background: #f0f0f0;
+    border-radius: 4px;
+}
+.log-message::-webkit-scrollbar-thumb {
+    background: #aaa;
+    border-radius: 4px;
+}
+.log-message::-webkit-scrollbar-thumb:hover {
+    background: #777;
 }
 
 .logs-table tr:hover {
@@ -1289,7 +1317,7 @@ function renderCacheStats(data) {
         <div class="stats-grid">
             <div class="stat-card overall-card">
                 <h3>Overall Statistics</h3>
-                ${stat('Total Requests', formatNumber(data.overall?.total_requests || 0), 'Total HTTP requests processed (HEAD + GET).')}
+                ${stat('Total Requests', formatNumber(data.overall?.total_requests || 0), 'Total HTTP requests processed (GET + HEAD + PUT).')}
                 ${stat('Cached Objects', data.disk_cache?.cached_objects != null ? formatNumber(data.disk_cache.cached_objects) : 'N/A', 'Number of distinct S3 objects currently stored on disk.')}
                 ${stat('Total Cache Size', (data.disk_cache?.size_human || '0 B') + (data.disk_cache?.max_size_human ? ' / ' + data.disk_cache.max_size_human : ''), 'Total disk cache usage (read + write cache) vs configured maximum.')}
                 ${stat('Write Cache', (data.write_cache?.size_human || '0 B') + ' / ' + (data.write_cache?.max_size_human || '0 B'), 'Disk space used by MPUs in progress and PUT objects not yet read via GET.')}
@@ -1316,7 +1344,7 @@ function renderLogs(data) {
             <td>${formatTimestamp(entry.timestamp)}</td>
             <td><span class="log-level ${escapeHtml(entry.level)}">${escapeHtml(entry.level)}</span></td>
             <td>${escapeHtml(entry.target || '')}</td>
-            <td>${escapeHtml(entry.message)}</td>
+            <td><div class="log-message">${escapeHtml(entry.message)}</div></td>
         </tr>
     `).join('');
     
@@ -1425,8 +1453,7 @@ document.getElementById('log-text-filter').addEventListener('input', function() 
     textFilterTimeout = setTimeout(loadLogs, 300);
 });
 
-// === Bucket and Prefix Overrides Table ===
-let bucketStatsData = [];
+// === Cache Rules Table ===
 let bucketStatsRules = [];
 let bucketShowAll = false;
 let expandedSettings = new Set(); // Track which rows have settings expanded
@@ -1438,14 +1465,12 @@ async function loadBucketStats() {
         if (!response.ok) return;
         const data = await response.json();
         const section = document.getElementById('bucket-stats-section');
-        const hasBuckets = data.buckets && data.buckets.length > 0;
         const hasRules = data.rules && data.rules.length > 0;
-        if (!hasBuckets && !hasRules) {
+        if (!hasRules) {
             section.style.display = 'none';
             return;
         }
         section.style.display = '';
-        bucketStatsData = data.buckets || [];
         bucketStatsRules = data.rules || [];
         renderBucketStats();
     } catch (e) {
@@ -1467,23 +1492,10 @@ function renderBucketStats() {
         if (filter && !r.pattern.toLowerCase().includes(filter)) return;
         rows.push({
             rowKey: 'rule::' + idx,
-            bucket: '',
             prefix: r.pattern,
             headHits: r.head_hit_count || 0, headTotal: (r.head_hit_count || 0) + (r.head_miss_count || 0),
             getHits: r.get_hit_count || 0, getTotal: (r.get_hit_count || 0) + (r.get_miss_count || 0),
             settings: r
-        });
-    });
-    // Per-bucket traffic rollup rows.
-    bucketStatsData.forEach(b => {
-        if (filter && !b.bucket.toLowerCase().includes(filter)) return;
-        rows.push({
-            rowKey: 'bucket::' + b.bucket,
-            bucket: b.bucket,
-            prefix: '(bucket total)',
-            headHits: b.head_hit_count || 0, headTotal: (b.head_hit_count || 0) + (b.head_miss_count || 0),
-            getHits: b.get_hit_count || 0, getTotal: (b.get_hit_count || 0) + (b.get_miss_count || 0),
-            settings: null
         });
     });
 
@@ -1502,12 +1514,11 @@ function renderBucketStats() {
     tbody.innerHTML = '';
     display.forEach(r => {
         const tr = document.createElement('tr');
-        tr.className = r.bucket ? 'bucket-row' : 'prefix-row';
+        tr.className = 'prefix-row';
         const settingsBtn = r.settings
             ? '<button class="stats-btn" onclick="event.stopPropagation();toggleSettings(this,\'' + r.rowKey.replace(/'/g, "\\'") + '\')">Settings</button>'
             : '';
         tr.innerHTML =
-            '<td>' + escapeHtml(r.bucket) + '</td>' +
             '<td>' + escapeHtml(r.prefix) + '</td>' +
             '<td>' + hitSummary(r.headHits, r.headTotal) + '</td>' +
             '<td>' + hitSummary(r.getHits, r.getTotal) + '</td>' +
@@ -1530,7 +1541,7 @@ function appendSettingsRow(row, settings, rowKey) {
     detail.className = 'stats-detail-row';
     detail.dataset.rowKey = rowKey;
     const td = document.createElement('td');
-    td.colSpan = 5;
+    td.colSpan = 4;
     const items = [];
     if (s.get_ttl) items.push('GET TTL: ' + escapeHtml(s.get_ttl));
     if (s.head_ttl) items.push('HEAD TTL: ' + escapeHtml(s.head_ttl));
@@ -1630,6 +1641,7 @@ function renderBucketTraffic() {
             '<td>' + formatNumber(s.get_requests) + '</td>' +
             '<td>' + formatNumber(s.put_requests) + '</td>' +
             '<td>' + escapeHtml(formatBytes(s.bytes_served)) + '</td>' +
+            '<td>' + escapeHtml(formatBytes(s.bytes_saved || 0)) + '</td>' +
             '<td>' + escapeHtml(formatBytes(s.bytes_uploaded)) + '</td>';
         tbody.appendChild(tr);
     });
@@ -1764,10 +1776,7 @@ impl ApiHandler {
             let metadata_entries = metadata_cache.len().await;
             let metadata_max_entries = metadata_cache.config().max_entries;
 
-            // Calculate overall request count with overflow protection
-            let total_requests = cache_stats
-                .cache_hits
-                .saturating_add(cache_stats.cache_misses);
+            // Calculate overall request count — computed after put_total is known (see below).
 
             // Use RAM cache stats if available
             let (ram_hit_rate, ram_hits, ram_misses, ram_evictions, ram_max_size) =
@@ -1793,8 +1802,10 @@ impl ApiHandler {
             let disk_only_get_hits = cache_stats.get_hits.saturating_sub(ram_hits);
             let disk_only_get_misses = cache_stats.get_misses;
 
-            // Get uptime from metrics manager if available
-            let uptime_seconds = if let Some(metrics_manager) = metrics_manager_guard.as_ref() {
+            // Get uptime and PUT request count from metrics manager if available
+            let (uptime_seconds, put_total) = if let Some(metrics_manager) =
+                metrics_manager_guard.as_ref()
+            {
                 debug!("Metrics manager is available, getting uptime");
                 let fresh_metrics = metrics_manager.read().await.collect_metrics().await;
                 debug!(
@@ -1802,13 +1813,25 @@ impl ApiHandler {
                     fresh_metrics.uptime_seconds
                 );
 
+                let put_total = fresh_metrics
+                    .signed_put
+                    .as_ref()
+                    .map(|sp| sp.cached_puts_total.saturating_add(sp.bypassed_puts_total))
+                    .unwrap_or(0);
+
                 // Use minimum of 1 second for uptime (0 is normal at startup)
-                fresh_metrics.uptime_seconds.max(1)
+                (fresh_metrics.uptime_seconds.max(1), put_total)
             } else {
                 warn!("Metrics manager not available in dashboard, this indicates a configuration issue");
                 // Fallback: return 0 to indicate the issue
-                0
+                (0, 0)
             };
+
+            // Overall request count: GETs + HEADs (cache hit/miss path) + PUTs
+            let total_requests = cache_stats
+                .cache_hits
+                .saturating_add(cache_stats.cache_misses)
+                .saturating_add(put_total);
 
             // Calculate correct disk cache size (read cache only, write cache is separate)
             // Note: disk_cache now shows only read cache, write_cache shows write cache separately
@@ -1919,6 +1942,7 @@ impl ApiHandler {
                 },
                 overall: OverallStats {
                     total_requests,
+                    put_total,
                     head_total: cache_stats
                         .head_hits
                         .saturating_add(cache_stats.head_misses),
@@ -2118,13 +2142,6 @@ impl ApiHandler {
         let bsm = cache_manager.get_bucket_settings_manager();
         let rules = bsm.rules().await;
 
-        // Get per-bucket cache stats from metrics manager (all buckets with traffic)
-        let bucket_cache_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
-            mm.read().await.get_bucket_cache_stats().await
-        } else {
-            std::collections::HashMap::new()
-        };
-
         // Get per-rule cache stats from metrics manager (keyed by glob pattern)
         let rule_cache_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
             mm.read().await.get_rule_cache_stats().await
@@ -2154,39 +2171,7 @@ impl ApiHandler {
             })
             .collect();
 
-        // Build per-bucket entries from observed traffic.
-        let mut bucket_names: Vec<&String> = bucket_cache_stats.keys().collect();
-        bucket_names.sort();
-        let mut entries = Vec::with_capacity(bucket_names.len());
-        for bucket in bucket_names {
-            let stats = bucket_cache_stats.get(bucket.as_str());
-            let hit_count = stats.map_or(0, |s| s.hit_count);
-            let miss_count = stats.map_or(0, |s| s.miss_count);
-            let head_hit_count = stats.map_or(0, |s| s.head_hit_count);
-            let head_miss_count = stats.map_or(0, |s| s.head_miss_count);
-            let get_hit_count = stats.map_or(0, |s| s.get_hit_count);
-            let get_miss_count = stats.map_or(0, |s| s.get_miss_count);
-            let total = hit_count + miss_count;
-            let hit_rate = if total > 0 {
-                hit_count as f64 / total as f64
-            } else {
-                0.0
-            };
-
-            entries.push(BucketStatsEntry {
-                bucket: bucket.clone(),
-                hit_count,
-                miss_count,
-                hit_rate,
-                head_hit_count,
-                head_miss_count,
-                get_hit_count,
-                get_miss_count,
-            });
-        }
-
         let response = BucketStatsResponse {
-            buckets: entries,
             rules: rule_entries,
         };
         let body = serde_json::to_string(&response).map_err(|e| {
@@ -2236,6 +2221,7 @@ impl ApiHandler {
                 display_key,
                 BucketTrafficEntry {
                     bytes_served: stats.bytes_served,
+                    bytes_saved: stats.bytes_saved,
                     bytes_uploaded: stats.bytes_uploaded,
                     get_requests: stats.get_requests,
                     put_requests: stats.put_requests,
@@ -2651,6 +2637,7 @@ pub struct CacheStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverallStats {
     pub total_requests: u64,
+    pub put_total: u64,
     pub head_total: u64,
     pub get_total: u64,
     pub head_hits: u64,
@@ -2708,10 +2695,9 @@ pub struct LogsResponse {
     pub has_more: bool,
 }
 
-/// Per-bucket cache stats response for `/api/bucket-stats`
+/// Cache rules response for `/api/bucket-stats`
 #[derive(Debug, Serialize)]
 pub struct BucketStatsResponse {
-    pub buckets: Vec<BucketStatsEntry>,
     pub rules: Vec<RuleStatsEntry>,
 }
 
@@ -2729,22 +2715,10 @@ pub struct BucketTrafficResponse {
 #[derive(Debug, Serialize)]
 pub struct BucketTrafficEntry {
     pub bytes_served: u64,
+    pub bytes_saved: u64,
     pub bytes_uploaded: u64,
     pub get_requests: u64,
     pub put_requests: u64,
-}
-
-/// Per-bucket cache stats entry (traffic-derived; all buckets)
-#[derive(Debug, Serialize)]
-pub struct BucketStatsEntry {
-    pub bucket: String,
-    pub hit_count: u64,
-    pub miss_count: u64,
-    pub hit_rate: f64,
-    pub head_hit_count: u64,
-    pub head_miss_count: u64,
-    pub get_hit_count: u64,
-    pub get_miss_count: u64,
 }
 
 /// One active cache rule, its set fields, and its hit/miss stats.
@@ -2940,6 +2914,7 @@ mod tests {
             "alpha-bucket".to_string(),
             BucketTrafficEntry {
                 bytes_served: 1000,
+                bytes_saved: 0,
                 bytes_uploaded: 0,
                 get_requests: 1,
                 put_requests: 0,
@@ -2949,6 +2924,7 @@ mod tests {
             "beta-bucket".to_string(),
             BucketTrafficEntry {
                 bytes_served: 512,
+                bytes_saved: 0,
                 bytes_uploaded: 2048,
                 get_requests: 0,
                 put_requests: 1,
@@ -2993,6 +2969,7 @@ mod tests {
             "bkt-one".to_string(),
             BucketTrafficEntry {
                 bytes_served: 100,
+                bytes_saved: 0,
                 bytes_uploaded: 0,
                 get_requests: 1,
                 put_requests: 0,
@@ -3002,6 +2979,7 @@ mod tests {
             "bkt-two".to_string(),
             BucketTrafficEntry {
                 bytes_served: 100,
+                bytes_saved: 0,
                 bytes_uploaded: 0,
                 get_requests: 1,
                 put_requests: 0,
@@ -3012,6 +2990,7 @@ mod tests {
             "__other__".to_string(),
             BucketTrafficEntry {
                 bytes_served: 50,
+                bytes_saved: 0,
                 bytes_uploaded: 0,
                 get_requests: 1,
                 put_requests: 0,

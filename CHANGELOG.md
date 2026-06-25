@@ -5,6 +5,30 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] - 2026-06-25
+
+Dashboard improvements: per-bucket traffic table gains a dedicated "S3 Transfer Saved" column backed by a new `bytes_saved` counter, total requests now includes PUTs, and long application log messages are horizontally scrollable. A new `X-Cache: HIT` response header on all cache-hit responses is the mechanism that powers `bytes_saved` tracking and provides a direct cache-hit signal to downstream clients.
+
+### Added
+
+- **`X-Cache: HIT` response header**: all responses served from the proxy cache now include `x-cache: HIT`. This applies to full-object 200 responses (`serve_full_object_from_cache`), range 206 responses (RAM path, streaming path, buffered path), and HEAD responses served from cached metadata. Responses fetched from S3 do not include this header. The header is visible to any HTTP client (curl, AWS SDK, CDN) and is the signal the proxy uses internally to populate the new `bytes_saved` counter.
+
+- **Per-bucket `bytes_saved` metric**: `BucketTrafficStats` gains a new cumulative counter that tracks bytes served from cache per bucket. Unlike `bytes_served` (all GET bytes delivered to clients, including S3 fetches), `bytes_saved` counts only bytes from GET cache hits — the S3 transfer cost the proxy avoided. The difference `bytes_served - bytes_saved` gives bytes actually fetched from S3. Zero for PUTs and UploadPart. Exposed in the `/metrics` JSON and `/api/bucket-traffic` endpoint alongside the existing counters.
+
+### Changed
+
+- **Dashboard: "S3 Transfer Saved" column in per-bucket traffic table**: the per-bucket table now shows three byte columns — **Bytes Downloaded** (all GET bytes to clients, i.e., `bytes_served`), **S3 Transfer Saved** (`bytes_saved`: cache-hit GET bytes only), and **Bytes Uploaded** (`bytes_uploaded`). Previously there was a single "Bytes Served" column.
+
+- **Dashboard: Total Requests includes PUTs**: the "Total Requests" stat in the Overall Statistics card now counts GET + HEAD + PUT (previously GET + HEAD only). PUT count is sourced from `SignedPutMetrics.cached_puts_total + bypassed_puts_total`, which covers both PutObject and UploadPart. A new `put_total` field is also exposed in the `OverallStats` API response.
+
+- **Dashboard: Application log message column is horizontally scrollable**: long messages no longer get clipped at the cell boundary. The log table is now `table-layout: fixed` with explicit column widths for Timestamp, Level, and Target, giving the Message column all remaining space. Messages are wrapped in a `div` with `overflow-x: auto` and `white-space: nowrap`, so the full text is always reachable by scrolling regardless of message length.
+
+### Fixed
+
+- **Dashboard: global cache hit/miss counters now populated.** `Total Requests`, `Get Hits`, `Get Misses`, and `Cache Hit Rate` in the Overall Statistics card were stuck at 0 because `CacheManager.update_statistics()` was missing from the write-through full-object cache-hit path. Consolidated all scattered `update_statistics()` calls into a single exit-point call in `handle_request`, keyed on the `served_from_cache` flag derived from the `X-Cache: HIT` response header (the same source as the per-bucket `bytes_saved` counter). This single-site accounting relies on every cache-hit path setting `X-Cache: HIT`, including the metadata-only HEAD cache-hit path (see Added); without that header a HEAD cache hit is counted as a miss and `head_hits` stays 0.
+
+- **Dashboard: "Cache Rules and Bucket Stats" renamed to "Cache Rules".** The per-bucket traffic rollup rows (showing hit/miss counts per bucket) have been removed from this section — that information is now covered by the Per-Bucket Traffic table's `bytes_saved` column, which is the more accurate and comprehensive signal. The section now only appears when `cache_rules.json` has at least one configured rule, and each row represents a single rule pattern with its settings and how often it has matched.
+
 ## [2.2.2] - 2026-06-24
 
 Download bandwidth QoS: operators can now cap the aggregate cache-miss origin download rate and share it fairly across callers or buckets using deficit round-robin scheduling. The feature is **disabled by default** (`max_bytes_per_sec = 0`); a binary-only upgrade changes no behavior until the operator opts in.

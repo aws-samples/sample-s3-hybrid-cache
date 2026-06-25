@@ -618,6 +618,7 @@ mod tests {
                 },
                 BucketTrafficStats {
                     bytes_served: 5000,
+                    bytes_saved: 0,
                     bytes_uploaded: 1000,
                     get_requests: 10,
                     put_requests: 3,
@@ -630,6 +631,7 @@ mod tests {
                 },
                 BucketTrafficStats {
                     bytes_served: 2000,
+                    bytes_saved: 0,
                     bytes_uploaded: 500,
                     get_requests: 4,
                     put_requests: 2,

@@ -536,6 +536,7 @@ impl SignedPutHandler {
                         None, // prefix: no per-bucket prefix config in this handler; bucket-level
                         RequestType::Put,
                         0, // bytes_served: PutObject response body is empty
+                        0, // bytes_saved: PUT is not a cache hit
                         body_bytes_uploaded,
                     )
                     .await;
@@ -1307,6 +1308,7 @@ impl SignedPutHandler {
                         None,             // prefix: no per-bucket prefix config in this handler
                         RequestType::Put, // UploadPart is a PUT operation
                         0,                // bytes_served: UploadPart response body is empty
+                        0,                // bytes_saved: PUT is not a cache hit
                         body_bytes_uploaded,
                     )
                     .await;

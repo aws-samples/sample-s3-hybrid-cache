@@ -14612,3 +14612,79 @@ mod write_cache_range_sink_property_tests {
         })
     }
 }
+
+#[cfg(test)]
+mod global_cache_stats_unit_tests {
+    use super::CacheManager;
+    use tempfile::TempDir;
+
+    /// Verifies that `update_statistics` increments the correct counters exactly once
+    /// per call and accumulates across successive calls.  This mirrors the exit-point
+    /// call added in `handle_request` (global-cache-stats-fix spec, R8).
+    ///
+    /// Sequence:
+    ///   1. GET hit  (1 KB)  → cache_hits=1, get_hits=1, bytes_served_from_cache=1024
+    ///   2. GET miss (0 B)   → cache_misses=1, get_misses=1, cache_hits unchanged
+    ///   3. HEAD hit (512 B) → head_hits=1, cache_hits=2, bytes_served_from_cache=1536
+    #[test]
+    fn test_update_statistics_exit_point_accounting() {
+        let temp_dir = TempDir::new().unwrap();
+        let cm = CacheManager::new_with_defaults(
+            temp_dir.path().to_path_buf(),
+            false, // RAM cache not needed
+            0,
+        );
+
+        // 1. GET cache hit, 1 KB
+        cm.update_statistics(true, 1024, false);
+        let stats = cm.get_statistics();
+        assert_eq!(stats.cache_hits, 1, "cache_hits after GET hit");
+        assert_eq!(stats.get_hits, 1, "get_hits after GET hit");
+        assert_eq!(stats.head_hits, 0, "head_hits must stay 0 after GET hit");
+        assert_eq!(
+            stats.bytes_served_from_cache, 1024,
+            "bytes_served_from_cache after GET hit"
+        );
+        assert_eq!(
+            stats.cache_misses, 0,
+            "cache_misses must be 0 after GET hit"
+        );
+        assert_eq!(stats.get_misses, 0, "get_misses must be 0 after GET hit");
+
+        // 2. GET cache miss
+        cm.update_statistics(false, 0, false);
+        let stats = cm.get_statistics();
+        assert_eq!(stats.cache_misses, 1, "cache_misses after GET miss");
+        assert_eq!(stats.get_misses, 1, "get_misses after GET miss");
+        assert_eq!(
+            stats.cache_hits, 1,
+            "cache_hits must be unchanged after GET miss"
+        );
+        assert_eq!(
+            stats.get_hits, 1,
+            "get_hits must be unchanged after GET miss"
+        );
+        assert_eq!(
+            stats.bytes_served_from_cache, 1024,
+            "bytes_served_from_cache must be unchanged after miss"
+        );
+
+        // 3. HEAD cache hit, 512 B
+        cm.update_statistics(true, 512, true);
+        let stats = cm.get_statistics();
+        assert_eq!(stats.head_hits, 1, "head_hits after HEAD hit");
+        assert_eq!(stats.cache_hits, 2, "cache_hits must be 2 after two hits");
+        assert_eq!(
+            stats.bytes_served_from_cache, 1536,
+            "bytes_served_from_cache must accumulate: 1024 + 512"
+        );
+        assert_eq!(
+            stats.get_hits, 1,
+            "get_hits must be unchanged after HEAD hit"
+        );
+        assert_eq!(
+            stats.cache_misses, 1,
+            "cache_misses must be unchanged after HEAD hit"
+        );
+    }
+}

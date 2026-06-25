@@ -1233,6 +1233,7 @@ impl HttpProxy {
         );
 
         let metrics_for_recording = metrics_manager.clone();
+        let cache_manager_for_stats = cache_manager.clone(); // exit-point global stats (R2)
 
         // Handle the request based on method
         let (response, served_from_cache) = match method {
@@ -1380,11 +1381,27 @@ impl HttpProxy {
                             traffic_key.prefix.as_deref(),
                             RequestType::Get,
                             bytes_sent,
+                            if served_from_cache { bytes_sent } else { 0 }, // bytes_saved: cache hits only
                             0, // GET carries no request body
                         )
                         .await;
                 }
             }
+        }
+
+        // Global cache hit/miss accounting — exactly once per request (R1, R2, R3, R4, R5)
+        if method == Method::GET || method == Method::HEAD {
+            let bytes = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            cache_manager_for_stats.update_statistics(
+                served_from_cache,
+                bytes,
+                method == Method::HEAD,
+            );
         }
 
         Ok(response)
@@ -2664,7 +2681,6 @@ impl HttpProxy {
                             "HEAD forward_to_s3: skipping cache hit, forwarding to S3: cache_key={}",
                             cache_key
                         );
-                        cache_manager.update_statistics(false, 0, true);
                         cache_manager
                             .record_bucket_cache_access(
                                 &cache_key,
@@ -2715,7 +2731,6 @@ impl HttpProxy {
                     );
 
                     // Record per-bucket cache hit for HEAD
-                    cache_manager.update_statistics(true, 0, true);
                     cache_manager
                         .record_bucket_cache_access(
                             &cache_key,
@@ -2726,7 +2741,9 @@ impl HttpProxy {
                         .await;
 
                     // Build response from HEAD cache
-                    let mut response_builder = Response::builder().status(StatusCode::OK);
+                    let mut response_builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-cache", "HIT"); // R9: metadata HEAD hits must carry the cache-hit signal
 
                     // Add cached headers
                     for (key, value) in &head_entry.headers {
@@ -2750,7 +2767,6 @@ impl HttpProxy {
                     );
 
                     // Record per-bucket cache miss for HEAD
-                    cache_manager.update_statistics(false, 0, true);
                     cache_manager
                         .record_bucket_cache_access(
                             &cache_key,
@@ -2867,7 +2883,6 @@ impl HttpProxy {
                                         .await;
                                 }
 
-                                cache_manager.update_statistics(true, total_size, false);
                                 cache_manager
                                     .record_bucket_cache_access(
                                         &cache_key,
@@ -5352,7 +5367,6 @@ impl HttpProxy {
 
                             // Record cache miss for disk cache statistics (GET request)
                             // This is a partial or complete miss since we need to fetch from S3
-                            cache_manager.update_statistics(false, 0, false);
                             cache_manager
                                 .record_bucket_cache_access(
                                     &cache_key,
@@ -5566,7 +5580,8 @@ impl HttpProxy {
         let mut response_builder = Response::builder()
             .status(StatusCode::OK)
             .header("content-length", range_data.len().to_string())
-            .header("accept-ranges", "bytes");
+            .header("accept-ranges", "bytes")
+            .header("x-cache", "HIT");
 
         // Restore all original S3 headers from cache
         for (key, value) in &cached_metadata.response_headers {
@@ -5648,7 +5663,9 @@ impl HttpProxy {
         uri: &str,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Build 206 Partial Content response - Requirement 4.1
-        let mut response_builder = Response::builder().status(StatusCode::PARTIAL_CONTENT);
+        let mut response_builder = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("x-cache", "HIT");
 
         // Add all headers from cached part response - Requirements 4.2, 4.3, 4.4, 10.1-10.13
         for (key, value) in &cached_part.headers {
@@ -5734,7 +5751,8 @@ impl HttpProxy {
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header("content-length", ram_data.len().to_string())
                 .header("content-range", &content_range_value)
-                .header("accept-ranges", "bytes");
+                .header("accept-ranges", "bytes")
+                .header("x-cache", "HIT");
 
             // Add S3 headers from cached metadata
             response_builder = Self::add_cached_s3_headers(
@@ -5772,7 +5790,6 @@ impl HttpProxy {
             }
 
             // Record cache hit statistics
-            cache_manager.update_statistics(true, range_size, method == Method::HEAD);
             cache_manager
                 .record_bucket_cache_access(
                     cache_key,
@@ -5815,7 +5832,8 @@ impl HttpProxy {
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header("content-length", range_size.to_string())
                 .header("content-range", &content_range_value)
-                .header("accept-ranges", "bytes");
+                .header("accept-ranges", "bytes")
+                .header("x-cache", "HIT");
 
             // Add S3 headers from cached metadata
             response_builder = Self::add_cached_s3_headers(
@@ -6078,7 +6096,6 @@ impl HttpProxy {
                     }
 
                     // Record cache hit statistics for streaming path
-                    cache_manager.update_statistics(true, range_size, false);
                     cache_manager
                         .record_bucket_cache_access(cache_key, true, false, &resolved.source)
                         .await;
@@ -6324,7 +6341,8 @@ impl HttpProxy {
             .status(StatusCode::PARTIAL_CONTENT)
             .header("content-length", range_data.len().to_string())
             .header("content-range", &content_range_value)
-            .header("accept-ranges", "bytes");
+            .header("accept-ranges", "bytes")
+            .header("x-cache", "HIT");
 
         // Add S3 headers from cached metadata
         response_builder = Self::add_cached_s3_headers(
@@ -6351,9 +6369,7 @@ impl HttpProxy {
 
         let response = response_builder.body(body).unwrap();
 
-        // Record cache hit statistics (buffered path — RAM and streaming paths record separately)
-        let range_size = range_spec.end - range_spec.start + 1;
-        cache_manager.update_statistics(true, range_size, method == Method::HEAD);
+        // Record per-bucket cache access (buffered path — RAM and streaming paths record separately)
         cache_manager
             .record_bucket_cache_access(cache_key, true, method == Method::HEAD, &resolved.source)
             .await;
@@ -6873,7 +6889,6 @@ impl HttpProxy {
         // If coordination is disabled, go directly to S3
         // Requirement 18.4
         if !coordination_enabled {
-            cache_manager.update_statistics(false, 0, false);
             cache_manager
                 .record_bucket_cache_access(&cache_key, false, false, &resolved.source)
                 .await;
@@ -6908,7 +6923,6 @@ impl HttpProxy {
                 );
 
                 // Fetcher always goes to S3 — record cache miss
-                cache_manager.update_statistics(false, 0, false);
                 cache_manager
                     .record_bucket_cache_access(&cache_key, false, false, &resolved.source)
                     .await;
@@ -7937,7 +7951,6 @@ impl HttpProxy {
                     );
                 }
 
-                cache_manager.update_statistics(true, total_size, method == Method::HEAD);
                 cache_manager
                     .record_bucket_cache_access(
                         &cache_key,
@@ -7949,7 +7962,9 @@ impl HttpProxy {
 
                 if method == Method::HEAD {
                     // Return cached metadata headers with empty body.
-                    let mut builder = Response::builder().status(StatusCode::OK);
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-cache", "HIT");
                     for (k, v) in &metadata.object_metadata.response_headers {
                         builder = builder.header(k, v);
                     }
@@ -8243,7 +8258,9 @@ impl HttpProxy {
                 .unwrap());
         }
         if method == Method::HEAD {
-            let mut builder = Response::builder().status(StatusCode::OK);
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("x-cache", "HIT");
             for (k, v) in &metadata.object_metadata.response_headers {
                 builder = builder.header(k, v);
             }
@@ -8784,7 +8801,6 @@ impl HttpProxy {
                         cache_key, e
                     );
                 }
-                cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
                 cache_manager
                     .record_bucket_cache_access(&cache_key, true, false, &resolved.source)
                     .await;
@@ -8830,7 +8846,6 @@ impl HttpProxy {
                         .record_coalesce_waiter_conditional_error()
                         .await;
                 }
-                cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
                 Self::serve_cached_part_response(cached_part, method, uri.path()).await
             }
             Err(e) => {
@@ -8844,7 +8859,6 @@ impl HttpProxy {
                         .record_coalesce_waiter_conditional_error()
                         .await;
                 }
-                cache_manager.update_statistics(true, cached_part.data.len() as u64, false);
                 Self::serve_cached_part_response(cached_part, method, uri.path()).await
             }
         }

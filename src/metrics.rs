@@ -377,6 +377,9 @@ pub struct BucketTrafficKey {
 pub struct BucketTrafficStats {
     /// Cumulative bytes sent to the client (response body). Mirrors S3 `BytesDownloaded`.
     pub bytes_served: u64,
+    /// Cumulative bytes sent to the client that were served from cache (cache hits only).
+    /// The difference `bytes_served - bytes_saved` is bytes fetched from S3.
+    pub bytes_saved: u64,
     /// Cumulative bytes received from the client (request body for PUT/UploadPart).
     /// Mirrors S3 `BytesUploaded`. Zero for GET.
     pub bytes_uploaded: u64,
@@ -2168,6 +2171,7 @@ impl MetricsManager {
         prefix: Option<&str>,
         request_type: RequestType,
         bytes_served: u64,
+        bytes_saved: u64,
         bytes_uploaded: u64,
     ) {
         if bucket.is_empty() {
@@ -2211,6 +2215,7 @@ impl MetricsManager {
 
         let entry = stats.entry(use_key).or_default();
         entry.bytes_served = entry.bytes_served.saturating_add(bytes_served);
+        entry.bytes_saved = entry.bytes_saved.saturating_add(bytes_saved);
         entry.bytes_uploaded = entry.bytes_uploaded.saturating_add(bytes_uploaded);
 
         match request_type {
@@ -3712,7 +3717,7 @@ mod tests {
                     RequestType::Put
                 };
                 metrics
-                    .record_bucket_traffic(bucket, None, rtype, bs, bu)
+                    .record_bucket_traffic(bucket, None, rtype, bs, 0, bu)
                     .await;
             }
 
@@ -3763,7 +3768,7 @@ mod tests {
 
             let snap_before = metrics.get_bucket_traffic_stats().await;
             metrics
-                .record_bucket_traffic(&bucket, None, request_type, bytes_served, bytes_uploaded)
+                .record_bucket_traffic(&bucket, None, request_type, bytes_served, 0, bytes_uploaded)
                 .await;
             let snap_after = metrics.get_bucket_traffic_stats().await;
 
@@ -3832,7 +3837,7 @@ mod tests {
                     RequestType::Get
                 };
                 metrics
-                    .record_bucket_traffic(&bucket_name, None, rtype, *bs as u64, *bu as u64)
+                    .record_bucket_traffic(&bucket_name, None, rtype, *bs as u64, 0, *bu as u64)
                     .await;
             }
             let s1 = metrics.get_bucket_traffic_stats().await;
@@ -3845,7 +3850,7 @@ mod tests {
                     RequestType::Get
                 };
                 metrics
-                    .record_bucket_traffic(&bucket_name, None, rtype, *bs as u64, *bu as u64)
+                    .record_bucket_traffic(&bucket_name, None, rtype, *bs as u64, 0, *bu as u64)
                     .await;
             }
             let s2 = metrics.get_bucket_traffic_stats().await;
@@ -3891,7 +3896,7 @@ mod tests {
                 let mm = metrics.clone();
                 let bkt = bucket.to_string();
                 handles.push(tokio::spawn(async move {
-                    mm.record_bucket_traffic(&bkt, None, RequestType::Get, b, 0)
+                    mm.record_bucket_traffic(&bkt, None, RequestType::Get, b, 0, 0)
                         .await;
                 }));
             }
@@ -3950,7 +3955,7 @@ mod tests {
                 let bs = *served as u64;
                 let bu = *uploaded as u64;
                 metrics
-                    .record_bucket_traffic(&bucket, None, RequestType::Get, bs, bu)
+                    .record_bucket_traffic(&bucket, None, RequestType::Get, bs, 0, bu)
                     .await;
                 total_requests += 1;
                 total_bytes_served += bs;
@@ -4004,24 +4009,24 @@ mod tests {
 
         // Bucket A: 2 GETs (object reads), 1 PUT (object write).
         metrics
-            .record_bucket_traffic("bucket-a", None, RequestType::Get, 100, 0)
+            .record_bucket_traffic("bucket-a", None, RequestType::Get, 100, 0, 0)
             .await;
         metrics
-            .record_bucket_traffic("bucket-a", None, RequestType::Get, 200, 0)
+            .record_bucket_traffic("bucket-a", None, RequestType::Get, 200, 0, 0)
             .await;
         metrics
-            .record_bucket_traffic("bucket-a", None, RequestType::Put, 0, 500)
+            .record_bucket_traffic("bucket-a", None, RequestType::Put, 0, 0, 500)
             .await;
 
         // Bucket B: 1 GET, 1 PUT (PutObject), 1 PUT (UploadPart).
         metrics
-            .record_bucket_traffic("bucket-b", None, RequestType::Get, 300, 0)
+            .record_bucket_traffic("bucket-b", None, RequestType::Get, 300, 0, 0)
             .await;
         metrics
-            .record_bucket_traffic("bucket-b", None, RequestType::Put, 0, 1000)
+            .record_bucket_traffic("bucket-b", None, RequestType::Put, 0, 0, 1000)
             .await;
         metrics
-            .record_bucket_traffic("bucket-b", None, RequestType::Put, 0, 2000)
+            .record_bucket_traffic("bucket-b", None, RequestType::Put, 0, 0, 2000)
             .await;
 
         let snapshot = metrics.get_bucket_traffic_stats().await;
@@ -4086,7 +4091,14 @@ mod tests {
                     RequestType::Get
                 };
                 metrics
-                    .record_bucket_traffic(&bucket, None, rtype, *served as u64, *uploaded as u64)
+                    .record_bucket_traffic(
+                        &bucket,
+                        None,
+                        rtype,
+                        *served as u64,
+                        0,
+                        *uploaded as u64,
+                    )
                     .await;
                 buckets_with_traffic.insert(bucket);
             }
@@ -4146,10 +4158,10 @@ mod tests {
         let metrics = MetricsManager::new();
 
         metrics
-            .record_bucket_traffic("shape-test-bucket", None, RequestType::Get, 1024, 0)
+            .record_bucket_traffic("shape-test-bucket", None, RequestType::Get, 1024, 0, 0)
             .await;
         metrics
-            .record_bucket_traffic("shape-test-bucket", None, RequestType::Put, 0, 512)
+            .record_bucket_traffic("shape-test-bucket", None, RequestType::Put, 0, 0, 512)
             .await;
 
         let system_metrics = metrics.collect_metrics().await;
@@ -4209,31 +4221,31 @@ mod tests {
 
         // HTTP proxy GET cache miss (origin served 4096 bytes).
         metrics
-            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0)
+            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0, 0)
             .await;
         // GET cache hit — still exactly one recording.
         metrics
-            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0)
+            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 4096, 0)
             .await;
         // GET coalesced fetch — the coalesced client records once at completion.
         metrics
-            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0)
+            .record_bucket_traffic(bucket, None, RequestType::Get, 4096, 0, 0)
             .await;
         // Range request (partial content) — 1024 bytes served.
         metrics
-            .record_bucket_traffic(bucket, None, RequestType::Get, 1024, 0)
+            .record_bucket_traffic(bucket, None, RequestType::Get, 1024, 0, 0)
             .await;
         // Signed PUT write-through — 8192 bytes uploaded.
         metrics
-            .record_bucket_traffic(bucket, None, RequestType::Put, 0, 8192)
+            .record_bucket_traffic(bucket, None, RequestType::Put, 0, 0, 8192)
             .await;
         // UploadPart (maps to Put) — 5 MiB part uploaded.
         metrics
-            .record_bucket_traffic(bucket, None, RequestType::Put, 0, 5_242_880)
+            .record_bucket_traffic(bucket, None, RequestType::Put, 0, 0, 5_242_880)
             .await;
         // TLS-terminating listener GET — 2048 bytes served.
         metrics
-            .record_bucket_traffic(bucket, None, RequestType::Get, 2048, 0)
+            .record_bucket_traffic(bucket, None, RequestType::Get, 2048, 0, 0)
             .await;
 
         let snapshot = metrics.get_bucket_traffic_stats().await;
