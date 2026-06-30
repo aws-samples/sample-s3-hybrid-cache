@@ -87,7 +87,7 @@ dashmap = "6.0"
 
 # OpenTelemetry for OTLP metrics export (0.29 uses rand 0.9, fully resolves RUSTSEC-2026-0097)
 opentelemetry = { version = "0.29", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
 # default features pull in `reqwest-blocking-client`, whose blocking client cannot
 # be constructed inside the Tokio runtime and makes the HTTP exporter fail at init
 # with "no http client specified". Disable defaults and use the async reqwest-client.
@@ -110,7 +110,7 @@ quickcheck_macros = "1.0"
 rcgen = "0.13"
 hex = "0.4"
 ureq = "2.9"  # For health check HTTP requests in tests
-opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio", "testing"] }  # testing enables InMemoryMetricExporter
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio", "testing"] }  # testing enables InMemoryMetricExporter
 
 [[example]]
 name = "compression_demo"
