@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "2.2.3"
+version = "2.2.4"
 edition = "2021"
 # MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
 # Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
@@ -85,14 +85,21 @@ walkdir = "2.4"
 # Concurrent data structures
 dashmap = "6.0"
 
-# OpenTelemetry for OTLP metrics export (0.29 uses rand 0.9, fully resolves RUSTSEC-2026-0097)
-opentelemetry = { version = "0.29", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio"] }
+# OpenTelemetry for OTLP metrics export (0.29 uses rand 0.9, fully resolves RUSTSEC-2026-0097).
+# Bumped to 0.32 for GHSA-w9wp-h8wv-79jx / CVE-2026-48504 (opentelemetry_sdk baggage
+# propagation unbounded allocation, fixed in opentelemetry_sdk 0.32.1). All four
+# opentelemetry crates must move together — they share types (KeyValue, MeterProvider,
+# PushMetricExporter) across crate boundaries, and a partial bump leaves two
+# incompatible copies of `opentelemetry`/`opentelemetry_sdk` in the dependency graph
+# (fails to compile with "multiple different versions of crate X in the dependency
+# graph" — see the reverted GitHub PR #10 that only bumped opentelemetry_sdk alone).
+opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
 # default features pull in `reqwest-blocking-client`, whose blocking client cannot
 # be constructed inside the Tokio runtime and makes the HTTP exporter fail at init
 # with "no http client specified". Disable defaults and use the async reqwest-client.
-opentelemetry-otlp = { version = "0.29", default-features = false, features = ["metrics", "http-proto", "reqwest-client"] }
-opentelemetry-semantic-conventions = "0.29"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = "0.32"
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]
@@ -110,7 +117,7 @@ quickcheck_macros = "1.0"
 rcgen = "0.13"
 hex = "0.4"
 ureq = "2.9"  # For health check HTTP requests in tests
-opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio", "testing"] }  # testing enables InMemoryMetricExporter
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio", "testing"] }  # testing enables InMemoryMetricExporter
 
 [[example]]
 name = "compression_demo"

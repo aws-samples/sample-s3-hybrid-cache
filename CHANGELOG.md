@@ -5,6 +5,12 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.4] - 2026-07-10
+
+### Security
+
+- **GHSA-w9wp-h8wv-79jx / CVE-2026-48504 resolved**: Bumped `opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` / `opentelemetry-semantic-conventions` from `0.29` to `0.32` (fixed in `opentelemetry_sdk 0.32.1`). Unbounded allocation when parsing oversized inbound W3C `baggage` headers; availability-only impact. Test-only OTLP metric assertions in `src/otlp.rs` were updated for the new API; no production behavior changed.
+
 ## [2.2.3] - 2026-06-25
 
 Dashboard improvements: per-bucket traffic table gains a dedicated "S3 Transfer Saved" column backed by a new `bytes_saved` counter, total requests now includes PUTs, and long application log messages are horizontally scrollable. A new `X-Cache: HIT` response header on all cache-hit responses is the mechanism that powers `bytes_saved` tracking and provides a direct cache-hit signal to downstream clients.

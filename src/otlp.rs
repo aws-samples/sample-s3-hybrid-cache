@@ -585,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn test_per_bucket_otlp_recording_attributes() {
         use opentelemetry::metrics::MeterProvider as _;
-        use opentelemetry_sdk::metrics::data::Sum;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
         use opentelemetry_sdk::metrics::{
             InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
         };
@@ -682,97 +682,96 @@ mod tests {
         // Find the scope for our test meter.
         let rm = &finished[0];
         let scope = rm
-            .scope_metrics
-            .iter()
-            .find(|s| s.scope.name() == "s3-proxy-test")
+            .scope_metrics()
+            .find(|s| s.scope().name() == "s3-proxy-test")
             .expect("scope_metrics should contain s3-proxy-test");
 
         // Assert: s3proxy.bytes_downloaded has correct data points.
         let bytes_dl_metric = scope
-            .metrics
-            .iter()
-            .find(|m| m.name == "s3proxy.bytes_downloaded")
+            .metrics()
+            .find(|m| m.name() == "s3proxy.bytes_downloaded")
             .expect("should find s3proxy.bytes_downloaded metric");
 
-        let sum_data = bytes_dl_metric
-            .data
-            .as_any()
-            .downcast_ref::<Sum<u64>>()
-            .expect("bytes_downloaded should be Sum<u64>");
+        let sum_data = match bytes_dl_metric.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => sum,
+            other => panic!("bytes_downloaded should be Sum<u64>, got {other:?}"),
+        };
 
         assert!(
-            sum_data.is_monotonic,
+            sum_data.is_monotonic(),
             "Observable counters must be monotonic (cumulative)"
         );
 
         // Bucket-only data point (test-bucket, no prefix attr).
         let bucket_only_dp = sum_data
-            .data_points
-            .iter()
+            .data_points()
             .find(|dp| {
-                dp.attributes
-                    .contains(&KeyValue::new("bucket", "test-bucket"))
-                    && !dp.attributes.iter().any(|kv| kv.key.as_str() == "prefix")
+                dp.attributes()
+                    .any(|kv| kv == &KeyValue::new("bucket", "test-bucket"))
+                    && !dp.attributes().any(|kv| kv.key.as_str() == "prefix")
             })
             .expect("should have a data point for test-bucket without prefix");
         assert_eq!(
-            bucket_only_dp.value, 5000,
+            bucket_only_dp.value(),
+            5000,
             "bucket-only bytes_downloaded should be 5000"
         );
 
         // Prefix-attributed data point (test-bucket + prefix "logs/").
         let prefix_dp = sum_data
-            .data_points
-            .iter()
+            .data_points()
             .find(|dp| {
-                dp.attributes
-                    .contains(&KeyValue::new("bucket", "test-bucket"))
-                    && dp.attributes.contains(&KeyValue::new("prefix", "logs/"))
+                dp.attributes()
+                    .any(|kv| kv == &KeyValue::new("bucket", "test-bucket"))
+                    && dp
+                        .attributes()
+                        .any(|kv| kv == &KeyValue::new("prefix", "logs/"))
             })
             .expect("should have a data point for test-bucket with prefix=logs/");
         assert_eq!(
-            prefix_dp.value, 2000,
+            prefix_dp.value(),
+            2000,
             "prefix-attributed bytes_downloaded should be 2000"
         );
 
         // 6. Verify put_requests metric to confirm the request-count counters work.
         let put_req_metric = scope
-            .metrics
-            .iter()
-            .find(|m| m.name == "s3proxy.put_requests")
+            .metrics()
+            .find(|m| m.name() == "s3proxy.put_requests")
             .expect("should find s3proxy.put_requests metric");
 
-        let put_req_sum = put_req_metric
-            .data
-            .as_any()
-            .downcast_ref::<Sum<u64>>()
-            .expect("put_requests should be Sum<u64>");
+        let put_req_sum = match put_req_metric.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => sum,
+            other => panic!("put_requests should be Sum<u64>, got {other:?}"),
+        };
 
         let put_req_bucket_dp = put_req_sum
-            .data_points
-            .iter()
+            .data_points()
             .find(|dp| {
-                dp.attributes
-                    .contains(&KeyValue::new("bucket", "test-bucket"))
-                    && !dp.attributes.iter().any(|kv| kv.key.as_str() == "prefix")
+                dp.attributes()
+                    .any(|kv| kv == &KeyValue::new("bucket", "test-bucket"))
+                    && !dp.attributes().any(|kv| kv.key.as_str() == "prefix")
             })
             .expect("should have put_requests data point for test-bucket without prefix");
         assert_eq!(
-            put_req_bucket_dp.value, 3,
+            put_req_bucket_dp.value(),
+            3,
             "bucket-only put_requests should be 3"
         );
 
         let put_req_prefix_dp = put_req_sum
-            .data_points
-            .iter()
+            .data_points()
             .find(|dp| {
-                dp.attributes
-                    .contains(&KeyValue::new("bucket", "test-bucket"))
-                    && dp.attributes.contains(&KeyValue::new("prefix", "logs/"))
+                dp.attributes()
+                    .any(|kv| kv == &KeyValue::new("bucket", "test-bucket"))
+                    && dp
+                        .attributes()
+                        .any(|kv| kv == &KeyValue::new("prefix", "logs/"))
             })
             .expect("should have put_requests data point for test-bucket with prefix=logs/");
         assert_eq!(
-            put_req_prefix_dp.value, 2,
+            put_req_prefix_dp.value(),
+            2,
             "prefix-attributed put_requests should be 2"
         );
 
