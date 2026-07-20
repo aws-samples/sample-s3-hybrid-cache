@@ -1,15 +1,23 @@
 //! Cache Consistency Demo
 //!
-//! Demonstrates how the cache system handles compression algorithm changes
-//! and rule changes using per-entry metadata to maintain consistency
-//! without invalidating the entire cache.
+//! Demonstrates how the cache system stores per-entry compression metadata
+//! (`CompressionInfo::body_algorithm`) so that reads never depend on the
+//! *current* compression configuration — only on what was recorded when the
+//! entry was written. This is what lets denylist / threshold / cache-rule
+//! changes take effect for new writes without invalidating or needing to
+//! migrate existing cache entries.
+//!
+//! Reworked for the compression-content-aware-fix change: the compression
+//! decision is now made by the caller (`CacheManager::effective_compression`,
+//! combining per-key cache-rule overrides, the size threshold, and the
+//! built-in extension denylist) and passed into
+//! `CompressionHandler::compress_with_metadata`. There is no longer a
+//! `should_recompress_entry` / `compress_cache_entry` / `decompress_cache_entry`
+//! API on `CacheManager` — those were dead code with zero production callers.
+//! This demo now drives `CompressionHandler` directly, which is what those
+//! removed helpers did internally anyway.
 
-use s3_proxy::cache::{CacheEntry, CacheManager, CompressionInfo};
-use s3_proxy::cache_types::CacheMetadata;
-use s3_proxy::compression::CompressionAlgorithm;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::SystemTime;
+use s3_proxy::compression::CompressionHandler;
 
 fn main() {
     println!("Multi-Algorithm Cache Consistency Demo");
@@ -17,183 +25,84 @@ fn main() {
     println!("Demonstrates per-entry compression metadata for cache consistency");
     println!();
 
-    // Create a cache manager with initial compression settings
-    let cache_manager = CacheManager::new(
-        PathBuf::from("/tmp/cache"),
-        false, // RAM cache disabled for simplicity
-        0,     // No RAM cache
-        100,   // 100 byte threshold
-        true,  // Compression enabled
-    );
+    let mut handler = CompressionHandler::new(100, true); // 100-byte threshold, compression enabled
 
     println!(
-        "Initial compression algorithm: {:?}",
-        cache_manager
-            .get_compression_handler()
-            .get_preferred_algorithm()
+        "Preferred algorithm: {:?}",
+        handler.get_preferred_algorithm()
     );
     println!();
 
-    // Simulate a cache entry for a JPEG image (initially compressible)
-    let mut jpeg_entry = CacheEntry {
-        cache_key: "bucket.amazonaws.com:/photos/image.jpg".to_string(),
-        headers: HashMap::new(),
-        body: Some(b"fake jpeg data that was compressed".to_vec()),
-        ranges: vec![],
-        metadata: CacheMetadata {
-            etag: "abc123".to_string(),
-            last_modified: "2024-01-01T00:00:00Z".to_string(),
-            content_length: 1000,
-            part_number: None,
-            cache_control: None,
-            access_count: 0,
-            last_accessed: SystemTime::now(),
-        },
-        created_at: SystemTime::now(),
-        expires_at: SystemTime::now(),
-        metadata_expires_at: SystemTime::now(),
-        compression_info: CompressionInfo {
-            body_algorithm: CompressionAlgorithm::Lz4, // This was compressed with LZ4
-            original_size: Some(2000),
-            compressed_size: Some(1000),
-            file_extension: Some("jpg".to_string()),
-        },
-        is_put_cached: false,
-    };
-
-    println!("Scenario 1: Cache entry created with LZ4 compression");
-    println!("  - JPEG file was compressed with LZ4 (content-aware was disabled)");
+    // Scenario 1: a JPEG key under the built-in default denylist.
+    println!("Scenario 1: JPEG key, no cache-rule override (built-in denylist applies)");
+    let jpeg_data = b"fake jpeg data that will be store-mode framed, not compressed";
+    // .jpg is in the built-in denylist, so the default-layer decision skips compression.
+    let jpeg_should_compress = !CompressionHandler::is_denylisted_extension("photos/image.jpg");
+    let jpeg_result =
+        handler.compress_with_metadata(jpeg_data, "photos/image.jpg", jpeg_should_compress);
     println!(
-        "  - Entry algorithm: {:?}",
-        jpeg_entry.compression_info.body_algorithm
+        "  is_denylisted_extension(\"photos/image.jpg\") = {}",
+        CompressionHandler::is_denylisted_extension("photos/image.jpg")
+    );
+    println!("  was_compressed: {}", jpeg_result.was_compressed);
+    println!("  stored algorithm tag: {:?}", jpeg_result.algorithm);
+    println!(
+        "  original_size={}, compressed_size={}",
+        jpeg_result.original_size, jpeg_result.compressed_size
     );
     println!(
-        "  - Original size: {:?}",
-        jpeg_entry.compression_info.original_size
+        "  (Even when was_compressed=false, the stored bytes are a checksummed LZ4 frame with"
     );
-    println!(
-        "  - Compressed size: {:?}",
-        jpeg_entry.compression_info.compressed_size
-    );
+    println!("   stored/uncompressed blocks — never raw, unprotected bytes.)");
     println!();
 
-    // Check if we should recompress this entry
-    let should_recompress = cache_manager.should_recompress_entry(&jpeg_entry.compression_info);
-    println!("Should recompress entry: {}", should_recompress);
-    println!();
-
-    // Now simulate changing preferred algorithm
-    println!("Scenario 2: Changing preferred compression algorithm...");
-    // In a real scenario, this would be done via configuration
-    println!(
-        "Current algorithm: {:?}",
-        cache_manager
-            .get_compression_handler()
-            .get_preferred_algorithm()
-    );
-    println!("(In real usage, algorithm changes would be via configuration)");
-    println!();
-
-    // Try to decompress the cache entry (this should fail due to version mismatch)
-    println!("Scenario 3: Decompressing cache entry with algorithm metadata...");
-    match cache_manager.decompress_cache_entry(&mut jpeg_entry) {
-        Ok(_) => {
-            println!("✅ Decompression succeeded using stored algorithm metadata");
-            println!(
-                "   Algorithm used: {:?}",
-                jpeg_entry.compression_info.body_algorithm
-            );
+    // Scenario 2: reading it back only needs the stored algorithm tag, not the
+    // current handler config — this is the consistency property.
+    println!("Scenario 2: Decompressing using only the stored algorithm metadata");
+    match handler.decompress_with_algorithm(&jpeg_result.data, jpeg_result.algorithm.clone()) {
+        Ok(decompressed) => {
+            println!("  Decompression succeeded using stored algorithm metadata");
+            println!("  Bytes match original: {}", decompressed == jpeg_data);
         }
-        Err(e) => {
-            println!("❌ Decompression failed: {}", e);
-        }
+        Err(e) => println!("  Decompression failed: {}", e),
     }
     println!();
 
-    // Create a new cache entry with current rules
-    println!("Scenario 4: Creating new cache entry with current rules...");
-    let sample_data = b"This is some sample JPEG data that should not be compressed now";
-
-    // Check if JPEG should be compressed under new rules
-    let should_compress = cache_manager
-        .get_compression_handler()
-        .should_compress_content("/photos/image.jpg", sample_data.len());
-
-    println!("Should JPEG be compressed now: {}", should_compress);
-
-    let mut new_jpeg_entry = CacheEntry {
-        cache_key: "bucket.amazonaws.com:/photos/new_image.jpg".to_string(),
-        headers: HashMap::new(),
-        body: Some(sample_data.to_vec()),
-        ranges: vec![],
-        metadata: CacheMetadata {
-            etag: "def456".to_string(),
-            last_modified: "2024-01-02T00:00:00Z".to_string(),
-            content_length: sample_data.len() as u64,
-            part_number: None,
-            cache_control: None,
-            access_count: 0,
-            last_accessed: SystemTime::now(),
-        },
-        created_at: SystemTime::now(),
-        expires_at: SystemTime::now(),
-        metadata_expires_at: SystemTime::now(),
-        compression_info: CompressionInfo::default(), // Will be updated during compression
-        is_put_cached: false,
-    };
-
-    // Compress the new entry (should not compress JPEG under new rules)
-    match cache_manager.compress_cache_entry(&mut new_jpeg_entry) {
-        Ok(was_compressed) => {
-            println!("New entry compression result: {}", was_compressed);
-            println!(
-                "New entry algorithm: {:?}",
-                new_jpeg_entry.compression_info.body_algorithm
-            );
-            println!(
-                "New entry original size: {:?}",
-                new_jpeg_entry.compression_info.original_size
-            );
-            println!(
-                "New entry compressed size: {:?}",
-                new_jpeg_entry.compression_info.compressed_size
-            );
-        }
-        Err(e) => {
-            println!("Compression failed: {}", e);
-        }
-    }
+    // Scenario 3: a text/JSON key — not in the built-in denylist, so it
+    // compresses under the default layer.
+    println!("Scenario 3: JSON key, no cache-rule override (compresses under default layer)");
+    let json_data =
+        b"{\"this\": \"is some sample JSON data that should compress well under LZ4 because it repeats\"}".repeat(4);
+    let json_denylisted = CompressionHandler::is_denylisted_extension("config/settings.json");
+    println!(
+        "  is_denylisted_extension(\"config/settings.json\") = {}",
+        json_denylisted
+    );
+    let json_result =
+        handler.compress_with_metadata(&json_data, "config/settings.json", !json_denylisted);
+    println!("  was_compressed: {}", json_result.was_compressed);
+    println!(
+        "  original_size={}, compressed_size={}",
+        json_result.original_size, json_result.compressed_size
+    );
     println!();
 
-    // Verify the new entry can be decompressed successfully
-    println!("Scenario 5: Decompressing new cache entry...");
-    match cache_manager.decompress_cache_entry(&mut new_jpeg_entry) {
-        Ok(_) => {
-            println!("✅ New entry decompression succeeded");
-            println!("   Data integrity maintained with current compression rules");
-        }
-        Err(e) => {
-            println!("❌ New entry decompression failed: {}", e);
-        }
-    }
-    println!();
-
-    // Demonstrate text file behavior
-    println!("Scenario 6: Text file behavior (should still be compressed)...");
-    let text_data = b"This is a JSON configuration file that should be compressed even with content-aware rules";
-    let should_compress_json = cache_manager
-        .get_compression_handler()
-        .should_compress_content("/config/settings.json", text_data.len());
-
-    println!("Should JSON be compressed: {}", should_compress_json);
+    // Scenario 4: a cache-rule explicitly forcing compression of a normally
+    // denylisted extension ("rules win" — see CacheManager::effective_compression).
+    println!("Scenario 4: A cache_rules.json rule can override the denylist either way");
+    println!("  e.g. {{\"pattern\": \"**/*.jpg\", \"compression_enabled\": true}}");
+    println!("  forces compression of .jpg keys despite the built-in denylist.");
+    let jpeg_forced_result = handler.compress_with_metadata(jpeg_data, "photos/image.jpg", true);
+    println!(
+        "  was_compressed (rule-forced): {}",
+        jpeg_forced_result.was_compressed
+    );
     println!();
 
     println!("Summary:");
     println!("========");
-    println!("✅ Cache consistency is maintained with per-entry algorithm metadata");
-    println!("✅ Cache entries store which algorithm was used for compression");
-    println!("✅ Algorithm changes don't invalidate existing cache entries");
-    println!("✅ Content-aware compression works correctly for different file types");
-    println!("✅ Per-entry metadata prevents serving incorrectly processed data");
-    println!("✅ Future algorithm support can be added without breaking existing cache");
+    println!("- Cache consistency is maintained with per-entry algorithm metadata");
+    println!("- Every write is a checksummed LZ4 frame (compressed OR store-mode blocks)");
+    println!("- Reads depend only on the stored algorithm tag, never current config");
+    println!("- The built-in denylist is the default layer; cache_rules.json wins when set");
 }

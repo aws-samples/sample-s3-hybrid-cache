@@ -83,7 +83,6 @@ fn test_system_metrics() -> SystemMetrics {
             compression_failures: 0,
             decompression_failures: 0,
             average_compression_ratio: 0.7,
-            compression_time_ms: 500,
         }),
         connection_pool: Some(ConnectionPoolMetrics {
             failed_connections: 2,

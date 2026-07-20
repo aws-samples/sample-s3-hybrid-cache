@@ -568,9 +568,15 @@ connection_pool:
 
 compression:
   enabled: true
-  threshold: 4096  # 4KB minimum size for compression
-  preferred_algorithm: "lz4"
-  content_aware: true
+  # Size floor in bytes below which writes always skip compression, regardless
+  # of extension or any cache_rules.json override.
+  threshold: 4096
+  preferred_algorithm: "lz4"  # only "lz4" is implemented; parsed but otherwise inert
+  # `content_aware` has been removed — it never had any effect (content-aware
+  # filtering, i.e. the built-in extension denylist, was always applied
+  # unconditionally regardless of this field's value). Use a cache_rules.json
+  # rule's `compression_enabled` field to override the denylist per key; see
+  # docs/COMPRESSION.md and docs/CONFIGURATION.md.
 
 health:
   enabled: true

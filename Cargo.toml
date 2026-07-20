@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "2.2.4"
+version = "2.3.0"
 edition = "2021"
 # MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
 # Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
@@ -32,6 +32,12 @@ tower = "0.5"
 
 # Compression
 lz4_flex = "0.11.6"
+# xxhash32, matching the version lz4_flex itself uses internally for frame
+# checksums. Used directly by the store-mode frame writer in compression.rs
+# (see compression-content-aware-fix spec) to hand-roll a valid LZ4 frame with
+# uncompressed blocks — avoiding the LZ4 compressor entirely while still
+# producing a checksummed frame that lz4_flex::frame::FrameDecoder can read.
+twox-hash = "2.1.2"
 
 # Hashing
 blake3 = "1.5"

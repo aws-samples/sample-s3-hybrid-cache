@@ -5,6 +5,135 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-07-20
+
+Makes content-aware compression fully functional. The extension denylist for
+already-compressed formats (images, video, audio, archives, documents,
+executables) had no effect on any live write path — every write went through
+`compress_content_aware_with_metadata`, which always LZ4-compressed
+regardless of extension. `compression.threshold`, and the
+`compression.enabled` flag on one reconstruction path, were similarly
+disconnected from the write path. This release wires the denylist and
+threshold into live writes, adds a `cache_rules.json`-driven override, and
+adds integrity checksums to the newly-enabled compression-skip path.
+
+### Changed (behavior)
+
+- **The built-in extension denylist is now enforced on writes.** Previously,
+  every write compressed regardless of file extension — `.jpg`, `.zip`,
+  `.mp4`, and every other "already compressed" format were LZ4-compressed
+  anyway, because `CompressionHandler::should_compress_content()` (the only
+  reader of the denylist) had no callers on the write path. Newly written
+  entries for denylisted extensions are now skipped for compression by
+  default, reducing CPU cost on writes; disk usage may shift for workloads
+  dominated by such content. Existing cache entries are unaffected — reads
+  are driven solely by each entry's stored per-entry algorithm tag, never by
+  current configuration.
+- **`compression.threshold` now takes effect.** It was previously hardcoded
+  to `1024` bytes in `HttpProxy::new`, ignoring any configured value.
+  Configured thresholds now apply.
+- **`cache_rules.json`'s `compression_enabled` field now wins over the
+  built-in denylist in both directions.** A rule explicitly setting
+  `compression_enabled: true` for a matching key now forces compression of
+  otherwise-denylisted extensions (e.g. force-compress `.jpg` keys); a rule
+  setting `false` continues to disable compression as before. This is the
+  intended operator override mechanism — there is no separate
+  extension-list configuration field.
+- **Compression-skip writes are now checksummed instead of raw.** A
+  `cache_rules.json` rule setting `compression_enabled: false` already
+  worked pre-2.3.0 and wrote data uncompressed — but as raw bytes with no
+  frame or checksum (tagged `CompressionAlgorithm::None`). The
+  newly-enabled denylist/threshold skip paths (above) would have hit the
+  same gap. Both now go through a new **store-mode LZ4 frame** — a
+  standard LZ4 frame with uncompressed ("stored") data blocks, carrying
+  the same xxhash32 content checksum as compressed frames, without
+  invoking the LZ4 block compressor. Corruption is now detected on read
+  for all compression-skip cases. Entries written by pre-2.3.0 proxies
+  (tagged `CompressionAlgorithm::None`, no frame) remain readable; no
+  write path produces that tag anymore.
+- **`create_configured_disk_cache_manager` now honors `compression.enabled`.**
+  It previously hardcoded `compression_enabled: true` for disk-cache
+  managers rebuilt after initial construction, ignoring the config entirely
+  on that path.
+- **Compression statistics in `/metrics` and OTLP are now live.** They were
+  previously frozen at startup-time (mostly zero) values, because the
+  snapshot handed to health/metrics reporting was a value clone that never
+  observed later mutations, and the dominant streaming write path bypassed
+  the stats-tracking code entirely. `decompression_failures` is now
+  incremented on real decode failures (it was previously always zero).
+
+### Removed
+
+- **`compression.content_aware` config field removed.** It never had any
+  effect in any version of this proxy — verified that no production code
+  path ever read it; content-aware filtering was always applied
+  unconditionally. It is still accepted in YAML via a deprecation alias so
+  existing config files keep parsing; a startup warning is logged if
+  present, and the value is ignored.
+- Dead code removed from `src/compression.rs` and `src/cache.rs` with no
+  production callers: `should_recompress_entry`, `compress_cache_entry(_with_handler)`,
+  `decompress_cache_entry(_with_handler)`, `compress_data`,
+  `compress_data_with_fallback`, `compress_data_content_aware(_with_fallback)`,
+  `CompressionHandler::new_with_content_aware`,
+  `is_content_aware_compression_enabled`, `set_compression_threshold`,
+  `set_compression_enabled`, `set_preferred_algorithm`,
+  `CompressionHandler::calculate_compression_ratio`, `wrap_in_frame` (its
+  encoder setup was identical to the real compression path, so it never
+  actually skipped compression either — superseded by the new store-mode
+  frame encoder), an unreachable `"tar.gz"` match arm in the built-in
+  denylist (extension extraction only ever returns the final dot-suffix, so
+  `.tar.gz` was already matching via `"gz"`), the entire `cache_writer` module
+  (`CacheWriter`, superseded by `disk_cache`'s incremental range writer),
+  `CompressionHandler::should_compress`, `get_skipped_extensions`,
+  `get_compression_threshold`, and `decompress_data_with_fallback`,
+  `DiskCacheManager::get_compression_handler`,
+  `CacheManager::decompress_ram_cache_entry`, the write-only `RamCacheManager`
+  struct (a leftover of the sharded refactor whose fields were never read), the
+  never-incremented `compression_time_ms` stat field (removed from
+  `CompressionStats`, `CompressionMetrics`, and the `/metrics` export), the
+  unused `IncrementalRangeWriter.content_path` field, and the buffered
+  `CacheManager::promote_range_to_ram_cache` (production uses the frame-verbatim
+  `promote_range_to_ram_cache_frame`). Test coverage that exercised the removed
+  helpers was migrated to the live paths rather than dropped.
+  `SignedPutHandler::cache_upload_part` — also production-dead (parts are cached
+  through the streaming part sink) — was moved behind `#[cfg(test)]` rather than
+  deleted: it remains the part-population helper for the multipart test suite
+  (including the same-part-race concurrency regression) and no longer ships in
+  the production binary.
+
+### Fixed
+
+- **S3 keys containing a colon** were previously misclassified for
+  compression purposes by `extract_path_from_cache_key`, which split the
+  cache key at the first `:` — truncating any object key that legitimately
+  contains one. It now strips only the known proxy-appended suffix patterns
+  (`:part:<n>`, `:range:<start>-<end>`).
+- **Compression stats from the disk-cache write paths now reach `/metrics`.**
+  Every per-operation `DiskCacheManager` (built by
+  `create_configured_disk_cache_manager`) constructed its own
+  `CompressionHandler` with a *fresh* stats `Arc`, so `store_range` and the
+  streaming writers counted into short-lived `Arc`s that were dropped with the
+  manager and never observed by the `/metrics` snapshot. Only the buffered
+  in-`CacheManager` paths were visible. The disk-cache manager now shares the
+  `CacheManagerInner` stats `Arc` (new
+  `DiskCacheManager::new_with_shared_stats`), so all write paths contribute to
+  the reported counters.
+- **RAM-tier reads now decompress by the entry's algorithm tag.** Range reads
+  from the RAM cache called an LZ4 frame decoder unconditionally on any entry
+  flagged `compressed`. A legacy `CompressionAlgorithm::None`-tagged range
+  (raw, unframed bytes written by a pre-2.3.0 proxy) that was promoted into RAM
+  verbatim would therefore fail to decode — surfacing as a request error on one
+  read path and a silent cache miss on the other. Both RAM read paths now
+  dispatch on the entry's `compression_algorithm`, returning `None`-tagged
+  bytes verbatim (matching the disk read path and the full-object promotion
+  path).
+- **RAM cache eviction metric now reflects real evictions.** After the sharded
+  RAM-cache refactor, `ShardedRamCache::stats()` hard-coded `eviction_count: 0`
+  / `last_eviction: None`, so the exported `ram_cache_evictions` metric and the
+  dashboard figure were permanently zero regardless of actual eviction
+  activity. Evictions are now counted per shard and aggregated, so the metric
+  tracks RAM-cache pressure.
+
 ## [2.2.4] - 2026-07-10
 
 ### Security

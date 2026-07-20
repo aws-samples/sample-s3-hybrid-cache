@@ -38,9 +38,24 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// Range size used for every per-task write. Fixed so that with compression
-/// disabled, each commit contributes exactly this many bytes to the size
-/// accumulator — makes the expected delta deterministic.
+/// disabled, each commit contributes a deterministic number of bytes to the
+/// size accumulator (see `STORE_MODE_FRAME_OVERHEAD` below).
 const RANGE_SIZE: usize = 16 * 1024; // 16 KiB
+
+/// Fixed byte overhead of one `encode_store_mode_frame` LZ4 frame that fits
+/// its payload in a single stored block: magic (4) + FLG (1) + BD (1) +
+/// header checksum (1) + block-size word (4) + end mark (4) + content
+/// checksum (4) = 19 bytes. See `CompressionHandler::encode_store_mode_frame`
+/// in `src/compression.rs` (compression-content-aware-fix spec, Requirement
+/// 3). `commit_one_range` writes `RANGE_SIZE` bytes as a single flushed
+/// batch, so exactly one frame — and therefore one overhead charge — is
+/// produced per commit.
+const STORE_MODE_FRAME_OVERHEAD: u64 = 19;
+
+/// Bytes contributed to the size accumulator by one `commit_one_range` call
+/// with compression disabled: the logical payload plus the store-mode frame
+/// envelope that now wraps every write (compressed or not) for integrity.
+const EXPECTED_COMMIT_BYTES: u64 = RANGE_SIZE as u64 + STORE_MODE_FRAME_OVERHEAD;
 
 // ---------------------------------------------------------------------------
 // Test setup helpers
@@ -64,9 +79,11 @@ fn test_object_metadata(content_length: u64) -> ObjectMetadata {
 /// runs. Returns the manager (wrapped in `Arc`) and the consolidator so the
 /// caller can read `size_accumulator.current_delta()`.
 ///
-/// Compression is disabled so `compressed_bytes_written == bytes_written`,
-/// which makes the expected accumulator delta an exact multiple of
-/// `RANGE_SIZE` and independent of LZ4 frame overhead.
+/// Compression is disabled so `compressed_bytes_written == bytes_written +
+/// STORE_MODE_FRAME_OVERHEAD`: every write, compressed or not, is wrapped in
+/// a real LZ4 frame (store-mode blocks when disabled) for integrity, so the
+/// expected accumulator delta is an exact multiple of `EXPECTED_COMMIT_BYTES`
+/// rather than of `RANGE_SIZE` alone.
 async fn setup(cache_dir: &Path) -> (Arc<DiskCacheManager>, Arc<JournalConsolidator>) {
     let cache_dir = cache_dir.to_path_buf();
 
@@ -137,8 +154,19 @@ fn k_from_seed(seed: u8) -> usize {
 /// Drive one full `begin → write_range_chunk → commit_incremental_range`
 /// cycle for `(cache_key, start, end)`. Writes `RANGE_SIZE` bytes split into
 /// four equal chunks so the batching path exists even though compression is
-/// off (it's a no-op passthrough in that case). Returns the
-/// `compressed_bytes_written` reported by the writer just before commit.
+/// off (it's a no-op store-mode pass through the same batch buffer). Returns
+/// the number of bytes the commit contributes to the size accumulator.
+///
+/// Note: `writer.compressed_bytes_written` cannot be read before commit to
+/// obtain this value. The disabled-compression path now batches into
+/// `batch_buf` just like the compressed path (compression-content-aware-fix
+/// Requirement 3), and `setup()`'s `compression_batch_size` (1 MiB) is far
+/// larger than `RANGE_SIZE` (16 KiB), so the batch never reaches the
+/// threshold flush inside `write_range_chunk`. The only flush is the
+/// residual flush inside `finalize_incremental_range`, which runs *inside*
+/// `commit_incremental_range` after `writer` has already been consumed. So
+/// the post-commit total is exactly one store-mode frame covering the whole
+/// payload: `EXPECTED_COMMIT_BYTES`.
 async fn commit_one_range(
     cache_manager: Arc<DiskCacheManager>,
     cache_key: String,
@@ -157,8 +185,6 @@ async fn commit_one_range(
             .map_err(|e| format!("write_range_chunk failed: {}", e))?;
     }
 
-    let compressed_bytes = writer.compressed_bytes_written;
-
     cache_manager
         .commit_incremental_range(
             writer,
@@ -168,7 +194,7 @@ async fn commit_one_range(
         .await
         .map_err(|e| format!("commit_incremental_range failed: {}", e))?;
 
-    Ok(compressed_bytes)
+    Ok(EXPECTED_COMMIT_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -231,8 +257,9 @@ fn prop_concurrent_commit_size_accounting() {
             }
 
             // Sanity: with compression disabled and a fixed RANGE_SIZE per
-            // commit, the expected sum must equal K * RANGE_SIZE.
-            let expected_exact = (k as u64) * (RANGE_SIZE as u64);
+            // commit, the expected sum must equal K * EXPECTED_COMMIT_BYTES
+            // (payload + store-mode frame overhead per commit).
+            let expected_exact = (k as u64) * EXPECTED_COMMIT_BYTES;
             if expected_sum != expected_exact {
                 return TestResult::error(format!(
                     "Precondition failed: expected_sum={} != K*RANGE_SIZE={}",
@@ -327,11 +354,11 @@ fn prop_concurrent_commit_dedup_same_range() {
             }
 
             // With compression disabled and fixed RANGE_SIZE, that one range
-            // must be exactly RANGE_SIZE bytes.
-            if single_range_size != RANGE_SIZE as u64 {
+            // must be exactly RANGE_SIZE + STORE_MODE_FRAME_OVERHEAD bytes.
+            if single_range_size != EXPECTED_COMMIT_BYTES {
                 return TestResult::error(format!(
-                    "Precondition failed: single_range_size={} != RANGE_SIZE={}",
-                    single_range_size, RANGE_SIZE
+                    "Precondition failed: single_range_size={} != EXPECTED_COMMIT_BYTES={}",
+                    single_range_size, EXPECTED_COMMIT_BYTES
                 ));
             }
 
@@ -371,10 +398,10 @@ async fn run_distinct_ranges_case(k: usize) {
     let delta = consolidator.size_accumulator().current_delta();
     assert_eq!(
         delta as u64,
-        (k as u64) * (RANGE_SIZE as u64),
+        (k as u64) * EXPECTED_COMMIT_BYTES,
         "distinct-ranges case K={}: expected delta={}, got {}",
         k,
-        (k as u64) * (RANGE_SIZE as u64),
+        (k as u64) * EXPECTED_COMMIT_BYTES,
         delta
     );
 }
@@ -403,9 +430,9 @@ async fn run_same_range_case(k: usize) {
 
     let delta = consolidator.size_accumulator().current_delta();
     assert_eq!(
-        delta as u64, RANGE_SIZE as u64,
+        delta as u64, EXPECTED_COMMIT_BYTES,
         "same-range case K={}: expected delta={} (one range), got {}",
-        k, RANGE_SIZE, delta
+        k, EXPECTED_COMMIT_BYTES, delta
     );
 }
 

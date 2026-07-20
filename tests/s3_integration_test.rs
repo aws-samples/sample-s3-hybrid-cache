@@ -126,7 +126,7 @@ fn create_test_config() -> Config {
             enabled: true,
             threshold: 1024,
             preferred_algorithm: CompressionAlgorithm::Lz4,
-            content_aware: true,
+            content_aware_deprecated: None,
         },
         health: HealthConfig {
             enabled: true,

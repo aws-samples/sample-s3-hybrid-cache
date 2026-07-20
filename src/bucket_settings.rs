@@ -237,6 +237,13 @@ pub struct ResolvedSettings {
     pub read_cache_enabled: bool,
     pub write_cache_enabled: bool,
     pub compression_enabled: bool,
+    /// True iff a matched rule explicitly set `compression_enabled` for this
+    /// key, as opposed to `compression_enabled` falling through to the
+    /// global default. Drives rules-win semantics for the built-in
+    /// extension denylist in `CacheManager::effective_compression`: an
+    /// explicit rule value is honored verbatim (bypassing the denylist in
+    /// either direction); a fallthrough value is combined with the denylist.
+    pub compression_from_rule: bool,
     pub ram_cache_eligible: bool,
     pub evaluate_conditions_from_cache: bool,
     /// Tracks which layer provided the dominant settings.
@@ -267,6 +274,7 @@ impl Default for ResolvedSettings {
             read_cache_enabled: true,
             write_cache_enabled: true,
             compression_enabled: false,
+            compression_from_rule: false,
             ram_cache_eligible: true,
             evaluate_conditions_from_cache: true,
             source: SettingsSource::Global,
@@ -353,8 +361,9 @@ impl RuleSet {
         let read_cache_enabled = first(&|r| r.read_cache_enabled).unwrap_or(g.read_cache_enabled);
         let write_cache_enabled =
             first(&|r| r.write_cache_enabled).unwrap_or(g.write_cache_enabled);
-        let compression_enabled =
-            first(&|r| r.compression_enabled).unwrap_or(g.compression_enabled);
+        let compression_enabled_from_rule = first(&|r| r.compression_enabled);
+        let compression_from_rule = compression_enabled_from_rule.is_some();
+        let compression_enabled = compression_enabled_from_rule.unwrap_or(g.compression_enabled);
         let mut ram_cache_eligible =
             first(&|r| r.ram_cache_eligible).unwrap_or(g.ram_cache_enabled);
         let evaluate_conditions_from_cache = first(&|r| r.evaluate_conditions_from_cache)
@@ -377,6 +386,7 @@ impl RuleSet {
             read_cache_enabled,
             write_cache_enabled,
             compression_enabled,
+            compression_from_rule,
             ram_cache_eligible,
             evaluate_conditions_from_cache,
             source,
@@ -945,14 +955,54 @@ mod tests {
         // get_ttl from rule 0 (earlier wins), compression from rule 1 (rule 0 didn't set it).
         assert_eq!(r.get_ttl, Duration::from_secs(1));
         assert!(!r.compression_enabled);
-        // source is the first matching rule.
+        assert!(r.compression_from_rule); // rule 1 explicitly set it
+                                          // source is the first matching rule.
         assert!(matches!(r.source, SettingsSource::Rule(0, _)));
 
         // A key only matching the broad rule.
         let r = mgr.resolve("b/other/y").await;
         assert_eq!(r.get_ttl, Duration::from_secs(9));
         assert!(!r.compression_enabled);
+        assert!(r.compression_from_rule);
         assert!(matches!(r.source, SettingsSource::Rule(1, _)));
+    }
+
+    #[tokio::test]
+    async fn resolve_compression_provenance_fallthrough_is_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A rule matches the key but does not set compression_enabled, so
+        // resolution falls through to the global default — provenance must
+        // reflect "not from a rule" even though a rule did match.
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**", "get_ttl": "9s"}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+
+        let r = mgr.resolve("b/key").await;
+        assert!(matches!(r.source, SettingsSource::Rule(0, _)));
+        assert!(!r.compression_from_rule);
+        // Falls through to the test global default (compression_enabled: true).
+        assert!(r.compression_enabled);
+    }
+
+    #[tokio::test]
+    async fn resolve_compression_provenance_explicit_true_overrides_denylist_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An explicit true is provenance-tracked even when it matches what
+        // the global default already was, so callers can distinguish
+        // "operator explicitly forced this on" from "just the default".
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**", "compression_enabled": true}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+
+        let r = mgr.resolve("b/key").await;
+        assert!(r.compression_enabled);
+        assert!(r.compression_from_rule);
     }
 
     #[tokio::test]

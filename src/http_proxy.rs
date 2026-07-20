@@ -635,8 +635,8 @@ impl HttpProxy {
             config.cache.max_ram_cache_size,
             config.cache.max_cache_size,
             eviction_algorithm,
-            1024,                       // 1KB compression threshold
-            config.compression.enabled, // compression enabled (from config.compression.enabled)
+            config.compression.threshold, // compression size threshold (from config.compression.threshold)
+            config.compression.enabled,   // compression enabled (from config.compression.enabled)
             config.cache.get_ttl,
             config.cache.head_ttl,
             config.cache.put_ttl,
@@ -4452,8 +4452,13 @@ impl HttpProxy {
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Settings are resolved once per logical request and threaded in here;
         // the spawned per-range cache-write task reuses these values instead of
-        // re-resolving (Requirement 8.2).
-        let compression_enabled = resolved.compression_enabled;
+        // re-resolving (Requirement 8.2). The effective compression decision
+        // additionally folds in the size threshold and the built-in extension
+        // denylist (rules-win — see `CacheManager::effective_compression`).
+        let range_size = range_spec.end.saturating_sub(range_spec.start) + 1;
+        let compression_enabled = range_handler
+            .get_cache_manager()
+            .effective_compression(resolved, &cache_key, range_size);
         let get_ttl = resolved.get_ttl;
         let idle_timeout = config.connection_pool.upstream_idle_timeout;
         let mut response_builder = Response::builder().status(s3_response.status);
@@ -6003,32 +6008,26 @@ impl HttpProxy {
                     let promotion_start = range_spec.start;
                     let promotion_end = range_spec.end;
                     let promotion_etag = cached_metadata.etag.clone();
+                    let promotion_last_modified = cached_metadata.last_modified.clone();
                     // Settings are resolved once per logical request and threaded in;
                     // the promotion task reuses this rather than re-resolving (Req 8.2).
                     let promotion_ram_eligible = resolved.ram_cache_eligible;
                     let promotion_source = resolved.source.clone();
+                    let promotion_range_handler = range_handler.clone();
 
                     tokio::spawn(async move {
                         use futures::StreamExt;
                         let mut stream = std::pin::pin!(data_stream);
 
-                        // Collect chunks for RAM cache promotion if range fits
-                        let mut promotion_buffer: Option<Vec<u8>> =
-                            if range_size <= max_ram_cache_size {
-                                Some(Vec::with_capacity(range_size as usize))
-                            } else {
-                                None
-                            };
+                        // Only used to decide range_size eligibility for promotion; the
+                        // RAM entry itself is built from the on-disk frame, not these bytes
+                        // (compression-content-aware-fix Requirement 9).
+                        let promotion_eligible_by_size = range_size <= max_ram_cache_size;
                         let mut stream_completed = true;
 
                         while let Some(result) = stream.next().await {
                             match result {
                                 Ok(bytes) => {
-                                    // Collect chunk data for RAM cache promotion
-                                    if let Some(ref mut buf) = promotion_buffer {
-                                        buf.extend_from_slice(&bytes);
-                                    }
-
                                     if frame_tx
                                         .send(Ok(hyper::body::Frame::data(bytes)))
                                         .await
@@ -6051,23 +6050,53 @@ impl HttpProxy {
                         }
 
                         // Promote to RAM cache after successful streaming (Requirements 2.2, 5.1, 5.2, 6.1, 6.5)
-                        if stream_completed {
-                            if let Some(buffer) = promotion_buffer {
-                                // RAM cache eligibility was resolved once per request
-                                // and threaded in (Requirement 8.2).
-                                if !promotion_ram_eligible {
-                                    debug!(
-                                        "Skipping RAM cache promotion for {}: ram_cache_eligible=false (source={:?})",
-                                        promotion_cache_key, promotion_source
-                                    );
-                                } else {
-                                    promotion_cache_manager.promote_range_to_ram_cache(
+                        if stream_completed && promotion_eligible_by_size {
+                            // RAM cache eligibility was resolved once per request
+                            // and threaded in (Requirement 8.2).
+                            if !promotion_ram_eligible {
+                                debug!(
+                                    "Skipping RAM cache promotion for {}: ram_cache_eligible=false (source={:?})",
+                                    promotion_cache_key, promotion_source
+                                );
+                            } else {
+                                // Read the on-disk frame verbatim (compressed or store-mode)
+                                // rather than re-using the decompressed streamed bytes, so the
+                                // RAM entry mirrors the full-object/write-cache promotion paths
+                                // (compression-content-aware-fix Requirement 9). The client
+                                // stream above already carries the decompressed bytes and is
+                                // unaffected.
+                                let promotion_range = crate::cache::Range {
+                                    start: promotion_start,
+                                    end: promotion_end,
+                                    data: Vec::new(),
+                                    etag: promotion_etag.clone(),
+                                    last_modified: promotion_last_modified.clone(),
+                                    compression_algorithm:
+                                        crate::compression::CompressionAlgorithm::Lz4,
+                                };
+                                match promotion_range_handler
+                                    .load_range_frame_from_new_storage(
                                         &promotion_cache_key,
-                                        promotion_start,
-                                        promotion_end,
-                                        &buffer,
-                                        promotion_etag,
-                                    );
+                                        &promotion_range,
+                                    )
+                                    .await
+                                {
+                                    Ok((frame_data, algorithm)) => {
+                                        promotion_cache_manager.promote_range_to_ram_cache_frame(
+                                            &promotion_cache_key,
+                                            (promotion_start, promotion_end),
+                                            frame_data,
+                                            algorithm,
+                                            promotion_etag,
+                                            promotion_last_modified,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            "Skipping RAM cache promotion for {}: failed to load on-disk frame: {}",
+                                            promotion_cache_key, e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -6539,8 +6568,11 @@ impl HttpProxy {
                         let data_clone = fetched_data.clone();
                         let s3_headers_clone = s3_response.headers.clone();
                         let s3_client_clone = s3_client.clone();
-                        // Reuse the once-per-request resolved compression setting (Req 8.2).
-                        let compression_enabled = resolved.compression_enabled;
+                        // Reuse the once-per-request resolved settings (Req 8.2), combined
+                        // with the size threshold and built-in denylist (rules-win).
+                        let compression_enabled = range_handler
+                            .get_cache_manager()
+                            .effective_compression(resolved, &cache_key_clone, end - start + 1);
 
                         tokio::spawn(async move {
                             // Use the new method to create ObjectMetadata with all S3 response headers
@@ -9097,13 +9129,25 @@ impl HttpProxy {
                             let s3_client_clone = Arc::clone(&s3_client);
                             // Settings are resolved once per logical request and threaded in;
                             // reuse them here instead of re-resolving (Requirement 8.2).
-                            let compression_enabled = resolved.compression_enabled;
                             let get_ttl = resolved.get_ttl;
 
                             // Extract content_length for incremental write range bounds
                             let content_length: Option<u64> = response_headers
                                 .get("content-length")
                                 .and_then(|v| v.parse::<u64>().ok());
+
+                            // Effective decision folds in the size threshold and the
+                            // built-in denylist (rules-win) on top of the resolved
+                            // per-key compression_enabled. Uses u64::MAX when the size
+                            // is not yet known (part requests / missing content-length)
+                            // so only enabled/rules/denylist gate the decision — matching
+                            // this call site's pre-existing behavior, which never checked
+                            // a threshold for those cases either.
+                            let compression_enabled = cache_manager_clone.effective_compression(
+                                resolved,
+                                &cache_key_clone,
+                                content_length.unwrap_or(u64::MAX),
+                            );
 
                             // Move coordination guard into the spawned cache-write task so the
                             // flight key remains registered until the cache entry is committed
@@ -9677,8 +9721,12 @@ impl HttpProxy {
         let status = s3_response.status;
         // Settings are resolved once per logical request and threaded in; the
         // spawned per-range cache-write tasks reuse these values rather than
-        // re-resolving (Requirement 8.2).
-        let compression_enabled = resolved.compression_enabled;
+        // re-resolving (Requirement 8.2). The effective decision additionally
+        // folds in the size threshold and the built-in denylist (rules-win).
+        let range_size = range_spec.end.saturating_sub(range_spec.start) + 1;
+        let compression_enabled = range_handler
+            .get_cache_manager()
+            .effective_compression(resolved, &cache_key, range_size);
         let get_ttl = resolved.get_ttl;
 
         // Handle successful range response (206 Partial Content)
@@ -10213,8 +10261,11 @@ impl HttpProxy {
                     let end = fetched_spec.end;
                     let data_clone = fetched_data.to_vec();
                     let ttl = config.cache.get_ttl;
-                    // Reuse the once-per-request resolved compression setting (Req 8.2).
-                    let compression_enabled = resolved.compression_enabled;
+                    // Reuse the once-per-request resolved settings (Req 8.2), combined
+                    // with the size threshold and built-in denylist (rules-win).
+                    let compression_enabled = range_handler
+                        .get_cache_manager()
+                        .effective_compression(resolved, &cache_key_clone, end - start + 1);
                     tokio::spawn(async move {
                         if let Err(e) = range_handler_clone
                             .store_range_new_storage(

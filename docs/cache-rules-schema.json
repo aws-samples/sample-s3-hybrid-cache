@@ -83,7 +83,7 @@
         },
         "compression_enabled": {
           "type": "boolean",
-          "description": "Enable or disable LZ4 compression for cached data. Disable for keys containing already-compressed data (images, videos, archives). Default: from global config."
+          "description": "Enable or disable LZ4 compression for cached data matching this rule, overriding the built-in default denylist in either direction. The proxy already skips compression by default for already-compressed formats (images, videos, archives, documents, executables - see docs/COMPRESSION.md for the full list); use this field to force compression ON for a normally-denylisted extension, force it OFF for a normally-compressible one, or override per-bucket/prefix regardless of extension. When set here, this value wins over the built-in denylist for matching keys. Default: from global config (compression.enabled)."
         },
         "ram_cache_eligible": {
           "type": "boolean",

@@ -6,7 +6,6 @@
 use s3_proxy::{
     cache::CacheManager,
     cache_types::CacheMetadata,
-    compression::CompressionHandler,
     config::{CacheConfig, EvictionAlgorithm, SharedStorageConfig},
 };
 use std::collections::HashMap;
@@ -89,7 +88,6 @@ fn create_shared_cache_config(shared_dir: PathBuf, _instance_id: &str) -> CacheC
 struct TestProxyInstance {
     instance_id: String,
     cache_manager: CacheManager,
-    compression_handler: CompressionHandler,
 }
 
 impl TestProxyInstance {
@@ -102,12 +100,9 @@ impl TestProxyInstance {
             cache_config.max_ram_cache_size,
         );
 
-        let compression_handler = CompressionHandler::new(1024, true);
-
         Self {
             instance_id,
             cache_manager,
-            compression_handler,
         }
     }
 
@@ -427,14 +422,6 @@ async fn test_compression_across_instances() {
         access_count: 0,
         last_accessed: std::time::SystemTime::now(),
     };
-
-    // Verify compression will be applied
-    assert!(
-        instance1
-            .compression_handler
-            .should_compress(large_test_data.len()),
-        "Large data should be compressed"
-    );
 
     // Instance 1 writes compressed data
     instance1

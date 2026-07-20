@@ -1730,26 +1730,32 @@ mod tests {
             let cache_key = "test-bucket/test-object";
             let upload_id = "test-upload-abort";
 
-            // Cache multiple parts
-            let mut expected_parts = Vec::new();
+            // Populate the in-progress upload directory directly on disk (part
+            // files + tracker), mirroring what a part write produces. The
+            // buffered `cache_upload_part` helper was removed as dead code; this
+            // test targets abort cleanup (`cleanup_multipart_upload`), so it only
+            // needs parts present on disk, not the write path itself.
+            let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+            tokio::fs::create_dir_all(&multipart_dir).await.unwrap();
+
+            let mut tracker =
+                MultipartUploadTracker::new(upload_id.to_string(), cache_key.to_string());
             for part_num in 1..=part_count {
                 let data: Vec<u8> = (0..data_size).map(|i| i + part_num).collect();
-                let etag = format!("\"part-etag-{}\"", part_num);
-
-                let result = handler
-                    .cache_upload_part(cache_key, upload_id, part_num as u32, &data, &etag)
-                    .await;
-
-                if result.is_err() {
-                    return TestResult::failed();
-                }
-
-                expected_parts.push((part_num, data.len()));
+                let part_file = multipart_dir.join(format!("part{}.bin", part_num));
+                tokio::fs::write(&part_file, &data).await.unwrap();
+                tracker.add_part(CachedPartInfo::new(
+                    part_num as u32,
+                    data.len() as u64,
+                    format!("\"part-etag-{}\"", part_num),
+                    crate::compression::CompressionAlgorithm::Lz4,
+                ));
             }
 
-            // Verify parts exist before cleanup
-            let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
             let upload_meta_file = multipart_dir.join("upload.meta");
+            tokio::fs::write(&upload_meta_file, tracker.to_json().unwrap())
+                .await
+                .unwrap();
 
             if !upload_meta_file.exists() {
                 return TestResult::failed();

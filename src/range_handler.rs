@@ -812,6 +812,79 @@ impl RangeHandler {
         Ok(data)
     }
 
+    /// Load the raw (still-encoded) frame bytes for a range from new storage,
+    /// without decompressing.
+    ///
+    /// Mirrors `load_range_data_from_new_storage`'s metadata/journal range-spec
+    /// lookup, but delegates to `DiskCacheManager::load_range_frame` instead of
+    /// `load_range_data`, so the caller gets the on-disk frame bytes verbatim
+    /// plus the range's tagged compression algorithm. Used by the RAM-tier
+    /// range-promotion path (compression-content-aware-fix Requirement 9) to
+    /// avoid a decompress-then-store-uncompressed round trip.
+    ///
+    /// # Arguments
+    /// * `cache_key` - The cache key for the object
+    /// * `range` - The Range struct (which may have empty data field)
+    ///
+    /// # Returns
+    /// The raw frame bytes and the range's compression algorithm.
+    pub async fn load_range_frame_from_new_storage(
+        &self,
+        cache_key: &str,
+        range: &Range,
+    ) -> Result<(Vec<u8>, crate::compression::CompressionAlgorithm)> {
+        debug!(
+            "Loading range frame from new storage: key={}, range={}-{}",
+            cache_key, range.start, range.end
+        );
+
+        let disk_cache = self.disk_cache_manager.read().await;
+
+        // Get metadata to find the range spec
+        let metadata = disk_cache.get_metadata(cache_key).await?;
+
+        // Find the matching range spec in metadata
+        let range_spec = if let Some(ref meta) = metadata {
+            meta.ranges
+                .iter()
+                .find(|r| r.start == range.start && r.end == range.end)
+                .cloned()
+        } else {
+            None
+        };
+
+        // If not found in metadata, check journals (shared storage mode)
+        let range_spec = match range_spec {
+            Some(spec) => spec,
+            None => {
+                let journal_ranges = disk_cache
+                    .find_pending_journal_ranges(cache_key, range.start, range.end)
+                    .await?;
+
+                journal_ranges
+                    .into_iter()
+                    .find(|r| r.start == range.start && r.end == range.end)
+                    .ok_or_else(|| {
+                        ProxyError::CacheError(format!(
+                            "Range spec not found for range {}-{} in key: {} (checked metadata and journals)",
+                            range.start, range.end, cache_key
+                        ))
+                    })?
+            }
+        };
+
+        // Load the raw frame bytes (no decompression)
+        let (frame_data, algorithm) = disk_cache.load_range_frame(&range_spec).await?;
+
+        debug!(
+            "Successfully loaded {} byte frame for range {}-{}",
+            frame_data.len(),
+            range.start,
+            range.end
+        );
+        Ok((frame_data, algorithm))
+    }
+
     /// Store range data using new storage architecture
     ///
     /// This method stores a range using the new separated storage architecture.

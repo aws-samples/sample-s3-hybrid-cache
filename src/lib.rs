@@ -13,7 +13,6 @@ pub mod cache_initialization_coordinator;
 pub mod cache_size_tracker;
 pub mod cache_types;
 pub mod cache_validator;
-pub mod cache_writer;
 pub mod capacity_manager;
 pub mod compression;
 pub mod config;

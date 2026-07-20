@@ -25,6 +25,66 @@ use uuid::Uuid;
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
 const OBJECT_CONCURRENCY_LIMIT: usize = 8;
 
+/// Strip the known trailing suffix patterns that `generate_part_cache_key`,
+/// `generate_range_cache_key`, and `generate_cache_key_with_params` append to
+/// a bare object path, returning just the object path.
+///
+/// Cache keys have the form:
+/// - `path`
+/// - `path:part:<n>`
+/// - `path:range:<start>-<end>`
+/// - `path:part:<n>:range:<start>-<end>`
+///
+/// Strips only the two known suffix grammars, from the end, so a colon that
+/// is part of the object key itself is left alone (compression-content-aware-fix
+/// spec, Requirement 2).
+pub(crate) fn strip_known_cache_key_suffixes(cache_key: &str) -> String {
+    // `:range:<start>-<end>` is always the last suffix if present (see
+    // generate_cache_key_with_params: range wraps part, not the reverse).
+    let without_range = match cache_key.rfind(":range:") {
+        Some(pos) => {
+            let (head, tail) = cache_key.split_at(pos);
+            let range_body = &tail[":range:".len()..];
+            // Validate the expected `<digits>-<digits>` shape before
+            // stripping, so a legitimate `:range:` substring inside an
+            // object key isn't mistaken for the suffix.
+            if is_range_suffix_body(range_body) {
+                head
+            } else {
+                cache_key
+            }
+        }
+        None => cache_key,
+    };
+
+    match without_range.rfind(":part:") {
+        Some(pos) => {
+            let (head, tail) = without_range.split_at(pos);
+            let part_body = &tail[":part:".len()..];
+            if part_body.chars().all(|c| c.is_ascii_digit()) && !part_body.is_empty() {
+                head.to_string()
+            } else {
+                without_range.to_string()
+            }
+        }
+        None => without_range.to_string(),
+    }
+}
+
+/// Validate that a `:range:` suffix body matches `<digits>-<digits>`
+/// (the exact shape produced by `generate_range_cache_key`).
+fn is_range_suffix_body(body: &str) -> bool {
+    match body.split_once('-') {
+        Some((start, end)) => {
+            !start.is_empty()
+                && !end.is_empty()
+                && start.chars().all(|c| c.is_ascii_digit())
+                && end.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Format bytes into human-readable string (KiB, MiB, GiB)
 fn format_bytes_human(bytes: u64) -> String {
     const KIB: u64 = 1024;
@@ -442,19 +502,6 @@ impl Default for WriteCacheSizeTracker {
     }
 }
 
-/// RAM cache management structures
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RamCacheManager {
-    pub current_size: u64,
-    pub max_size: u64,
-    pub eviction_algorithm: CacheEvictionAlgorithm,
-    pub entries_count: u64,
-    pub hit_count: u64,
-    pub miss_count: u64,
-    pub eviction_count: u64,
-    pub last_eviction: Option<SystemTime>,
-}
-
 /// Cache eviction algorithms
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum CacheEvictionAlgorithm {
@@ -492,7 +539,7 @@ pub struct RamCacheEntry {
     pub compression_algorithm: crate::compression::CompressionAlgorithm,
 }
 
-/// Lightweight read-view returned by RamCache::get() — no whole-entry clone.
+/// Lightweight read-view returned by `ShardedRamCache::get()` — no whole-entry clone.
 #[derive(Debug, Clone)]
 pub struct RamCacheRead {
     pub data: Arc<Bytes>,
@@ -633,6 +680,15 @@ pub struct CacheManager {
     // production builder sets it from CacheConfig::partial_range_commit_ratio
     // before Arc-wrapping. Spec: crt-conditional-range-caching Req 2
     partial_range_commit_ratio: f64,
+    // Global compression size threshold (bytes). Sourced from
+    // `config.compression.threshold`; forwarded to `DiskCacheManager` in
+    // `create_configured_disk_cache_manager` and consulted by
+    // `effective_compression`. Spec: compression-content-aware-fix Req 2/4.
+    compression_threshold: usize,
+    // Global compression enabled flag. Sourced from `config.compression.enabled`;
+    // forwarded to `DiskCacheManager` in `create_configured_disk_cache_manager`.
+    // Spec: compression-content-aware-fix Req 2/4.
+    compression_enabled_global: bool,
     // Bucket-level settings manager for per-bucket/prefix cache configuration
     bucket_settings_manager: Arc<crate::bucket_settings::BucketSettingsManager>,
     // RAM cache flush interval for cross-instance access visibility (Req 19)
@@ -649,7 +705,6 @@ pub struct CacheManager {
 struct CacheManagerInner {
     statistics: CacheStatistics,
     write_cache_tracker: WriteCacheSizeTracker,
-    ram_cache_manager: RamCacheManager,
     compression_handler: CompressionHandler,
 }
 
@@ -786,12 +841,6 @@ impl CacheManager {
         ram_cache_flush_interval: std::time::Duration,
         ram_cache_shard_count: usize,
     ) -> Self {
-        let ram_cache_manager = RamCacheManager {
-            max_size: max_ram_cache_size,
-            eviction_algorithm: eviction_algorithm.clone(),
-            ..RamCacheManager::default()
-        };
-
         // Create ShardedRamCache if enabled with the specified eviction algorithm.
         // Warn if per-shard capacity is small — objects larger than the per-shard limit are
         // silently dropped. Each shard gets max_ram_cache_size / shard_count bytes.
@@ -832,7 +881,6 @@ impl CacheManager {
         let inner = CacheManagerInner {
             statistics,
             write_cache_tracker,
-            ram_cache_manager,
             compression_handler: CompressionHandler::new(
                 compression_threshold,
                 compression_enabled,
@@ -887,21 +935,73 @@ impl CacheManager {
             max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default; overridden by config in http_proxy.rs
             metadata_io_concurrency: 32, // default; overridden by config in http_proxy.rs
             partial_range_commit_ratio: 1.0, // exact-only; production sets from config
+            compression_threshold,
+            compression_enabled_global: compression_enabled,
             ram_cache_flush_interval,
             ram_cache: sharded_ram_cache,
             inner: Arc::new(Mutex::new(inner)),
         }
     }
 
-    /// Create a properly configured DiskCacheManager with atomic metadata writes support
+    /// Effective compression decision for one cache write.
+    ///
+    /// Combines per-key cache-rule overrides with the global size threshold
+    /// and the built-in extension denylist, with **rules winning**: if a
+    /// matched `cache_rules.json` rule explicitly set `compression_enabled`
+    /// for this key, that value is honored verbatim — including forcing
+    /// compression of a normally-denylisted extension, or skipping
+    /// compression of a normally-compressible one. Only when no rule set it
+    /// (resolution fell through to the global default) does the built-in
+    /// denylist apply.
+    ///
+    /// The size threshold applies in both cases: it is a size floor guarding
+    /// against compressing tiny payloads, orthogonal to the content-type
+    /// question rules answer.
+    ///
+    /// See `compression-content-aware-fix` spec, Requirement 1.
+    pub fn effective_compression(
+        &self,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        cache_key: &str,
+        size: u64,
+    ) -> bool {
+        if !resolved.compression_enabled {
+            return false;
+        }
+        if (size as usize) < self.compression_threshold {
+            return false;
+        }
+        if resolved.compression_from_rule {
+            // Rule explicitly set compression_enabled=true and it already
+            // passed the guards above — honor it regardless of extension.
+            return true;
+        }
+        // No rule set it: apply the built-in denylist as the default layer.
+        let path = strip_known_cache_key_suffixes(cache_key);
+        !CompressionHandler::is_denylisted_extension(&path)
+    }
+
+    /// Create a properly configured DiskCacheManager with atomic metadata writes support.
+    ///
+    /// Forwards `compression_enabled_global` and `compression_threshold` as
+    /// captured at `CacheManager` construction time (compression-content-aware-fix
+    /// spec, Requirement 2.3).
     pub fn create_configured_disk_cache_manager(&self) -> crate::disk_cache::DiskCacheManager {
-        let mut disk_cache = crate::disk_cache::DiskCacheManager::new(
-            self.cache_dir.clone(),
-            true, // compression_enabled
-            1024, // compression_threshold
-            self.write_cache_enabled,
-            self.compression_batch_size,
-        );
+        // Share the CacheManagerInner compression stats Arc so this manager's
+        // write paths (streaming writers + store_range) are visible in the
+        // /metrics snapshot, instead of counting into a throwaway Arc.
+        // Spec: compression-followup-fixes Requirement 1.
+        let mut disk_cache = {
+            let inner = self.inner.lock().unwrap();
+            crate::disk_cache::DiskCacheManager::new_with_shared_stats(
+                self.cache_dir.clone(),
+                self.compression_enabled_global,
+                self.compression_threshold,
+                self.write_cache_enabled,
+                self.compression_batch_size,
+                &inner.compression_handler,
+            )
+        };
 
         // Configure metadata I/O limits (cache-metadata-resilience Req 1, 3, 4)
         disk_cache.set_metadata_config(self.max_metadata_file_bytes, self.metadata_io_concurrency);
@@ -2437,6 +2537,15 @@ impl CacheManager {
     /// 4. Updates upload_state to Complete
     /// 5. Clears temporary part data from metadata
     /// 6. Sets expires_at using PUT_TTL
+    ///
+    /// Restored after an earlier, incorrect dead-code assessment during the
+    /// compression-content-aware-fix change: it has no caller within `src/`,
+    /// but is a public API exercised extensively by integration tests
+    /// (`tests/multipart_completion_test.rs`, `tests/archive_zip_corruption_test.rs`,
+    /// `tests/multipart_get_integration_test.rs`,
+    /// `tests/http_proxy_handlers_test.rs`,
+    /// `tests/put_cache_invalidation_property_test.rs`) simulating the
+    /// buffered-parts-in-metadata completion path. Not truly dead.
     pub async fn complete_multipart_upload(&self, path: &str) -> Result<()> {
         let cache_key = Self::generate_cache_key(path, None);
 
@@ -2512,6 +2621,7 @@ impl CacheManager {
         // Requirement 7.3: Store each part as a range at calculated position
         let mut current_position = 0u64;
         let mut range_specs = Vec::new();
+        let resolved = self.resolve_settings(&cache_key).await;
 
         for part in &metadata.object_metadata.parts {
             let start = current_position;
@@ -2522,12 +2632,16 @@ impl CacheManager {
                 part.part_number, start, end, part.size
             );
 
-            // Compress the part data
+            // Compress the part data (Requirements 5.1, 5.2, 5.3: per-bucket
+            // compression control via `effective_compression`; always written
+            // as a checksummed LZ4 frame regardless of the decision).
+            let should_compress =
+                self.effective_compression(&resolved, path, part.data.len() as u64);
             let compression_result = {
                 let mut inner = self.inner.lock().unwrap();
                 inner
                     .compression_handler
-                    .compress_content_aware_with_metadata(&part.data, path)
+                    .compress_with_metadata(&part.data, path, should_compress)
             }; // Lock is dropped here
 
             let compressed_data = compression_result.data;
@@ -3024,6 +3138,12 @@ impl CacheManager {
             if let Some(ram_read) = ram_read {
                 let compressed = ram_read.compressed;
                 let entry_data = ram_read.data.clone();
+                // Dispatch by the entry's algorithm tag: Lz4 frames are decoded,
+                // legacy None-tagged (raw, unframed) bytes are returned verbatim.
+                // Using decompress_data_with_fallback unconditionally would run
+                // the LZ4 decoder on raw None bytes and error.
+                // Spec: compression-followup-fixes Requirement 2.
+                let algorithm = ram_read.compression_algorithm.clone();
 
                 // RAM cache stores compressed data, decompress if needed
                 let data = if compressed {
@@ -3034,7 +3154,7 @@ impl CacheManager {
                     let inner = self.inner.lock().unwrap();
                     inner
                         .compression_handler
-                        .decompress_data_with_fallback(&entry_data)?
+                        .decompress_with_algorithm(&entry_data, algorithm)?
                 } else {
                     entry_data.to_vec()
                 };
@@ -3075,35 +3195,52 @@ impl CacheManager {
                     range.start, range.end, resolved.source
                 );
             } else {
-                // Create a RAM cache entry for the range data
-                // Note: Data from disk cache is already decompressed, so store as uncompressed in RAM
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let ram_entry = RamCacheEntry {
-                    cache_key: range_cache_key,
-                    data: Arc::new(Bytes::from(range_data.clone())),
-                    metadata: CacheMetadata {
-                        etag: range.etag.clone(),
-                        last_modified: range.last_modified.clone(),
-                        content_length: range_data.len() as u64,
-                        part_number: None,
-                        cache_control: None,
-                        access_count: 0,
-                        last_accessed: SystemTime::now(),
-                    },
-                    created_at: SystemTime::now(),
-                    last_accessed: AtomicU64::new(now_ms),
-                    access_count: AtomicU64::new(1),
-                    compressed: false, // Data from disk cache is already decompressed
-                    compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
-                };
+                // Load the raw on-disk frame bytes (no decompression) so the RAM entry
+                // mirrors the on-disk footprint, matching the full-object
+                // (`convert_cache_entry_to_ram_entry`) and write-cache
+                // (`convert_write_entry_to_ram_entry`) promotion paths
+                // (compression-content-aware-fix Requirement 9). The client-facing
+                // decompressed `range_data` above is unaffected by this.
+                match range_handler
+                    .load_range_frame_from_new_storage(cache_key, range)
+                    .await
+                {
+                    Ok((frame_data, algorithm)) => {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let ram_entry = RamCacheEntry {
+                            cache_key: range_cache_key,
+                            data: Arc::new(Bytes::from(frame_data)),
+                            metadata: CacheMetadata {
+                                etag: range.etag.clone(),
+                                last_modified: range.last_modified.clone(),
+                                content_length: range_data.len() as u64,
+                                part_number: None,
+                                cache_control: None,
+                                access_count: 0,
+                                last_accessed: SystemTime::now(),
+                            },
+                            created_at: SystemTime::now(),
+                            last_accessed: AtomicU64::new(now_ms),
+                            access_count: AtomicU64::new(1),
+                            compressed: true,
+                            compression_algorithm: algorithm,
+                        };
 
-                if let Some(ref ram_cache) = self.ram_cache {
-                    // RAM cache put is best-effort; eviction from RAM only means
-                    // the entry will be served from disk on next access.
-                    let _ = ram_cache.put(ram_entry).await;
+                        if let Some(ref ram_cache) = self.ram_cache {
+                            // RAM cache put is best-effort; eviction from RAM only means
+                            // the entry will be served from disk on next access.
+                            let _ = ram_cache.put(ram_entry).await;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Skipping RAM cache promotion for range {}-{}: failed to load on-disk frame: {}",
+                            range.start, range.end, e
+                        );
+                    }
                 }
             }
         }
@@ -3165,94 +3302,6 @@ impl CacheManager {
         new_total <= max_allowed
     }
 
-    /// Compress cache entry data with external compression handler
-    pub fn compress_cache_entry_with_handler(
-        compression_handler: &mut CompressionHandler,
-        entry: &mut CacheEntry,
-    ) -> Result<bool> {
-        let mut compressed_any = false;
-
-        // Extract path from cache key for content-aware compression
-        let path = Self::extract_path_from_cache_key(&entry.cache_key);
-        let file_extension = Self::extract_file_extension(&path);
-
-        // Compress body if present
-        if let Some(body) = &entry.body {
-            let result = compression_handler.compress_content_aware_with_metadata(body, &path);
-            entry.body = Some(result.data);
-            entry.compression_info.body_algorithm = result.algorithm;
-            entry.compression_info.original_size = Some(result.original_size);
-            entry.compression_info.compressed_size = Some(result.compressed_size);
-            entry.compression_info.file_extension = Some(file_extension.clone());
-            compressed_any |= result.was_compressed;
-        }
-
-        // Compress range data
-        for range in &mut entry.ranges {
-            let result =
-                compression_handler.compress_content_aware_with_metadata(&range.data, &path);
-            range.data = result.data;
-            range.compression_algorithm = result.algorithm;
-            compressed_any |= result.was_compressed;
-        }
-
-        Ok(compressed_any)
-    }
-
-    /// Compress cache entry data
-    pub fn compress_cache_entry(&self, entry: &mut CacheEntry) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
-        Self::compress_cache_entry_with_handler(&mut inner.compression_handler, entry)
-    }
-    /// Decompress cache entry data using stored algorithm metadata with external handler
-    pub fn decompress_cache_entry_with_handler(
-        compression_handler: &mut CompressionHandler,
-        entry: &mut CacheEntry,
-    ) -> Result<()> {
-        // Decompress body using stored algorithm
-        if let Some(body) = &entry.body {
-            match compression_handler
-                .decompress_with_algorithm(body, entry.compression_info.body_algorithm.clone())
-            {
-                Ok(decompressed_body) => {
-                    entry.body = Some(decompressed_body);
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to decompress cache entry body with algorithm {:?}: {}",
-                        entry.compression_info.body_algorithm, e
-                    );
-                    return Err(e);
-                }
-            }
-        }
-
-        // Decompress range data using stored algorithm
-        for range in &mut entry.ranges {
-            match compression_handler
-                .decompress_with_algorithm(&range.data, range.compression_algorithm.clone())
-            {
-                Ok(decompressed_data) => {
-                    range.data = decompressed_data;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to decompress range data with algorithm {:?}: {}",
-                        range.compression_algorithm, e
-                    );
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Decompress cache entry data using stored algorithm metadata
-    pub fn decompress_cache_entry(&self, entry: &mut CacheEntry) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        Self::decompress_cache_entry_with_handler(&mut inner.compression_handler, entry)
-    }
     /// Decompress RAM cache read data, returning the raw decompressed bytes.
     pub fn decompress_ram_cache_read(&self, read: &RamCacheRead) -> Result<Vec<u8>> {
         if read.compressed {
@@ -3275,32 +3324,6 @@ impl CacheManager {
         }
     }
 
-    /// Decompress RAM cache entry data
-    pub fn decompress_ram_cache_entry(&self, entry: &mut RamCacheEntry) -> Result<()> {
-        if entry.compressed {
-            let inner = self.inner.lock().unwrap();
-            match inner
-                .compression_handler
-                .decompress_with_algorithm(&entry.data, entry.compression_algorithm.clone())
-            {
-                Ok(decompressed_data) => {
-                    entry.data = Arc::new(Bytes::from(decompressed_data));
-                    entry.compressed = false;
-                    entry.compression_algorithm = crate::compression::CompressionAlgorithm::Lz4;
-                    Ok(())
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to decompress RAM cache entry with algorithm {:?}: {}",
-                        entry.compression_algorithm, e
-                    );
-                    Err(e)
-                }
-            }
-        } else {
-            Ok(())
-        }
-    }
     /// Get compression handler (for testing, configuration, and health/metrics monitoring)
     pub fn get_compression_handler(&self) -> Arc<CompressionHandler> {
         let inner = self.inner.lock().unwrap();
@@ -4845,26 +4868,10 @@ impl CacheManager {
 
         Ok(stats)
     }
-    /// Extract path from cache key for content-aware compression
+    /// Extract path from cache key for content-aware compression.
+    /// See [`strip_known_cache_key_suffixes`] for the suffix grammar.
     fn extract_path_from_cache_key(cache_key: &str) -> String {
-        // Cache keys are in new format: path or path:version:id or path:part:num etc.
-        // We want to extract the path part (before any additional components) for file extension detection
-        let parts: Vec<&str> = cache_key.split(':').collect();
-        if !parts.is_empty() {
-            parts[0].to_string()
-        } else {
-            cache_key.to_string()
-        }
-    }
-
-    /// Extract file extension from path
-    fn extract_file_extension(path: &str) -> String {
-        if let Some(last_segment) = path.split('/').next_back() {
-            if let Some(dot_pos) = last_segment.rfind('.') {
-                return last_segment[dot_pos + 1..].to_lowercase();
-            }
-        }
-        String::new()
+        strip_known_cache_key_suffixes(cache_key)
     }
 
     /// Check if the given ranges represent a full object (single range from 0 to content_length-1)
@@ -6564,35 +6571,6 @@ impl CacheManager {
         false
     }
 
-    /// Check if we should recompress a cache entry due to algorithm changes
-    pub fn should_recompress_entry(&self, compression_info: &CompressionInfo) -> bool {
-        let inner = self.inner.lock().unwrap();
-
-        // Check if the preferred algorithm has changed
-        let current_algorithm = inner.compression_handler.get_preferred_algorithm();
-
-        // If the entry was compressed with a different algorithm than preferred, consider recompression
-        if compression_info.body_algorithm != *current_algorithm {
-            return true;
-        }
-
-        // Check if content-aware rules would now make a different decision
-        if let Some(ref extension) = compression_info.file_extension {
-            let path = format!("file.{}", extension);
-            let original_size = compression_info.original_size.unwrap_or(0) as usize;
-            let should_compress_now = inner
-                .compression_handler
-                .should_compress_content(&path, original_size);
-
-            // All data is now frame-encoded; if content-aware says don't compress
-            // but data was compressed, consider recompression
-            if !should_compress_now {
-                return false; // Already frame-wrapped, no need to recompress
-            }
-        }
-
-        false
-    }
     /// Extract multipart information from S3 response headers
     /// Validates: Requirements 2.1, 2.3
     ///
@@ -6687,6 +6665,7 @@ impl CacheManager {
 
         // Resolve per-bucket compression settings (Requirements 5.1, 5.2, 5.3)
         let resolved = self.resolve_settings(cache_key).await;
+        let should_compress = self.effective_compression(&resolved, cache_key, body.len() as u64);
 
         match disk_cache
             .store_range(
@@ -6696,7 +6675,7 @@ impl CacheManager {
                 body,
                 object_metadata,
                 self.get_ttl,
-                resolved.compression_enabled,
+                should_compress,
             )
             .await
         {
@@ -7854,13 +7833,17 @@ impl CacheManager {
         if let Some(ram_read) = ram_read {
             let compressed = ram_read.compressed;
             let entry_data = ram_read.data.clone();
+            // Dispatch by the entry's algorithm tag so legacy None-tagged (raw)
+            // ranges are returned verbatim instead of being fed to the LZ4
+            // decoder. Spec: compression-followup-fixes Requirement 2.
+            let algorithm = ram_read.compression_algorithm.clone();
 
             let data = if compressed {
                 debug!("Decompressing RAM cache range data for {}-{}", start, end);
                 let inner = self.inner.lock().unwrap();
                 match inner
                     .compression_handler
-                    .decompress_data_with_fallback(&entry_data)
+                    .decompress_with_algorithm(&entry_data, algorithm)
                 {
                     Ok(decompressed) => decompressed,
                     Err(e) => {
@@ -7882,26 +7865,36 @@ impl CacheManager {
         }
     }
 
-    /// Promote range data to RAM cache after a disk cache hit.
-    /// Skips promotion if RAM cache is disabled or the data exceeds max_ram_cache_size.
-    pub fn promote_range_to_ram_cache(
+    /// Promote a range to RAM cache from its on-disk frame bytes, verbatim.
+    ///
+    /// Unlike `promote_range_to_ram_cache` (which stores caller-supplied bytes
+    /// uncompressed), this stores `frame_data` — the raw on-disk frame
+    /// (compressed or store-mode) — with `compressed: true` and the range's
+    /// tagged `compression_algorithm`, performing no decompression. This
+    /// mirrors the full-object (`convert_cache_entry_to_ram_entry`) and
+    /// write-cache (`convert_write_entry_to_ram_entry`) promotion paths
+    /// (compression-content-aware-fix Requirement 9). Skips promotion if RAM
+    /// cache is disabled or the frame exceeds `max_ram_cache_size`.
+    pub fn promote_range_to_ram_cache_frame(
         &self,
         cache_key: &str,
-        start: u64,
-        end: u64,
-        data: &[u8],
+        range: (u64, u64),
+        frame_data: Vec<u8>,
+        algorithm: crate::compression::CompressionAlgorithm,
         etag: String,
+        last_modified: String,
     ) {
+        let (start, end) = range;
         if !self.ram_cache_enabled {
             return;
         }
 
         let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
 
-        if data.len() as u64 > self.max_ram_cache_size {
+        if frame_data.len() as u64 > self.max_ram_cache_size {
             debug!(
-                "Skipping RAM cache promotion for range {}-{}: data size {} exceeds max_ram_cache_size {}",
-                start, end, data.len(), self.max_ram_cache_size
+                "Skipping RAM cache promotion for range {}-{}: frame size {} exceeds max_ram_cache_size {}",
+                start, end, frame_data.len(), self.max_ram_cache_size
             );
             return;
         }
@@ -7912,11 +7905,11 @@ impl CacheManager {
             .as_millis() as u64;
         let ram_entry = RamCacheEntry {
             cache_key: range_cache_key,
-            data: Arc::new(Bytes::from(data.to_vec())),
+            data: Arc::new(Bytes::from(frame_data)),
             metadata: CacheMetadata {
                 etag,
-                last_modified: String::new(),
-                content_length: data.len() as u64,
+                last_modified,
+                content_length: end.saturating_sub(start) + 1,
                 part_number: None,
                 cache_control: None,
                 access_count: 0,
@@ -7925,8 +7918,8 @@ impl CacheManager {
             created_at: SystemTime::now(),
             last_accessed: AtomicU64::new(now_ms),
             access_count: AtomicU64::new(1),
-            compressed: false,
-            compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+            compressed: true,
+            compression_algorithm: algorithm,
         };
 
         if let Some(ram_cache) = &self.ram_cache {
@@ -7978,9 +7971,11 @@ impl CacheManager {
             };
             let ram_stats = tokio::task::block_in_place(|| handle.block_on(ram_cache.stats()));
             let mut inner = self.inner.lock().unwrap();
-            inner.ram_cache_manager.hit_count = ram_stats.hit_count;
-            inner.ram_cache_manager.miss_count = ram_stats.miss_count;
-            // eviction_count and last_eviction not tracked by ShardedRamCache yet
+            // Refresh the exposed aggregate RAM stats on a hit. Authoritative
+            // hit/miss/eviction counts live in ShardedRamCache::stats(); here we
+            // mirror the derived size/hit-rate into the shared statistics view.
+            inner.statistics.ram_cache_size = ram_stats.current_size;
+            inner.statistics.ram_cache_hit_rate = ram_stats.hit_rate;
         }
     }
     /// Store PUT request in write-through cache with compression - Requirement 10.1
@@ -8254,9 +8249,11 @@ impl CacheManager {
         // same batched `IncrementalRangeWriter` the GET miss path uses (reusing
         // `compression_batch_size`) rather than compressing the whole object into
         // one buffer + a single `std::fs::write`. Per-bucket compression control
-        // (Requirements 5.1, 5.2, 5.3) is honoured via `resolved.compression_enabled`.
+        // (Requirements 5.1, 5.2, 5.3) is honoured via `effective_compression`
+        // (rules-win + built-in denylist default + threshold).
         let end = content_length - 1;
         let resolved = self.resolve_settings(cache_key).await;
+        let should_compress = self.effective_compression(&resolved, cache_key, content_length);
 
         // Open the streaming write-cache sink over a configured disk cache manager
         // (carries `compression_batch_size` + journal/size wiring). The capacity
@@ -8266,7 +8263,7 @@ impl CacheManager {
             disk_cache,
             cache_key,
             content_length,
-            resolved.compression_enabled,
+            should_compress,
             reservation,
         )
         .await
@@ -8399,12 +8396,13 @@ impl CacheManager {
         };
 
         let resolved = self.resolve_settings(cache_key).await;
+        let should_compress = self.effective_compression(&resolved, cache_key, content_length);
         let disk_cache = self.create_configured_disk_cache_manager();
         let sink = WriteCacheRangeSink::open(
             disk_cache,
             cache_key,
             content_length,
-            resolved.compression_enabled,
+            should_compress,
             Some(reservation),
         )
         .await?;
@@ -8414,11 +8412,11 @@ impl CacheManager {
     /// Open a streaming sink that stages an `UploadPart` body into the upload's
     /// in-progress directory (`mpus_in_progress/{upload_id}/part{N}.bin`) as it
     /// flows, so the part is cached incrementally (streaming-write-path Req 6.2)
-    /// rather than buffered whole in RAM like `cache_upload_part` does.
+    /// rather than buffered whole in RAM.
     ///
     /// The sink reuses the GET-path batched-LZ4 incremental writer (per-bucket
     /// compression resolved via [`Self::resolve_settings`]). Parts are not
-    /// write-cache-capacity-reserved (matching `cache_upload_part`); the handler's
+    /// write-cache-capacity-reserved; the handler's
     /// `should_cache` decision already gates whether a part is cached. The caller
     /// finalizes the sink and records the tracker under `upload.lock` only on S3
     /// success, preserving the per-part correctness gate.
@@ -8429,6 +8427,14 @@ impl CacheManager {
         part_number: u32,
     ) -> Result<MultipartPartSink> {
         let resolved = self.resolve_settings(cache_key).await;
+        // Part size is not known until the body finishes streaming, so the
+        // size-threshold guard in `effective_compression` cannot be applied
+        // here (matching this call site's pre-existing behavior, which never
+        // checked a threshold either). Pass `u64::MAX` so only the
+        // enabled/rules/denylist checks apply. S3 multipart parts are
+        // virtually always well above the default 1 KiB threshold in
+        // practice.
+        let should_compress = self.effective_compression(&resolved, cache_key, u64::MAX);
         let disk_cache = self.create_configured_disk_cache_manager();
         let part_final_path = self
             .cache_dir
@@ -8436,7 +8442,7 @@ impl CacheManager {
             .join(upload_id)
             .join(format!("part{}.bin", part_number));
         let writer = disk_cache
-            .begin_incremental_part_write(part_final_path, cache_key, resolved.compression_enabled)
+            .begin_incremental_part_write(part_final_path, cache_key, should_compress)
             .await?;
         Ok(MultipartPartSink {
             writer: Some(writer),
@@ -8662,32 +8668,28 @@ impl CacheManager {
             start, end, cache_key, content_length
         );
 
-        // Compress the range data (Requirements 5.1, 5.2, 5.3: per-bucket compression control)
+        // Compress the range data (Requirements 5.1, 5.2, 5.3: per-bucket compression
+        // control, combined with the built-in denylist + threshold via
+        // `effective_compression`). Whether or not compression runs, the data is
+        // always written as a checksummed LZ4 frame (compressed blocks when
+        // `should_compress`, store-mode/stored blocks otherwise) via
+        // `compress_with_metadata` — never raw bytes. See
+        // compression-content-aware-fix spec, Requirement 3.
         let resolved = self.resolve_settings(cache_key).await;
         let path = Self::extract_path_from_cache_key(cache_key);
-        let (compressed_data, compression_algorithm, compressed_size, uncompressed_size) =
-            if resolved.compression_enabled {
-                let compression_result = {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner
-                        .compression_handler
-                        .compress_content_aware_with_metadata(data, &path)
-                }; // Lock is dropped here
-                (
-                    compression_result.data,
-                    compression_result.algorithm,
-                    compression_result.compressed_size,
-                    compression_result.original_size,
-                )
-            } else {
-                // Compression disabled for this bucket
-                (
-                    data.to_vec(),
-                    crate::compression::CompressionAlgorithm::None,
-                    data.len() as u64,
-                    data.len() as u64,
-                )
-            };
+        let should_compress = self.effective_compression(&resolved, cache_key, data.len() as u64);
+        let compression_result = {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .compression_handler
+                .compress_with_metadata(data, &path, should_compress)
+        }; // Lock is dropped here
+        let (compressed_data, compression_algorithm, compressed_size, uncompressed_size) = (
+            compression_result.data,
+            compression_result.algorithm,
+            compression_result.compressed_size,
+            compression_result.original_size,
+        );
 
         // Write range data to .tmp file then atomically rename
         let range_file_path = self.get_new_range_file_path(cache_key, start, end);
@@ -9990,12 +9992,15 @@ impl CacheManager {
 
         // Resolve per-bucket compression settings (Requirements 5.1, 5.2, 5.3)
         let resolved = self.resolve_settings(cache_key).await;
+        let should_compress =
+            self.effective_compression(&resolved, cache_key, range_data.len() as u64);
 
-        // Use the disk cache manager to store the range
+        // Use the disk cache manager to store the range. Uses the same
+        // configured threshold/enabled as the rest of the manager.
         let mut disk_cache_manager = crate::disk_cache::DiskCacheManager::new(
             self.cache_dir.clone(),
-            true,
-            1024,
+            self.compression_enabled_global,
+            self.compression_threshold,
             false,
             1_048_576,
         );
@@ -10008,7 +10013,7 @@ impl CacheManager {
                 range_data,
                 object_metadata,
                 self.get_ttl,
-                resolved.compression_enabled,
+                should_compress,
             )
             .await?;
 
@@ -10919,7 +10924,7 @@ impl MultipartPartSink {
     /// (algorithm + sizes) for the upload tracker. Consumes the sink. MUST be
     /// called under the upload's `upload.lock` so the on-disk part file and the
     /// tracker ETag are updated as one critical section (the per-part correctness
-    /// gate, identical to `cache_upload_part`).
+    /// gate for concurrent same-part writes).
     pub(crate) fn finalize(mut self) -> Result<crate::disk_cache::PartFinalizeInfo> {
         let writer = self.writer.take().ok_or_else(|| {
             ProxyError::CacheError(format!(
@@ -13664,6 +13669,23 @@ mod ram_cache_range_property_tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
+    /// Test helper: promote raw bytes as a legacy `None`-tagged (verbatim) range
+    /// via the live promotion path (`promote_range_to_ram_cache_frame`). Replaces
+    /// the removed buffered `promote_range_to_ram_cache` so these ShardedRamCache
+    /// invariant tests keep exercising the production promotion path. `None`-tagged
+    /// bytes are stored and read back verbatim (no LZ4 decode), so round-trip and
+    /// size/count invariants are preserved.
+    fn promote_raw(cm: &CacheManager, key: &str, start: u64, end: u64, data: &[u8], etag: String) {
+        cm.promote_range_to_ram_cache_frame(
+            key,
+            (start, end),
+            data.to_vec(),
+            crate::compression::CompressionAlgorithm::None,
+            etag,
+            String::new(),
+        );
+    }
+
     /// **Feature: ram-cache-range-fix, Property 1: Range RAM cache round-trip**
     /// For any valid cache_key (non-empty string), start offset, end offset (where start <= end),
     /// and range data (non-empty byte vector), storing the range in RAM cache via
@@ -13678,8 +13700,17 @@ mod ram_cache_range_property_tests {
         data: Vec<u8>,
         etag_seed: u8,
     ) -> TestResult {
-        // Constrain inputs: non-empty cache_key, start <= end, non-empty data
+        // Constrain inputs: non-empty cache_key, start <= end, non-empty data,
+        // and a range width that doesn't overflow the frame promotion's
+        // content_length computation (end - start + 1).
         if cache_key.is_empty() || data.is_empty() || start > end {
+            return TestResult::discard();
+        }
+        if end
+            .checked_sub(start)
+            .and_then(|w| w.checked_add(1))
+            .is_none()
+        {
             return TestResult::discard();
         }
 
@@ -13703,8 +13734,8 @@ mod ram_cache_range_property_tests {
 
             let etag = format!("\"etag-{}\"", etag_seed);
 
-            // Promote range data to RAM cache
-            cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag);
+            // Promote range data to RAM cache (verbatim, via the live frame path)
+            promote_raw(&cache_manager, &cache_key, start, end, &data, etag);
 
             // Look up the range from RAM cache
             match cache_manager.get_range_from_ram_cache(&cache_key, start, end) {
@@ -13720,6 +13751,83 @@ mod ram_cache_range_property_tests {
         })
     }
 
+    /// Spec: compression-followup-fixes Requirement 2.
+    /// A legacy `None`-tagged range holds raw (unframed) bytes. After verbatim
+    /// promotion into RAM via `promote_range_to_ram_cache_frame`, it must read
+    /// back byte-exact through BOTH RAM read paths, without the LZ4 frame
+    /// decoder running on the raw bytes (which would error). Regression guard
+    /// for the previous unconditional `decompress_data_with_fallback` call.
+    #[test]
+    fn test_none_tagged_range_reads_back_verbatim_from_ram() {
+        use crate::compression::CompressionAlgorithm;
+        use crate::disk_cache::DiskCacheManager;
+        use crate::range_handler::RangeHandler;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let cache_manager = Arc::new(CacheManager::new(
+                temp_dir.path().to_path_buf(),
+                true,        // ram_cache_enabled
+                1024 * 1024, // max_ram_cache_size
+                1024,        // compression_threshold
+                true,        // compression_enabled
+            ));
+
+            // Raw, unframed bytes — deliberately NOT a valid LZ4 frame. The LZ4
+            // FrameDecoder fails on these, so this payload proves the read path
+            // dispatches on the algorithm tag rather than blindly decoding.
+            let raw: Vec<u8> = (0u16..512).map(|b| (b % 251) as u8).collect();
+            let start = 0u64;
+            let end = (raw.len() - 1) as u64;
+            let cache_key = "legacy-bucket/none-tagged-object";
+
+            // Promote verbatim as a legacy None-tagged range.
+            cache_manager.promote_range_to_ram_cache_frame(
+                cache_key,
+                (start, end),
+                raw.clone(),
+                CompressionAlgorithm::None,
+                "\"legacy-etag\"".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            );
+
+            // Path 2: get_range_from_ram_cache — verbatim, byte-exact.
+            let via_get = cache_manager
+                .get_range_from_ram_cache(cache_key, start, end)
+                .expect("None-tagged range should be a RAM hit");
+            assert_eq!(
+                via_get, raw,
+                "get_range_from_ram_cache must return raw bytes verbatim"
+            );
+
+            // Path 1: load_range_data_with_cache — RAM hit; disk is never touched.
+            let disk =
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+            let range_handler =
+                RangeHandler::new(cache_manager.clone(), Arc::new(RwLock::new(disk)));
+            let range = Range {
+                start,
+                end,
+                data: Vec::new(),
+                etag: "\"legacy-etag\"".to_string(),
+                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                compression_algorithm: CompressionAlgorithm::None,
+            };
+            let (via_load, is_ram_hit) = cache_manager
+                .load_range_data_with_cache(cache_key, &range, &range_handler)
+                .await
+                .expect("load_range_data_with_cache must succeed for None-tagged range");
+            assert!(is_ram_hit, "range should be served from RAM");
+            assert_eq!(
+                via_load, raw,
+                "load_range_data_with_cache must return raw bytes verbatim"
+            );
+        });
+    }
+
     /// **Feature: ram-cache-range-fix, Property 2: Promotion preserves metadata**
     /// For any valid cache_key, start, end, data, and etag string, after promoting range data
     /// to RAM cache, the RamCacheEntry stored under the range key should have metadata.etag
@@ -13733,8 +13841,16 @@ mod ram_cache_range_property_tests {
         data: Vec<u8>,
         etag_seed: u8,
     ) -> TestResult {
-        // Constrain inputs: non-empty cache_key, start <= end, non-empty data
+        // Constrain inputs: non-empty cache_key, start <= end, non-empty data,
+        // and a non-overflowing range width (frame content_length = end-start+1).
         if cache_key.is_empty() || data.is_empty() || start > end {
+            return TestResult::discard();
+        }
+        if end
+            .checked_sub(start)
+            .and_then(|w| w.checked_add(1))
+            .is_none()
+        {
             return TestResult::discard();
         }
 
@@ -13757,10 +13873,12 @@ mod ram_cache_range_property_tests {
             );
 
             let etag = format!("\"etag-{}\"", etag_seed);
-            let expected_content_length = data.len() as u64;
+            // The frame promotion path derives content_length from the range
+            // (end - start + 1), not the payload length.
+            let expected_content_length = end - start + 1;
 
-            // Promote range data to RAM cache
-            cache_manager.promote_range_to_ram_cache(&cache_key, start, end, &data, etag.clone());
+            // Promote range data to RAM cache (verbatim, via the live frame path)
+            promote_raw(&cache_manager, &cache_key, start, end, &data, etag.clone());
 
             // Inspect the stored RamCacheEntry directly via the sharded RAM cache.
             let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
@@ -13895,7 +14013,7 @@ mod ram_cache_range_property_tests {
                         let s = *start as u64;
                         let e = s + (*end as u64); // ensure end >= start
                         let etag = format!("\"etag-{}\"", etag_seed);
-                        cache_manager.promote_range_to_ram_cache(key, s, e, data, etag);
+                        promote_raw(&cache_manager, key, s, e, data, etag);
                     }
                     CacheOp::Get {
                         key_idx,
@@ -14020,7 +14138,7 @@ mod ram_cache_range_property_tests {
                 let e = s + (op.end as u64); // ensure end >= start
                 let etag = format!("\"etag-{}\"", op.etag_seed);
 
-                cache_manager.promote_range_to_ram_cache(key, s, e, &op.data, etag);
+                promote_raw(&cache_manager, key, s, e, &op.data, etag);
 
                 // Check size invariant after each promotion
                 let stats = cache_manager
@@ -14045,6 +14163,23 @@ mod ram_cache_range_property_tests {
 mod ram_cache_range_unit_tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Test helper: promote raw bytes as a legacy `None`-tagged (verbatim) range
+    /// via the live promotion path (`promote_range_to_ram_cache_frame`), replacing
+    /// the removed buffered `promote_range_to_ram_cache`. `None`-tagged bytes are
+    /// stored and read back verbatim, and the frame path applies the same
+    /// max_ram_cache_size / ram-disabled guards, so these tests are unchanged in
+    /// intent.
+    fn promote_raw(cm: &CacheManager, key: &str, start: u64, end: u64, data: &[u8], etag: String) {
+        cm.promote_range_to_ram_cache_frame(
+            key,
+            (start, end),
+            data.to_vec(),
+            crate::compression::CompressionAlgorithm::None,
+            etag,
+            String::new(),
+        );
+    }
 
     /// Helper: create a CacheManager with RAM cache enabled and a given max size.
     fn create_ram_cache_manager(max_ram_cache_size: u64) -> (CacheManager, TempDir) {
@@ -14084,7 +14219,7 @@ mod ram_cache_range_unit_tests {
         let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let etag = "\"abc123\"".to_string();
 
-        cm.promote_range_to_ram_cache(cache_key, start, end, &data, etag);
+        promote_raw(&cm, cache_key, start, end, &data, etag);
 
         let result = cm.get_range_from_ram_cache(cache_key, start, end);
         assert!(
@@ -14109,7 +14244,7 @@ mod ram_cache_range_unit_tests {
         let data = vec![0xFFu8; (max_size + 1) as usize]; // 1 byte over limit
         let etag = "\"big\"".to_string();
 
-        cm.promote_range_to_ram_cache(cache_key, 0, data.len() as u64 - 1, &data, etag);
+        promote_raw(&cm, cache_key, 0, data.len() as u64 - 1, &data, etag);
 
         let result = cm.get_range_from_ram_cache(cache_key, 0, data.len() as u64 - 1);
         assert!(
@@ -14129,7 +14264,7 @@ mod ram_cache_range_unit_tests {
         let etag = "\"disabled\"".to_string();
 
         // Promote should silently do nothing
-        cm.promote_range_to_ram_cache(cache_key, 0, 4, &data, etag);
+        promote_raw(&cm, cache_key, 0, 4, &data, etag);
 
         // Get should return None
         let result = cm.get_range_from_ram_cache(cache_key, 0, 4);
@@ -14139,6 +14274,305 @@ mod ram_cache_range_unit_tests {
         assert!(
             cm.get_ram_cache_stats().is_none(),
             "RAM cache disabled: stats must be None"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ram_promotion_frame_property_tests {
+    use super::*;
+    use crate::compression::CompressionHandler;
+    use crate::range_handler::RangeHandler;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    /// Build a `CacheManager` + `RangeHandler` pair sharing the same disk cache
+    /// dir, with RAM cache enabled. Mirrors the constructor pattern used by the
+    /// other range-promotion tests in this file.
+    fn make_test_infra(temp_dir: &TempDir) -> (Arc<CacheManager>, RangeHandler) {
+        let max_ram_cache_size: u64 = 8 * 1024 * 1024; // 8 MiB, generous for test payloads
+        let cache_manager = Arc::new(CacheManager::new(
+            temp_dir.path().to_path_buf(),
+            true, // ram_cache_enabled
+            max_ram_cache_size,
+            1024, // compression_threshold
+            true, // compression_enabled (global default; per-write decision still explicit)
+        ));
+
+        let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
+            cache_manager.create_configured_disk_cache_manager(),
+        ));
+
+        let range_handler = RangeHandler::new(cache_manager.clone(), disk_cache_manager);
+
+        (cache_manager, range_handler)
+    }
+
+    /// Store `data` as a range on disk via `store_range_new_storage`, honoring
+    /// `compression_enabled` (true => real LZ4 compression via the compressible
+    /// payload; false => store-mode frame, per `compress_with_metadata`).
+    async fn store_test_range(
+        range_handler: &RangeHandler,
+        cache_key: &str,
+        data: &[u8],
+        compression_enabled: bool,
+    ) {
+        let object_metadata = crate::cache_types::ObjectMetadata {
+            etag: "\"test-etag\"".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: data.len() as u64,
+            content_type: Some("application/octet-stream".to_string()),
+            ..Default::default()
+        };
+
+        range_handler
+            .store_range_new_storage(
+                cache_key,
+                0,
+                data.len() as u64 - 1,
+                data,
+                object_metadata,
+                std::time::Duration::from_secs(3600),
+                compression_enabled,
+            )
+            .await
+            .expect("store_range_new_storage should succeed");
+    }
+
+    /// Read the on-disk frame bytes + algorithm directly, bypassing RAM,
+    /// for comparison against what gets promoted into RAM.
+    async fn read_on_disk_frame(
+        range_handler: &RangeHandler,
+        cache_key: &str,
+        range: &Range,
+    ) -> (Vec<u8>, crate::compression::CompressionAlgorithm) {
+        range_handler
+            .load_range_frame_from_new_storage(cache_key, range)
+            .await
+            .expect("on-disk frame should be readable")
+    }
+
+    /// **Feature: compression-content-aware-fix, Property 8: RAM Promotion Mirrors
+    /// the On-Disk Frame**
+    ///
+    /// *For any* object cached on disk (compressed or store-mode) and promoted to
+    /// RAM via the range path (`load_range_data_with_cache`), the RAM entry holds
+    /// the same bytes, `compressed` flag, and `compression_algorithm` as the
+    /// on-disk frame -- no decompression occurs on promotion -- and a read back
+    /// through the RAM tier is byte-exact against the original object.
+    ///
+    /// **Validates: Requirements 9.1, 9.2, 9.3**
+    #[quickcheck]
+    fn prop_ram_promotion_mirrors_on_disk_frame(
+        data: Vec<u8>,
+        use_compression: bool,
+    ) -> TestResult {
+        // Non-empty payload; cap size to keep the test fast.
+        if data.is_empty() || data.len() > 64 * 1024 {
+            return TestResult::discard();
+        }
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (cache_manager, range_handler) = make_test_infra(&temp_dir);
+
+            let cache_key = "test-bucket/promotion-object";
+
+            // Store the range with the decision under test: real compression, or
+            // store-mode (compression disabled at the write site).
+            store_test_range(&range_handler, cache_key, &data, use_compression).await;
+
+            let range = Range {
+                start: 0,
+                end: data.len() as u64 - 1,
+                data: Vec::new(),
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+            };
+
+            // Read the on-disk frame directly (ground truth) before promotion.
+            let (on_disk_frame, on_disk_algorithm) =
+                read_on_disk_frame(&range_handler, cache_key, &range).await;
+
+            // Trigger the RAM-promotion path under test: first call is a disk hit
+            // that promotes to RAM.
+            let (first_read_data, first_is_ram_hit) = cache_manager
+                .load_range_data_with_cache(cache_key, &range, &range_handler)
+                .await
+                .expect("load_range_data_with_cache should succeed on disk hit");
+
+            if first_is_ram_hit {
+                // First call must be a disk hit (nothing was in RAM yet).
+                return TestResult::error("expected first read to be a disk hit, not a RAM hit");
+            }
+            if first_read_data != data {
+                return TestResult::error(
+                    "disk-hit read-back did not match the original object bytes",
+                );
+            }
+
+            // Inspect the RAM entry directly to verify it mirrors the on-disk frame.
+            let range_cache_key = format!("{}:range:{}:{}", cache_key, range.start, range.end);
+            let ram_read = cache_manager
+                .ram_cache
+                .as_ref()
+                .expect("RAM cache must be enabled")
+                .get(&range_cache_key)
+                .await;
+
+            let ram_read = match ram_read {
+                Some(r) => r,
+                None => return TestResult::error("expected a RAM cache entry after promotion"),
+            };
+
+            if !ram_read.compressed {
+                return TestResult::error("RAM entry `compressed` flag must be true after promotion");
+            }
+            if ram_read.compression_algorithm != on_disk_algorithm {
+                return TestResult::error(format!(
+                    "RAM entry compression_algorithm ({:?}) does not match on-disk algorithm ({:?})",
+                    ram_read.compression_algorithm, on_disk_algorithm
+                ));
+            }
+            if ram_read.data.as_ref().as_ref() != on_disk_frame.as_slice() {
+                return TestResult::error(
+                    "RAM entry bytes do not match the on-disk frame bytes verbatim (decompression occurred on promotion)",
+                );
+            }
+
+            // Second call should be a RAM hit, and the decompressing read path must
+            // still return the original object bytes byte-exact.
+            let (second_read_data, second_is_ram_hit) = cache_manager
+                .load_range_data_with_cache(cache_key, &range, &range_handler)
+                .await
+                .expect("load_range_data_with_cache should succeed on RAM hit");
+
+            if !second_is_ram_hit {
+                return TestResult::error("expected second read to be a RAM hit");
+            }
+            if second_read_data != data {
+                return TestResult::error(
+                    "RAM-hit read-back did not match the original object bytes (byte-exact check failed)",
+                );
+            }
+
+            TestResult::passed()
+        })
+    }
+
+    /// Deterministic companion to the property test above: exercises both the
+    /// store-mode (denylisted / compression-disabled) and real-compression cases
+    /// explicitly, using a small fixed payload, so failures are easy to read
+    /// without relying on quickcheck shrinking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ram_promotion_store_mode_and_compressed_both_mirror_frame() {
+        for use_compression in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let (cache_manager, range_handler) = make_test_infra(&temp_dir);
+            let cache_key = "test-bucket/promotion-fixed-object";
+
+            // Compressible payload so the `use_compression=true` case actually
+            // produces compressed blocks (repetitive data compresses well).
+            let data: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+                .iter()
+                .cycle()
+                .take(4096)
+                .copied()
+                .collect();
+
+            store_test_range(&range_handler, cache_key, &data, use_compression).await;
+
+            let range = Range {
+                start: 0,
+                end: data.len() as u64 - 1,
+                data: Vec::new(),
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+            };
+
+            let (on_disk_frame, on_disk_algorithm) =
+                read_on_disk_frame(&range_handler, cache_key, &range).await;
+
+            // Sanity: store-mode vs compressed frames are distinguishable by size
+            // for this compressible payload (compressed should be smaller).
+            if use_compression {
+                assert!(
+                    on_disk_frame.len() < data.len(),
+                    "compressed frame should be smaller than the original for repetitive data"
+                );
+            }
+
+            let (first_data, first_is_ram_hit) = cache_manager
+                .load_range_data_with_cache(cache_key, &range, &range_handler)
+                .await
+                .expect("disk-hit load should succeed");
+            assert!(!first_is_ram_hit, "first read must be a disk hit");
+            assert_eq!(first_data, data, "disk-hit read-back must be byte-exact");
+
+            let range_cache_key = format!("{}:range:{}:{}", cache_key, range.start, range.end);
+            let ram_read = cache_manager
+                .ram_cache
+                .as_ref()
+                .unwrap()
+                .get(&range_cache_key)
+                .await
+                .expect("RAM entry must exist after promotion");
+
+            assert!(
+                ram_read.compressed,
+                "RAM entry must be tagged compressed=true (use_compression={})",
+                use_compression
+            );
+            assert_eq!(
+                ram_read.compression_algorithm, on_disk_algorithm,
+                "RAM entry algorithm must match on-disk algorithm (use_compression={})",
+                use_compression
+            );
+            assert_eq!(
+                ram_read.data.as_ref().as_ref(),
+                on_disk_frame.as_slice(),
+                "RAM entry bytes must equal the on-disk frame verbatim (use_compression={})",
+                use_compression
+            );
+
+            let (second_data, second_is_ram_hit) = cache_manager
+                .load_range_data_with_cache(cache_key, &range, &range_handler)
+                .await
+                .expect("RAM-hit load should succeed");
+            assert!(second_is_ram_hit, "second read must be a RAM hit");
+            assert_eq!(
+                second_data, data,
+                "RAM-hit read-back must be byte-exact (use_compression={})",
+                use_compression
+            );
+        }
+    }
+
+    /// Confirms the store-mode frame is a distinct, checksummed encoding (not
+    /// raw bytes) and is not identical to a compressed frame of the same
+    /// payload, so the store-mode/compressed cases in the tests above are
+    /// actually exercising two different on-disk encodings.
+    #[test]
+    fn test_store_mode_frame_differs_from_compressed_frame() {
+        let data = b"the quick brown fox jumps over the lazy dog ".repeat(64);
+        let store_mode = CompressionHandler::encode_store_mode_frame(&data).unwrap();
+        let mut handler = CompressionHandler::new(1024, true);
+        let compressed = handler
+            .compress_with_algorithm(&data, crate::compression::CompressionAlgorithm::Lz4)
+            .unwrap();
+
+        assert_ne!(
+            store_mode, compressed.data,
+            "store-mode and compressed frames must differ for compressible data"
+        );
+        assert!(
+            compressed.data.len() < store_mode.len(),
+            "compressed frame should be smaller than store-mode for compressible data"
         );
     }
 }

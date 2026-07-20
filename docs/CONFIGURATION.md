@@ -569,6 +569,17 @@ The file holds an optional `$schema` reference plus an ordered `rules` array. Ea
 
 **Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`
 
+**`compression_enabled` is rules-win.** The proxy has a built-in default
+denylist of already-compressed extensions (images, video, audio, archives,
+documents, executables — see `docs/COMPRESSION.md`) that skip LZ4
+compression when no rule matches. If a rule explicitly sets
+`compression_enabled` for a key, that value is honored verbatim, overriding
+the denylist in either direction — e.g. `{"pattern": "**/*.jpg", "compression_enabled": true}`
+forces compression of `.jpg` keys despite the built-in denylist; the reverse
+lets you disable compression for an extension the denylist would otherwise
+compress. The global `compression.threshold` size floor still applies
+regardless of any rule.
+
 **Duration format**: Same as global config — `"0s"`, `"30s"`, `"5m"`, `"1h"`, `"7d"`
 
 **Schema and example**: Include `$schema` for IDE autocompletion. Full schema at [`docs/cache-rules-schema.json`](cache-rules-schema.json); a complete example at [`config/cache_rules.example.json`](../config/cache_rules.example.json).
@@ -1066,22 +1077,36 @@ cache:
 ```yaml
 compression:
   enabled: true
-  threshold: 4096                    # 4KB minimum
-  preferred_algorithm: "lz4"         # Options: lz4
-  content_aware: true                # Skip compressed formats
+  threshold: 4096                    # Size floor in bytes; smaller writes always skip compression
+  preferred_algorithm: "lz4"         # Options: lz4 (parsed but otherwise inert)
 ```
 
-### Content-Aware Compression
+### Content-Aware Compression (Built-In Denylist)
 
-When `content_aware: true`, these formats are automatically skipped:
+Content-aware filtering is always active: when no `cache_rules.json` rule
+explicitly sets `compression_enabled` for a key, these already-compressed
+formats automatically skip the LZ4 compressor (they are written as
+checksummed store-mode LZ4 frames instead — see `docs/COMPRESSION.md`):
 
-**Images**: jpg, png, gif, webp, avif, heic, bmp, ico, svg
-**Videos**: mp4, avi, mkv, mov, webm, flv, wmv, m4v
-**Audio**: mp3, aac, ogg, flac, opus, m4a, wma, wav
-**Archives**: zip, rar, 7z, gz, bz2, xz, tar, tgz
-**Documents**: pdf, docx, xlsx, pptx
+**Images**: jpg, jpeg, png, gif, webp, avif, heic, heif
+**Videos**: mp4, avi, mkv, mov, wmv, flv, webm, m4v
+**Audio**: mp3, aac, ogg, flac, m4a, wma, opus
+**Archives**: zip, rar, 7z, gz, bz2, xz, lz4, zst, tgz
+**Documents**: pdf, docx, xlsx, pptx, odt, ods, odp
+**Applications**: apk, ipa, jar, war, ear
+**Fonts**: woff, woff2
+**Database**: sqlite, db
+**Executables**: exe, msi, dmg, pkg
 
 **Text files** (json, html, css, js, txt, etc.) are still compressed.
+
+A `cache_rules.json` rule setting `compression_enabled` explicitly overrides
+this denylist in either direction for matching keys (see the Cache Rules
+section above).
+
+**Note**: the former `compression.content_aware` boolean has been removed —
+it never had any effect. It still parses via a deprecation alias but is
+ignored; a startup warning is logged if present.
 
 ### Algorithm Metadata
 
@@ -1877,7 +1902,6 @@ connection_pool:
 compression:
   enabled: true
   threshold: 1024
-  content_aware: true
 
 dashboard:
   enabled: true

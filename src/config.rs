@@ -1974,8 +1974,24 @@ pub struct UpstreamOverrideConfig {
 pub struct CompressionConfig {
     pub enabled: bool,
     pub threshold: usize,
+    /// Preferred compression algorithm. FUTURE USE — intentionally retained,
+    /// not dead code. Production currently always uses Lz4 (handlers are built
+    /// via `CompressionHandler::new`); this field is the forward-looking config
+    /// surface for planned multi-algorithm support (e.g. zstd), consumed via
+    /// `CompressionHandler::new_with_algorithm`/`get_preferred_algorithm`. Do
+    /// not remove in dead-code sweeps.
+    /// Spec: compression-followup-fixes Requirement 5.
     pub preferred_algorithm: CompressionAlgorithm,
-    pub content_aware: bool,
+    /// Deprecated, ignored. Content-aware filtering (the built-in extension
+    /// denylist) is always applied by default when no `cache_rules.json`
+    /// rule explicitly sets `compression_enabled` for a key — there is no
+    /// configuration path to disable it. This field has no effect (verified:
+    /// no production code path reads it). Accepted via serde alias so
+    /// existing config files with `content_aware: true/false` keep parsing;
+    /// a startup warning is logged when present. See
+    /// compression-content-aware-fix spec, Requirement 4.
+    #[serde(default, alias = "content_aware", skip_serializing)]
+    pub content_aware_deprecated: Option<bool>,
 }
 
 /// Compression algorithms
@@ -1999,7 +2015,7 @@ impl Default for CompressionConfig {
             enabled: true,
             threshold: 1024, // 1KB
             preferred_algorithm: CompressionAlgorithm::default(),
-            content_aware: true,
+            content_aware_deprecated: None,
         }
     }
 }
@@ -2409,7 +2425,7 @@ impl Default for Config {
                 enabled: true,
                 threshold: 1024, // 1KB
                 preferred_algorithm: CompressionAlgorithm::default(),
-                content_aware: true,
+                content_aware_deprecated: None,
             },
             health: HealthConfig {
                 enabled: true,
@@ -2461,6 +2477,20 @@ impl Config {
 
         // Override with command line arguments
         config.apply_cli_overrides(&matches);
+
+        // Deprecation warning: `compression.content_aware` never had any
+        // effect (verified: no production code path ever read it) and has
+        // been removed as a live field. It still parses via a serde alias
+        // for backward compatibility, but a value here is now silently
+        // ignored. See compression-content-aware-fix spec, Requirement 4.
+        if config.compression.content_aware_deprecated.is_some() {
+            tracing::warn!(
+                "compression.content_aware is deprecated and has no effect (it never did); \
+                 the built-in extension denylist is now always applied by default when no \
+                 cache_rules.json rule explicitly sets compression_enabled for a key. \
+                 Remove this field from your config."
+            );
+        }
 
         // Validate shared storage configuration
         if let Err(e) = config.cache.shared_storage.validate() {
@@ -6462,6 +6492,122 @@ metrics:
     }
 
     #[test]
+    fn test_compression_content_aware_alias_still_parses() {
+        // compression-content-aware-fix spec, Requirement 4.1/4.3/8.2: a
+        // pre-upgrade config setting `compression.content_aware` must still
+        // parse (via the serde alias) rather than fail configuration
+        // validation. The value lands in `content_aware_deprecated` and has
+        // no effect on behavior.
+        let yaml = r#"
+server:
+  http_port: 8000
+  https_port: 8443
+  https_mode: "passthrough"
+  max_concurrent_requests: 200
+  request_timeout: "30s"
+cache:
+  cache_dir: "./cache"
+  max_cache_size: 1073741824
+  ram_cache_enabled: false
+  max_ram_cache_size: 268435456
+  eviction_algorithm: "lru"
+  write_cache_enabled: true
+  write_cache_percent: 10.0
+  write_cache_max_object_size: 268435456
+  put_ttl: "1h"
+  get_ttl: "315360000s"
+  head_ttl: "1h"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+  access_log_enabled: true
+  access_log_mode: "all"
+  log_level: "info"
+connection_pool:
+  max_connections_per_ip: 10
+  dns_refresh_interval: "1m"
+  connection_timeout: "30s"
+  idle_timeout: "2m"
+compression:
+  enabled: true
+  threshold: 1024
+  preferred_algorithm: "lz4"
+  content_aware: false
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  check_interval: "1m"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 8080
+  collection_interval: "5m"
+"#;
+
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("content_aware must still parse via alias");
+        assert_eq!(config.compression.content_aware_deprecated, Some(false));
+        // Behavior is unaffected regardless of the (ignored) value.
+        assert!(config.compression.enabled);
+        assert_eq!(config.compression.threshold, 1024);
+    }
+
+    #[test]
+    fn test_compression_section_omitted_uses_defaults() {
+        // compression-content-aware-fix spec, Requirement 7.1/8.1: a config
+        // omitting the `compression:` section entirely must still start,
+        // with `enabled: true`, `threshold: 1024`, and no deprecated field set.
+        let yaml = r#"
+server:
+  http_port: 8000
+  https_port: 8443
+  https_mode: "passthrough"
+  max_concurrent_requests: 200
+  request_timeout: "30s"
+cache:
+  cache_dir: "./cache"
+  max_cache_size: 1073741824
+  ram_cache_enabled: false
+  max_ram_cache_size: 268435456
+  eviction_algorithm: "lru"
+  write_cache_enabled: true
+  write_cache_percent: 10.0
+  write_cache_max_object_size: 268435456
+  put_ttl: "1h"
+  get_ttl: "315360000s"
+  head_ttl: "1h"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+  access_log_enabled: true
+  access_log_mode: "all"
+  log_level: "info"
+connection_pool:
+  max_connections_per_ip: 10
+  dns_refresh_interval: "1m"
+  connection_timeout: "30s"
+  idle_timeout: "2m"
+health:
+  enabled: true
+  endpoint: "/health"
+  port: 8080
+  check_interval: "1m"
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 8080
+  collection_interval: "5m"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml)
+            .expect("omitting the compression section entirely must still parse");
+        assert!(config.compression.enabled);
+        assert_eq!(config.compression.threshold, 1024);
+        assert_eq!(config.compression.content_aware_deprecated, None);
+    }
+
+    #[test]
     fn test_compression_batch_size_below_range_rejected() {
         // Requirement 5.4: values below 64 KiB must be rejected.
         let cfg = CacheConfig {
@@ -7418,7 +7564,11 @@ mod rolling_validation_config_property_tests {
             config.compression.preferred_algorithm,
             CompressionAlgorithm::Lz4
         );
-        assert!(config.compression.content_aware);
+        // `content_aware` has been removed from config.example.yaml (it never
+        // had any effect); the deprecation-alias field is None here since the
+        // example no longer sets it. Separate tests cover the alias parsing
+        // an old-style config that still sets `content_aware`.
+        assert_eq!(config.compression.content_aware_deprecated, None);
 
         // --- health section ---
         assert!(config.health.enabled);

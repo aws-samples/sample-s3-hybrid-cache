@@ -94,7 +94,6 @@ src/
 │   # Cache layer
 ├── cache.rs             # Unified cache manager
 ├── cache_types.rs       # Cache data structures
-├── cache_writer.rs      # Async cache writer for streaming
 ├── cache_size_tracker.rs # Cache size tracking (delegates to consolidator)
 ├── cache_initialization_coordinator.rs # Coordinated cache initialization
 ├── cache_validator.rs   # Cache integrity validation and file scanning

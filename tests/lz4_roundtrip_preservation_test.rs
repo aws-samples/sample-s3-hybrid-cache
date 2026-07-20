@@ -1,10 +1,16 @@
 // Feature: dependency-security-upgrades, Task 2.1: LZ4 round-trip preservation
 //
-// Establishes a baseline green run on the unchanged workspace before Task 3 (lz4_flex bump).
-// After the Cluster A fix lands, this test must continue to pass — any regression in the
-// FrameDecoder / FrameEncoder surface will surface here before it reaches production.
+// Originally established a baseline green run on the unchanged workspace before
+// Task 3 (lz4_flex bump). Now exercises the frame-producing primitives the
+// streaming write path (`disk_cache.rs::flush_batch`) actually uses —
+// `compress_with_algorithm` (compressed blocks) and `encode_store_mode_frame`
+// (stored/"store-mode" blocks) — per the compression-content-aware-fix spec,
+// which removed the `compress_always` helper this file previously called.
+// Any regression in the FrameDecoder / FrameEncoder surface, or in either frame
+// primitive, will surface here before it reaches production.
 //
-// **Validates: Cluster A preservation (lz4_flex round-trip correctness)**
+// **Validates: Cluster A preservation (lz4_flex round-trip correctness);
+// compression-content-aware-fix Requirement 6.6 (surviving frame primitives)**
 
 use quickcheck::{quickcheck, TestResult};
 use s3_proxy::compression::CompressionHandler;
@@ -34,9 +40,10 @@ fn split_into_n_chunks(data: &[u8], n: usize) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Property 1: decompress(compress(X)) == X for arbitrary Vec<u8> X
 //
-// Uses CompressionHandler::new(0, true) so the threshold is 0 — every input
-// is compressed regardless of size.  Routes through compress_data /
-// decompress_data, the same entry points the disk cache uses.
+// Routes through compress_with_algorithm(Lz4) / decompress_data, the same
+// entry points the disk cache uses since the compression-content-aware-fix
+// change (the effective compress/skip decision is made by the caller;
+// CompressionHandler no longer makes a threshold-based decision itself).
 // ---------------------------------------------------------------------------
 #[test]
 fn prop_lz4_roundtrip_arbitrary_bytes() {
@@ -48,9 +55,11 @@ fn prop_lz4_roundtrip_arbitrary_bytes() {
 
         let mut handler = CompressionHandler::new(0, true);
 
-        let compressed = match handler.compress_data(&data) {
-            Ok(c) => c,
-            Err(e) => return TestResult::error(format!("compress_data failed: {}", e)),
+        let compressed = match handler
+            .compress_with_algorithm(&data, s3_proxy::compression::CompressionAlgorithm::Lz4)
+        {
+            Ok(c) => c.data,
+            Err(e) => return TestResult::error(format!("compress_with_algorithm failed: {}", e)),
         };
 
         let decompressed = match handler.decompress_data(&compressed) {
@@ -73,15 +82,48 @@ fn prop_lz4_roundtrip_arbitrary_bytes() {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: encode one chunk as a single LZ4 frame, alternating between the
+// two frame-producing primitives the streaming write path actually uses
+// (`disk_cache.rs::flush_batch`, per the compression-content-aware-fix
+// spec):
+//   - compressed blocks, via `compress_with_algorithm(Lz4)`, when
+//     `compression_enabled` is true for the flushed batch
+//   - stored ("store-mode") blocks, via `encode_store_mode_frame`, when
+//     `compression_enabled` is false for the flushed batch
+//
+// Real batches pick one mode for the whole flush, not per-chunk, but
+// alternating here lets a single property arbitrarily mix both frame kinds
+// in one concatenated buffer and confirm the multi-frame read loop in
+// `decompress_data` decodes both kinds transparently side by side.
+// ---------------------------------------------------------------------------
+fn encode_chunk_frame(
+    handler: &mut CompressionHandler,
+    chunk: &[u8],
+    index: usize,
+) -> Result<Vec<u8>, String> {
+    if index.is_multiple_of(2) {
+        CompressionHandler::encode_store_mode_frame(chunk).map_err(|e| e.to_string())
+    } else {
+        handler
+            .compress_with_algorithm(chunk, s3_proxy::compression::CompressionAlgorithm::Lz4)
+            .map(|c| c.data)
+            .map_err(|e| e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Property 2: Concatenated-frame round-trip (IncrementalRangeWriter framing)
 //
 // Simulates the path documented in compression-internals steering:
-//   - Each write_range_chunk produces one complete LZ4 frame via compress_always
+//   - `disk_cache.rs::flush_batch` produces one complete LZ4 frame per
+//     flushed batch, via `FrameEncoder` (compressed blocks) or
+//     `encode_store_mode_frame` (stored blocks) depending on
+//     `compression_enabled` for that batch
 //   - Frames are concatenated into a single buffer
 //   - decompress_data loops through frames until EOF
 //
 // For arbitrary Vec<u8> X and chunk count seed n_seed:
-//   concat(compress_always(chunk_i) for chunk_i in split(X)) decompresses to X
+//   concat(encode_chunk_frame(chunk_i, i) for chunk_i in split(X)) decompresses to X
 // ---------------------------------------------------------------------------
 #[test]
 fn prop_lz4_concatenated_frames_roundtrip() {
@@ -94,15 +136,16 @@ fn prop_lz4_concatenated_frames_roundtrip() {
         let n_chunks = 1 + (n_seed as usize % 8);
         let chunks = split_into_n_chunks(&data, n_chunks);
 
-        // Compress each chunk independently (one LZ4 frame per chunk)
+        // Encode each chunk independently (one LZ4 frame per chunk, alternating
+        // compressed / store-mode so the concatenated buffer mixes both kinds)
         let mut handler = CompressionHandler::new(0, true);
         let mut concatenated = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
-            match handler.compress_always(chunk) {
+            match encode_chunk_frame(&mut handler, chunk, i) {
                 Ok(frame) => concatenated.extend_from_slice(&frame),
                 Err(e) => {
                     return TestResult::error(format!(
-                        "compress_always failed on chunk {}: {}",
+                        "encode_chunk_frame failed on chunk {}: {}",
                         i, e
                     ))
                 }
@@ -141,9 +184,9 @@ fn prop_lz4_concatenated_frames_roundtrip() {
 //
 // Sizes chosen to cover:
 //   - 1 byte  : smallest possible input
-//   - 63 bytes: just below the 64-byte threshold in compress_always (wrap_in_frame path)
-//   - 64 bytes: exactly at the threshold boundary
-//   - 1024 bytes: medium, well above threshold
+//   - 63 bytes: sub-KiB, well below any batch-size boundary
+//   - 64 bytes: sub-KiB, well below any batch-size boundary
+//   - 1024 bytes: medium
 //   - 1 MiB + 1 byte: crosses the default compression_batch_size boundary
 // ---------------------------------------------------------------------------
 fn roundtrip_fixture(size: usize, label: &str) {
@@ -151,8 +194,9 @@ fn roundtrip_fixture(size: usize, label: &str) {
     let mut handler = CompressionHandler::new(0, true);
 
     let compressed = handler
-        .compress_data(&data)
-        .unwrap_or_else(|e| panic!("compress_data failed for {}: {}", label, e));
+        .compress_with_algorithm(&data, s3_proxy::compression::CompressionAlgorithm::Lz4)
+        .unwrap_or_else(|e| panic!("compress_with_algorithm failed for {}: {}", label, e))
+        .data;
 
     let decompressed = handler
         .decompress_data(&compressed)
@@ -171,10 +215,9 @@ fn concatenated_frames_fixture(size: usize, n_chunks: usize, label: &str) {
 
     let mut handler = CompressionHandler::new(0, true);
     let mut concatenated = Vec::new();
-    for chunk in &chunks {
-        let frame = handler
-            .compress_always(chunk)
-            .unwrap_or_else(|e| panic!("compress_always failed for {}: {}", label, e));
+    for (i, chunk) in chunks.iter().enumerate() {
+        let frame = encode_chunk_frame(&mut handler, chunk, i)
+            .unwrap_or_else(|e| panic!("encode_chunk_frame failed for {}: {}", label, e));
         concatenated.extend_from_slice(&frame);
     }
 

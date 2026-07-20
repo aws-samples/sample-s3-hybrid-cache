@@ -46,7 +46,6 @@ src/
 ├── lib.rs               # Library exports, module declarations
 ├── cache.rs             # Unified cache manager with part caching (3500+ lines)
 ├── cache_types.rs       # Cache data structures
-├── cache_writer.rs      # Async cache writer for streaming
 ├── disk_cache.rs        # Disk cache with streaming support
 ├── ram_cache.rs         # RAM cache with LRU/frequency-recency eviction
 ├── metadata_cache.rs    # RAM cache for NewCacheMetadata objects

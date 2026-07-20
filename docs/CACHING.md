@@ -2825,8 +2825,11 @@ compression:
   enabled: true
   threshold: 1024           # 1KB minimum
   preferred_algorithm: "lz4"
-  content_aware: true       # Skip .jpg, .mp4, .zip, etc.
 ```
+
+The built-in extension denylist (skip .jpg, .mp4, .zip, etc.) is always
+active by default; override it per key with a `cache_rules.json` rule's
+`compression_enabled` field. See [COMPRESSION.md](COMPRESSION.md).
 
 ### RAM Cache Compression Optimization
 

@@ -22,9 +22,9 @@
 //! Short version:
 //!
 //! - In-flight state lives under `{cache_dir}/mpus_in_progress/{uploadId}/`.
-//! - `cache_upload_part` must hold `upload.lock` across both the part-file
-//!   rename and the tracker update — same-part-number concurrent writes rely
-//!   on this.
+//! - The streaming part path (`open_multipart_part_sink` + its `finalize`) must
+//!   hold `upload.lock` across both the part-file rename and the tracker update
+//!   — same-part-number concurrent writes rely on this.
 //! - `finalize_multipart_upload` only retains the cache if S3 succeeded, the
 //!   request body parses, every requested part is cached locally, and every
 //!   requested ETag matches the tracker. Any miss → cleanup, no cache entry.
@@ -1210,7 +1210,7 @@ impl SignedPutHandler {
                 // the part-staging cache sink (streaming-write-path Req 6.2). This
                 // replaces the former buffer-then-forward implementation
                 // (`read_request_body_bounded` + inline `raw_request` assembly +
-                // `forward_raw_request_to_s3` + whole-buffer `cache_upload_part`):
+                // `forward_raw_request_to_s3` + a whole-buffer part cache write):
                 // the client body frames flow straight to the upstream (the awaited
                 // socket write is the primary backpressure), and the same frames are
                 // tee'd to a bounded channel feeding the incremental part-cache task.
@@ -1318,18 +1318,17 @@ impl SignedPutHandler {
         result
     }
 
-    /// Cache an upload part as a range file
-    ///
-    /// This method:
-    /// 1. Stores part data as a range file in ranges/{bucket}/{XX}/{YYY}/
-    /// 2. Updates upload.meta with part info (acquires lock first)
-    /// 3. Tracks uploadId, partNumber, size, etag
-    ///
-    /// # Requirements
-    ///
-    /// - Requirement 2.1: Store part data as range file with part number suffix
-    /// - Requirement 2.2: Track uploadId, partNumber, size, etag
-    /// - Requirement 2.5: Store each part as a separate range file
+    /// Cache an upload part as a range file. **Test-support only** (`#[cfg(test)]`):
+    /// production caches parts through the streaming part sink
+    /// (`open_multipart_part_sink` + `MultipartPartSink::finalize`), which
+    /// consults per-bucket cache rules and streams rather than buffering. This
+    /// buffered one-shot writer is retained solely as the part-population helper
+    /// for the multipart test suite (cleanup, finalize, GET-from-cache, and the
+    /// same-part-race concurrency regression); it holds `upload.lock` across the
+    /// part-file rename and the tracker update, the same correctness gate the
+    /// sink enforces. It is compiled only under `cfg(test)` and never ships in
+    /// the production binary. Spec: compression-followup-fixes Requirement 4.
+    #[cfg(test)]
     pub async fn cache_upload_part(
         &mut self,
         cache_key: &str,
@@ -1352,24 +1351,18 @@ impl SignedPutHandler {
         // Store part data in the upload-specific directory (isolated per upload_id)
         let part_file_path = multipart_dir.join(format!("part{}.bin", part_number));
 
-        // Compress the part data (no shared state touched, safe outside the lock)
-        let compression_result = self
-            .compression_handler
-            .compress_content_aware_with_metadata(data, cache_key);
+        // Compress the part data (no shared state touched, safe outside the lock).
+        let should_compress = self.compression_handler.is_compression_enabled();
+        let compression_result =
+            self.compression_handler
+                .compress_with_metadata(data, cache_key, should_compress);
 
-        // Acquire lock BEFORE writing part file and updating tracker.
-        //
-        // Holding the upload.lock across both the part-file write AND the tracker
-        // update ensures that a misbehaving or racing client which issues concurrent
-        // UploadPart requests for the same part number on the same upload_id cannot
-        // leave the on-disk bytes and the tracker's ETag out of sync. Without this,
-        // interleaved file renames and tracker updates could cause the tracker to
-        // record ETag_A while the bytes on disk are from upload B (or vice versa),
-        // producing a cache entry that deserializes fine but serves incorrect data.
+        // Acquire lock BEFORE writing part file and updating tracker, so a racing
+        // same-part-number write cannot leave the on-disk bytes out of sync with
+        // the tracker ETag (the invariant exercised by the concurrency test).
         let upload_meta_file = multipart_dir.join("upload.meta");
         let lock_file_path = multipart_dir.join("upload.lock");
 
-        // Create lock file if it doesn't exist
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1377,7 +1370,6 @@ impl SignedPutHandler {
             .open(&lock_file_path)
             .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
 
-        // Acquire exclusive lock for the full file-write + tracker-update critical section
         lock_file.lock_exclusive().map_err(|e| {
             ProxyError::CacheError(format!("Failed to acquire lock for upload.meta: {}", e))
         })?;
@@ -1390,18 +1382,9 @@ impl SignedPutHandler {
                 ProxyError::CacheError(format!("Failed to write temporary part file: {}", e))
             })?;
 
-        // Atomically rename to final location
         tokio::fs::rename(&temp_part_file_path, &part_file_path)
             .await
             .map_err(|e| ProxyError::CacheError(format!("Failed to rename part file: {}", e)))?;
-
-        debug!(
-            "Stored part {} data: {} bytes compressed to {} bytes at {:?}",
-            part_number,
-            data.len(),
-            compression_result.compressed_size,
-            part_file_path
-        );
 
         // Create part info for tracker (path is deterministic from upload_id + part_number)
         let part_info = CachedPartInfo::new(
@@ -1420,7 +1403,6 @@ impl SignedPutHandler {
                 })?;
 
             MultipartUploadTracker::from_json(&meta_content).unwrap_or_else(|_| {
-                // If parsing fails, create a new tracker
                 warn!("Failed to parse existing upload.meta, creating new tracker");
                 MultipartUploadTracker::new(upload_id.to_string(), cache_key.to_string())
             })
@@ -1428,10 +1410,8 @@ impl SignedPutHandler {
             MultipartUploadTracker::new(upload_id.to_string(), cache_key.to_string())
         };
 
-        // Add part to tracker (handles re-upload of same part number)
         tracker.add_part(part_info);
 
-        // Write updated tracker
         let tracker_json = tracker.to_json().map_err(|e| {
             ProxyError::CacheError(format!("Failed to serialize upload tracker: {}", e))
         })?;
@@ -1442,17 +1422,7 @@ impl SignedPutHandler {
                 ProxyError::CacheError(format!("Failed to write upload metadata: {}", e))
             })?;
 
-        // Release lock (automatically released when lock_file is dropped)
         drop(lock_file);
-
-        debug!(
-            "Updated upload tracker: upload_id={}, part_number={}, total_parts={}, total_size={}",
-            upload_id,
-            part_number,
-            tracker.parts.len(),
-            tracker.total_size
-        );
-
         Ok(())
     }
 
@@ -2111,18 +2081,20 @@ impl SignedPutHandler {
                 .to_string_lossy()
                 .to_string();
 
-            // Get file size for compression info (file is already compressed from cache_upload_part)
+            // Get file size for compression info (the part file was already framed
+            // by the streaming part sink when the part was uploaded)
             let compressed_size = tokio::fs::metadata(&new_range_file_path)
                 .await
                 .map(|m| m.len())
                 .unwrap_or(part_info.size);
 
-            // Create range spec using the actual compression algorithm from cache_upload_part
+            // Create range spec using the actual compression algorithm recorded
+            // for the part when it was written
             let range_spec = RangeSpec::new(
                 *start,
                 *end,
                 range_file_relative_path,
-                part_info.compression_algorithm.clone(), // Use actual algorithm from cache_upload_part
+                part_info.compression_algorithm.clone(), // actual algorithm recorded at part write
                 compressed_size,
                 part_info.size,
             );
@@ -3133,9 +3105,8 @@ impl SignedPutHandler {
     /// Both `None` means no caching for this part — the body still streams to the
     /// upstream verbatim (Req 7.2). Caching is skipped (no tee) when there is no
     /// cache manager or the part sink cannot be opened. Unlike the single-part PUT
-    /// sink, a part is not pre-sized and not write-cache-capacity-reserved (matching
-    /// [`Self::cache_upload_part`]); the handler's `should_cache` decision already
-    /// gated this call.
+    /// sink, a part is not pre-sized and not write-cache-capacity-reserved; the
+    /// handler's `should_cache` decision already gated this call.
     async fn setup_upload_part_cache_tee(
         &self,
         cache_key: &str,
@@ -3759,7 +3730,9 @@ mod tests {
     ///
     /// Uses two separate SignedPutHandler instances pointing at the same cache
     /// dir — the same shape as two proxy instances sharing an EFS volume, which
-    /// is where this race would realistically surface.
+    /// is where this race would realistically surface. The buffered
+    /// `cache_upload_part` helper drives the same `upload.lock` critical section
+    /// that the production streaming part sink's `finalize` uses.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_cache_upload_part_concurrent_same_part_keeps_file_and_tracker_consistent() {
         let temp_dir = TempDir::new().unwrap();

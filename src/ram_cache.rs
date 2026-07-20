@@ -8,14 +8,12 @@
 
 use crate::cache::{CacheEvictionAlgorithm, RamCacheEntry, RamCacheRead};
 use crate::cache_types::CacheMetadata;
-use crate::compression::CompressionHandler;
-use crate::{ProxyError, Result};
+use crate::Result;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Compute the shard index for a cache key.
 ///
@@ -30,8 +28,8 @@ pub fn shard_index(cache_key: &str, shard_count: usize) -> usize {
 
 /// Per-shard eviction state: holds all LRU/TinyLFU counters for one shard.
 ///
-/// Extracted from `RamCache` so each `RamCacheShard` owns an independent copy
-/// of the eviction bookkeeping with no sharing between shards.
+/// Each `RamCacheShard` owns an independent copy of the eviction bookkeeping
+/// with no sharing between shards.
 pub(crate) struct EvictionState {
     /// Which algorithm this shard uses.
     pub eviction_algorithm: CacheEvictionAlgorithm,
@@ -69,7 +67,7 @@ impl EvictionState {
 ///
 /// Fields:
 /// - `data` — the cache entries stored in this shard.
-/// - `eviction` — per-shard LRU/TinyLFU counters (extracted from `RamCache`).
+/// - `eviction` — per-shard LRU/TinyLFU counters.
 /// - `current_size` — sum of entry sizes currently stored (bytes).
 /// - `capacity` — maximum bytes this shard may hold (= total_capacity / shard_count).
 /// - `pending_accesses` — deferred-reorder buffer: keys pushed here by `get()`
@@ -86,13 +84,18 @@ pub(crate) struct RamCacheShard {
     pub capacity: usize,
     /// Deferred access-reorder buffer drained by the next `put()` write lock.
     pub pending_accesses: Vec<String>,
+    /// Number of entries evicted from this shard under capacity pressure.
+    /// Incremented under the write lock in `put()`; read under the read lock
+    /// in `stats()`. Spec: compression-followup-fixes Requirement 3.
+    pub eviction_count: u64,
+    /// Unix-millis timestamp of the most recent eviction (`0` = never evicted).
+    pub last_eviction_ms: u64,
 }
 
 impl RamCacheShard {
     /// Create a new, empty shard with the given capacity and eviction algorithm.
     pub fn new(capacity: usize, eviction_algorithm: CacheEvictionAlgorithm) -> Self {
-        // Use the same window-size heuristic as RamCache::new: capacity in KiB,
-        // capped at 10 000 entries.
+        // Window-size heuristic: capacity in KiB, capped at 10 000 entries.
         let tinylfu_window_size = (capacity / 1024).min(10_000);
         Self {
             data: HashMap::new(),
@@ -100,6 +103,8 @@ impl RamCacheShard {
             current_size: 0,
             capacity,
             pending_accesses: Vec::new(),
+            eviction_count: 0,
+            last_eviction_ms: 0,
         }
     }
 }
@@ -322,6 +327,14 @@ impl ShardedRamCache {
                     let evicted_size = shard_calculate_entry_size(&evicted);
                     guard.current_size = guard.current_size.saturating_sub(evicted_size);
                     shard_remove_from_tracking(&mut guard, &victim_key);
+                    // Track eviction for observability (Spec:
+                    // compression-followup-fixes Requirement 3). Under the
+                    // write lock, so plain-field updates are race-free.
+                    guard.eviction_count += 1;
+                    guard.last_eviction_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
                     debug!(
                         "ShardedRamCache evicted key {} ({} bytes) from shard {}",
                         victim_key, evicted_size, idx
@@ -428,13 +441,14 @@ impl ShardedRamCache {
 
     /// Return aggregate statistics for the whole sharded cache.
     ///
-    /// Hit/miss counts are read from atomics (no lock needed).  Entry count
-    /// and `current_size` are aggregated by iterating all shards under shared
-    /// read locks.  `eviction_count` and `last_eviction` are not tracked at
-    /// the shard level and are returned as `0` / `None`.  The
-    /// `eviction_algorithm` is read from the first shard.
+    /// Hit/miss counts are read from atomics (no lock needed).  Entry count,
+    /// `current_size`, `eviction_count`, and `last_eviction` are aggregated by
+    /// iterating all shards under shared read locks: eviction counts are summed
+    /// and the most recent per-shard eviction timestamp is returned (`None` if
+    /// nothing has been evicted).  The `eviction_algorithm` is read from the
+    /// first shard.
     ///
-    /// _Requirements: 1.1_
+    /// _Requirements: 1.1; compression-followup-fixes Req 3_
     pub async fn stats(&self) -> RamCacheStats {
         let hit_count = self.hit_count.load(Ordering::Relaxed);
         let miss_count = self.miss_count.load(Ordering::Relaxed);
@@ -450,16 +464,26 @@ impl ShardedRamCache {
 
         let mut current_size: u64 = 0;
         let mut entries_count: u64 = 0;
+        let mut eviction_count: u64 = 0;
+        let mut last_eviction_ms: u64 = 0;
         let mut eviction_algorithm = CacheEvictionAlgorithm::LRU;
 
         for (i, shard_lock) in self.shards.iter().enumerate() {
             let guard = shard_lock.read().await;
             current_size += guard.current_size as u64;
             entries_count += guard.data.len() as u64;
+            eviction_count += guard.eviction_count;
+            last_eviction_ms = last_eviction_ms.max(guard.last_eviction_ms);
             if i == 0 {
                 eviction_algorithm = guard.eviction.eviction_algorithm.clone();
             }
         }
+
+        let last_eviction = if last_eviction_ms == 0 {
+            None
+        } else {
+            Some(UNIX_EPOCH + std::time::Duration::from_millis(last_eviction_ms))
+        };
 
         RamCacheStats {
             current_size,
@@ -468,8 +492,8 @@ impl ShardedRamCache {
             hit_count,
             miss_count,
             hit_rate,
-            eviction_count: 0,
-            last_eviction: None,
+            eviction_count,
+            last_eviction,
             eviction_algorithm,
         }
     }
@@ -598,534 +622,6 @@ fn shard_find_tinylfu_victim(shard: &RamCacheShard) -> Option<String> {
         .map(|(key, _)| key.clone())
 }
 
-// ---------------------------------------------------------------------------
-
-/// RAM cache manager with configurable eviction algorithms
-pub struct RamCache {
-    /// Maximum size in bytes
-    pub max_size: u64,
-    /// Current size in bytes
-    pub current_size: u64,
-    /// Eviction algorithm to use
-    eviction_algorithm: CacheEvictionAlgorithm,
-    /// Cache entries storage
-    pub entries: HashMap<String, RamCacheEntry>,
-    /// LRU tracking (for LRU algorithm)
-    lru_order: VecDeque<String>,
-    /// TinyLFU window and frequency estimator (for TinyLFU algorithm)
-    tinylfu_window: VecDeque<String>,
-    tinylfu_frequencies: HashMap<String, u64>,
-    tinylfu_window_size: usize,
-    /// Statistics
-    hit_count: u64,
-    miss_count: u64,
-    eviction_count: u64,
-    last_eviction: Option<SystemTime>,
-}
-
-impl RamCache {
-    /// Create a new RAM cache with specified size and eviction algorithm
-    pub fn new(max_size: u64, eviction_algorithm: CacheEvictionAlgorithm) -> Self {
-        let tinylfu_window_size = (max_size / 1024).min(10000) as usize; // Reasonable window size
-
-        Self {
-            max_size,
-            current_size: 0,
-            eviction_algorithm,
-            entries: HashMap::new(),
-            lru_order: VecDeque::new(),
-            tinylfu_window: VecDeque::new(),
-            tinylfu_frequencies: HashMap::new(),
-            tinylfu_window_size,
-            hit_count: 0,
-            miss_count: 0,
-            eviction_count: 0,
-            last_eviction: None,
-        }
-    }
-
-    /// Create a new RAM cache with custom configuration
-    /// Note: flush_interval, flush_threshold, flush_on_eviction, and verification_interval
-    /// parameters are kept for API compatibility but are no longer used.
-    /// Access tracking is now handled by the journal system at the DiskCacheManager level.
-    pub fn new_with_config(
-        max_size: u64,
-        eviction_algorithm: CacheEvictionAlgorithm,
-        _flush_interval: Duration,
-        _flush_threshold: usize,
-        _flush_on_eviction: bool,
-        _verification_interval: Duration,
-    ) -> Self {
-        Self::new(max_size, eviction_algorithm)
-    }
-
-    /// Get an entry from the RAM cache
-    pub fn get(&mut self, cache_key: &str) -> Option<RamCacheRead> {
-        if !self.entries.contains_key(cache_key) {
-            self.miss_count += 1;
-            debug!("RAM cache miss for key: {}", cache_key);
-            return None;
-        }
-
-        // Update eviction tracking (LRU order / TinyLFU frequencies)
-        self.update_access_tracking(cache_key);
-
-        // Update access metadata via atomics and build a lightweight RamCacheRead
-        let entry = self.entries.get(cache_key).unwrap();
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        entry.last_accessed.store(now_ms, Ordering::Relaxed);
-        entry.access_count.fetch_add(1, Ordering::Relaxed);
-
-        let result = RamCacheRead {
-            data: entry.data.clone(),
-            metadata: entry.metadata.clone(),
-            compressed: entry.compressed,
-            compression_algorithm: entry.compression_algorithm.clone(),
-        };
-
-        self.hit_count += 1;
-        debug!("RAM cache hit for key: {}", cache_key);
-        Some(result)
-    }
-
-    /// Check if a key exists in the RAM cache without updating access tracking
-    pub fn contains(&self, cache_key: &str) -> bool {
-        self.entries.contains_key(cache_key)
-    }
-
-    /// Store an entry in the RAM cache
-    /// Optimized to avoid decompress/recompress cycles when data is already compressed
-    pub fn put(
-        &mut self,
-        entry: RamCacheEntry,
-        compression_handler: &mut CompressionHandler,
-    ) -> Result<()> {
-        let cache_key = entry.cache_key.clone();
-
-        // Handle compression based on current state of the entry
-        let final_entry = if entry.compressed {
-            // Entry is already compressed (from disk cache), use it as-is
-            debug!(
-                "Using pre-compressed data for RAM cache entry: {} (algorithm: {:?})",
-                cache_key, entry.compression_algorithm
-            );
-            entry
-        } else {
-            // Entry is uncompressed, always compress for RAM efficiency
-            let mut compressed_entry = entry;
-            match compression_handler.compress_always(&compressed_entry.data) {
-                Ok(compressed_data) => {
-                    compressed_entry.data = Arc::new(bytes::Bytes::from(compressed_data));
-                    compressed_entry.compressed = true;
-                    compressed_entry.compression_algorithm =
-                        compression_handler.get_preferred_algorithm().clone();
-                }
-                Err(e) => {
-                    debug!("RAM cache compression failed, storing uncompressed: {}", e);
-                    // Keep original data, compressed = false
-                }
-            }
-            compressed_entry
-        };
-
-        let final_entry_size = self.calculate_entry_size(&final_entry);
-
-        // Check if we need to make space (use final compressed size for eviction decisions)
-        while self.current_size + final_entry_size > self.max_size && !self.entries.is_empty() {
-            self.evict_entry()?;
-        }
-
-        // Size check AFTER compression - this fixes the original warning issue
-        if final_entry_size > self.max_size {
-            warn!("Entry {} too large for RAM cache ({} bytes > {} bytes max) even after compression (algorithm: {:?})", 
-                  cache_key, final_entry_size, self.max_size, final_entry.compression_algorithm);
-            return Ok(());
-        }
-
-        // Remove existing entry if present
-        if let Some(existing_entry) = self.entries.remove(&cache_key) {
-            let existing_size = self.calculate_entry_size(&existing_entry);
-            self.current_size = self.current_size.saturating_sub(existing_size);
-            self.remove_from_tracking(&cache_key);
-        }
-
-        // Capture values for logging before moving the entry
-        let is_compressed = final_entry.compressed;
-        let compression_algorithm = final_entry.compression_algorithm.clone();
-
-        // Add new entry
-        self.entries.insert(cache_key.clone(), final_entry);
-        self.current_size += final_entry_size;
-
-        // Update tracking structures
-        self.add_to_tracking(&cache_key);
-
-        debug!(
-            "Stored entry in RAM cache: {} ({} bytes, compressed: {}, algorithm: {:?})",
-            cache_key, final_entry_size, is_compressed, compression_algorithm
-        );
-        Ok(())
-    }
-
-    /// Remove an entry from the RAM cache
-    pub fn remove(&mut self, cache_key: &str) -> Option<RamCacheEntry> {
-        if let Some(entry) = self.entries.remove(cache_key) {
-            let entry_size = self.calculate_entry_size(&entry);
-            self.current_size = self.current_size.saturating_sub(entry_size);
-            self.remove_from_tracking(cache_key);
-            debug!("Removed entry from RAM cache: {}", cache_key);
-            Some(entry)
-        } else {
-            None
-        }
-    }
-
-    /// Clear all entries from the RAM cache
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.lru_order.clear();
-        self.tinylfu_window.clear();
-        self.tinylfu_frequencies.clear();
-        self.current_size = 0;
-        info!("Cleared all entries from RAM cache");
-    }
-
-    /// Get current cache statistics
-    pub fn get_stats(&self) -> RamCacheStats {
-        let total_requests = self.hit_count + self.miss_count;
-        let hit_rate = if total_requests > 0 {
-            self.hit_count as f32 / total_requests as f32
-        } else {
-            0.0
-        };
-
-        RamCacheStats {
-            current_size: self.current_size,
-            max_size: self.max_size,
-            entries_count: self.entries.len() as u64,
-            hit_count: self.hit_count,
-            miss_count: self.miss_count,
-            hit_rate,
-            eviction_count: self.eviction_count,
-            last_eviction: self.last_eviction,
-            eviction_algorithm: self.eviction_algorithm.clone(),
-        }
-    }
-
-    /// Check if cache is enabled and has capacity
-    pub fn is_enabled(&self) -> bool {
-        self.max_size > 0
-    }
-
-    /// Get current size utilization as percentage
-    pub fn get_utilization(&self) -> f32 {
-        if self.max_size > 0 {
-            (self.current_size as f32 / self.max_size as f32) * 100.0
-        } else {
-            0.0
-        }
-    }
-
-    /// Evict an entry based on the configured algorithm
-    ///
-    /// NOTE: Per design, eviction does NOT flush pending updates to disk.
-    /// This avoids blocking eviction operations with disk I/O.
-    /// Access tracking is now handled by the journal system at the DiskCacheManager level.
-    pub fn evict_entry(&mut self) -> Result<()> {
-        let key_to_evict = match self.eviction_algorithm {
-            CacheEvictionAlgorithm::LRU => self.find_lru_victim(),
-            CacheEvictionAlgorithm::TinyLFU => self.find_tinylfu_victim(),
-        };
-
-        if let Some(key) = key_to_evict {
-            if let Some(entry) = self.entries.remove(&key) {
-                let entry_size = self.calculate_entry_size(&entry);
-                self.current_size = self.current_size.saturating_sub(entry_size);
-                self.remove_from_tracking(&key);
-                self.eviction_count += 1;
-                self.last_eviction = Some(SystemTime::now());
-
-                debug!(
-                    "Evicted entry from RAM cache using {:?}: {} ({} bytes)",
-                    self.eviction_algorithm, key, entry_size
-                );
-                return Ok(());
-            }
-        }
-
-        Err(ProxyError::CacheError(
-            "No entries available for eviction".to_string(),
-        ))
-    }
-
-    /// Find LRU victim for eviction
-    fn find_lru_victim(&self) -> Option<String> {
-        self.lru_order.front().cloned()
-    }
-
-    /// Find TinyLFU victim for eviction
-    fn find_tinylfu_victim(&self) -> Option<String> {
-        // TinyLFU combines frequency and recency
-        // For simplicity, we'll use a weighted approach: frequency * recency_factor
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        self.entries
-            .iter()
-            .min_by_key(|(key, entry)| {
-                let frequency = self.tinylfu_frequencies.get(*key).unwrap_or(&1);
-                let last_accessed_ms = entry.last_accessed.load(Ordering::Relaxed);
-                let age_secs = now_ms.saturating_sub(last_accessed_ms) / 1000;
-                let recency_factor = age_secs.max(1); // Avoid division by zero
-
-                // Lower score = better eviction candidate
-                frequency * 1000 / recency_factor // Scale frequency to balance with recency
-            })
-            .map(|(key, _)| key.clone())
-    }
-
-    /// Update access tracking based on eviction algorithm
-    fn update_access_tracking(&mut self, cache_key: &str) {
-        match self.eviction_algorithm {
-            CacheEvictionAlgorithm::LRU => {
-                // Move to back of LRU queue
-                if let Some(pos) = self.lru_order.iter().position(|k| k == cache_key) {
-                    self.lru_order.remove(pos);
-                }
-                self.lru_order.push_back(cache_key.to_string());
-            }
-            CacheEvictionAlgorithm::TinyLFU => {
-                // Update TinyLFU window and frequencies
-                self.tinylfu_window.push_back(cache_key.to_string());
-                *self
-                    .tinylfu_frequencies
-                    .entry(cache_key.to_string())
-                    .or_insert(0) += 1;
-
-                // Maintain window size
-                if self.tinylfu_window.len() > self.tinylfu_window_size {
-                    if let Some(old_key) = self.tinylfu_window.pop_front() {
-                        // Decay frequency for evicted window entry
-                        if let Some(freq) = self.tinylfu_frequencies.get_mut(&old_key) {
-                            *freq = (*freq).saturating_sub(1);
-                            if *freq == 0 {
-                                self.tinylfu_frequencies.remove(&old_key);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Add entry to tracking structures
-    fn add_to_tracking(&mut self, cache_key: &str) {
-        match self.eviction_algorithm {
-            CacheEvictionAlgorithm::LRU => {
-                self.lru_order.push_back(cache_key.to_string());
-            }
-            CacheEvictionAlgorithm::TinyLFU => {
-                self.tinylfu_window.push_back(cache_key.to_string());
-                self.tinylfu_frequencies.insert(cache_key.to_string(), 1);
-
-                // Maintain window size
-                if self.tinylfu_window.len() > self.tinylfu_window_size {
-                    if let Some(old_key) = self.tinylfu_window.pop_front() {
-                        if let Some(freq) = self.tinylfu_frequencies.get_mut(&old_key) {
-                            *freq = (*freq).saturating_sub(1);
-                            if *freq == 0 {
-                                self.tinylfu_frequencies.remove(&old_key);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Remove entry from tracking structures
-    fn remove_from_tracking(&mut self, cache_key: &str) {
-        match self.eviction_algorithm {
-            CacheEvictionAlgorithm::LRU => {
-                if let Some(pos) = self.lru_order.iter().position(|k| k == cache_key) {
-                    self.lru_order.remove(pos);
-                }
-            }
-            CacheEvictionAlgorithm::TinyLFU => {
-                // Remove from window if present
-                if let Some(pos) = self.tinylfu_window.iter().position(|k| k == cache_key) {
-                    self.tinylfu_window.remove(pos);
-                }
-                // Keep frequency data for potential re-insertion
-            }
-        }
-    }
-
-    /// Calculate the size of a RAM cache entry
-    fn calculate_entry_size(&self, entry: &RamCacheEntry) -> u64 {
-        let base_size = std::mem::size_of::<RamCacheEntry>() as u64;
-        let key_size = entry.cache_key.len() as u64;
-        let data_size = entry.data.len() as u64;
-        let metadata_size = std::mem::size_of::<CacheMetadata>() as u64;
-
-        base_size + key_size + data_size + metadata_size
-    }
-
-    /// Parse a range cache key to extract base key, start, and end
-    ///
-    /// Cache keys for ranges are in format: "path:range:start:end"
-    /// Returns (base_key, start, end) if successful
-    pub fn parse_range_cache_key(cache_key: &str) -> Option<(String, u64, u64)> {
-        let parts: Vec<&str> = cache_key.split(':').collect();
-        if parts.len() >= 4 && parts[parts.len() - 3] == "range" {
-            let start = parts[parts.len() - 2].parse::<u64>().ok()?;
-            let end = parts[parts.len() - 1].parse::<u64>().ok()?;
-            // Base key is everything before ":range:start:end"
-            let base_key = parts[..parts.len() - 3].join(":");
-            Some((base_key, start, end))
-        } else {
-            None
-        }
-    }
-    /// Record a RAM cache access for disk metadata update
-    ///
-    /// Note: This is now a no-op. Access tracking is handled by the journal system
-    /// at the DiskCacheManager level via record_range_access().
-    /// This method is kept for API compatibility.
-    pub fn record_disk_access(&mut self, _cache_key: &str) {
-        // No-op: Access tracking is now handled by the journal system
-        // at the DiskCacheManager level via CacheHitUpdateBuffer
-    }
-    /// Get the number of pending disk updates
-    /// Note: Always returns 0 as access tracking is now handled by journal system
-    pub fn pending_disk_updates(&self) -> usize {
-        0
-    }
-
-    /// Find expired entries for TTL-aware eviction
-    /// Note: GET entries (RamCacheEntry) don't have expires_at field
-    /// Their expiration is handled at the cache manager level
-    pub fn find_expired_entries(&self) -> Vec<String> {
-        // GET entries don't have expires_at, so return empty
-        Vec::new()
-    }
-
-    /// Evict expired entries and return count of evicted entries
-    pub fn evict_expired_entries(&mut self) -> Result<u64> {
-        let expired_keys = self.find_expired_entries();
-        let mut evicted_count = 0u64;
-
-        for key in expired_keys {
-            if let Some(entry) = self.entries.remove(&key) {
-                let entry_size = self.calculate_entry_size(&entry);
-                self.current_size = self.current_size.saturating_sub(entry_size);
-                self.remove_from_tracking(&key);
-                evicted_count += 1;
-                debug!("Evicted expired entry: {}", key);
-            }
-        }
-
-        if evicted_count > 0 {
-            self.eviction_count += evicted_count;
-            self.last_eviction = Some(SystemTime::now());
-            debug!("Evicted {} expired entries from RAM cache", evicted_count);
-        }
-
-        Ok(evicted_count)
-    }
-    /// Invalidate an entry from the cache
-    pub fn invalidate_entry(&mut self, cache_key: &str) -> Result<()> {
-        if let Some(entry) = self.entries.remove(cache_key) {
-            let entry_size = self.calculate_entry_size(&entry);
-            self.current_size = self.current_size.saturating_sub(entry_size);
-            self.remove_from_tracking(cache_key);
-            debug!("Invalidated entry from RAM cache: {}", cache_key);
-        } else {
-            debug!("Entry not found for invalidation: {}", cache_key);
-        }
-
-        Ok(())
-    }
-
-    /// Invalidate all entries whose key starts with the given prefix.
-    /// Used to remove all cached range data for an object when it is overwritten.
-    pub fn invalidate_by_prefix(&mut self, prefix: &str) -> Result<usize> {
-        let keys_to_remove: Vec<String> = self
-            .entries
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        let count = keys_to_remove.len();
-        for key in &keys_to_remove {
-            if let Some(entry) = self.entries.remove(key) {
-                let entry_size = self.calculate_entry_size(&entry);
-                self.current_size = self.current_size.saturating_sub(entry_size);
-                self.remove_from_tracking(key);
-            }
-        }
-        if count > 0 {
-            debug!(
-                "Invalidated {} RAM cache entries with prefix: {}",
-                count, prefix
-            );
-        }
-        Ok(count)
-    }
-
-    /// Get detailed cache information for debugging
-    pub fn get_debug_info(&self) -> RamCacheDebugInfo {
-        RamCacheDebugInfo {
-            entries: self.entries.keys().cloned().collect(),
-            lru_order: self.lru_order.clone().into(),
-            tinylfu_window: self.tinylfu_window.clone().into(),
-            tinylfu_frequencies: self.tinylfu_frequencies.clone(),
-        }
-    }
-
-    /// Validate cache consistency (for testing)
-    pub fn validate_consistency(&self) -> Result<()> {
-        // Check that all entries in tracking structures exist in main storage
-        match self.eviction_algorithm {
-            CacheEvictionAlgorithm::LRU => {
-                for key in &self.lru_order {
-                    if !self.entries.contains_key(key) {
-                        return Err(ProxyError::CacheError(format!(
-                            "LRU tracking contains non-existent key: {}",
-                            key
-                        )));
-                    }
-                }
-            }
-            CacheEvictionAlgorithm::TinyLFU => {
-                // TinyLFU may contain keys not in main storage (due to window behavior)
-                // This is normal and expected
-            }
-        }
-
-        // Check that current_size matches actual size
-        let calculated_size: u64 = self
-            .entries
-            .values()
-            .map(|entry| self.calculate_entry_size(entry))
-            .sum();
-
-        if calculated_size != self.current_size {
-            return Err(ProxyError::CacheError(format!(
-                "Size mismatch: calculated {} vs tracked {}",
-                calculated_size, self.current_size
-            )));
-        }
-
-        Ok(())
-    }
-}
-
 /// RAM cache statistics
 #[derive(Debug, Clone)]
 pub struct RamCacheStats {
@@ -1138,408 +634,6 @@ pub struct RamCacheStats {
     pub eviction_count: u64,
     pub last_eviction: Option<SystemTime>,
     pub eviction_algorithm: CacheEvictionAlgorithm,
-}
-
-/// RAM cache debug information
-#[derive(Debug, Clone)]
-pub struct RamCacheDebugInfo {
-    pub entries: Vec<String>,
-    pub lru_order: Vec<String>,
-    pub tinylfu_window: Vec<String>,
-    pub tinylfu_frequencies: HashMap<String, u64>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::compression::CompressionHandler;
-
-    pub(super) fn create_test_entry(key: &str, data: &[u8]) -> RamCacheEntry {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        RamCacheEntry {
-            cache_key: key.to_string(),
-            data: Arc::new(bytes::Bytes::from(data.to_vec())),
-            metadata: CacheMetadata {
-                etag: "test-etag".to_string(),
-                last_modified: "test-modified".to_string(),
-                content_length: data.len() as u64,
-                part_number: None,
-                cache_control: None,
-                access_count: 0,
-                last_accessed: SystemTime::now(),
-            },
-            created_at: SystemTime::now(),
-            last_accessed: AtomicU64::new(now_ms),
-            access_count: AtomicU64::new(0),
-            compressed: false,
-            compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
-        }
-    }
-
-    #[test]
-    fn test_ram_cache_basic_operations() {
-        let mut cache = RamCache::new(1024, CacheEvictionAlgorithm::LRU);
-        let mut compression_handler = CompressionHandler::new(100, true);
-
-        // Test put and get
-        let entry = create_test_entry("test:key1", b"test data");
-        cache.put(entry, &mut compression_handler).unwrap();
-
-        let retrieved = cache.get("test:key1").unwrap();
-        // RamCacheRead has metadata.etag rather than cache_key
-        assert_eq!(retrieved.metadata.etag, "test-etag");
-
-        // Test miss
-        assert!(cache.get("nonexistent").is_none());
-
-        // Test remove
-        let removed = cache.remove("test:key1").unwrap();
-        assert_eq!(removed.cache_key, "test:key1");
-        assert!(cache.get("test:key1").is_none());
-    }
-
-    #[test]
-    fn test_lru_eviction() {
-        let mut cache = RamCache::new(800, CacheEvictionAlgorithm::LRU); // Size that allows 2 entries
-        let mut compression_handler = CompressionHandler::new(1000, false); // Disable compression for predictable sizes
-
-        // Add entries that will exceed cache size
-        let entry1 = create_test_entry("test:key1", &[b'A'; 50]);
-        let entry2 = create_test_entry("test:key2", &[b'B'; 50]);
-        let entry3 = create_test_entry("test:key3", &[b'C'; 50]);
-
-        cache.put(entry1, &mut compression_handler).unwrap();
-        cache.put(entry2, &mut compression_handler).unwrap();
-
-        // Access key1 to make it recently used
-        cache.get("test:key1");
-
-        // Add key3, should evict key2 (least recently used)
-        cache.put(entry3, &mut compression_handler).unwrap();
-
-        // key1 should still be there (recently used)
-        assert!(cache.get("test:key1").is_some());
-        // key2 should be evicted (least recently used)
-        assert!(cache.get("test:key2").is_none());
-        // key3 should be there (newly added)
-        assert!(cache.get("test:key3").is_some());
-    }
-
-    #[test]
-    fn test_tinylfu_eviction() {
-        let mut cache = RamCache::new(200, CacheEvictionAlgorithm::TinyLFU);
-        let mut compression_handler = CompressionHandler::new(100, false);
-
-        let entry1 = create_test_entry("test:key1", &[b'A'; 50]);
-        let entry2 = create_test_entry("test:key2", &[b'B'; 50]);
-        let entry3 = create_test_entry("test:key3", &[b'C'; 50]);
-        let entry4 = create_test_entry("test:key4", &[b'D'; 50]);
-
-        cache.put(entry1, &mut compression_handler).unwrap();
-        cache.put(entry2, &mut compression_handler).unwrap();
-        cache.put(entry3, &mut compression_handler).unwrap();
-
-        // Access patterns to establish frequency and recency
-        cache.get("test:key1");
-        cache.get("test:key1");
-
-        // Sleep to make key2 less recent (in real scenario)
-        // For test, we'll just access key3 to make it more recent
-        cache.get("test:key3");
-
-        // Add key4, TinyLFU should evict based on frequency and recency
-        cache.put(entry4, &mut compression_handler).unwrap();
-
-        // At least one entry should be evicted
-        let remaining_count = [
-            cache.get("test:key1").is_some(),
-            cache.get("test:key2").is_some(),
-            cache.get("test:key3").is_some(),
-            cache.get("test:key4").is_some(),
-        ]
-        .iter()
-        .filter(|&&x| x)
-        .count();
-
-        assert!(remaining_count <= 3); // At least one should be evicted
-    }
-
-    #[test]
-    fn test_cache_statistics() {
-        let mut cache = RamCache::new(1024, CacheEvictionAlgorithm::LRU);
-        let mut compression_handler = CompressionHandler::new(100, true);
-
-        let initial_stats = cache.get_stats();
-        assert_eq!(initial_stats.hit_count, 0);
-        assert_eq!(initial_stats.miss_count, 0);
-        assert_eq!(initial_stats.entries_count, 0);
-
-        // Add an entry
-        let entry = create_test_entry("test:key1", b"test data");
-        cache.put(entry, &mut compression_handler).unwrap();
-
-        let stats_after_put = cache.get_stats();
-        assert_eq!(stats_after_put.entries_count, 1);
-        assert!(stats_after_put.current_size > 0);
-
-        // Test hit
-        cache.get("test:key1");
-        let stats_after_hit = cache.get_stats();
-        assert_eq!(stats_after_hit.hit_count, 1);
-        assert_eq!(stats_after_hit.miss_count, 0);
-
-        // Test miss
-        cache.get("nonexistent");
-        let stats_after_miss = cache.get_stats();
-        assert_eq!(stats_after_miss.hit_count, 1);
-        assert_eq!(stats_after_miss.miss_count, 1);
-        assert_eq!(stats_after_miss.hit_rate, 0.5);
-    }
-
-    #[test]
-    fn test_cache_clear() {
-        let mut cache = RamCache::new(1024, CacheEvictionAlgorithm::LRU);
-        let mut compression_handler = CompressionHandler::new(100, true);
-
-        // Add some entries
-        let entry1 = create_test_entry("test:key1", b"data1");
-        let entry2 = create_test_entry("test:key2", b"data2");
-        cache.put(entry1, &mut compression_handler).unwrap();
-        cache.put(entry2, &mut compression_handler).unwrap();
-
-        assert_eq!(cache.get_stats().entries_count, 2);
-
-        // Clear cache
-        cache.clear();
-
-        let stats = cache.get_stats();
-        assert_eq!(stats.entries_count, 0);
-        assert_eq!(stats.current_size, 0);
-        assert!(cache.get("test:key1").is_none());
-        assert!(cache.get("test:key2").is_none());
-    }
-
-    #[test]
-    fn test_cache_utilization() {
-        let mut cache = RamCache::new(1000, CacheEvictionAlgorithm::LRU);
-        let mut compression_handler = CompressionHandler::new(100, false);
-
-        assert_eq!(cache.get_utilization(), 0.0);
-
-        // Add entry that uses about 10% of cache
-        let entry = create_test_entry("test:key1", &[b'A'; 50]); // Plus metadata overhead
-        cache.put(entry, &mut compression_handler).unwrap();
-
-        let utilization = cache.get_utilization();
-        assert!(utilization > 0.0);
-        assert!(utilization < 100.0);
-    }
-
-    #[test]
-    fn test_cache_consistency_validation() {
-        let mut cache = RamCache::new(1024, CacheEvictionAlgorithm::LRU);
-        let mut compression_handler = CompressionHandler::new(100, true);
-
-        // Add some entries
-        let entry1 = create_test_entry("test:key1", b"data1");
-        let entry2 = create_test_entry("test:key2", b"data2");
-        cache.put(entry1, &mut compression_handler).unwrap();
-        cache.put(entry2, &mut compression_handler).unwrap();
-
-        // Cache should be consistent
-        assert!(cache.validate_consistency().is_ok());
-
-        // Access entries to update tracking
-        cache.get("test:key1");
-        cache.get("test:key2");
-
-        // Should still be consistent
-        assert!(cache.validate_consistency().is_ok());
-    }
-
-    #[test]
-    fn test_compression_integration() {
-        let mut cache = RamCache::new(2048, CacheEvictionAlgorithm::LRU); // Larger cache
-        let mut compression_handler = CompressionHandler::new(10, true); // Low threshold
-
-        // Create entry with compressible data
-        let compressible_data =
-            "This is some test data that should compress well because it has repetitive content. "
-                .repeat(5);
-        let entry = create_test_entry("test:file.txt", compressible_data.as_bytes());
-
-        cache.put(entry, &mut compression_handler).unwrap();
-
-        // Verify the entry was stored and can be retrieved
-        assert!(cache.entries.contains_key("test:file.txt"));
-
-        if let Some(retrieved) = cache.get("test:file.txt") {
-            // RamCacheRead has metadata, not cache_key
-            assert_eq!(retrieved.metadata.etag, "test-etag");
-            // The entry should have been compressed during storage
-            assert!(retrieved.compressed || !compression_handler.is_compression_enabled());
-        } else {
-            panic!("Entry should be retrievable after putting it in cache");
-        }
-    }
-
-    #[test]
-    fn test_invalidation() {
-        let mut cache = RamCache::new(1024, CacheEvictionAlgorithm::LRU);
-        let mut compression_handler = CompressionHandler::new(100, true);
-
-        // Add entry
-        let entry = create_test_entry("test:key", b"test data");
-        cache.put(entry, &mut compression_handler).unwrap();
-
-        // Verify entry exists
-        assert!(cache.get("test:key").is_some());
-
-        // Invalidate the key
-        cache.invalidate_entry("test:key").unwrap();
-
-        // Entry should be removed
-        assert!(cache.get("test:key").is_none());
-    }
-}
-
-// Property-Based Tests for Eviction Behavior
-
-#[cfg(test)]
-mod eviction_property_tests {
-    use super::*;
-    use crate::ram_cache::tests::create_test_entry;
-    use quickcheck::TestResult;
-    use quickcheck_macros::quickcheck;
-
-    /// Test that eviction works correctly with LRU algorithm
-    #[test]
-    fn test_lru_eviction() {
-        let mut cache = RamCache::new(
-            500, // Small cache to force eviction
-            CacheEvictionAlgorithm::LRU,
-        );
-        let mut compression_handler = CompressionHandler::new(1000, false);
-
-        // Add entries to fill cache
-        let entry1 = create_test_entry("test:object1:range:0:1000", &[b'A'; 50]);
-        let entry2 = create_test_entry("test:object2:range:0:1000", &[b'B'; 50]);
-
-        cache.put(entry1, &mut compression_handler).unwrap();
-        cache.put(entry2, &mut compression_handler).unwrap();
-
-        // Add entry3 to force eviction of entry1 (LRU)
-        let entry3 = create_test_entry("test:object3:range:0:1000", &[b'C'; 50]);
-        cache.put(entry3, &mut compression_handler).unwrap();
-
-        // Verify eviction occurred - entry1 should be evicted (LRU)
-        // Note: exact eviction depends on cache size calculations
-        let _stats = cache.get_stats();
-        // Stats are retrieved to verify no panic, eviction behavior depends on size
-    }
-
-    /// Test that eviction completes quickly
-    #[test]
-    fn test_eviction_performance() {
-        let mut cache = RamCache::new(
-            500, // Small cache to force eviction
-            CacheEvictionAlgorithm::LRU,
-        );
-        let mut compression_handler = CompressionHandler::new(1000, false);
-
-        // Add entries to fill cache
-        let entry1 = create_test_entry("test:object1:range:0:1000", &[b'A'; 50]);
-        let entry2 = create_test_entry("test:object2:range:0:1000", &[b'B'; 50]);
-
-        cache.put(entry1, &mut compression_handler).unwrap();
-        cache.put(entry2, &mut compression_handler).unwrap();
-
-        // Measure eviction time
-        let start = std::time::Instant::now();
-
-        // Add entry3 to force eviction
-        let entry3 = create_test_entry("test:object3:range:0:1000", &[b'C'; 50]);
-        cache.put(entry3, &mut compression_handler).unwrap();
-
-        let elapsed = start.elapsed();
-
-        // Verify eviction completed quickly (< 10ms)
-        assert!(
-            elapsed.as_millis() < 10,
-            "Eviction took too long: {:?}",
-            elapsed
-        );
-    }
-
-    /// Test that eviction works correctly with multiple entries
-    #[quickcheck]
-    fn prop_eviction_with_multiple_entries(entry_count: u8) -> TestResult {
-        if entry_count == 0 || entry_count > 20 {
-            return TestResult::discard();
-        }
-
-        let mut cache = RamCache::new(
-            1000, // Moderate cache size
-            CacheEvictionAlgorithm::LRU,
-        );
-        let mut compression_handler = CompressionHandler::new(1000, false);
-
-        // Add entries
-        for i in 0..entry_count {
-            let key = format!("test:object{}:range:0:1000", i);
-            let entry = create_test_entry(&key, &[b'A'; 30]);
-            cache.put(entry, &mut compression_handler).unwrap();
-        }
-
-        let _initial_entries = cache.entries.len();
-
-        // Force eviction by adding more entries
-        for i in entry_count..(entry_count + 5) {
-            let key = format!("test:object{}:range:0:1000", i);
-            let entry = create_test_entry(&key, &[b'A'; 30]);
-            cache.put(entry, &mut compression_handler).unwrap();
-        }
-
-        // Cache should have handled the entries (either stored or evicted)
-        let _final_entries = cache.entries.len();
-
-        // Verify cache is still functional
-        let stats = cache.get_stats();
-        assert!(stats.entries_count > 0);
-
-        TestResult::passed()
-    }
-
-    /// Test eviction behavior with different eviction algorithms
-    #[test]
-    fn test_eviction_algorithms() {
-        for algorithm in &[CacheEvictionAlgorithm::LRU, CacheEvictionAlgorithm::TinyLFU] {
-            let mut cache = RamCache::new(500, algorithm.clone());
-            let mut compression_handler = CompressionHandler::new(1000, false);
-
-            // Add entries
-            let entry1 = create_test_entry("test:obj1:range:0:1000", &[b'A'; 50]);
-            let entry2 = create_test_entry("test:obj2:range:0:1000", &[b'B'; 50]);
-
-            cache.put(entry1, &mut compression_handler).unwrap();
-            cache.put(entry2, &mut compression_handler).unwrap();
-
-            // Force eviction
-            let entry3 = create_test_entry("test:obj3:range:0:1000", &[b'C'; 50]);
-            cache.put(entry3, &mut compression_handler).unwrap();
-
-            // Cache should still be functional
-            let stats = cache.get_stats();
-            assert!(
-                stats.entries_count > 0,
-                "Cache should have entries for {:?}",
-                algorithm
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1697,6 +791,51 @@ mod sharded_tests {
         );
         // Arc ref-count should still be 1 (we hold the only clone).
         assert_eq!(Arc::strong_count(&arc_clone), 1);
+    }
+
+    /// Spec: compression-followup-fixes Requirement 3.
+    /// Evictions under capacity pressure must be counted and surfaced through
+    /// `stats()` — the previously hardcoded `0` / `None` was a permanently-zero
+    /// exported metric.
+    #[tokio::test]
+    async fn test_eviction_stats_are_counted() {
+        let small_data = b"evict_stats_data";
+        let one_entry_size = std::mem::size_of::<RamCacheEntry>()
+            + "evict:stats:A".len()
+            + small_data.len()
+            + std::mem::size_of::<crate::cache_types::CacheMetadata>();
+        // Capacity for exactly one entry (plus a small margin), one shard.
+        let cache = ShardedRamCache::new(one_entry_size + 16, 1, CacheEvictionAlgorithm::LRU);
+
+        // Before any eviction: metric is zero / never.
+        let before = cache.stats().await;
+        assert_eq!(before.eviction_count, 0);
+        assert!(before.last_eviction.is_none());
+
+        // Insert three same-sized entries into the single one-entry shard,
+        // forcing two evictions.
+        cache
+            .put(make_entry("evict:stats:A", small_data))
+            .await
+            .unwrap();
+        cache
+            .put(make_entry("evict:stats:B", small_data))
+            .await
+            .unwrap();
+        cache
+            .put(make_entry("evict:stats:C", small_data))
+            .await
+            .unwrap();
+
+        let after = cache.stats().await;
+        assert_eq!(
+            after.eviction_count, 2,
+            "two evictions should be counted (A and B evicted for B and C)"
+        );
+        assert!(
+            after.last_eviction.is_some(),
+            "last_eviction timestamp must be set after an eviction"
+        );
     }
 
     // -----------------------------------------------------------------

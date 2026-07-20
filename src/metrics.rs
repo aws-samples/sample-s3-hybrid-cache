@@ -95,7 +95,6 @@ pub struct CompressionMetrics {
     pub compression_failures: u64,
     pub decompression_failures: u64,
     pub average_compression_ratio: f32,
-    pub compression_time_ms: u64,
 }
 
 /// Connection pool metrics
@@ -993,7 +992,6 @@ impl MetricsManager {
                 compression_failures: stats.compression_failures,
                 decompression_failures: stats.decompression_failures,
                 average_compression_ratio: stats.average_compression_ratio,
-                compression_time_ms: stats.compression_time_ms,
             }),
             Err(e) => {
                 warn!("Failed to collect compression metrics: {}", e);

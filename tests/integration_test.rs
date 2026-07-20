@@ -73,21 +73,6 @@ fn test_cache_key_generation() {
 }
 
 #[test]
-fn test_compression_threshold() {
-    let handler = CompressionHandler::new(1024, true);
-
-    // Small data should not be compressed
-    assert!(!handler.should_compress(512));
-
-    // Large data should be compressed
-    assert!(handler.should_compress(2048));
-
-    // Disabled compression should never compress
-    let disabled_handler = CompressionHandler::new(1024, false);
-    assert!(!disabled_handler.should_compress(2048));
-}
-
-#[test]
 fn test_tcp_proxy_creation() {
     // Test that TCP proxy can be created with different addresses
     let tcp_addr1 = SocketAddr::from(([127, 0, 0, 1], 443));

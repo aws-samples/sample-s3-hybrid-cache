@@ -229,7 +229,7 @@ impl HealthManager {
         // Test compression with a small sample
         let _test_data = b"Hello, World! This is a test compression string.";
 
-        // Since compress_content_aware_with_metadata requires &mut self, we'll just check if compression is enabled
+        // Since compress_with_metadata requires &mut self, we'll just check if compression is enabled
         let response_time = start_time
             .elapsed()
             .unwrap_or(Duration::from_millis(0))
