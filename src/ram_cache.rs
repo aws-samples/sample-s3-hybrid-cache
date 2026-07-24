@@ -35,26 +35,18 @@ pub(crate) struct EvictionState {
     pub eviction_algorithm: CacheEvictionAlgorithm,
     /// LRU recency queue (front = least-recently used).
     pub lru_order: VecDeque<String>,
-    /// TinyLFU admission window (front = oldest entry in window).
-    pub tinylfu_window: VecDeque<String>,
-    /// Per-key access frequency counter used by TinyLFU.
-    pub tinylfu_frequencies: HashMap<String, u64>,
-    /// Maximum number of entries tracked in the TinyLFU window.
-    pub tinylfu_window_size: usize,
 }
 
 impl EvictionState {
     /// Create a new eviction state for the given algorithm.
     ///
-    /// `tinylfu_window_size` is ignored for LRU but must be passed so callers
-    /// can use a single constructor regardless of algorithm.
-    pub fn new(eviction_algorithm: CacheEvictionAlgorithm, tinylfu_window_size: usize) -> Self {
+    /// TinyLFU no longer needs any window/frequency state here: victim scoring
+    /// (`shard_find_tinylfu_victim`) reads `access_count`/`last_accessed`
+    /// directly from each entry's atomics at eviction time.
+    pub fn new(eviction_algorithm: CacheEvictionAlgorithm) -> Self {
         Self {
             eviction_algorithm,
             lru_order: VecDeque::new(),
-            tinylfu_window: VecDeque::new(),
-            tinylfu_frequencies: HashMap::new(),
-            tinylfu_window_size,
         }
     }
 }
@@ -95,11 +87,9 @@ pub(crate) struct RamCacheShard {
 impl RamCacheShard {
     /// Create a new, empty shard with the given capacity and eviction algorithm.
     pub fn new(capacity: usize, eviction_algorithm: CacheEvictionAlgorithm) -> Self {
-        // Window-size heuristic: capacity in KiB, capped at 10 000 entries.
-        let tinylfu_window_size = (capacity / 1024).min(10_000);
         Self {
             data: HashMap::new(),
-            eviction: EvictionState::new(eviction_algorithm, tinylfu_window_size),
+            eviction: EvictionState::new(eviction_algorithm),
             current_size: 0,
             capacity,
             pending_accesses: Vec::new(),
@@ -241,6 +231,10 @@ impl ShardedRamCache {
                     compression_algorithm: entry.compression_algorithm.clone(),
                 };
 
+                // Read the eviction algorithm before dropping the read guard —
+                // needed below to gate the deferred-reorder block to LRU only.
+                let eviction_algorithm = guard.eviction.eviction_algorithm.clone();
+
                 // Release the read lock before any write-lock attempt.
                 // The Arc clone keeps the data alive independently.
                 drop(guard);
@@ -252,7 +246,11 @@ impl ShardedRamCache {
                 // non-blocking write lock to push the key onto pending_accesses.
                 // If the lock is already held (contended write), skip silently —
                 // best-effort; the next put() will drain whatever was recorded.
-                if new_count % 8 == 0 {
+                //
+                // Only meaningful for LRU: TinyLFU victim scoring reads
+                // `access_count`/`last_accessed` atomics directly at eviction
+                // time and needs no per-access ordering structure.
+                if new_count % 8 == 0 && eviction_algorithm == CacheEvictionAlgorithm::LRU {
                     if let Ok(mut write_guard) = shard.try_write() {
                         write_guard.pending_accesses.push(key.to_string());
                     }
@@ -514,36 +512,24 @@ fn shard_calculate_entry_size(entry: &RamCacheEntry) -> usize {
     base_size + key_size + data_size + metadata_size
 }
 
-/// Add `key` to the shard's LRU or TinyLFU eviction tracking.
+/// Add `key` to the shard's LRU eviction tracking.
+///
+/// TinyLFU is a no-op here: victim scoring (`shard_find_tinylfu_victim`) reads
+/// `access_count`/`last_accessed` directly from each entry's atomics at
+/// eviction time, so no separate window/frequency bookkeeping is needed.
 /// Equivalent to `RamCache::add_to_tracking`.
 fn shard_add_to_tracking(shard: &mut RamCacheShard, key: &str) {
     match shard.eviction.eviction_algorithm {
         CacheEvictionAlgorithm::LRU => {
             shard.eviction.lru_order.push_back(key.to_string());
         }
-        CacheEvictionAlgorithm::TinyLFU => {
-            shard.eviction.tinylfu_window.push_back(key.to_string());
-            shard
-                .eviction
-                .tinylfu_frequencies
-                .insert(key.to_string(), 1);
-
-            // Maintain window size
-            if shard.eviction.tinylfu_window.len() > shard.eviction.tinylfu_window_size {
-                if let Some(old_key) = shard.eviction.tinylfu_window.pop_front() {
-                    if let Some(freq) = shard.eviction.tinylfu_frequencies.get_mut(&old_key) {
-                        *freq = (*freq).saturating_sub(1);
-                        if *freq == 0 {
-                            shard.eviction.tinylfu_frequencies.remove(&old_key);
-                        }
-                    }
-                }
-            }
-        }
+        CacheEvictionAlgorithm::TinyLFU => {}
     }
 }
 
-/// Remove `key` from the shard's LRU or TinyLFU eviction tracking.
+/// Remove `key` from the shard's LRU eviction tracking.
+///
+/// TinyLFU is a no-op (see `shard_add_to_tracking`).
 /// Equivalent to `RamCache::remove_from_tracking`.
 fn shard_remove_from_tracking(shard: &mut RamCacheShard, key: &str) {
     match shard.eviction.eviction_algorithm {
@@ -552,16 +538,13 @@ fn shard_remove_from_tracking(shard: &mut RamCacheShard, key: &str) {
                 shard.eviction.lru_order.remove(pos);
             }
         }
-        CacheEvictionAlgorithm::TinyLFU => {
-            if let Some(pos) = shard.eviction.tinylfu_window.iter().position(|k| k == key) {
-                shard.eviction.tinylfu_window.remove(pos);
-            }
-            // Keep frequency data for potential re-insertion (same as RamCache)
-        }
+        CacheEvictionAlgorithm::TinyLFU => {}
     }
 }
 
-/// Update LRU/TinyLFU ordering for `key` on an access.
+/// Update LRU ordering for `key` on an access.
+///
+/// TinyLFU is a no-op (see `shard_add_to_tracking`).
 /// Equivalent to `RamCache::update_access_tracking`.
 fn shard_update_access_tracking(shard: &mut RamCacheShard, key: &str) {
     match shard.eviction.eviction_algorithm {
@@ -572,26 +555,7 @@ fn shard_update_access_tracking(shard: &mut RamCacheShard, key: &str) {
             }
             shard.eviction.lru_order.push_back(key.to_string());
         }
-        CacheEvictionAlgorithm::TinyLFU => {
-            shard.eviction.tinylfu_window.push_back(key.to_string());
-            *shard
-                .eviction
-                .tinylfu_frequencies
-                .entry(key.to_string())
-                .or_insert(0) += 1;
-
-            // Maintain window size
-            if shard.eviction.tinylfu_window.len() > shard.eviction.tinylfu_window_size {
-                if let Some(old_key) = shard.eviction.tinylfu_window.pop_front() {
-                    if let Some(freq) = shard.eviction.tinylfu_frequencies.get_mut(&old_key) {
-                        *freq = (*freq).saturating_sub(1);
-                        if *freq == 0 {
-                            shard.eviction.tinylfu_frequencies.remove(&old_key);
-                        }
-                    }
-                }
-            }
-        }
+        CacheEvictionAlgorithm::TinyLFU => {}
     }
 }
 
@@ -602,6 +566,12 @@ fn shard_find_lru_victim(shard: &RamCacheShard) -> Option<String> {
 }
 
 /// Find the TinyLFU victim key in a shard.
+///
+/// Selects the entry minimizing `(decayed_frequency(access_count, idle_secs),
+/// last_accessed_ms)` — lowest decayed frequency first, oldest `last_accessed` as
+/// tiebreak. Reads `access_count`/`last_accessed` directly from the entry's atomics
+/// rather than the (superseded) windowed-frequency tracking, so a genuinely hot but
+/// idle entry is not evicted before a fresh one-hit-wonder.
 /// Equivalent to `RamCache::find_tinylfu_victim`.
 fn shard_find_tinylfu_victim(shard: &RamCacheShard) -> Option<String> {
     let now_ms = SystemTime::now()
@@ -612,12 +582,14 @@ fn shard_find_tinylfu_victim(shard: &RamCacheShard) -> Option<String> {
     shard
         .data
         .iter()
-        .min_by_key(|(key, entry)| {
-            let frequency = shard.eviction.tinylfu_frequencies.get(*key).unwrap_or(&1);
+        .min_by_key(|(_key, entry)| {
             let last_accessed_ms = entry.last_accessed.load(Ordering::Relaxed);
-            let age_secs = now_ms.saturating_sub(last_accessed_ms) / 1000;
-            let recency_factor = age_secs.max(1);
-            frequency * 1000 / recency_factor
+            let idle_secs = now_ms.saturating_sub(last_accessed_ms) / 1000;
+            let access_count = entry.access_count.load(Ordering::Relaxed);
+            (
+                crate::cache::decayed_frequency(access_count, idle_secs),
+                last_accessed_ms,
+            )
         })
         .map(|(key, _)| key.clone())
 }
@@ -1053,6 +1025,245 @@ mod sharded_tests {
         assert!(
             !cold_present,
             "cold key must be evicted first (it was at the front of LRU queue)"
+        );
+    }
+
+    /// Back-date `entry`'s `last_accessed` atomic to `idle_secs` ago, so eviction
+    /// scoring sees it as idle without needing to actually sleep in the test.
+    fn backdate(entry: &RamCacheEntry, idle_secs: u64) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let old_ms = now_ms.saturating_sub(idle_secs * 1000);
+        entry.last_accessed.store(old_ms, Ordering::Relaxed);
+    }
+
+    // -----------------------------------------------------------------
+    // Test 8: test_tinylfu_inversion_regression
+    //
+    // One shard sized for exactly 2 entries. A "hot" entry has a very high
+    // access_count but has been idle for 2 half-lives (2 * 3600s); a "fresh"
+    // one-hit entry has access_count == 1 and last_accessed == now. Inserting
+    // a 3rd entry forces exactly one eviction; the fresh one-hit-wonder must be
+    // evicted and the idle-hot entry must survive.
+    //
+    // Sanity check against the OLD buggy formula (frequency * 1000 / recency),
+    // which this test would have failed against pre-fix:
+    //   hot:   frequency=100_000, recency ~= idle_secs = 7200s
+    //          old_score = 100_000 * 1000 / 7200 ≈ 13_888
+    //   fresh: frequency=1, recency ~= 1s (just inserted)
+    //          old_score = 1 * 1000 / 1 = 1000
+    //   Old formula treats lower score as colder/evict-first, so it would have
+    //   picked "fresh" (1000) over "hot" (13_888) as the *lower* score... but
+    //   with a fresh entry inserted at recency≈0, `recency` clamps to a tiny
+    //   value, driving the old score arbitrarily high (division by ~0) or, with
+    //   a slightly aged fresh entry (recency=1s..few s), the old score for hot
+    //   *drops relative to* fresh as hot's idle grows, and once hot has been
+    //   idle long enough the "hot" score falls below "fresh" — the exact
+    //   inversion this spec fixes. With hot idle 7200s and access_count as low
+    //   as 1000, old_score(hot) = 1000*1000/7200 ≈ 138, well below
+    //   old_score(fresh) ≈ 1000, so the buggy formula evicts the *hot* entry
+    //   instead of the one-hit-wonder. The decayed-frequency fix instead keeps
+    //   hot's Effective_Frequency = access_count >> halvings = 100_000 >> 2 =
+    //   25_000, far above fresh's Effective_Frequency = 1, so fresh is
+    //   correctly evicted.
+    // Validates: Requirements 6.1
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn test_tinylfu_inversion_regression() {
+        let payload = vec![b'H'; 20];
+        let one_entry_size = std::mem::size_of::<RamCacheEntry>()
+            + "inv:hot".len()
+            + payload.len()
+            + std::mem::size_of::<crate::cache_types::CacheMetadata>();
+        // Capacity holds exactly 2 entries; a 3rd forces exactly one eviction.
+        let capacity = one_entry_size * 2 + 16;
+        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::TinyLFU);
+
+        // Insert the hot entry, then bump its access_count high and back-date its
+        // last_accessed to 2 half-lives ago (2 * 3600s = 7200s).
+        cache.put(make_entry("inv:hot", &payload)).await.unwrap();
+        {
+            let idx = shard_index("inv:hot", 1);
+            let guard = cache.shards[idx].read().await;
+            let entry = guard.data.get("inv:hot").unwrap();
+            entry.access_count.store(100_000, Ordering::Relaxed);
+            backdate(entry, 2 * 3600);
+        }
+
+        // Insert the fresh one-hit entry (access_count == 1, last_accessed == now).
+        cache.put(make_entry("inv:fresh", &payload)).await.unwrap();
+        {
+            let idx = shard_index("inv:fresh", 1);
+            let guard = cache.shards[idx].read().await;
+            let entry = guard.data.get("inv:fresh").unwrap();
+            entry.access_count.store(1, Ordering::Relaxed);
+        }
+
+        // Insert a 3rd entry, forcing exactly one eviction from the 2-capacity shard.
+        cache.put(make_entry("inv:new", &payload)).await.unwrap();
+
+        let shard_guard = cache.shards[0].read().await;
+        assert_eq!(
+            shard_guard.data.len(),
+            2,
+            "shard must hold exactly 2 entries after one eviction"
+        );
+        assert!(
+            shard_guard.data.contains_key("inv:hot"),
+            "idle-hot entry must survive eviction (Effective_Frequency = 100_000 >> 2 = 25_000)"
+        );
+        assert!(
+            !shard_guard.data.contains_key("inv:fresh"),
+            "fresh one-hit-wonder must be evicted (Effective_Frequency = 1)"
+        );
+        assert!(
+            shard_guard.data.contains_key("inv:new"),
+            "newly inserted entry must be present"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Test 9: test_tinylfu_large_cold_read_evicts_only_cold_tail
+    //
+    // Several cold entries (old, access_count == 1) plus one hot entry share a
+    // shard at capacity. Inserting a new entry that requires evicting multiple
+    // cold entries to fit must only evict cold entries — the hot entry must
+    // survive throughout.
+    // Validates: Requirements 6.1
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn test_tinylfu_large_cold_read_evicts_only_cold_tail() {
+        let payload = vec![b'C'; 20];
+        let one_entry_size = std::mem::size_of::<RamCacheEntry>()
+            + "cold:tail:0".len()
+            + payload.len()
+            + std::mem::size_of::<crate::cache_types::CacheMetadata>();
+
+        // Capacity for 4 small entries (3 cold + 1 hot).
+        let capacity = one_entry_size * 4 + 16;
+        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::TinyLFU);
+
+        // Insert 3 cold entries: access_count == 1, idle for 2 half-lives.
+        let cold_keys = ["cold:tail:0", "cold:tail:1", "cold:tail:2"];
+        for key in cold_keys {
+            cache.put(make_entry(key, &payload)).await.unwrap();
+            let idx = shard_index(key, 1);
+            let guard = cache.shards[idx].read().await;
+            let entry = guard.data.get(key).unwrap();
+            entry.access_count.store(1, Ordering::Relaxed);
+            backdate(entry, 2 * 3600);
+        }
+
+        // Insert the hot entry: high access_count, idle only a fraction of a
+        // half-life so its Effective_Frequency stays high.
+        cache
+            .put(make_entry("cold:tail:hot", &payload))
+            .await
+            .unwrap();
+        {
+            let idx = shard_index("cold:tail:hot", 1);
+            let guard = cache.shards[idx].read().await;
+            let entry = guard.data.get("cold:tail:hot").unwrap();
+            entry.access_count.store(100_000, Ordering::Relaxed);
+            backdate(entry, 60);
+        }
+
+        // A new "large" entry needs room for 2 more entries worth of bytes than
+        // are currently free, forcing eviction of the 2 lowest-scoring (cold)
+        // entries to fit — same eviction loop, just sized to require >1 eviction.
+        let large_payload = vec![b'L'; payload.len() * 3];
+        cache
+            .put(make_entry("cold:tail:large", &large_payload))
+            .await
+            .unwrap();
+
+        let shard_guard = cache.shards[0].read().await;
+        assert!(
+            shard_guard.data.contains_key("cold:tail:hot"),
+            "hot entry must survive while only cold entries are evicted"
+        );
+        assert!(
+            shard_guard.data.contains_key("cold:tail:large"),
+            "newly inserted large entry must be present"
+        );
+        let remaining_cold = cold_keys
+            .iter()
+            .filter(|k| shard_guard.data.contains_key(**k))
+            .count();
+        assert!(
+            remaining_cold < cold_keys.len(),
+            "at least one cold entry must have been evicted to make room"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Test 10: test_tinylfu_all_cold_lru_fallback
+    //
+    // All entries share access_count == 1 (Effective_Frequency == 1 for all),
+    // so the `(decayed_frequency, last_accessed)` tuple falls through to the
+    // Last_Accessed tiebreak. Eviction order must therefore be ascending
+    // last_accessed — i.e. plain LRU order — oldest evicted first.
+    // Validates: Requirements 6.4
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn test_tinylfu_all_cold_lru_fallback() {
+        // Fixed-width keys ("allcold:0" .. "allcold:9") so every entry has an
+        // identical byte size — avoids off-by-a-few-bytes capacity math from
+        // differing key lengths triggering an extra eviction.
+        let payload = vec![b'A'; 20];
+        let one_entry_size = std::mem::size_of::<RamCacheEntry>()
+            + "allcold:0".len()
+            + payload.len()
+            + std::mem::size_of::<crate::cache_types::CacheMetadata>();
+
+        // Capacity for exactly 3 entries (plus margin); a 4th forces exactly
+        // one eviction, which must be the oldest (by last_accessed) of the 3.
+        let capacity = one_entry_size * 3 + 64;
+        let cache = ShardedRamCache::new(capacity, 1, CacheEvictionAlgorithm::TinyLFU);
+
+        // Insert 3 entries, all access_count == 1, but with distinct
+        // last_accessed times: "allcold:0" is furthest in the past, "allcold:1"
+        // less so, "allcold:2" barely idle at all.
+        let entries = [
+            ("allcold:0", 300u64),
+            ("allcold:1", 150u64),
+            ("allcold:2", 10u64),
+        ];
+        for (key, idle_secs) in entries {
+            cache.put(make_entry(key, &payload)).await.unwrap();
+            let idx = shard_index(key, 1);
+            let guard = cache.shards[idx].read().await;
+            let entry = guard.data.get(key).unwrap();
+            entry.access_count.store(1, Ordering::Relaxed);
+            backdate(entry, idle_secs);
+        }
+
+        // Insert a 4th entry (same key width), forcing exactly one eviction.
+        // All 3 existing entries have Effective_Frequency == 1 (no decay yet —
+        // idle_secs are all well under one half-life), so the tiebreak on
+        // last_accessed must pick "allcold:0" (oldest last_accessed) as the
+        // victim.
+        cache.put(make_entry("allcold:9", &payload)).await.unwrap();
+
+        let shard_guard = cache.shards[0].read().await;
+        assert!(
+            !shard_guard.data.contains_key("allcold:0"),
+            "the entry with the oldest last_accessed must be evicted first under \
+             an all-cold (Effective_Frequency == 1) LRU fallback"
+        );
+        assert!(
+            shard_guard.data.contains_key("allcold:1"),
+            "middle-aged entry must survive"
+        );
+        assert!(
+            shard_guard.data.contains_key("allcold:2"),
+            "newest entry must survive"
+        );
+        assert!(
+            shard_guard.data.contains_key("allcold:9"),
+            "newly inserted entry must be present"
         );
     }
 }

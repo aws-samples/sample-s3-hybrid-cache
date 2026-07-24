@@ -1346,7 +1346,6 @@ mod property_tests {
                     created_at: base_time - Duration::from_secs(3600),
                     last_accessed,
                     access_count,
-                    frequency_score: access_count,
                 };
 
                 let metadata = crate::cache_types::NewCacheMetadata {

@@ -59,7 +59,7 @@ Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access 
 1. **RAM Cache** (Optional, First Tier)
    - In-memory cache for hot objects, HEAD metadata, and range data
    - Configurable size limit (default: 256MB)
-   - Eviction algorithms: LRU or TinyLFU (simplified frequency-recency hybrid)
+   - Eviction algorithms: LRU or TinyLFU (decayed-frequency scoring, see [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction))
    - Fastest access path
    - Compression optimization: Eliminates decompress/recompress cycles during disk-to-RAM promotion
    - Size limits enforced on compressed data (allows large compressible files to be cached)
@@ -71,7 +71,7 @@ Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access 
 2. **Disk Cache** (Second Tier)
    - File-based persistent cache
    - Supports shared volumes for multi-instance deployments
-   - Eviction algorithms: LRU or TinyLFU (simplified frequency-recency hybrid)
+   - Eviction algorithms: LRU or TinyLFU (decayed-frequency scoring, see [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction))
    - Range-level eviction granularity for optimal cache utilization
    - LZ4 compression for space efficiency
    - Range storage architecture: `.meta` (lightweight metadata) + `.bin` (range data)
@@ -134,7 +134,7 @@ RAM Hit → DiskCacheManager.record_range_access() called
 ```
 
 **Why This Matters:**
-- Disk eviction algorithms (LRU/TinyLFU) need accurate access statistics
+- Disk eviction algorithms (LRU/TinyLFU, decayed-frequency scoring) need accurate access statistics
 - Without propagation, frequently-accessed RAM entries would appear "cold" on disk
 - Hot data could be evicted from disk while still being served from RAM
 - When RAM evicts the entry, disk would have already evicted it → cache miss
@@ -257,7 +257,7 @@ MetadataCacheEntry {
 
 #### Eviction with LRU
 
-The RAM Metadata Cache uses simple LRU eviction (not TinyLFU):
+The RAM Metadata Cache uses simple LRU eviction (not TinyLFU/decayed-frequency):
 
 **Why LRU (not TinyLFU):**
 - All metadata entries are similar size (~1-2KB)
@@ -2983,7 +2983,7 @@ Consolidated access data is written to range metadata:
 The eviction system uses per-range access tracking data to make decisions:
 
 - **LRU (Least Recently Used)**: Sorts ranges by `last_accessed` (oldest first)
-- **TinyLFU** (TinyLFU-like): Combines frequency (`access_count`) and recency (`last_accessed`) using a simplified windowed frequency approach
+- **TinyLFU**: Decayed-frequency scoring — victim is the range minimizing `(decayed_frequency(access_count, idle_secs), last_accessed)`. `access_count` halves once per hour of idle time, so a frequently-accessed range stays shielded from a single large one-hit read; recency only breaks ties among equally-decayed ranges.
 
 Each range is evaluated independently, allowing hot ranges to be retained even if other ranges of the same object are cold. See [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction) for details.
 
@@ -3565,10 +3565,21 @@ The disk cache uses **range-level eviction** where each cached range is an indep
 - Oldest accessed ranges are evicted first
 - Simple and predictable behavior
 
-**TinyLFU**:
-- Simplified frequency-recency hybrid inspired by TinyLFU
-- Uses windowed frequency counting with decay
-- Better performance than LRU for most workloads
+**TinyLFU (decayed-frequency)**:
+- Both cache tiers — RAM (`shard_find_tinylfu_victim`) and disk (`RangeSpec::tinylfu_score` /
+  `sort_range_candidates_for_tinylfu`) — score victims with the same shared helper,
+  `decayed_frequency(access_count, idle_secs) = access_count >> min(idle_secs / 3600, 63)`.
+- Access count halves once per hour (the half-life) of idle time. The victim is the range
+  minimizing `(decayed_frequency, last_accessed)` — lowest decayed frequency first, oldest
+  `last_accessed` as tiebreak.
+- A frequently-accessed-but-idle range is shielded from a single large one-hit read or scan:
+  its decayed frequency stays higher than a range accessed only once, so the one-hit range is
+  evicted first. (Prior to this fix the score divided frequency by recency, which inverted
+  this — a genuinely hot-but-idle range could be evicted before a fresh one-hit read.)
+- Decay only reduces a range's score toward 0 as it sits idle; it never resets a TTL or
+  forces expiry on its own. TTL expiry/revalidation remains the ceiling for how long stale
+  data can persist when there is no capacity pressure — decay only matters once eviction
+  needs to reclaim space.
 
 ### Range-Level Granularity
 
@@ -3719,7 +3730,7 @@ cache:
 
 **Eviction Algorithms**:
 - **LRU (Least Recently Used)**: Evicts ranges with oldest `last_accessed` timestamp first
-- **TinyLFU** (TinyLFU-like): Combines frequency (`access_count`) and recency (`last_accessed`) using a simplified windowed frequency approach
+- **TinyLFU** (decayed-frequency): victim minimizes `(decayed_frequency(access_count, idle_secs), last_accessed)` — see [Eviction Algorithms](#eviction-algorithms) above
 
 ## Monitoring
 
@@ -4768,7 +4779,7 @@ When eviction triggers, it continues until cache usage drops to 80% or below, fr
 The proxy supports two eviction algorithms configured via `cache.eviction_algorithm`:
 
 - **LRU** (Least Recently Used, default): Evicts ranges with oldest access time
-- **TinyLFU**: Combines recency and frequency using a simplified windowed frequency approach (TinyLFU-like)
+- **TinyLFU**: Decayed-frequency scoring — victim minimizes `(decayed_frequency(access_count, idle_secs), last_accessed)`, shielding hot-but-idle ranges from one-hit reads (see [Eviction Algorithms](#eviction-algorithms))
 
 ### Range-Based Eviction
 

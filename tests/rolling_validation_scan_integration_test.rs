@@ -69,7 +69,6 @@ fn create_meta_file(path: &std::path::Path, compressed_size: u64) {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         }],
         created_at: now,
         expires_at: now + Duration::from_secs(86400),

@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "2.3.0"
+version = "2.3.1"
 edition = "2021"
 # MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
 # Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
@@ -144,6 +144,9 @@ path = "examples/presigned_url_demo.rs"
 [[example]]
 name = "resolve_settings_bench"
 path = "examples/resolve_settings_bench.rs"
+[[example]]
+name = "ram_cache_shard_contention_bench"
+path = "examples/ram_cache_shard_contention_bench.rs"
 
 # ─── Profile tuning: reduce peak linker memory during test builds ───
 # The lib-test binary links the entire crate + heavy deps (tokio-full, hyper-full,

@@ -785,7 +785,6 @@ impl JournalConsolidator {
                 created_at: now,
                 last_accessed: now,
                 access_count: 0,
-                frequency_score: 0,
             };
 
             let journal_entry = JournalEntry {
@@ -3866,7 +3865,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         }
     }
 
@@ -4068,7 +4066,6 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
-                frequency_score: 1,
             };
 
             let mut metadata = NewCacheMetadata {
@@ -4189,7 +4186,6 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
-                frequency_score: 1,
             };
 
             let range2 = RangeSpec {
@@ -4202,7 +4198,6 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 5,
-                frequency_score: 1,
             };
 
             let range3 = RangeSpec {
@@ -4215,7 +4210,6 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
-                frequency_score: 1,
             };
 
             // Create metadata with range2 (for TTL refresh and access update tests)
@@ -4809,7 +4803,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         // Create the range file so validation passes
@@ -4912,7 +4905,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         // Create the range file
@@ -5070,7 +5062,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         // Create the range file
@@ -6068,7 +6059,6 @@ mod tests {
                         created_at: base_time,
                         last_accessed: base_time,
                         access_count: 1,
-                        frequency_score: 1,
                     },
                     operation: JournalOperation::Add,
                     range_file_path: format!("range_{}.bin", i),
@@ -6315,7 +6305,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         // Create range file
@@ -6422,7 +6411,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         let range_file_path = consolidator

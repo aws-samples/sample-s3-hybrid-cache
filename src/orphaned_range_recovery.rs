@@ -668,7 +668,6 @@ impl OrphanedRangeRecovery {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         })
     }
 

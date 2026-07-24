@@ -416,7 +416,6 @@ impl CacheHitUpdateBuffer {
             created_at: entry.timestamp,
             last_accessed: entry.timestamp,
             access_count: 0,
-            frequency_score: 0,
         };
 
         Ok(JournalEntry {

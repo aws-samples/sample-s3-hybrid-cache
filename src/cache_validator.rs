@@ -1547,7 +1547,6 @@ mod tests {
                 created_at: SystemTime::now(),
                 last_accessed: SystemTime::now(),
                 access_count: 1,
-                frequency_score: 1,
             },
             RangeSpec {
                 start: 1024,
@@ -1559,7 +1558,6 @@ mod tests {
                 created_at: SystemTime::now(),
                 last_accessed: SystemTime::now(),
                 access_count: 1,
-                frequency_score: 1,
             },
         ];
 

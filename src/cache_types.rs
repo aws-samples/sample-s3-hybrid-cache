@@ -481,10 +481,6 @@ pub struct RangeSpec {
     pub created_at: SystemTime,
     pub last_accessed: SystemTime,
     pub access_count: u64,
-
-    // TinyLFU frequency tracking
-    #[serde(default)]
-    pub frequency_score: u64, // Frequency estimate for TinyLFU algorithm
 }
 
 impl RangeSpec {
@@ -508,7 +504,6 @@ impl RangeSpec {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1, // Initial frequency score
         }
     }
 
@@ -521,28 +516,24 @@ impl RangeSpec {
             .as_secs()
     }
 
-    /// Calculate TinyLFU score (lower = evict first)
-    /// Combines frequency and recency: frequency weighted by recency
-    pub fn tinylfu_score(&self) -> u64 {
-        let now = SystemTime::now();
-        let recency_factor = now
+    /// Decayed-frequency eviction score (lower = evict first). Testable via injected `now`.
+    ///
+    /// Halves `access_count` once per `TINYLFU_HALF_LIFE_SECS` of idle time (see
+    /// `crate::cache::decayed_frequency`). Monotonic non-increasing in idle time and never
+    /// divides by recency, which avoids the inversion where an idle-hot range is evicted
+    /// before a fresh one-hit-wonder.
+    pub fn tinylfu_score(&self, now: SystemTime) -> u64 {
+        let idle_secs = now
             .duration_since(self.last_accessed)
             .unwrap_or_default()
-            .as_secs()
-            .max(1);
-
-        // Frequency weighted by recency
-        self.access_count * 1000 / recency_factor
+            .as_secs();
+        crate::cache::decayed_frequency(self.access_count, idle_secs)
     }
 
     /// Update access statistics
     pub fn record_access(&mut self) {
         self.last_accessed = SystemTime::now();
         self.access_count += 1;
-
-        // Update frequency score for TinyLFU algorithm
-        // Use a simple increment with decay to prevent unbounded growth
-        self.frequency_score = (self.frequency_score + 1).min(1000);
     }
 }
 
@@ -625,6 +616,7 @@ mod tests {
     use super::*;
     use quickcheck::TestResult;
     use quickcheck_macros::quickcheck;
+    use serde_json::json;
 
     #[test]
     fn test_upload_state_serialization() {
@@ -753,7 +745,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         // Serialize
@@ -841,7 +832,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         let json = serde_json::to_string(&range_spec).unwrap();
@@ -1000,7 +990,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         let score = range.lru_score();
@@ -1018,7 +1007,6 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(3600),
             last_accessed: now - std::time::Duration::from_secs(3600),
             access_count: 1,
-            frequency_score: 1,
         };
 
         assert!(range.lru_score() > older_range.lru_score());
@@ -1039,7 +1027,6 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(3600),
             last_accessed: now - std::time::Duration::from_secs(10),
             access_count: 100,
-            frequency_score: 100,
         };
 
         // Infrequently accessed, old range
@@ -1053,11 +1040,10 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(7200),
             last_accessed: now - std::time::Duration::from_secs(3600),
             access_count: 5,
-            frequency_score: 5,
         };
 
         // Hot range should have higher score (less likely to be evicted)
-        assert!(hot_range.tinylfu_score() > cold_range.tinylfu_score());
+        assert!(hot_range.tinylfu_score(now) > cold_range.tinylfu_score(now));
     }
 
     #[test]
@@ -1073,7 +1059,6 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(3600),
             last_accessed: now - std::time::Duration::from_secs(1800),
             access_count: 5,
-            frequency_score: 5,
         };
 
         let old_last_accessed = range.last_accessed;
@@ -1087,6 +1072,42 @@ mod tests {
 
         // access_count should be incremented
         assert_eq!(range.access_count, old_access_count + 1);
+    }
+
+    /// `.meta` compatibility: a JSON `RangeSpec` containing the now-removed
+    /// `frequency_score` field (as an old-format `.meta` would have on disk) still
+    /// deserializes successfully, with serde silently ignoring the unknown field.
+    /// **Validates: Requirements 5.2, 6.5**
+    #[test]
+    fn test_range_spec_meta_compat_ignores_removed_frequency_score() {
+        let range = RangeSpec::new(
+            0,
+            8388607,
+            "test_bucket_object_0-8388607.bin".to_string(),
+            CompressionAlgorithm::Lz4,
+            1024,
+            2048,
+        );
+
+        // Serialize the current (field-less) RangeSpec to a JSON value, then splice in a
+        // `frequency_score` key to simulate what an old `.meta` file on disk would contain.
+        let mut value = serde_json::to_value(&range).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("frequency_score".to_string(), json!(42));
+        let json_with_frequency_score = serde_json::to_string(&value).unwrap();
+        assert!(json_with_frequency_score.contains("frequency_score"));
+
+        // Deserializing must succeed even though `RangeSpec` no longer has this field.
+        let deserialized: RangeSpec = serde_json::from_str(&json_with_frequency_score).unwrap();
+
+        assert_eq!(deserialized.start, range.start);
+        assert_eq!(deserialized.end, range.end);
+        assert_eq!(deserialized.file_path, range.file_path);
+        assert_eq!(deserialized.access_count, range.access_count);
+        assert_eq!(deserialized.created_at, range.created_at);
+        assert_eq!(deserialized.last_accessed, range.last_accessed);
     }
 
     // ===== PROPERTY TESTS FOR PART-NUMBER CACHING =====

@@ -52,7 +52,6 @@ fn test_range_spec_lru_score() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 1,
-        frequency_score: 0,
     };
 
     // More recently accessed range should have higher score
@@ -74,7 +73,6 @@ fn test_range_spec_tinylfu_score() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(10),
         access_count: 100,
-        frequency_score: 0,
     };
 
     // Infrequently accessed, old range (cold)
@@ -88,11 +86,10 @@ fn test_range_spec_tinylfu_score() {
         created_at: now - Duration::from_secs(7200),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 5,
-        frequency_score: 0,
     };
 
     // Hot range should have higher score (less likely to be evicted)
-    assert!(hot_range.tinylfu_score() > cold_range.tinylfu_score());
+    assert!(hot_range.tinylfu_score(now) > cold_range.tinylfu_score(now));
 }
 
 #[test]
@@ -108,7 +105,6 @@ fn test_range_spec_record_access() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(1800),
         access_count: 5,
-        frequency_score: 0,
     };
 
     let old_last_accessed = range.last_accessed;
@@ -137,7 +133,6 @@ fn test_range_spec_serialization_with_access_fields() {
         created_at: now,
         last_accessed: now,
         access_count: 1,
-        frequency_score: 0,
     };
 
     // Serialize
@@ -173,7 +168,6 @@ fn test_lru_eviction_order() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(3600), // Oldest
         access_count: 10,
-        frequency_score: 0,
     };
 
     let range2 = RangeSpec {
@@ -186,7 +180,6 @@ fn test_lru_eviction_order() {
         created_at: now - Duration::from_secs(1800),
         last_accessed: now - Duration::from_secs(1800), // Middle
         access_count: 5,
-        frequency_score: 0,
     };
 
     let range3 = RangeSpec {
@@ -199,7 +192,6 @@ fn test_lru_eviction_order() {
         created_at: now - Duration::from_secs(600),
         last_accessed: now - Duration::from_secs(600), // Newest
         access_count: 2,
-        frequency_score: 0,
     };
 
     // LRU: Lower score = older = evict first
@@ -222,7 +214,6 @@ fn test_tinylfu_eviction_order() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(10),
         access_count: 100,
-        frequency_score: 0,
     };
 
     // Warm range: medium frequency, medium recency
@@ -236,7 +227,6 @@ fn test_tinylfu_eviction_order() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(600),
         access_count: 50,
-        frequency_score: 0,
     };
 
     // Cold range: low frequency, old access
@@ -250,10 +240,9 @@ fn test_tinylfu_eviction_order() {
         created_at: now - Duration::from_secs(7200),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 5,
-        frequency_score: 0,
     };
 
     // TinyLFU: Higher score = more valuable = keep longer
-    assert!(hot_range.tinylfu_score() > warm_range.tinylfu_score());
-    assert!(warm_range.tinylfu_score() > cold_range.tinylfu_score());
+    assert!(hot_range.tinylfu_score(now) > warm_range.tinylfu_score(now));
+    assert!(warm_range.tinylfu_score(now) > cold_range.tinylfu_score(now));
 }

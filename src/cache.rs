@@ -25,6 +25,163 @@ use uuid::Uuid;
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
 const OBJECT_CONCURRENCY_LIMIT: usize = 8;
 
+/// Idle duration after which a decayed frequency halves. Compile-time constant
+/// (not config). Decay bounds immortality under capacity pressure; TTL expiry is the
+/// hard ceiling for the no-pressure case.
+pub(crate) const TINYLFU_HALF_LIFE_SECS: u64 = 3600;
+
+/// Exponential-decay LFU score (lower = evict first). Halves `access_count` once per
+/// Half_Life of idle time via an integer shift. Monotonic non-increasing in `idle_secs`;
+/// never divides by recency.
+pub(crate) fn decayed_frequency(access_count: u64, idle_secs: u64) -> u64 {
+    let halvings = (idle_secs / TINYLFU_HALF_LIFE_SECS).min(63);
+    access_count >> halvings
+}
+
+#[cfg(test)]
+mod decayed_frequency_tests {
+    use super::*;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+
+    /// Zero idle time never decays the count (structural: no division by recency,
+    /// idle_secs=0 gives the undecayed access_count).
+    /// **Validates: Requirements 6.3**
+    #[test]
+    fn test_zero_idle_time_is_undecayed() {
+        assert_eq!(decayed_frequency(100, 0), 100);
+        assert_eq!(decayed_frequency(1, 0), 1);
+        assert_eq!(decayed_frequency(0, 0), 0);
+    }
+
+    /// The score halves exactly once per half-life of idle time.
+    /// **Validates: Requirements 6.3**
+    #[test]
+    fn test_halving_per_half_life() {
+        assert_eq!(decayed_frequency(100, 0), 100);
+        assert_eq!(decayed_frequency(100, TINYLFU_HALF_LIFE_SECS), 50);
+        assert_eq!(decayed_frequency(100, 2 * TINYLFU_HALF_LIFE_SECS), 25);
+        assert_eq!(decayed_frequency(100, 3 * TINYLFU_HALF_LIFE_SECS), 12);
+        assert_eq!(decayed_frequency(100, 4 * TINYLFU_HALF_LIFE_SECS), 6);
+    }
+
+    /// Idle time just short of a half-life boundary must not trigger the next halving
+    /// (integer division truncates, so the boundary is exclusive on the low side).
+    /// **Validates: Requirements 6.3**
+    #[test]
+    fn test_half_life_boundary_is_exclusive_below() {
+        assert_eq!(decayed_frequency(100, TINYLFU_HALF_LIFE_SECS - 1), 100);
+        assert_eq!(decayed_frequency(100, TINYLFU_HALF_LIFE_SECS), 50);
+    }
+
+    /// Very large idle_secs saturates to 0 via the `.min(63)` shift cap rather than
+    /// panicking or dividing — proves the "never divides by recency" structural
+    /// guarantee holds at the extreme.
+    /// **Validates: Requirements 6.3**
+    #[test]
+    fn test_very_large_idle_secs_saturates_to_zero_without_panic() {
+        // u64::MAX >> 63 == 1 (only the top bit survives the max 63-shift cap).
+        assert_eq!(decayed_frequency(u64::MAX, u64::MAX), 1);
+        assert_eq!(decayed_frequency(u64::MAX, 64 * TINYLFU_HALF_LIFE_SECS), 1);
+        // Smaller counts fully saturate to 0 under the same cap.
+        assert_eq!(decayed_frequency(1, 64 * TINYLFU_HALF_LIFE_SECS), 0);
+        assert_eq!(decayed_frequency(100, 64 * TINYLFU_HALF_LIFE_SECS), 0);
+    }
+
+    /// A high-count idle entry eventually scores below a fresh `access_count == 1`
+    /// entry (which scores 1 at idle_secs == 0), and this happens within a bounded
+    /// number of half-lives — not asymptotically / never.
+    /// **Validates: Requirements 6.3**
+    #[test]
+    fn test_high_count_idle_entry_eventually_scores_below_fresh_one_hit() {
+        let fresh_one_hit_score = decayed_frequency(1, 0);
+        assert_eq!(fresh_one_hit_score, 1);
+
+        let high_count = 1000u64;
+        // access_count=1000 needs 10 halvings to drop below 1 (1000 >> 10 == 0).
+        // Confirm it happens, and within a small bounded number of half-lives.
+        let mut found = false;
+        for halvings in 0..=63u64 {
+            let idle_secs = halvings * TINYLFU_HALF_LIFE_SECS;
+            if decayed_frequency(high_count, idle_secs) < fresh_one_hit_score {
+                found = true;
+                assert!(
+                    halvings <= 10,
+                    "expected access_count=1000 to drop below a fresh one-hit score \
+                     within 10 half-lives, took {}",
+                    halvings
+                );
+                break;
+            }
+        }
+        assert!(
+            found,
+            "a high-count idle entry must eventually score below a fresh one-hit entry"
+        );
+    }
+
+    /// The decay function is monotonic non-increasing in idle time for a fixed
+    /// access_count: as idle_secs increases, the score never increases.
+    /// **Validates: Requirements 6.3**
+    #[test]
+    fn test_monotonic_non_increasing_across_half_life_steps() {
+        let access_count = 100_000u64;
+        let mut previous = decayed_frequency(access_count, 0);
+        for halvings in 1..=70u64 {
+            let idle_secs = halvings * TINYLFU_HALF_LIFE_SECS;
+            let current = decayed_frequency(access_count, idle_secs);
+            assert!(
+                current <= previous,
+                "score must be non-increasing: idle_secs={} gave {} > previous {}",
+                idle_secs,
+                current,
+                previous
+            );
+            previous = current;
+        }
+    }
+
+    /// Property: for any access_count, decayed_frequency is monotonic non-increasing
+    /// as idle_secs increases (checked pairwise across arbitrary idle_secs values).
+    /// **Validates: Requirements 6.3**
+    #[quickcheck]
+    fn prop_monotonic_non_increasing_in_idle_time(
+        access_count: u64,
+        idle_a: u64,
+        idle_b: u64,
+    ) -> TestResult {
+        let (lo, hi) = if idle_a <= idle_b {
+            (idle_a, idle_b)
+        } else {
+            (idle_b, idle_a)
+        };
+
+        let score_lo = decayed_frequency(access_count, lo);
+        let score_hi = decayed_frequency(access_count, hi);
+
+        if score_hi > score_lo {
+            return TestResult::failed();
+        }
+        TestResult::passed()
+    }
+
+    /// Property: decayed_frequency never panics and is bounded by access_count
+    /// (decay only ever reduces the score, never increases it above the original
+    /// count), for arbitrary inputs.
+    /// **Validates: Requirements 6.3**
+    #[quickcheck]
+    fn prop_never_exceeds_access_count_and_never_panics(
+        access_count: u64,
+        idle_secs: u64,
+    ) -> TestResult {
+        let score = decayed_frequency(access_count, idle_secs);
+        if score > access_count {
+            return TestResult::failed();
+        }
+        TestResult::passed()
+    }
+}
+
 /// Strip the known trailing suffix patterns that `generate_part_cache_key`,
 /// `generate_range_cache_key`, and `generate_cache_key_with_params` append to
 /// a bare object path, returning just the object path.
@@ -507,7 +664,12 @@ impl Default for WriteCacheSizeTracker {
 pub enum CacheEvictionAlgorithm {
     #[default]
     LRU, // Least Recently Used (default)
-    TinyLFU, // Simplified frequency-recency hybrid inspired by TinyLFU
+    /// Decayed-frequency eviction: victim minimizes `(decayed_frequency(access_count,
+    /// idle_secs), last_accessed)`. Access count halves once per `TINYLFU_HALF_LIFE_SECS`
+    /// (1 hour) of idle time, so a frequently-accessed entry stays shielded from a single
+    /// one-hit read; an idle entry's score decays toward 0 under capacity pressure. TTL
+    /// expiry remains the hard ceiling for staleness — decay has no separate age ceiling.
+    TinyLFU,
 }
 
 /// Cache usage breakdown by type
@@ -4392,10 +4554,12 @@ impl CacheManager {
         }
     }
 
-    /// Sort range candidates for TinyLFU eviction using access_count and last_accessed
+    /// Sort range candidates for TinyLFU eviction using decayed-frequency scoring
     ///
-    /// TinyLFU score = access_count * 1000 / recency_seconds (lower = evict first)
-    /// This formula balances frequency (how often accessed) with recency (how recently accessed).
+    /// Score = `decayed_frequency(access_count, idle_secs)` (lower = evict first), with
+    /// `last_accessed` as a tiebreak. `now` is computed once per sort pass rather than per
+    /// comparison. This is the same decay helper used by `RangeSpec::tinylfu_score` — see
+    /// Requirement 1.2 (shared scoring, no duplicated formula).
     ///
     /// # Arguments
     /// * `candidates` - Mutable reference to vector of range candidates to sort in-place
@@ -4405,43 +4569,21 @@ impl CacheManager {
     fn sort_range_candidates_for_tinylfu(&self, candidates: &mut [RangeEvictionCandidate]) {
         let now = SystemTime::now();
 
-        // Calculate TinyLFU scores and sort (lowest score first = evict first)
-        candidates.sort_by(|a, b| {
-            let score_a = self.calculate_range_tinylfu_score(a, now);
-            let score_b = self.calculate_range_tinylfu_score(b, now);
-            score_a.cmp(&score_b)
+        candidates.sort_by_key(|c| {
+            let idle_secs = now
+                .duration_since(c.last_accessed)
+                .unwrap_or_default()
+                .as_secs();
+            (
+                decayed_frequency(c.access_count, idle_secs),
+                c.last_accessed,
+            )
         });
 
         debug!(
-            "Sorted {} range candidates for TinyLFU eviction (lowest frequency+recency score first)",
+            "Sorted {} range candidates for TinyLFU eviction (lowest decayed-frequency score first)",
             candidates.len()
         );
-    }
-
-    /// Calculate TinyLFU score for a range eviction candidate
-    ///
-    /// Score = access_count * 1000 / recency_seconds (lower = evict first)
-    /// This matches the formula used in RangeSpec::tinylfu_score()
-    ///
-    /// # Arguments
-    /// * `candidate` - The range eviction candidate
-    /// * `now` - Current time for recency calculation
-    ///
-    /// # Returns
-    /// TinyLFU score where lower values indicate higher eviction priority
-    fn calculate_range_tinylfu_score(
-        &self,
-        candidate: &RangeEvictionCandidate,
-        now: SystemTime,
-    ) -> u64 {
-        let recency_factor = now
-            .duration_since(candidate.last_accessed)
-            .unwrap_or_default()
-            .as_secs()
-            .max(1); // Avoid division by zero
-
-        // Frequency weighted by recency - same formula as RangeSpec::tinylfu_score()
-        candidate.access_count.saturating_mul(1000) / recency_factor
     }
 
     /// Recursively collect range candidates from a directory
@@ -15119,6 +15261,144 @@ mod global_cache_stats_unit_tests {
         assert_eq!(
             stats.cache_misses, 1,
             "cache_misses must be unchanged after HEAD hit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod range_tinylfu_sort_tests {
+    use super::{CacheEvictionAlgorithm, CacheManager, RangeEvictionCandidate};
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+    use tempfile::TempDir;
+
+    /// Build a minimal `RangeEvictionCandidate` for sort-ordering tests. Only
+    /// `access_count` and `last_accessed` affect `sort_range_candidates`; the
+    /// remaining fields are filled with harmless placeholders.
+    fn make_candidate(
+        cache_key: &str,
+        access_count: u64,
+        last_accessed: SystemTime,
+    ) -> RangeEvictionCandidate {
+        RangeEvictionCandidate {
+            cache_key: cache_key.to_string(),
+            range_start: 0,
+            range_end: 1023,
+            last_accessed,
+            size: 1024,
+            compressed_size: 1024,
+            access_count,
+            bin_file_path: PathBuf::from(format!("ranges/{}.bin", cache_key)),
+            meta_file_path: PathBuf::from(format!("metadata/{}.meta", cache_key)),
+            is_write_cached: false,
+        }
+    }
+
+    /// Construct a `CacheManager` configured for TinyLFU eviction, backed by a
+    /// throwaway temp dir (no cache I/O is exercised by `sort_range_candidates`,
+    /// which operates purely on the in-memory candidate slice).
+    fn make_tinylfu_manager() -> (CacheManager, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let cm = CacheManager::new_with_eviction_and_ttl(
+            temp_dir.path().to_path_buf(),
+            false, // ram_cache_enabled — irrelevant to disk-tier range sorting
+            0,
+            CacheEvictionAlgorithm::TinyLFU,
+            1_048_576,                 // compression_threshold
+            false,                     // compression_enabled
+            Duration::from_secs(3600), // get_ttl — irrelevant to sorting
+        );
+        (cm, temp_dir)
+    }
+
+    /// A fresh one-hit range (`access_count == 1`, just accessed) sorts before
+    /// (i.e. is ordered for eviction ahead of) an idle-hot range (`access_count ==
+    /// 100_000`, idle 2 half-lives) for a fixed scenario.
+    ///
+    /// Ascending sort means index 0 is evicted first. With
+    /// `TINYLFU_HALF_LIFE_SECS == 3600`:
+    ///   - idle-hot:  decayed_frequency(100_000, 2*3600) == 100_000 >> 2 == 25_000
+    ///   - fresh:     decayed_frequency(1, 0)            == 1
+    ///
+    /// `25_000 > 1`, so the fresh one-hit range has the lower score and sorts
+    /// first (evicted before the idle-hot range). This is the correct, expected
+    /// post-fix ordering for this choice of numbers — the idle-hot range's
+    /// historical access_count (100_000) is still far above the fresh range's
+    /// decayed score even after 2 half-lives of decay, so it correctly survives
+    /// longer than the fresh one-hit-wonder. This test pins the ordering
+    /// direction; the RAM-tier test (7.2) is what exercises the actual inversion
+    /// regression (there, the fresh entry is inserted at a *later* point after
+    /// the hot entry already occupies a full shard, so eviction pressure lands
+    /// on the fresh entry specifically to prove the hot entry is shielded).
+    ///
+    /// **Validates: Requirements 6.2**
+    #[test]
+    fn test_fresh_one_hit_sorts_before_idle_hot() {
+        let (cm, _temp_dir) = make_tinylfu_manager();
+        let now = SystemTime::now();
+
+        let idle_hot = make_candidate(
+            "bucket/idle-hot-object",
+            100_000,
+            now - Duration::from_secs(2 * crate::cache::TINYLFU_HALF_LIFE_SECS),
+        );
+        let fresh_one_hit = make_candidate("bucket/fresh-one-hit-object", 1, now);
+
+        let mut candidates = vec![idle_hot.clone(), fresh_one_hit.clone()];
+        cm.sort_range_candidates(&mut candidates);
+
+        let fresh_pos = candidates
+            .iter()
+            .position(|c| c.cache_key == fresh_one_hit.cache_key)
+            .expect("fresh one-hit candidate must remain in the sorted output");
+        let idle_hot_pos = candidates
+            .iter()
+            .position(|c| c.cache_key == idle_hot.cache_key)
+            .expect("idle-hot candidate must remain in the sorted output");
+
+        assert!(
+            fresh_pos < idle_hot_pos,
+            "fresh one-hit range (decayed score 1) must sort before (be ordered for \
+             eviction ahead of) the idle-hot range (decayed score 25_000): \
+             fresh_pos={}, idle_hot_pos={}",
+            fresh_pos,
+            idle_hot_pos
+        );
+    }
+
+    /// When every candidate has decayed to the same `Effective_Frequency`
+    /// (`access_count == 1`, idle well under one half-life so no decay has
+    /// occurred), `sort_range_candidates_for_tinylfu` must fall back to the
+    /// `Last_Accessed` tiebreak — i.e. ascending `last_accessed` (oldest
+    /// evicted first), matching plain LRU order.
+    ///
+    /// **Validates: Requirements 6.4**
+    #[test]
+    fn test_all_cold_candidates_fall_back_to_lru_order() {
+        let (cm, _temp_dir) = make_tinylfu_manager();
+        let now = SystemTime::now();
+
+        // All access_count == 1, idle_secs all well under TINYLFU_HALF_LIFE_SECS
+        // (3600s), so every candidate decays to the same Effective_Frequency == 1.
+        let oldest = make_candidate("bucket/all-cold-0", 1, now - Duration::from_secs(300));
+        let middle = make_candidate("bucket/all-cold-1", 1, now - Duration::from_secs(150));
+        let newest = make_candidate("bucket/all-cold-2", 1, now - Duration::from_secs(10));
+
+        // Insert out of order to prove the sort actually reorders them.
+        let mut candidates = vec![newest.clone(), oldest.clone(), middle.clone()];
+        cm.sort_range_candidates(&mut candidates);
+
+        let keys: Vec<&str> = candidates.iter().map(|c| c.cache_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                oldest.cache_key.as_str(),
+                middle.cache_key.as_str(),
+                newest.cache_key.as_str()
+            ],
+            "all-cold candidates (identical Effective_Frequency) must sort in \
+             ascending last_accessed order (oldest evicted first) — got {:?}",
+            keys
         );
     }
 }

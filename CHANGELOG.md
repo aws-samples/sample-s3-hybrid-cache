@@ -5,6 +5,42 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-07-27
+
+Fixes a TinyLFU eviction-scoring inversion present in both cache tiers (RAM
+and disk): a genuinely hot-but-idle entry could be evicted before a
+freshly-read one-hit-wonder, because the old score divided frequency by
+recency (`access_count * 1000 / recency`) instead of decaying it.
+
+### Fixed
+
+- **TinyLFU inversion: idle-hot entries no longer evicted before a fresh
+  one-hit read**, in both the RAM tier (`shard_find_tinylfu_victim`) and the
+  disk/shared-storage tier (`RangeSpec::tinylfu_score`,
+  `sort_range_candidates_for_tinylfu`). The new score is
+  `access_count >> min(idle_secs / 3600, 63)` (halves per hour of idle
+  time), computed by a single shared helper (`decayed_frequency` in
+  `cache.rs`) instead of the two duplicated divided-score formulas.
+
+### Changed
+
+- **RAM-tier windowed-frequency machinery removed**, superseded by the
+  decay-based scoring above: `EvictionState.tinylfu_window`,
+  `tinylfu_frequencies`, `tinylfu_window_size`, and the window-size
+  heuristic in `RamCacheShard::new`. Victim scoring now reads
+  `access_count`/`last_accessed` atomics directly.
+
+### Removed
+
+- **Vestigial `RangeSpec.frequency_score` field removed.** It was written
+  in ~15 places but never read for eviction. `.meta` files remain backward
+  compatible in both directions: old `.meta` files containing
+  `frequency_score` still parse (serde ignores the unknown field), and a
+  rolled-back older binary reading a new `.meta` without the field still
+  parses (the field carried `#[serde(default)]`). No config change — the
+  `eviction_algorithm: TinyLFU` token is unchanged; `TINYLFU_HALF_LIFE_SECS`
+  (3600s / 1 hour) is a compile-time constant, not a new config field.
+
 ## [2.3.0] - 2026-07-20
 
 Makes content-aware compression fully functional. The extension denylist for

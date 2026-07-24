@@ -234,7 +234,7 @@ fn get_sharded_path(base_dir: &Path, cache_key: &str, suffix: &str) -> Result<Pa
 - Frequency-based eviction
 - Configurable size limits
 - Streaming path checks RAM before disk, promotes to RAM after disk hits
-- Sharded into `ram_cache_shard_count` independent `tokio::sync::RwLock` partitions (default 64), keyed by `blake3(cache_key) % shard_count`, so concurrent reads of different keys do not contend
+- Sharded into `ram_cache_shard_count` independent `tokio::sync::RwLock` partitions (default 8), keyed by `blake3(cache_key) % shard_count`, so concurrent reads of different keys do not contend
 - Stores data as `Arc<Bytes>` for O(1) zero-copy reads; the shard lock is released before decompression and response construction
 - Access counters (`last_accessed`, `access_count`, hit/miss) are atomics updated under a shared read lock; LRU/TinyLFU reorder is deferred to the next `put()`
 - See [CACHING.md → RAM Cache Concurrency Model](CACHING.md#ram-cache-concurrency-model)

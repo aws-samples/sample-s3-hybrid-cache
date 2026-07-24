@@ -916,7 +916,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         }
     }
 
@@ -1187,7 +1186,6 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 1,
         };
 
         let entry = JournalEntry {

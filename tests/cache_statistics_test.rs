@@ -73,7 +73,6 @@ async fn test_calculate_disk_cache_size_with_new_architecture() {
         created_at: now,
         last_accessed: now,
         access_count: 1,
-        frequency_score: 0,
     };
 
     let now = SystemTime::now();
@@ -161,7 +160,6 @@ async fn test_collect_cache_entries_for_eviction_with_new_architecture() {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 0,
         });
     }
 
@@ -255,7 +253,6 @@ async fn test_collect_cache_entries_for_eviction_full_object() {
             created_at: now,
             last_accessed: now,
             access_count: 1,
-            frequency_score: 0,
         });
     }
 
@@ -348,7 +345,6 @@ async fn test_get_cache_usage_breakdown_with_new_architecture() {
         created_at: now,
         last_accessed: now,
         access_count: 1,
-        frequency_score: 0,
     };
 
     let cache_metadata = NewCacheMetadata {

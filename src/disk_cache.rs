@@ -13409,7 +13409,6 @@ mod tests {
                     created_at: now,
                     last_accessed: now,
                     access_count: 1,
-                    frequency_score: 1,
                 };
 
                 let metadata = crate::cache_types::NewCacheMetadata {
@@ -13508,7 +13507,6 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
-                frequency_score: 1,
             });
         }
 
@@ -13641,7 +13639,6 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
-                frequency_score: 1,
             });
         }
 
@@ -14715,7 +14712,6 @@ mod tests {
                 created_at: SystemTime::now(),
                 last_accessed: SystemTime::now(),
                 access_count: 0,
-                frequency_score: 0,
             };
 
             // load_range_data should return an error (cache miss) for unsafe paths
@@ -14771,7 +14767,6 @@ mod tests {
             created_at: SystemTime::now(),
             last_accessed: SystemTime::now(),
             access_count: 0,
-            frequency_score: 0,
         };
 
         // We need metadata on disk for delete_cache_entry to read it.
