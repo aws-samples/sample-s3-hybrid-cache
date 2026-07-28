@@ -2,40 +2,43 @@
 
 Deep-dive reference documentation for Hybrid Cache for Amazon S3. For an overview and quick start, see the [project README](../README.md).
 
-## Table of Contents
+## Getting Started
 
-### Getting Started
-- [Quick Start Guide](GETTING_STARTED.md) - Installation and basic setup
+- [Quick Start Guide](GETTING_STARTED.md) - Installation and first run
+- [Upgrading](UPGRADING.md) - Per-release manual steps and default changes
 - [Configuration Reference](CONFIGURATION.md) - Complete configuration options
 
-### Core Concepts
+## Core Concepts
+
 - [Architecture Overview](ARCHITECTURE.md) - Technical architecture and design principles
 - [Caching System](CACHING.md) - Multi-tier caching with RAM and disk
 - [Compression](COMPRESSION.md) - LZ4 compression and content detection
 - [Connection Pooling](CONNECTION_POOLING.md) - Connection management and load balancing
 
-### Advanced Features
+## Features
+
 - [Write-Through Caching](CACHING.md#write-through-cache) - PUT operation caching
 - [Multipart Upload Caching](MULTIPART_UPLOAD.md) - Multipart upload cache internals and correctness model
 - [Range Request Optimization](CACHING.md#intelligent-range-merging) - Intelligent range handling
+- [Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching) - Opt-in range read widening for analytics workloads
 - [Compression Optimization](COMPRESSION.md#ram-cache-compression-optimization) - Efficient memory usage
+- [Download Bandwidth QoS](BANDWIDTH_QOS.md) - Origin download rate ceiling and fair sharing
+
+## Monitoring
+
 - [Dashboard](DASHBOARD.md) - Web-based monitoring interface
+- [Metrics](METRICS.md) - Per-bucket traffic metrics and cache savings inference
 - [OTLP Metrics](OTLP_METRICS.md) - OpenTelemetry metrics export
 
-### Operations & Maintenance
-- [Error Handling](ERROR_HANDLING.md) - Robust error recovery mechanisms
-- [Testing Guide](TESTING.md) - Test suite and validation procedures
-- [Developer Guide](DEVELOPER.md) - Implementation details and development notes
+## Operations
 
-### Reference
-- [Error Handling](ERROR_HANDLING.md) - Error recovery and maintenance operations
+- [Error Handling](ERROR_HANDLING.md) - Recovery from cache corruption and disk issues
 - [Performance Tuning](CONFIGURATION.md#cache-hit-performance-tuning) - Optimization guidelines
+- [Testing Guide](TESTING.md) - Test suite and validation procedures
+- [Developer Guide](DEVELOPER.md) - Build, test, and coverage workflow
 
----
+## Reference
 
-## Quick Links
-
-- **[Configuration Reference](CONFIGURATION.md)** - All configuration options with examples
-- **[Caching Documentation](CACHING.md)** - Detailed caching behavior and TTL management
-- **[Error Handling](ERROR_HANDLING.md)** - Recovery mechanisms for cache corruption and disk issues
-- **[Dashboard](DASHBOARD.md)** - Web interface for monitoring cache statistics
+- [Cache rules schema](cache-rules-schema.json) - JSON Schema for `cache_rules.json`
+- [Cache rules examples](examples/) - Worked `cache_rules.json` files for common patterns
+- [`config/config.example.yaml`](../config/config.example.yaml) - Annotated example configuration

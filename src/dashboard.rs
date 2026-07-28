@@ -1550,6 +1550,9 @@ function appendSettingsRow(row, settings, rowKey) {
     if (s.write_cache_enabled != null) items.push('Write: ' + (s.write_cache_enabled ? 'On' : 'Off'));
     if (s.compression_enabled != null) items.push('Compression: ' + (s.compression_enabled ? 'On' : 'Off'));
     if (s.ram_cache_eligible != null) items.push('RAM: ' + (s.ram_cache_eligible ? 'On' : 'Off'));
+    if (s.evaluate_conditions_from_cache != null) items.push('Local conditions: ' + (s.evaluate_conditions_from_cache ? 'On' : 'Off'));
+    if (s.page_widening != null) items.push('Page widening: ' + (s.page_widening ? 'On' : 'Off'));
+    if (s.page_size != null) items.push('Page size: ' + formatBytes(s.page_size));
     td.innerHTML = '<div class="stats-detail">' + items.join('<span class="detail-sep">·</span>') + '</div>';
     detail.appendChild(td);
     row.after(detail);
@@ -1803,7 +1806,7 @@ impl ApiHandler {
             let disk_only_get_misses = cache_stats.get_misses;
 
             // Get uptime and PUT request count from metrics manager if available
-            let (uptime_seconds, put_total) = if let Some(metrics_manager) =
+            let (uptime_seconds, put_total, page_cache) = if let Some(metrics_manager) =
                 metrics_manager_guard.as_ref()
             {
                 debug!("Metrics manager is available, getting uptime");
@@ -1820,11 +1823,28 @@ impl ApiHandler {
                     .unwrap_or(0);
 
                 // Use minimum of 1 second for uptime (0 is normal at startup)
-                (fresh_metrics.uptime_seconds.max(1), put_total)
+                (
+                    fresh_metrics.uptime_seconds.max(1),
+                    put_total,
+                    fresh_metrics.page_cache,
+                )
             } else {
                 warn!("Metrics manager not available in dashboard, this indicates a configuration issue");
                 // Fallback: return 0 to indicate the issue
-                (0, 0)
+                (
+                    0,
+                    0,
+                    crate::metrics::PageCacheMetrics {
+                        widened_requests: 0,
+                        bytes_prefetched: 0,
+                        amplification_ratio: 1.0,
+                        page_hits: 0,
+                        skipped_signed_range: 0,
+                        fallbacks: 0,
+                        ram_page_promotions: 0,
+                        ram_page_promotion_skipped: 0,
+                    },
+                )
             };
 
             // Overall request count: GETs + HEADs (cache hit/miss path) + PUTs
@@ -1957,6 +1977,7 @@ impl ApiHandler {
                     s3_requests_saved: cache_stats.cache_hits,
                 },
                 last_consolidation,
+                page_cache,
             }
         } else {
             // Return service unavailable if cache manager is not available
@@ -2163,6 +2184,9 @@ impl ApiHandler {
                     write_cache_enabled: r.write_cache_enabled,
                     compression_enabled: r.compression_enabled,
                     ram_cache_eligible: r.ram_cache_eligible,
+                    evaluate_conditions_from_cache: r.evaluate_conditions_from_cache,
+                    page_widening: r.page_widening,
+                    page_size: r.page_size,
                     head_hit_count: rs.map_or(0, |s| s.head_hit_count),
                     head_miss_count: rs.map_or(0, |s| s.head_miss_count),
                     get_hit_count: rs.map_or(0, |s| s.get_hit_count),
@@ -2585,6 +2609,9 @@ pub struct CacheStatsResponse {
     /// Timestamp of last consolidation cycle
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_consolidation: Option<SystemTime>,
+    /// Page-aligned range caching (widening) metrics.
+    /// Spec: page-aligned-range-cache. Requirements: 8.1-8.6
+    pub page_cache: crate::metrics::PageCacheMetrics,
 }
 
 /// Write cache statistics (MPUs in progress and PUT objects not yet read)
@@ -2739,6 +2766,20 @@ pub struct RuleStatsEntry {
     pub compression_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ram_cache_eligible: Option<bool>,
+    /// Whether this rule evaluates client conditional headers locally against
+    /// cached metadata ("Mode B") instead of forwarding them to S3. Surfaced
+    /// because it has an audit-relevant consequence: when on, S3 does not
+    /// re-validate the caller's credentials on that conditional request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluate_conditions_from_cache: Option<bool>,
+    /// Page-aligned range caching opt-in for this rule.
+    /// Spec: page-aligned-range-cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_widening: Option<bool>,
+    /// Page size in bytes used when `page_widening` is enabled.
+    /// Spec: page-aligned-range-cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u64>,
     // Per-rule hit/miss stats
     pub head_hit_count: u64,
     pub head_miss_count: u64,

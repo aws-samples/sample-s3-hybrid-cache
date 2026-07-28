@@ -7,7 +7,32 @@ Type=simple
 ExecStart=/usr/local/bin/s3-proxy -c /etc/s3-proxy/config.yaml
 Restart=on-failure
 RestartSec=5
+
+# --- Privilege model ---
+# The proxy runs as root to bind ports 80/443. If your deployment uses
+# proxy-only mode (port 3128) or a load balancer that owns 80/443, switch
+# to User=s3proxy / Group=s3proxy and add:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 User=root
+
+# --- Sandbox directives (compatible with User=root) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# --- Filesystem allowlist ---
+# Adjust these paths to match your config.yaml cache_dir and log directories.
+# The proxy needs read-write access to the cache and log directories only.
+ReadWritePaths=/var/cache/s3-proxy /var/log/s3-proxy
+
+# --- Logging ---
 StandardOutput=journal
 StandardError=journal
 

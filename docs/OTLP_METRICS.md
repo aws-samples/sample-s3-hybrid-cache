@@ -187,6 +187,24 @@ All metrics are gauges with resource attributes `host.name`, `service.name`, and
 | `uptime_seconds` | Gauge (s) | Proxy uptime |
 | `process.memory_usage_bytes` | Gauge (bytes) | RSS memory usage |
 
+### Download Bandwidth QoS
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `download_bandwidth.instance_ceiling_bps` | Gauge (bytes/s) | This instance's share of the configured origin download ceiling |
+| `download_bandwidth.failopen_total` | Gauge (count) | Times the scheduler failed open, admitting traffic without shaping |
+| `download_bandwidth.class_bytes` | Gauge (bytes) | Bytes attributed to the scheduling class |
+
+See [Bandwidth QoS](BANDWIDTH_QOS.md) for what these mean and how the ceiling is
+shared across a fleet.
+
+### Not exported via OTLP
+
+The `page_cache.*` metrics for page-aligned range caching are **not** OTLP-exported.
+They are available from the `/metrics` JSON endpoint and in the dashboard's
+`/api/cache-stats` payload. If you need them in a metrics backend, scrape `/metrics`.
+See [CACHING.md — Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching).
+
 ## Configuration Options
 
 ### Export Interval
@@ -233,7 +251,7 @@ otlp:
 Check logs for OTLP export errors:
 
 ```bash
-grep "OTLP" /logs/app/$(hostname)/proxy.log
+grep "OTLP" /logs/app/$(hostname)/s3-proxy.log.$(date +%Y-%m-%d)
 ```
 
 Verify CloudWatch Agent is configured for OTLP:

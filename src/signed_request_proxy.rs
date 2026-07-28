@@ -292,6 +292,24 @@ pub fn is_aws_sigv4_signed(headers: &HashMap<String, String>) -> bool {
 /// - Requirement 1.4: Return false if SignedHeaders does not include "range"
 /// - Requirement 1.5: Return false for malformed or absent Authorization header
 pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
+    is_header_signed(headers, "range")
+}
+
+/// Check whether a named header is included in AWS SigV4 `SignedHeaders`.
+///
+/// Generalization of [`is_range_signed`] for any header the proxy may want to
+/// rewrite or strip: doing so to a SIGNED header invalidates the client's
+/// signature and earns a `SignatureDoesNotMatch` from S3, so every such
+/// rewrite must be gated on this returning `false`.
+///
+/// `header_name` must be given lowercase, matching the canonical form used in
+/// the `SignedHeaders` list.
+///
+/// Returns `false` for an absent or malformed `Authorization` header, and for
+/// a non-SigV4-family signature — in those cases there is no signature for a
+/// rewrite to invalidate. Matching is exact per semicolon-separated entry, so
+/// `x-range` and `content-range` never match `range`.
+pub fn is_header_signed(headers: &HashMap<String, String>, header_name: &str) -> bool {
     // Get Authorization header (case-insensitive)
     let auth = headers
         .get("authorization")
@@ -323,9 +341,9 @@ pub fn is_range_signed(headers: &HashMap<String, String>) -> bool {
 
     let signed_headers = &after_param[..signed_headers_end];
 
-    // Check if "range" is in the semicolon-separated list
+    // Check if the named header is in the semicolon-separated list.
     // Must be exact match to avoid matching "x-range" or similar (Requirement 1.3, 1.4)
-    signed_headers.split(';').any(|h| h == "range")
+    signed_headers.split(';').any(|h| h == header_name)
 }
 
 /// Extract metadata from S3 response and request headers

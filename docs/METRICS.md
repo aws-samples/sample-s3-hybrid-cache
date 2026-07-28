@@ -1,6 +1,11 @@
-# Metrics and Observability
+# Per-Bucket Traffic Metrics
 
-## Per-Bucket Traffic Metrics
+This document covers per-bucket traffic accounting and cache-savings inference. For the
+full OpenTelemetry export surface — every gauge the proxy emits, and how to publish to
+CloudWatch, Prometheus, or an OTel Collector — see
+[OTLP Metrics](OTLP_METRICS.md).
+
+## What is counted
 
 The proxy tracks cumulative per-bucket bandwidth and request counters for **object reads (GET) and object/part writes (PUT, including UploadPart)**. Counters mirror S3's named request metrics — `GetRequests`, `PutRequests`, `BytesDownloaded`, `BytesUploaded` — so the proxy's per-bucket data is directly comparable to S3 CloudWatch request metrics for cache savings inference.
 
@@ -30,7 +35,7 @@ Other operations (HEAD, DELETE, the multipart lifecycle POSTs, and LIST) are int
 
 **Dashboard** (`/api/bucket-traffic`): the operational dashboard shows a "Per-Bucket Traffic" table alongside the existing cache hit/miss table.
 
-**OTLP** (opt-in): set `metrics.otlp.per_bucket_enabled: true` to emit `s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, and `s3proxy.put_requests` as cumulative counters in CloudWatch (via CloudWatch Agent or ADOT).
+**OTLP** (opt-in): set `metrics.otlp.per_bucket_enabled: true` to emit `s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, and `s3proxy.put_requests` as cumulative counters in CloudWatch (via CloudWatch Agent or ADOT). See [OTLP Metrics — Per-bucket counters](OTLP_METRICS.md#per-bucket-counters-opt-in) for the export configuration.
 
 ### Operation-to-metric mapping
 

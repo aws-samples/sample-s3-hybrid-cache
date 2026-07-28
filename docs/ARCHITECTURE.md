@@ -250,6 +250,35 @@ fn get_sharded_path(base_dir: &Path, cache_key: &str, suffix: &str) -> Result<Pa
 - Atomic cache operations
 - Consistent metadata management
 
+### 3a. Range Read-Path Map
+
+`http_proxy.rs` and `cache.rs` each contain several similarly-named range read
+paths that differ in exactly the details that matter for cache-tier
+participation. Which tier a path reaches is not visible at its call site: RAM
+access happens one level down, inside `CacheManager`, so searching a file for
+`ram_cache` understates its RAM participation. This map records, per entry
+point, what actually happens.
+
+| Entry point | Consults RAM? | Promotes to RAM? | RAM key |
+|---|---|---|---|
+| `serve_range_from_cache` (streaming, `http_proxy.rs`) | Only via the buffered/RAM pre-check before the streaming decision | On disk-hit collection during streaming, via the frame-verbatim path | `generate_ram_range_key` (colon grammar) |
+| `serve_range_from_cache_buffered` (`http_proxy.rs`) | Yes — `get_cached_range_data` → single-range branch checks RAM directly | Yes, on disk hit | `generate_ram_range_key` (colon grammar) |
+| `get_cached_range_data` → single-range branch | Yes | Yes, on disk hit | `generate_ram_range_key` (colon grammar) |
+| `get_cached_range_data` → merge branch → `RangeHandler::merge_range_segments` → `extract_bytes_from_cached_range` → `CacheManager::load_range_data_with_cache` | Yes, **per cached segment** | Yes, per segment on disk hit | `generate_ram_range_key` (colon grammar), keyed on each segment's stored-range bounds |
+| `fill_page` (page mode) → `load_page_from_cache` | Yes — page-keyed RAM lookup (`get_range_from_ram_cache` with page bounds) | Yes, on disk hit only — never on the cold S3-fetch fill | `generate_ram_range_key` (colon grammar), keyed on page bounds, not the client's sub-range |
+
+Notes:
+- All four paths share the **same RAM key grammar** (`generate_ram_range_key`,
+  colon-separated) via the single-source-of-truth helper next to
+  `generate_range_cache_key` in `cache.rs`. This is distinct from the
+  disk-cache key grammar (`generate_range_cache_key`, hyphen-separated).
+- The merge branch's RAM participation is easy to miss because
+  `merge_range_segments` itself never mentions RAM — the tier access is
+  inside `extract_bytes_from_cached_range`, one call down.
+- See [CACHING.md](CACHING.md) for the maintained description of what gets
+  cached and why; this map is about *which code path* reaches which tier, not
+  about cache semantics.
+
 ### 4. Stateless Instance Architecture
 
 **Problem**: Traditional distributed caches require cluster membership, leader election, or inter-node communication, adding operational complexity.
@@ -507,7 +536,7 @@ Separate from the access-control model above, the proxy's **data integrity model
 
 **What the proxy trusts**:
 - **S3 validates bytes on ingress.** Every PUT and UploadPart is forwarded unmodified to S3. If S3 returns 200, its stored bytes match what the client sent (plus S3's own checksum of record — default CRC64NVME since December 2024).
-- **LZ4 frame content checksums catch disk corruption.** All cached bytes — compressed or uncompressed-frame-wrapped — carry an xxhash32 frame checksum (see [COMPRESSION.md](COMPRESSION.md#integrity-lz4-frame-content-checksums)). Bit-flips surface as decode errors and are handled as cache misses.
+- **LZ4 frame content checksums catch disk corruption.** All cached bytes — compressed or uncompressed-frame-wrapped — carry an xxhash32 frame checksum (see [COMPRESSION.md](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame)). Bit-flips surface as decode errors and are handled as cache misses.
 - **The storage layer catches lower-level corruption.** Filesystem and block-device integrity (EFS, ext4, XFS) cover everything below the frame checksum.
 
 **What the proxy verifies**:
@@ -523,9 +552,15 @@ Separate from the access-control model above, the proxy's **data integrity model
 **Residual integrity gap**:
 For a motivated attacker who can both (a) intercept a client's multipart upload in flight and substitute one part via a direct-to-S3 UploadPart call, and (b) produce an MD5 collision for that part, the cache could retain bytes that no longer match what S3 stored. This gap exists because per-part ETags on SSE-S3 single-part data are MD5 of the content, and MD5 is not collision-resistant. The same attacker could confuse any client or tool relying on ETag matching for integrity — this is not a proxy-specific weakness.
 
-Mitigations at the bucket/client layer (not the proxy):
-- **Specify a stronger checksum algorithm at `CreateMultipartUpload`** (e.g., `--checksum-algorithm SHA256`). Per-part checksums then land in the `CompleteMultipartUpload` request body and S3 verifies them end-to-end.
-- **Use SSE-KMS** so ETags become opaque, non-content-derived strings that an attacker cannot forge via content manipulation.
+**Note the precondition.** Step (a) requires an actor who can call `UploadPart` against
+that upload — meaning one who already holds valid S3 write credentials for the bucket.
+As stated above, such an actor can write to the bucket directly regardless of the proxy,
+which is outside the threat model. Weigh any mitigation against that: it is bought only
+for the narrow case where an authorized writer wants the cache to diverge from S3,
+having also defeated MD5.
+
+Mitigation at the bucket/client layer (not the proxy):
+- **Request a cryptographic checksum at `CreateMultipartUpload`** (e.g., `--checksum-algorithm SHA256`). Per-part checksums then land in the `CompleteMultipartUpload` request body and S3 verifies them end-to-end. Note that uploads are not unchecksummed by default — current AWS SDKs and CLI v2 apply CRC64NVME automatically, and S3 stores it as the default checksum. CRC64NVME detects corruption in transit but is not collision-resistant, so it does not defend against an attacker who controls the content; SHA256 does.
 
 ### Deployment Guidelines
 

@@ -20,7 +20,15 @@ The dashboard provides a lightweight, browser-based interface for monitoring pro
 - **Rule rows**: One row per rule, shown in first-match-per-field order. The "Rule / Pattern" column holds the glob pattern; HEAD and GET columns show per-rule hit summaries (e.g. `72.3% of 4 102`)
 - **Pattern filter**: Client-side text filter that matches rule patterns
 - **Top 20 display**: Shows the top 20 rows by default with a "Show all" toggle
-- **Expandable settings**: Click "Settings" on a rule row to view the fields that rule sets (GET/HEAD/PUT TTL, read/write/compression/RAM)
+- **Expandable settings**: Click "Settings" on a rule row to view the fields that rule sets (GET/HEAD/PUT TTL, read/write/compression/RAM, "Local conditions" for `evaluate_conditions_from_cache`, and page widening + page size for [page-aligned range caching](CACHING.md#page-aligned-range-caching)). Only fields the rule actually sets are shown; unset fields fall through to the global defaults and are omitted. "Local conditions: On" means the proxy answers conditional requests for matching keys from cached metadata rather than forwarding them to S3 — worth noting when auditing which prefixes skip S3-side credential revalidation.
+
+### Page-Aligned Range Caching Statistics
+
+The `page_cache` counters (widened requests, bytes prefetched, page hits, signed-range
+skips, fallbacks, and RAM page promotions) are returned in the `/api/cache-stats` JSON
+payload. There is no dedicated dashboard card for them yet — read them from that
+endpoint or from `/metrics`. Per-rule page settings *are* visible in the Cache Rules
+table via the Settings expander, described above.
 
 ### Application Log Viewer
 - **Recent entries**: Shows most recent 100 log entries by default (configurable)
@@ -44,7 +52,7 @@ The dashboard provides a lightweight, browser-based interface for monitoring pro
 dashboard:
   enabled: true                        # Enable dashboard server
   port: 8081                          # Dashboard server port
-  bind_address: "0.0.0.0"             # Bind to all interfaces
+  bind_address: "127.0.0.1"           # Default: loopback only
   cache_stats_refresh_interval: "5s"   # Cache stats refresh rate
   logs_refresh_interval: "10s"         # Log refresh rate
   max_log_entries: 100                 # Maximum log entries to display
@@ -149,7 +157,8 @@ dashboard:
 ### Performance Issues
 1. Increase refresh intervals to reduce update frequency
 2. Reduce `max_log_entries` for faster log loading
-3. Monitor concurrent user count (max 10 supported)
+3. Monitor concurrent connection count (50 concurrent connections are accepted; beyond
+   that, new connections are rejected and the rejection is logged)
 4. Check proxy logs for dashboard-related errors
 
 ### Connection Limits
@@ -162,7 +171,7 @@ dashboard:
 
 ### Unauthenticated, Read-Only Interface
 
-The dashboard is unauthenticated and read-only. It provides cache statistics, application log excerpts, and system information (hostname, version, uptime). It exposes no write operations, no credentials, and no control-plane actions. Presigned URL parameters are masked before they reach the log viewer (see Security Findings Remediation Req 5).
+The dashboard is unauthenticated and read-only. It provides cache statistics, application log excerpts, and system information (hostname, version, uptime). It exposes no write operations, no credentials, and no control-plane actions. Presigned URL parameters are masked before they reach the log viewer, so signatures, credentials, and session tokens are redacted rather than displayed.
 
 The security posture depends entirely on who can reach the port:
 

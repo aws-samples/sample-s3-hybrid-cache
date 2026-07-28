@@ -34,6 +34,31 @@
 //! S3. Each concurrent request is launched on its own `tokio::spawn` task so
 //! the coalescer sees concurrent registrations on the same flight key.
 //!
+//! ## Guaranteeing the participants actually overlap
+//!
+//! Case B asserts `authoritative <= 1`, which only holds if all N participants
+//! register while the first fetcher's flight is still open. `InFlightTracker`
+//! hands out `FetchRole::Fetcher` for any *vacant* flight key, and the
+//! `FetchGuard` removes the key on completion — so a participant that arrives
+//! after the previous flight closed correctly becomes a new fetcher and issues
+//! its own authoritative round-trip. That is right behaviour (coalescing only
+//! applies to overlapping requests), but it breaks the assertion.
+//!
+//! The harness therefore forces the overlap two ways:
+//!
+//! 1. A `tokio::sync::Barrier` holds every task until all N are running, so
+//!    none is still unscheduled when the first one proceeds.
+//! 2. The stub delays the fetcher's authoritative response by
+//!    `FETCHER_FLIGHT_HOLD`, keeping the flight open far longer than scheduler
+//!    jitter.
+//!
+//! Before this, the harness used a fixed 50µs stagger against an in-process
+//! stub that returned in microseconds. The flight routinely closed before the
+//! stragglers were scheduled, so the test passed on an idle machine and failed
+//! under CPU contention (reproduced at 2 failures in 6 runs with the machine
+//! loaded, versus 5/5 passes idle) — a false positive blaming correct
+//! production code. Do not reintroduce a fixed-sleep stagger here.
+//!
 //! # Re-use in Task 13 (fix-checking)
 //!
 //! Task 13 of `tasks.md` re-runs this exact file against the fixed code.
@@ -130,6 +155,21 @@ const FETCHER_BODY: &[u8] = b"OK-CONTENT-FROM-FETCHER";
 
 /// The authorization value we use for the fetcher. Any plausible SigV4
 /// string is fine — the stub routes on exact match.
+/// How long the stub holds the fetcher's authoritative response, keeping its
+/// `InFlightTracker` flight open so every other participant registers as a
+/// waiter on the same flight key rather than electing itself a second fetcher.
+///
+/// Sized as a large margin over tokio scheduling jitter, which was measured in
+/// the microsecond-to-low-millisecond range even under heavy CPU contention.
+/// Only the authoritative response is delayed (one per generated case), so the
+/// cost is bounded at roughly this value times the quickcheck case count.
+const FETCHER_FLIGHT_HOLD: Duration = Duration::from_millis(100);
+
+/// The ETag the primed cache entry carries. Waiters revalidating that entry
+/// send it back as `If-None-Match`, which is how the stub distinguishes a
+/// conditional round-trip from the fetcher's authoritative one.
+const CACHED_ETAG: &str = "\"cached-etag\"";
+
 const FETCHER_AUTHORIZATION: &str =
     "AWS4-HMAC-SHA256 Credential=AKIA-FETCHER/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef";
 
@@ -225,7 +265,7 @@ fn signed_get_headers(authorization: &str) -> HashMap<String, String> {
 /// moment it's written — i.e. `expires_at` is in the past.
 async fn prime_cache_with_expired_entry(cache_manager: &Arc<CacheManager>, cache_key: &str) {
     let headers: HashMap<String, String> = [
-        ("etag".to_string(), "\"cached-etag\"".to_string()),
+        ("etag".to_string(), CACHED_ETAG.to_string()),
         (
             "last-modified".to_string(),
             "Wed, 01 Jan 2020 00:00:00 GMT".to_string(),
@@ -240,7 +280,7 @@ async fn prime_cache_with_expired_entry(cache_manager: &Arc<CacheManager>, cache
     .collect();
 
     let metadata = CacheMetadata {
-        etag: "\"cached-etag\"".to_string(),
+        etag: CACHED_ETAG.to_string(),
         last_modified: "Wed, 01 Jan 2020 00:00:00 GMT".to_string(),
         content_length: FETCHER_BODY.len() as u64,
         part_number: None,
@@ -317,6 +357,16 @@ async fn launch_concurrent_gets(
 ) -> Vec<(StatusCode, Bytes)> {
     let wait_timeout = Duration::from_secs(config.cache.download_coordination.wait_timeout_secs);
 
+    // Gate every participant behind a barrier so all N tasks are demonstrably
+    // spawned and running before any of them enters the coordination helper.
+    // This replaces an earlier fixed 50µs stagger, which did not actually
+    // guarantee overlap: the stub S3 call is in-process and returns in
+    // microseconds, so the fetcher's flight could open and close before a
+    // straggler was scheduled. See `StubResponse::with_delay` for the other
+    // half of the fix (holding the fetcher's flight window open).
+    let participant_count = participants.len();
+    let start_barrier = Arc::new(tokio::sync::Barrier::new(participant_count));
+
     let mut join_set: JoinSet<(usize, StatusCode, Bytes)> = JoinSet::new();
     for (idx, headers) in participants.into_iter().enumerate() {
         let method = Method::GET;
@@ -328,15 +378,15 @@ async fn launch_concurrent_gets(
         let inflight_tracker = Arc::clone(&inflight_tracker);
         let range_handler = Arc::clone(&range_handler);
         let config = Arc::clone(&config);
+        let start_barrier = Arc::clone(&start_barrier);
 
         join_set.spawn(async move {
-            // Add a tiny deterministic stagger so the fetcher-election race
-            // is reproducible across runs — index 0 enters first, the rest
-            // enter after a microsecond so they land as waiters on the same
-            // flight key.
-            if idx != 0 {
-                tokio::time::sleep(Duration::from_micros(50)).await;
-            }
+            // Everyone waits here until all N participants are running, then
+            // they enter the coordination helper together. Index 0 still tends
+            // to win the fetcher election, but correctness of the test no
+            // longer depends on who wins — only on all N overlapping, which
+            // the barrier plus the fetcher's response delay guarantee.
+            start_barrier.wait().await;
             let (status, body) = run_one_coordinated_get(
                 method,
                 uri,
@@ -442,7 +492,10 @@ fn prop_case_a_iam_bypass_under_ttl_zero(waiter_count: u8) -> TestResult {
                 StubResponse::ok(Bytes::from_static(FETCHER_BODY))
                     .with_header("etag", "\"fetcher-etag\"")
                     .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
-                    .with_header("content-type", "application/octet-stream"),
+                    .with_header("content-type", "application/octet-stream")
+                    // Hold the fetcher's flight open so the waiters really do
+                    // park on it instead of racing past a closed flight.
+                    .with_delay(FETCHER_FLIGHT_HOLD),
             )
             .with_default(StubResponse::forbidden());
         let s3_client = stub.clone().into_trait_object();
@@ -555,11 +608,25 @@ fn prop_case_b_expired_cache_stampede(participant_count: u8) -> TestResult {
         // with the body so that on the fixed-code path a waiter's
         // conditional GET that races past the fetcher's revalidation will
         // still get bytes.
-        let stub = StubS3Client::new().with_default(
-            StubResponse::ok(Bytes::from_static(FETCHER_BODY))
-                .with_header("etag", "\"fetcher-etag\"")
-                .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT"),
-        );
+        // Two routes, differing only in latency:
+        //   - default (no If-None-Match) = the fetcher's authoritative call. It
+        //     is delayed so its flight stays open for the whole stampede.
+        //   - If-None-Match: CACHED_ETAG = a waiter's conditional revalidation.
+        //     Undelayed; these should not be throttled, and their count is what
+        //     the property asserts on.
+        let stub = StubS3Client::new()
+            .with_response_for_etag(
+                CACHED_ETAG,
+                StubResponse::ok(Bytes::from_static(FETCHER_BODY))
+                    .with_header("etag", "\"fetcher-etag\"")
+                    .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT"),
+            )
+            .with_default(
+                StubResponse::ok(Bytes::from_static(FETCHER_BODY))
+                    .with_header("etag", "\"fetcher-etag\"")
+                    .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+                    .with_delay(FETCHER_FLIGHT_HOLD),
+            );
         let s3_client = stub.clone().into_trait_object();
 
         let uri: hyper::Uri = "/bucket-case-b/expired-cache-target.bin"

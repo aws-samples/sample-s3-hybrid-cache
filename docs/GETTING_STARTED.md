@@ -87,11 +87,17 @@ The binary has no bundled assets. At runtime it needs a config file, cache direc
 
 ### Upgrading
 
-Configuration is backward-compatible at the field level: new options always have defaults, so an existing `config.yaml` keeps parsing and running across versions. Review `CHANGELOG.md` and `config/config.example.yaml` for new features and tuning knobs — in the normal case no config edits are required to upgrade.
-
-**Exception — upgrading to 2.0.0 (per-bucket `_settings.json` removed).** 2.0.0 replaced the per-bucket `cache_dir/metadata/{bucket}/_settings.json` mechanism (including `prefix_overrides`) with a single optional `cache_dir/cache_rules.json` holding an ordered list of glob rules matched against the full `{bucket}/{object_key}` cache key. There is no auto-migration: after upgrade any `_settings.json` files are ignored — the proxy logs a one-time warning if it finds them under `cache_dir/metadata/` — so their settings stop taking effect until you translate them by hand into `cache_rules.json`. Watch the matching change while translating: the old `prefix_overrides` were prefix matches, whereas rules are anchored globs, so "everything under `temp/` in `mybucket`" becomes the pattern `mybucket/temp/**`. If you never used `_settings.json`, no action is needed. See [Cache Rules](CONFIGURATION.md#cache-rules) and the 2.0.0 entry in [CHANGELOG.md](../CHANGELOG.md) for the rule syntax and a before/after example.
-
 The upgrade flow is: rebuild (or copy the binary from a build host), replace, restart.
+Configuration is backward-compatible at the field level: new options always have
+defaults, so an existing `config.yaml` keeps parsing and running across versions. In the
+normal case no config edits are required.
+
+A release can still change a **default**, so a deployment that pins nothing can see
+different memory use, connection counts, or network exposure after a binary swap.
+Before upgrading across more than one release, check
+**[UPGRADING.md](UPGRADING.md)** — it indexes every release that needs a manual step or
+changes a default, so you can read only the entries between your version and your
+target.
 
 ```bash
 git pull                                                 # Sync latest source
@@ -1314,7 +1320,7 @@ Tested on EC2 (m6in.2xlarge) with 100 concurrent clients downloading 1.4 GB each
 **Key considerations**:
 - Network bandwidth is the primary constraint — choose servers or instances with high network throughput
 - CPU usage is minimal (~1 core at 100 clients) — 2-4 vCPU is sufficient for most workloads
-- RAM cache (1 GB default) accelerates repeated reads — increase for hot working sets
+- RAM cache (512 MiB default) accelerates repeated reads — increase for hot working sets
 - Disk cache size depends on working set — NFS provides shared storage across instances
 - Download coordination reduces S3 fetches by 94% during concurrent access, so S3 bandwidth is rarely a bottleneck
 - Scale out by adding proxy instances behind DNS multivalue routing rather than scaling up

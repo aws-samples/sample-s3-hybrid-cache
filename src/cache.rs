@@ -195,6 +195,19 @@ mod decayed_frequency_tests {
 /// Strips only the two known suffix grammars, from the end, so a colon that
 /// is part of the object key itself is left alone (compression-content-aware-fix
 /// spec, Requirement 2).
+///
+/// **Two `:range:` grammars exist and this function only recognizes one.**
+/// The disk-cache key produced by `generate_range_cache_key` uses a hyphen —
+/// `:range:{start}-{end}` — which is what [`is_range_suffix_body`] validates
+/// below. The RAM-cache range key produced by `generate_ram_range_key` uses a
+/// colon instead — `:range:{start}:{end}` — which this function will decline
+/// to strip (the colon isn't `<digits>-<digits>`). This is safe today: every
+/// caller of this function (`effective_compression`,
+/// `extract_path_from_cache_key` in this file and in `disk_cache.rs`) only
+/// ever receives object keys for compression/extension detection, never a RAM
+/// range key. If a future caller passes a RAM range key here, this function
+/// will fail to strip it — treat that as a bug in the new caller, not in this
+/// function (page-aligned-range-cache Task 10).
 pub(crate) fn strip_known_cache_key_suffixes(cache_key: &str) -> String {
     // `:range:<start>-<end>` is always the last suffix if present (see
     // generate_cache_key_with_params: range wraps part, not the reverse).
@@ -1899,6 +1912,26 @@ impl CacheManager {
         format!("{}:range:{}-{}", base_key, start, end)
     }
 
+    /// Generate the key used for a RAM-cache range entry.
+    ///
+    /// This is a **distinct grammar** from [`generate_range_cache_key`], which
+    /// produces the disk-cache key `:range:{start}-{end}` (hyphen-separated,
+    /// validated by `is_range_suffix_body`). The RAM range key uses a colon
+    /// separator instead: `:range:{start}:{end}`. RAM range keys never pass
+    /// through [`strip_known_cache_key_suffixes`] — its callers only ever see
+    /// object keys, not RAM range keys — so the two grammars coexisting is
+    /// latent, not a live defect (page-aligned-range-cache Task 10).
+    ///
+    /// The three production sites that read or write a RAM range entry —
+    /// `load_range_data_with_cache`, `get_range_from_ram_cache`, and
+    /// `promote_range_to_ram_cache_frame` — MUST build the key through this
+    /// helper so lookup and promotion agree by construction. A mismatch
+    /// between them would silently disable the RAM tier for ranges, with no
+    /// test failure to surface it (the miss just falls through to disk).
+    pub(crate) fn generate_ram_range_key(cache_key: &str, start: u64, end: u64) -> String {
+        format!("{}:range:{}:{}", cache_key, start, end)
+    }
+
     /// Generate cache key with part number and range parameters
     pub fn generate_cache_key_with_params(
         path: &str,
@@ -3285,7 +3318,7 @@ impl CacheManager {
         range_handler: &crate::range_handler::RangeHandler,
     ) -> Result<(Vec<u8>, bool)> {
         // Generate a unique cache key for this specific range
-        let range_cache_key = format!("{}:range:{}:{}", cache_key, range.start, range.end);
+        let range_cache_key = Self::generate_ram_range_key(cache_key, range.start, range.end);
 
         // First tier: Check RAM cache if enabled
         if self.ram_cache_enabled {
@@ -7961,7 +7994,7 @@ impl CacheManager {
             return None;
         }
 
-        let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
+        let range_cache_key = Self::generate_ram_range_key(cache_key, start, end);
 
         let ram_read = {
             if let Some(ram_cache) = &self.ram_cache {
@@ -8017,6 +8050,14 @@ impl CacheManager {
     /// write-cache (`convert_write_entry_to_ram_entry`) promotion paths
     /// (compression-content-aware-fix Requirement 9). Skips promotion if RAM
     /// cache is disabled or the frame exceeds `max_ram_cache_size`.
+    ///
+    /// Returns `true` when the entry was handed to the RAM cache for
+    /// insertion, `false` when promotion was skipped up front because RAM
+    /// caching is disabled or the frame exceeds `max_ram_cache_size`. This is
+    /// used by the page-widening path (Requirement 8.6) to distinguish a
+    /// promotion from a size-budget skip; it does not detect an eviction-time
+    /// drop inside `ShardedRamCache::put` itself, which does not currently
+    /// signal that outcome back to the caller.
     pub fn promote_range_to_ram_cache_frame(
         &self,
         cache_key: &str,
@@ -8025,20 +8066,20 @@ impl CacheManager {
         algorithm: crate::compression::CompressionAlgorithm,
         etag: String,
         last_modified: String,
-    ) {
+    ) -> bool {
         let (start, end) = range;
         if !self.ram_cache_enabled {
-            return;
+            return false;
         }
 
-        let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
+        let range_cache_key = Self::generate_ram_range_key(cache_key, start, end);
 
         if frame_data.len() as u64 > self.max_ram_cache_size {
             debug!(
                 "Skipping RAM cache promotion for range {}-{}: frame size {} exceeds max_ram_cache_size {}",
                 start, end, frame_data.len(), self.max_ram_cache_size
             );
-            return;
+            return false;
         }
 
         let now_ms = SystemTime::now()
@@ -8072,7 +8113,7 @@ impl CacheManager {
                         "No Tokio runtime for RAM cache promotion of range {}-{}",
                         start, end
                     );
-                    return;
+                    return false;
                 }
             };
             if let Err(e) =
@@ -8082,7 +8123,11 @@ impl CacheManager {
                     "Failed to promote range {}-{} to RAM cache: {}",
                     start, end, e
                 );
+                return false;
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -10164,67 +10209,6 @@ impl CacheManager {
             range_start, range_end, cache_key
         );
         Ok(())
-    }
-
-    /// Get range data from cache with decompression
-    ///
-    /// NOTE: This method uses old storage format. The new range storage architecture
-    /// is accessed through RangeHandler::find_cached_ranges and load_range_data_from_new_storage
-    pub async fn get_range_from_cache(
-        &self,
-        cache_key: &str,
-        range_start: u64,
-        range_end: u64,
-    ) -> Result<Option<Range>> {
-        debug!(
-            "Retrieving range {}-{} from cache for key: {}",
-            range_start, range_end, cache_key
-        );
-
-        // Create range cache key
-        let range_cache_key = Self::generate_range_cache_key(
-            &Self::extract_path_from_cache_key(cache_key),
-            range_start,
-            range_end,
-            None,
-        );
-
-        // Try to get from cache hierarchy
-        if let Some(cache_entry) = self.get_cached_response(&range_cache_key).await? {
-            if let Some(range) = cache_entry.ranges.first() {
-                let mut range_copy = range.clone();
-
-                // Decompress range data
-                self.decompress_range_data(&mut range_copy)?;
-
-                info!(
-                    "Range cache hit for {}-{} in key: {}",
-                    range_start, range_end, cache_key
-                );
-                return Ok(Some(range_copy));
-            }
-        }
-
-        // Also check if the main cache entry has this range
-        if let Some(main_entry) = self.get_cached_response(cache_key).await? {
-            for range in &main_entry.ranges {
-                if range.start == range_start && range.end == range_end {
-                    let mut range_copy = range.clone();
-                    self.decompress_range_data(&mut range_copy)?;
-                    debug!(
-                        "Found range {}-{} in main cache entry: {}",
-                        range_start, range_end, cache_key
-                    );
-                    return Ok(Some(range_copy));
-                }
-            }
-        }
-
-        debug!(
-            "Range cache miss for {}-{} in key: {}",
-            range_start, range_end, cache_key
-        );
-        Ok(None)
     }
 
     /// Generate appropriate cache key based on S3 URL parameters - Requirements 6.1, 6.2, 6.3, 7.1
@@ -13970,6 +13954,91 @@ mod ram_cache_range_property_tests {
         });
     }
 
+    /// Spec: page-aligned-range-cache, Task 5 (RAM cache as the Page unit).
+    ///
+    /// When widening is enabled, the RAM entry stored for an object is keyed
+    /// by the *containing Page's* bounds (`fill_page` looks up
+    /// `get_range_from_ram_cache(cache_key, page_start, page_end)`, not the
+    /// client's requested sub-range — see `http_proxy.rs::fill_page`). No new
+    /// heat-tracking code is needed for this: because the stored entry *is*
+    /// the whole Page, any lookup keyed on the Page's bounds — regardless of
+    /// which narrower sub-range within it a particular client actually
+    /// asked for — increments that single entry's `access_count` via the
+    /// aggregate RAM cache hit counter (Requirement 7.4). This test promotes
+    /// a whole Page and asserts that repeated page-keyed lookups (standing in
+    /// for successive sub-page client reads, which always resolve to the same
+    /// page-keyed RAM lookup before slicing) each register as a hit against
+    /// that one Page entry — see the per-entry `access_count` assertion in
+    /// `ram_cache::sharded_tests::test_sub_page_hit_updates_page_access_count`
+    /// for the atomic-counter-level proof.
+    #[test]
+    fn test_sub_page_hit_updates_page_access_count() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let cache_manager = CacheManager::new(
+                temp_dir.path().to_path_buf(),
+                true,        // ram_cache_enabled
+                1024 * 1024, // max_ram_cache_size
+                1024,        // compression_threshold
+                true,        // compression_enabled
+            );
+
+            let cache_key = "bucket/page-access-count-object";
+            let page_start = 0u64;
+            let page_end = 4095u64; // a 4 KiB "Page" for this test
+            let page_data: Vec<u8> = (0u32..4096).map(|b| (b % 251) as u8).collect();
+
+            // Promote the whole Page as a single RAM entry, exactly as
+            // `promote_page_to_ram` does (keyed by page bounds, not any
+            // client sub-range).
+            promote_raw(
+                &cache_manager,
+                cache_key,
+                page_start,
+                page_end,
+                &page_data,
+                "\"page-etag\"".to_string(),
+            );
+
+            let stats_before = cache_manager
+                .get_ram_cache_stats()
+                .expect("ram_cache must be enabled");
+
+            // Simulate two sub-page client reads: each independently resolves
+            // to the same page-keyed RAM lookup (`fill_page` computes the
+            // containing Page and calls `get_range_from_ram_cache` with the
+            // Page's bounds, then slices the client's narrower sub-range from
+            // the returned buffer) — never a lookup keyed on the client's own
+            // sub-range.
+            let sub_range_1 =
+                cache_manager.get_range_from_ram_cache(cache_key, page_start, page_end);
+            assert!(
+                sub_range_1.is_some(),
+                "page-keyed lookup (standing in for a sub-page hit) must be a RAM hit"
+            );
+            assert_eq!(sub_range_1.unwrap(), page_data);
+            let sub_range_2 =
+                cache_manager.get_range_from_ram_cache(cache_key, page_start, page_end);
+            assert!(
+                sub_range_2.is_some(),
+                "a second sub-page hit must also resolve against the same cached Page"
+            );
+
+            let stats_after = cache_manager
+                .get_ram_cache_stats()
+                .expect("ram_cache must be enabled");
+
+            assert_eq!(
+                stats_after.hit_count,
+                stats_before.hit_count + 2,
+                "each sub-page hit must register as a hit against the whole \
+                 Page's single RAM entry, with no separate per-sub-range \
+                 tracking"
+            );
+        });
+    }
+
     /// **Feature: ram-cache-range-fix, Property 2: Promotion preserves metadata**
     /// For any valid cache_key, start, end, data, and etag string, after promoting range data
     /// to RAM cache, the RamCacheEntry stored under the range key should have metadata.etag
@@ -14023,7 +14092,7 @@ mod ram_cache_range_property_tests {
             promote_raw(&cache_manager, &cache_key, start, end, &data, etag.clone());
 
             // Inspect the stored RamCacheEntry directly via the sharded RAM cache.
-            let range_cache_key = format!("{}:range:{}:{}", cache_key, start, end);
+            let range_cache_key = CacheManager::generate_ram_range_key(&cache_key, start, end);
             let ram_read = if let Some(rc) = &cache_manager.ram_cache {
                 rc.get(&range_cache_key).await
             } else {
@@ -14558,7 +14627,8 @@ mod ram_promotion_frame_property_tests {
             }
 
             // Inspect the RAM entry directly to verify it mirrors the on-disk frame.
-            let range_cache_key = format!("{}:range:{}:{}", cache_key, range.start, range.end);
+            let range_cache_key =
+                CacheManager::generate_ram_range_key(cache_key, range.start, range.end);
             let ram_read = cache_manager
                 .ram_cache
                 .as_ref()
@@ -14656,7 +14726,8 @@ mod ram_promotion_frame_property_tests {
             assert!(!first_is_ram_hit, "first read must be a disk hit");
             assert_eq!(first_data, data, "disk-hit read-back must be byte-exact");
 
-            let range_cache_key = format!("{}:range:{}:{}", cache_key, range.start, range.end);
+            let range_cache_key =
+                CacheManager::generate_ram_range_key(cache_key, range.start, range.end);
             let ram_read = cache_manager
                 .ram_cache
                 .as_ref()

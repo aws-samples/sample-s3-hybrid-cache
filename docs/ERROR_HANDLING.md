@@ -5,19 +5,18 @@ This document describes the comprehensive error handling and recovery mechanisms
 ## Table of Contents
 - [Overview](#overview)
 - [Error Categories](#error-categories)
-  - [Corrupted Metadata Files](#1-corrupted-metadata-files-requirement-81)
-  - [Missing Range Binary Files](#2-missing-range-binary-files-requirement-82)
-  - [Disk Space Exhaustion](#3-disk-space-exhaustion-requirement-83)
-  - [Inconsistent Metadata](#4-inconsistent-metadata-requirement-84)
-  - [Partial Write Failures](#5-partial-write-failures-requirement-84)
-  - [Orphaned Files](#6-orphaned-files-requirement-75)
+  - [Corrupted Metadata Files](#1-corrupted-metadata-files)
+  - [Missing Range Binary Files](#2-missing-range-binary-files)
+  - [Disk Space Exhaustion](#3-disk-space-exhaustion)
+  - [Inconsistent Metadata](#4-inconsistent-metadata)
+  - [Partial Write Failures](#5-partial-write-failures)
+  - [Orphaned Files](#6-orphaned-files)
 - [Error Metrics](#error-metrics)
 - [Maintenance Operations](#maintenance-operations)
 - [Error Handling Best Practices](#error-handling-best-practices)
 - [Monitoring and Alerting](#monitoring-and-alerting)
 - [Testing Error Handling](#testing-error-handling)
 - [Troubleshooting](#troubleshooting)
-- [Future Enhancements](#future-enhancements)
 
 ## Overview
 
@@ -46,7 +45,7 @@ When an error occurs in the cache system, the following flow is typically follow
 
 The S3 proxy cache system handles several categories of errors, each with specific detection and recovery strategies.
 
-### 1. Corrupted Metadata Files (Requirement 8.1)
+### 1. Corrupted Metadata Files
 
 **Detection**: JSON parse failure when reading metadata files
 
@@ -74,7 +73,7 @@ let result = cache_manager.get_metadata(cache_key).await?;
 - Monitor disk health to prevent I/O errors
 - Regular backups of critical cache metadata (for disaster recovery)
 
-#### Self-Healing via Overwrite-in-Place (cache-metadata-resilience Req 3)
+#### Self-Healing via Overwrite-in-Place
 
 When a `.meta` file is classified as **confidently corrupt** (not a transient
 mid-write condition), the proxy heals it automatically:
@@ -118,7 +117,7 @@ consolidator because both paths acquire the per-key metadata lock before writing
 Transient (mid-write) files are never healed — only confident corruption triggers
 the destructive overwrite.
 
-### 2. Missing Range Binary Files (Requirement 8.2)
+### 2. Missing Range Binary Files
 
 **Detection**: File not found when loading range data
 
@@ -157,7 +156,7 @@ let result = cache_manager.load_range_data(&range_spec).await;
 - Monitor disk health and I/O errors
 - Implement regular cache validation
 
-### 3. Disk Space Exhaustion (Requirement 8.3)
+### 3. Disk Space Exhaustion
 
 **Detection**: Write operation fails with "No space left on device"
 
@@ -195,7 +194,7 @@ let result = cache_manager.store_range(cache_key, start, end, data, metadata).aw
 - Implement automated scaling for cloud deployments
 - Use separate disks/partitions for cache and logs
 
-### 4. Inconsistent Metadata (Requirement 8.4)
+### 4. Inconsistent Metadata
 
 **Detection**: Metadata references range files that don't exist
 
@@ -241,7 +240,7 @@ let fixed_count = cache_manager.verify_and_fix_metadata(cache_key).await?;
 - Avoid manual cache file manipulation
 - Regular cache validation and cleanup
 
-### 5. Partial Write Failures (Requirement 8.4)
+### 5. Partial Write Failures
 
 **Detection**: `.tmp` files exist without corresponding final files
 
@@ -282,7 +281,7 @@ cache_manager.cleanup_temp_files(cache_key).await?;
 - No impact on valid cache entries
 - System continues operating normally
 
-### 6. Orphaned Files (Requirement 7.5)
+### 6. Orphaned Files
 
 **Detection**: Range files exist without corresponding metadata
 
@@ -565,10 +564,10 @@ The error handling system is thoroughly tested in `tests/error_handling_test.rs`
 
 ```bash
 # Run error handling tests
-cargo test --test error_handling_test
+cargo test --release --test error_handling_test
 
 # Run specific test
-cargo test --test error_handling_test test_corrupted_metadata_handling
+cargo test --release --test error_handling_test test_corrupted_metadata_handling
 ```
 
 ### Test Coverage
@@ -646,18 +645,6 @@ cargo test --test error_handling_test test_corrupted_metadata_handling
 2. Run manual cleanup: `cache_manager.perform_cache_cleanup().await`
 3. Review deletion logic
 4. Check for crashes during cache operations
-
-## Future Enhancements
-
-Potential improvements to error handling:
-
-1. **Advanced Monitoring**
-   - Error rate trending and prediction
-   - Centralized error reporting with monitoring system integration
-
-2. **Proactive Cleanup**
-   - Background cleanup based on error rates
-   - Predictive maintenance
 
 ## Error Prevention Strategies
 
@@ -737,17 +724,3 @@ Implement comprehensive monitoring:
 - Monitor disk health and space
 - Track cache performance metrics
 - Implement log aggregation and analysis
-
-## Conclusion
-
-The S3 proxy's error handling system is designed to maintain availability and data integrity even when cache errors occur. By following the principles of graceful degradation, automatic recovery, and comprehensive monitoring, the system ensures that end users experience minimal disruption.
-
-Key takeaways:
-
-1. **Errors are handled gracefully** - Cache errors never cause proxy failures
-2. **Automatic recovery** - Many errors are automatically detected and repaired
-3. **Transparent to users** - End users experience no disruption during cache errors
-4. **Observable** - All errors are logged and metrics are recorded
-5. **Preventable** - Following best practices can minimize error occurrence
-
-By understanding these error handling mechanisms and implementing appropriate prevention strategies, operators can ensure reliable and resilient S3 proxy deployments.

@@ -92,6 +92,21 @@
         "evaluate_conditions_from_cache": {
           "type": "boolean",
           "description": "Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since) against cached metadata instead of forwarding to S3. When true, the proxy returns 304/412/200 locally from unexpired cache; when false (default), all conditional requests are forwarded to S3 for strict RFC 7232 semantics. Falls back to forward when cache metadata is expired or missing validators."
+        },
+        "page_widening": {
+          "type": "boolean",
+          "description": "Enables page-aligned range caching (range read widening) for keys matching this rule. When true, an eligible small ranged GET (requested length less than page_size, unsigned Range, no partNumber) is widened to a fixed-size, page-aligned fetch, and the whole page is cached (disk and RAM) instead of only the requested bytes. Off by default and never enabled globally - only via an explicit rule, because amplification is workload-dependent (a large win when reads cluster within a page, e.g. Parquet/ORC footer + column-chunk reads; a cost when reads are scattered). See docs/CACHING.md 'Page-Aligned Range Caching' for the full mechanism. Default: false."
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864,
+          "description": "Page size in bytes for page-aligned range caching, used only when page_widening is true. Requests are widened to this fixed, offset-0-anchored grid. Must be greater than 0 and at most 67108864 (64 MiB) - a page can never exceed the RAM cache's hardcoded 64 MiB admission ceiling; a rule enabling page_widening with an out-of-range page_size fails validation. Defaults to 16777216 (16 MiB) when page_widening is enabled without specifying this field.",
+          "examples": [
+            16777216,
+            33554432,
+            67108864
+          ]
         }
       }
     }
@@ -111,6 +126,11 @@
           "pattern": "prod-*/static/**",
           "get_ttl": "7d",
           "compression_enabled": true
+        },
+        {
+          "pattern": "**/*.parquet",
+          "page_widening": true,
+          "page_size": 16777216
         },
         {
           "pattern": "**",

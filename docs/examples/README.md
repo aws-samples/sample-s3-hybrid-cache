@@ -26,7 +26,7 @@ Each file is a `{ "rules": [...] }` document with an optional `$schema` referenc
 }
 ```
 
-Optional per-rule fields: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`.
+Optional per-rule fields: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`.
 
 ## Glob Syntax
 
@@ -63,6 +63,7 @@ Rules are an ordered list. For each field independently, the value comes from th
 | `no-cache-prefix-rules.json` | Bucket with a `volatile/` prefix that bypasses read caching, everything else cached 1h |
 | `allowlist-pattern-rules.json` | Rule enabling caching for one bucket when global `read_cache_enabled` is `false` |
 | `path-prefix-rules.json` | Matching several path prefixes within a bucket with distinct settings each |
+| `page-aligned-parquet-rules.json` | Page-aligned range caching (`page_widening` / `page_size`) for `.parquet` / `.orc` keys whose reads cluster within pages |
 
 ## Allowlist Pattern
 

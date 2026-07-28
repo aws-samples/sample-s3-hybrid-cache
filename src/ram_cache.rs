@@ -15,6 +15,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+/// Hardcoded RAM cache admission ceiling: 64 MiB.
+///
+/// A compile-time constant, not a config parameter. `ShardedRamCache::new`
+/// clamps the effective shard count so that `per_shard_capacity` is always
+/// at least this many bytes, guaranteeing that any single entry up to this
+/// size is admitted to the RAM cache rather than silently dropped
+/// (`put()` drops an entry when `entry_size > per_shard_capacity`). This
+/// applies unconditionally, independent of whether page-aligned range
+/// caching is enabled for any key.
+///
+/// Spec: page-aligned-range-cache Requirement 7.7.
+pub const RAM_CACHE_ADMISSION_CEILING: usize = 64 * 1024 * 1024;
+
 /// Compute the shard index for a cache key.
 ///
 /// Uses the first 8 bytes of the BLAKE3 hash as a `u64` (little-endian) and
@@ -121,10 +134,76 @@ pub struct ShardedRamCache {
 impl ShardedRamCache {
     /// Create a new sharded RAM cache.
     ///
-    /// `total_capacity` is divided equally across `shard_count` shards
-    /// (integer division; minimum 1 byte per shard).  All shards use
-    /// `eviction_algorithm` for their independent LRU/TinyLFU bookkeeping.
+    /// `total_capacity` is divided across an **effective shard count** that is
+    /// clamped so that `per_shard_capacity` never falls below
+    /// [`RAM_CACHE_ADMISSION_CEILING`] (64 MiB). This guarantees, unconditionally
+    /// and regardless of whether page-aligned range caching is enabled for any
+    /// key, that any single entry up to 64 MiB is admitted to the RAM cache
+    /// rather than silently dropped by `put()` (which drops an entry when
+    /// `entry_size > per_shard_capacity`).
+    ///
+    /// `effective_shard_count = min(shard_count, max(1, total_capacity / RAM_CACHE_ADMISSION_CEILING))`
+    ///
+    /// When the effective shard count is clamped below the requested
+    /// `shard_count`, a warning is logged naming the 64 MiB ceiling and
+    /// suggesting a larger `max_ram_cache_size`, since concurrency (shard
+    /// count) was reduced to honour the admission guarantee.
+    ///
+    /// All shards use `eviction_algorithm` for their independent LRU/TinyLFU
+    /// bookkeeping.
+    ///
+    /// Spec: page-aligned-range-cache Requirements 7.7, 7.8.
     pub fn new(
+        total_capacity: usize,
+        shard_count: usize,
+        eviction_algorithm: CacheEvictionAlgorithm,
+    ) -> Self {
+        let shard_count = shard_count.max(1);
+        let effective_shard_count =
+            shard_count.min((total_capacity / RAM_CACHE_ADMISSION_CEILING).max(1));
+
+        if effective_shard_count < shard_count {
+            warn!(
+                "ShardedRamCache: reducing RAM cache concurrency from {} to {} shards to honour \
+                 the 64 MiB ({} byte) RAM_CACHE_ADMISSION_CEILING (total_capacity = {} bytes). \
+                 Raise max_ram_cache_size to restore the configured shard count.",
+                shard_count, effective_shard_count, RAM_CACHE_ADMISSION_CEILING, total_capacity
+            );
+        }
+
+        let per_shard_capacity = (total_capacity / effective_shard_count).max(1);
+
+        let shards = (0..effective_shard_count)
+            .map(|_| {
+                RwLock::new(RamCacheShard::new(
+                    per_shard_capacity,
+                    eviction_algorithm.clone(),
+                ))
+            })
+            .collect();
+
+        Self {
+            shards,
+            shard_count: effective_shard_count,
+            hit_count: AtomicU64::new(0),
+            miss_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Test-only constructor that bypasses the [`RAM_CACHE_ADMISSION_CEILING`]
+    /// shard clamp, using exactly `shard_count` shards regardless of
+    /// `total_capacity`.
+    ///
+    /// Production code and the admission-ceiling tests must go through
+    /// [`ShardedRamCache::new`], which is where the ceiling guarantee (7.7,
+    /// 7.8) is enforced. This helper exists only so pre-existing sharding-
+    /// mechanics tests (shard routing, per-shard eviction, concurrent reads
+    /// across shards) can exercise a specific shard count at the tiny byte-
+    /// scale capacities those tests use, which the real clamp would otherwise
+    /// always collapse to 1 shard (any capacity under `shard_count * 64 MiB`
+    /// clamps).
+    #[cfg(test)]
+    fn new_unclamped_for_test(
         total_capacity: usize,
         shard_count: usize,
         eviction_algorithm: CacheEvictionAlgorithm,
@@ -849,7 +928,14 @@ mod sharded_tests {
         let per_shard_capacity = one_entry_size * 2 + 16;
         let total_capacity = per_shard_capacity * shard_count;
 
-        let cache = ShardedRamCache::new(total_capacity, shard_count, CacheEvictionAlgorithm::LRU);
+        // This test exercises per-shard eviction mechanics at a tiny byte scale,
+        // which the real admission-ceiling clamp would otherwise collapse to a
+        // single shard — use the unclamped test constructor to keep 2 shards.
+        let cache = ShardedRamCache::new_unclamped_for_test(
+            total_capacity,
+            shard_count,
+            CacheEvictionAlgorithm::LRU,
+        );
 
         // Insert 3 entries into shard 0.
         for key in shard0_keys.iter().take(3) {
@@ -865,6 +951,139 @@ mod sharded_tests {
             entry_count <= 2,
             "Shard 0 should hold at most 2 entries after eviction, but holds {}",
             entry_count
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Test: test_admission_ceiling_clamp_arithmetic
+    //
+    // Verifies the effective_shard_count clamp formula directly against the
+    // scenarios called out in the task: 512 MiB/8 -> 8 shards (no clamp);
+    // 256 MiB/8 -> 4 shards (clamp fires); 1 GiB/8 -> 8 (configured count,
+    // never *increased* by the clamp — max() only ever raises the floor when
+    // capacity is scarce, min() never expands beyond what was configured);
+    // 64 MiB/8 -> 1 shard (fully clamped to the floor).
+    // Validates: Requirements 7.7, 7.8
+    // -----------------------------------------------------------------
+    #[test]
+    fn test_admission_ceiling_clamp_arithmetic() {
+        const MIB: usize = 1024 * 1024;
+
+        // 512 MiB / 8 configured shards -> 8 effective shards (512/64 = 8, no clamp).
+        let cache = ShardedRamCache::new(512 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        assert_eq!(
+            cache.shard_count, 8,
+            "512 MiB / 8 shards must yield 8 effective shards"
+        );
+
+        // 256 MiB / 8 configured shards -> clamps to 4 effective shards (256/64 = 4).
+        let cache = ShardedRamCache::new(256 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        assert_eq!(
+            cache.shard_count, 4,
+            "256 MiB / 8 shards must clamp to 4 effective shards"
+        );
+
+        // 1 GiB / 8 configured shards -> capped AT the configured count (min() never
+        // raises above what was configured, even though 1024/64 = 16 > 8).
+        let cache = ShardedRamCache::new(1024 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        assert_eq!(
+            cache.shard_count, 8,
+            "1 GiB / 8 configured shards must stay at the configured 8 (never increased)"
+        );
+
+        // 64 MiB / 8 configured shards -> clamps all the way down to 1 effective shard.
+        let cache = ShardedRamCache::new(64 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        assert_eq!(
+            cache.shard_count, 1,
+            "64 MiB / 8 shards must clamp to 1 effective shard"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Test: test_64mib_entry_admitted_at_256mib_and_512mib
+    //
+    // A single entry of exactly RAM_CACHE_ADMISSION_CEILING (64 MiB) bytes
+    // must be admitted (not silently dropped) both at the old 256 MiB default
+    // (which clamps to 4 shards -> 64 MiB per shard) and at the new 512 MiB
+    // default (which clamps to 8 shards -> 64 MiB per shard). This is the
+    // core admission guarantee: an entry exactly at the ceiling always fits
+    // in a shard sized to the ceiling.
+    // Validates: Requirement 7.7
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn test_64mib_entry_admitted_at_256mib_and_512mib() {
+        const MIB: usize = 1024 * 1024;
+        // Payload sized so that the total entry size (struct overhead + key +
+        // data + metadata) is exactly RAM_CACHE_ADMISSION_CEILING bytes — this
+        // is the worst case that must still fit in a 64 MiB shard.
+        let key = "admission:ceiling:entry";
+        let overhead = std::mem::size_of::<RamCacheEntry>()
+            + key.len()
+            + std::mem::size_of::<crate::cache_types::CacheMetadata>();
+        let payload_len = RAM_CACHE_ADMISSION_CEILING - overhead;
+        let payload = vec![0xABu8; payload_len];
+
+        for total_capacity in [256 * MIB, 512 * MIB] {
+            let cache = ShardedRamCache::new(total_capacity, 8, CacheEvictionAlgorithm::LRU);
+            cache.put(make_entry(key, &payload)).await.unwrap();
+
+            let read = cache.get(key).await;
+            assert!(
+                read.is_some(),
+                "a {}-byte entry (exactly the admission ceiling) must be admitted at \
+                 total_capacity={} bytes, not silently dropped",
+                RAM_CACHE_ADMISSION_CEILING,
+                total_capacity
+            );
+            assert_eq!(read.unwrap().data.len(), payload_len);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Test: test_shard_clamp_warning_path_exercised
+    //
+    // When the configured shard_count is reduced by the admission-ceiling
+    // clamp, ShardedRamCache::new must still construct a working cache with
+    // the reduced (effective) shard count — exercising the warn! branch
+    // in `new` without asserting on log output (which the test harness does
+    // not capture), while confirming the resulting cache is fully usable.
+    // Validates: Requirement 7.8
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn test_shard_clamp_warning_path_exercised() {
+        const MIB: usize = 1024 * 1024;
+        // 128 MiB / 8 configured -> clamps to 2 effective shards (128/64=2),
+        // which is strictly less than the configured 8, so the warning path
+        // in `new()` fires.
+        let cache = ShardedRamCache::new(128 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        assert_eq!(cache.shard_count, 2, "128 MiB / 8 shards must clamp to 2");
+
+        // The clamped cache must still be fully functional.
+        cache
+            .put(make_entry("clamp:warn:key", b"still works"))
+            .await
+            .unwrap();
+        let read = cache.get("clamp:warn:key").await;
+        assert!(read.is_some());
+        assert_eq!(read.unwrap().data.as_ref(), b"still works" as &[u8]);
+    }
+
+    // -----------------------------------------------------------------
+    // Test: test_default_max_ram_cache_size_is_512mib
+    //
+    // The default `max_ram_cache_size` (config.rs `CacheConfig::default()`)
+    // must be 512 MiB, per the measured decision (Resolved Question 4) so
+    // that the unconditional 64 MiB shard clamp yields 8 effective shards
+    // out of the box, preserving pre-clamp concurrency.
+    // Validates: Resolved Question 4
+    // -----------------------------------------------------------------
+    #[test]
+    fn test_default_max_ram_cache_size_is_512mib() {
+        let default_cache_config = crate::config::CacheConfig::default();
+        assert_eq!(
+            default_cache_config.max_ram_cache_size,
+            512 * 1024 * 1024,
+            "default max_ram_cache_size must be 512 MiB"
         );
     }
 
@@ -897,6 +1116,73 @@ mod sharded_tests {
     }
 
     // -----------------------------------------------------------------
+    // Test: test_sub_page_hit_updates_page_access_count
+    //
+    // Spec: page-aligned-range-cache, Task 5 (RAM cache as the Page unit).
+    // When widening is enabled, `fill_page` (http_proxy.rs) looks up the RAM
+    // cache keyed by the *containing Page's* bounds — never by the client's
+    // requested sub-range — so a sub-page hit is, at the RAM-cache level,
+    // indistinguishable from any other hit against that single Page entry.
+    // No new heat-tracking code is required for this (Requirement 7.4): the
+    // existing `access_count` atomic increment in `get()` already applies
+    // per-entry, and the entry IS the whole Page by construction. This test
+    // promotes a whole Page-sized entry and asserts that two independent
+    // page-keyed lookups (standing in for two different sub-page client
+    // reads landing in the same Page) each increment the Page's single
+    // `access_count`, proving heat is tracked at Page granularity.
+    // Validates: Requirement 7.4.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn test_sub_page_hit_updates_page_access_count() {
+        let cache =
+            ShardedRamCache::new_unclamped_for_test(1024 * 1024, 4, CacheEvictionAlgorithm::LRU);
+
+        let page_key = "bucket/object:range:0:4095";
+        let page_data: Vec<u8> = (0u32..4096).map(|b| (b % 251) as u8).collect();
+        cache.put(make_entry(page_key, &page_data)).await.unwrap();
+
+        let access_count_before = {
+            let idx = shard_index(page_key, cache.shard_count);
+            let guard = cache.shards[idx].read().await;
+            guard
+                .data
+                .get(page_key)
+                .expect("page entry must be present after promotion")
+                .access_count
+                .load(Ordering::Relaxed)
+        };
+
+        // Two "sub-page" reads: both resolve to the same page-keyed lookup,
+        // exactly as `fill_page` does for any sub-range within the Page —
+        // there is no per-sub-range RAM key to look up separately.
+        let read1 = cache.get(page_key).await;
+        assert!(read1.is_some(), "first sub-page hit must find the Page");
+        let read2 = cache.get(page_key).await;
+        assert!(
+            read2.is_some(),
+            "second sub-page hit must find the same Page"
+        );
+
+        let access_count_after = {
+            let idx = shard_index(page_key, cache.shard_count);
+            let guard = cache.shards[idx].read().await;
+            guard
+                .data
+                .get(page_key)
+                .expect("page entry must still be present")
+                .access_count
+                .load(Ordering::Relaxed)
+        };
+
+        assert_eq!(
+            access_count_after,
+            access_count_before + 2,
+            "each sub-page hit must increment the whole Page's access_count \
+             by one, confirming heat tracking is page-granular by construction"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Test 6: test_get_uses_read_lock
     // Two concurrent tasks that call get() on the same key both succeed
     // and each increments access_count (atomic).
@@ -904,7 +1190,10 @@ mod sharded_tests {
     // -----------------------------------------------------------------
     #[tokio::test]
     async fn test_get_uses_read_lock() {
-        let cache = Arc::new(ShardedRamCache::new(
+        // This test exercises concurrent shard-lock access at a tiny byte scale,
+        // which the real admission-ceiling clamp would otherwise collapse to a
+        // single shard — use the unclamped test constructor to keep 4 shards.
+        let cache = Arc::new(ShardedRamCache::new_unclamped_for_test(
             64 * 1024,
             4,
             CacheEvictionAlgorithm::LRU,
@@ -1265,5 +1554,68 @@ mod sharded_tests {
             shard_guard.data.contains_key("allcold:9"),
             "newly inserted entry must be present"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 7 (page-aligned-range-cache): RAM lookup slices the Page, and a
+    // full 64 MiB Page-sized entry is admitted after the admission-ceiling
+    // shard clamp — the page-widening-specific composition of the Task 1
+    // admission-ceiling guarantee (`test_64mib_entry_admitted_at_256mib_and_512mib`
+    // above) with page-keyed RAM lookup semantics (`fill_page` /
+    // `get_range_from_ram_cache`).
+    // Validates: Requirements 3.4 (Page as RAM unit), 7.1, 7.2, 7.7
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn test_page_sized_64mib_entry_admitted_and_ram_lookup_slices_it() {
+        const MIB: usize = 1024 * 1024;
+        const PAGE_SIZE: usize = 64 * MIB;
+
+        // A page-shaped RAM key, exactly as `fill_page`/`get_range_from_ram_cache`
+        // construct it: "{cache_key}:range:{page_start}:{page_end}".
+        let page_key = "bucket/parquet-object:range:0:67108863";
+        // The entry's total tracked size includes struct/key/metadata overhead
+        // on top of the data payload (see `shard_calculate_entry_size`), so the
+        // payload must be shrunk by that overhead to keep the *total* entry
+        // size at exactly the 64 MiB admission ceiling — the worst case that
+        // must still fit in a 64 MiB shard. Mirrors
+        // `test_64mib_entry_admitted_at_256mib_and_512mib` above.
+        let overhead = std::mem::size_of::<RamCacheEntry>()
+            + page_key.len()
+            + std::mem::size_of::<crate::cache_types::CacheMetadata>();
+        let payload_len = PAGE_SIZE - overhead;
+        let page_data: Vec<u8> = (0u64..payload_len as u64)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        // At the default 512 MiB / 8 shards, each shard is exactly the 64 MiB
+        // admission ceiling — the worst case a full Page must still fit in.
+        let cache = ShardedRamCache::new(512 * MIB, 8, CacheEvictionAlgorithm::LRU);
+        cache
+            .put(make_entry(page_key, &page_data))
+            .await
+            .expect("a full 64 MiB Page must be admitted, not dropped, after the shard clamp");
+
+        // RAM lookup for the whole Page succeeds.
+        let read = cache
+            .get(page_key)
+            .await
+            .expect("the 64 MiB Page must be a RAM hit");
+        assert_eq!(read.data.len(), payload_len);
+
+        // Slicing a small sub-range out of the Page (as `fill_page` does after
+        // its page-keyed RAM lookup) must return exactly the requested bytes,
+        // proving RAM lookup slices the Page rather than returning something
+        // else entirely.
+        let sub_start = 12_345usize;
+        let sub_len = 37usize;
+        let sliced = &read.data[sub_start..sub_start + sub_len];
+        assert_eq!(sliced, &page_data[sub_start..sub_start + sub_len]);
+
+        // A second sub-page slice from a different offset within the same
+        // Page must also be correct, confirming the whole Page (not just a
+        // sub-range) is the RAM-resident unit.
+        let sub2_start = payload_len - 100;
+        let sliced2 = &read.data[sub2_start..payload_len];
+        assert_eq!(sliced2, &page_data[sub2_start..payload_len]);
     }
 }

@@ -114,14 +114,6 @@ async fn test_unified_head_get_share_meta_file() {
         "HEAD entry should still be retrievable after range storage"
     );
 
-    // Verify range data is accessible
-    let _range_result = cache_manager
-        .get_range_from_cache(cache_key, 0, 1023)
-        .await
-        .unwrap();
-    // Note: get_range_from_cache uses old storage format, may return None
-    // The important test is that HEAD is still accessible
-
     // Verify only one .meta file exists (unified storage)
     let metadata_dir = temp_dir.path().join("metadata");
     let meta_files: Vec<_> = walkdir::WalkDir::new(&metadata_dir)

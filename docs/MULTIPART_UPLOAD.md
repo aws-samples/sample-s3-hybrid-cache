@@ -2,7 +2,7 @@
 
 Scope: this document covers the proxy's **write-through cache for S3 multipart uploads** — `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and `AbortMultipartUpload`. It does not cover multipart *reads* (`GetObject?partNumber=N`), which are a separate concern on the read path in `http_proxy.rs`.
 
-Related docs: [CACHING.md](CACHING.md) covers the write-through cache policy at a higher level. [ARCHITECTURE.md#trust-and-integrity-model](ARCHITECTURE.md#trust-and-integrity-model) frames what the cache does and does not verify. The compressor's integrity guarantees are in [COMPRESSION.md](COMPRESSION.md#integrity-lz4-frame-content-checksums).
+Related docs: [CACHING.md](CACHING.md) covers the write-through cache policy at a higher level. [ARCHITECTURE.md#trust-and-integrity-model](ARCHITECTURE.md#trust-and-integrity-model) frames what the cache does and does not verify. The compressor's integrity guarantees are in [COMPRESSION.md](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame).
 
 Primary source file: `src/signed_put_handler.rs`.
 
@@ -170,7 +170,8 @@ If the header says the decoded body should be N bytes and the decoder produces M
 
 ## Compression and integrity
 
-Each `part{N}.bin` goes through the standard `CompressionHandler::compress_content_aware_with_metadata` path. Parts of compressible content types are LZ4-compressed; parts of incompressible content are wrapped in an uncompressed LZ4 frame. Either way, the frame carries an xxhash32 content checksum — disk bit-flips produce decode errors, handled as cache misses on read. See [COMPRESSION.md](COMPRESSION.md#integrity-lz4-frame-content-checksums).
+Each `part{N}.bin` goes through the standard compression path, with the
+compress-or-store decision made per part by `CacheManager::effective_compression`. Parts of compressible content types are LZ4-compressed; parts of incompressible content are wrapped in an uncompressed LZ4 frame. Either way, the frame carries an xxhash32 content checksum — disk bit-flips produce decode errors, handled as cache misses on read. See [COMPRESSION.md](COMPRESSION.md#integrity-every-write-is-a-checksummed-lz4-frame).
 
 Each part's `compression_algorithm` is recorded in the tracker and carried through into the final range metadata, so the correct decoder is used at read time.
 

@@ -24,6 +24,7 @@
 - [S3 Response Header Handling](#s3-response-header-handling)
 - [Conditional Headers Handling](#conditional-headers-handling)
 - [Cache Types](#cache-types)
+- [Page-Aligned Range Caching](#page-aligned-range-caching)
 - [Cache Rules](#cache-rules)
 - [Cache Bypass for Non-Cacheable Operations](#cache-bypass-for-non-cacheable-operations)
 - [Cache Bypass Headers](#cache-bypass-headers)
@@ -58,7 +59,7 @@ Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access 
 
 1. **RAM Cache** (Optional, First Tier)
    - In-memory cache for hot objects, HEAD metadata, and range data
-   - Configurable size limit (default: 256MB)
+   - Configurable size limit (`max_ram_cache_size`, default: 512 MiB)
    - Eviction algorithms: LRU or TinyLFU (decayed-frequency scoring, see [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction))
    - Fastest access path
    - Compression optimization: Eliminates decompress/recompress cycles during disk-to-RAM promotion
@@ -66,7 +67,7 @@ Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access 
    - **RAM Metadata Cache**: Caches `NewCacheMetadata` objects to reduce disk I/O for both HEAD and GET requests
    - **Range data caching**: Both streaming and buffered paths check RAM cache before disk and promote disk hits to RAM cache (key format: `{cache_key}:range:{start}:{end}`)
    - Note: PUT-cached objects are NOT stored in RAM cache (disk only)
-   - **Sharded for concurrency**: The RAM cache is partitioned into `ram_cache_shard_count` independent shards (default 8), each guarded by its own `tokio::sync::RwLock`. A key maps to a shard via `blake3(cache_key) % shard_count`. Reads for keys in different shards proceed in parallel with no contention, and concurrent reads of the same key share a read lock. Per-shard capacity is `max_ram_cache_size / ram_cache_shard_count`. See [Concurrency Model](#ram-cache-concurrency-model) below and [`ram_cache_shard_count`](CONFIGURATION.md) for tuning.
+   - **Sharded for concurrency**: The RAM cache is partitioned into `ram_cache_shard_count` independent shards (default 8), each guarded by its own `tokio::sync::RwLock`. A key maps to a shard via `blake3(cache_key) % shard_count`. Reads for keys in different shards proceed in parallel with no contention, and concurrent reads of the same key share a read lock. Per-shard capacity is `max_ram_cache_size / effective_shard_count`, where the effective count may be clamped below the configured value to honour the 64 MiB admission ceiling (see below). See [Concurrency Model](#ram-cache-concurrency-model) below and [`ram_cache_shard_count`](CONFIGURATION.md) for tuning.
 
 2. **Disk Cache** (Second Tier)
    - File-based persistent cache
@@ -80,7 +81,7 @@ Hybrid Cache for Amazon S3 provides intelligent caching to accelerate S3 access 
 
 The RAM cache read path is designed to scale with concurrent connections rather than serialize all reads through one lock.
 
-**Sharding**: The cache is split into `ram_cache_shard_count` shards (default 8). Each shard owns a disjoint subset of keys and its own `tokio::sync::RwLock`, eviction state, and capacity budget (`max_ram_cache_size / ram_cache_shard_count`). A key is routed to its shard with `blake3(cache_key) % shard_count` — reusing the BLAKE3 hash already computed for disk-path sharding, so routing adds no extra hashing cost. GETs and PUTs lock only the target shard; operations on keys in different shards never contend.
+**Sharding**: The cache is split into `ram_cache_shard_count` shards (default 8). Each shard owns a disjoint subset of keys and its own `tokio::sync::RwLock`, eviction state, and capacity budget (`max_ram_cache_size / effective_shard_count`, after the admission-ceiling clamp). A key is routed to its shard with `blake3(cache_key) % shard_count` — reusing the BLAKE3 hash already computed for disk-path sharding, so routing adds no extra hashing cost. GETs and PUTs lock only the target shard; operations on keys in different shards never contend.
 
 **Zero-copy reads**: Cached bytes are stored as `Arc<Bytes>`. A `get()` returns a reference-count increment (O(1)), not a copy of the object data. The shard lock is released before any LZ4 decompression or HTTP response-body construction, so the lock is held only for the pointer clone. Peak per-request memory for a cache hit is bounded by one copy of the decompressed object, not two.
 
@@ -88,7 +89,7 @@ The RAM cache read path is designed to scale with concurrent connections rather 
 
 **Read-only access tracking**: Per-entry `last_accessed` and `access_count`, plus the cache-wide hit/miss counters, are `AtomicU64` fields updated through the shared read lock. The read path never needs a write lock to record an access. LRU/TinyLFU ordering is updated approximately: reads push to a sampled `pending_accesses` buffer that the next `put()` drains under the write lock. Exact ordering on every read is not maintained — eviction only needs to favor cold entries, and a one-`put()`-delayed reorder is sufficient for steady-state hot-set workloads.
 
-**Shard skew caveat**: Because each shard evicts against its own capacity slice, an uneven key distribution or a few very large objects can fill one shard while others stay underused, lowering effective cache utilization below the configured maximum. BLAKE3 distributes keys uniformly, so skew is small across many keys; workloads dominated by a handful of very large hot objects should size `max_ram_cache_size` with headroom or lower `ram_cache_shard_count`. See [`ram_cache_shard_count`](CONFIGURATION.md) for tuning guidance.
+**Shard skew caveat**: Because each shard evicts against its own capacity slice, an uneven key distribution or a few very large objects can fill one shard while others stay underused, lowering effective cache utilization below the configured maximum. BLAKE3 distributes keys uniformly, so skew is small across many keys; workloads dominated by a handful of very large hot objects should size `max_ram_cache_size` with headroom or lower `ram_cache_shard_count`. Admission is not retention: the 64 MiB ceiling guarantees a large entry is *accepted*, but keeping `N` such entries resident concurrently needs `max_ram_cache_size >= N * 64 MiB`. See [`ram_cache_shard_count`](CONFIGURATION.md) for tuning guidance.
 
 ### RAM-Disk Cache Coherency
 
@@ -511,9 +512,11 @@ Range Request → Check RAM cache (key: {cache_key}:range:{start}:{end})
 - Dashboard statistics reflect RAM cache hits/misses from both paths
 
 **Configuration:**
-- Streaming threshold: 1MB (hardcoded, based on Content-Length header)
-- Chunk size for disk streaming: 64KB
-- No configuration changes required
+- Disk streaming threshold: `cache.disk_streaming_threshold`, default 1 MiB, based on
+  the Content-Length header. This governs the disk-read path only; it is not the
+  1 MiB S3-response streaming threshold that was removed in 1.7.6, when all S3
+  responses began streaming regardless of size.
+- Chunk size for disk streaming: 512 KiB (as shown in the flow above)
 
 #### Performance Optimizations
 
@@ -560,7 +563,7 @@ All cached data uses the same storage format, regardless of source:
 
 A streamed range cache write can end before the full requested range arrives — the client cancelled the transfer, or the mid-stream idle watchdog (`connection_pool.upstream_idle_timeout`) aborted a stalled upstream. By default such a range was discarded entirely. With `cache.partial_range_commit_ratio` (default `0.5`), the proxy instead commits the received prefix as a smaller valid range `[start, start + received - 1]` when at least that fraction of the requested bytes arrived **in order**.
 
-This matters for high-throughput clients like the AWS CLI CRT transfer client, which opens many parallel range connections — any of which can be cut short by the proxy's mid-stream idle watchdog or by CRT's adaptive part reassignment. Without salvage, the received bytes from those interrupted ranges are discarded entirely. The salvaged range is recorded with its true byte bounds, so it is never served as if it were the full requested range: a later request for the missing tail fetches it from S3 and merges with the cached prefix (see [Range Merging](#range-merging)). `1.0` keeps the exact-only behavior (any short range discarded); `0.0` commits any non-empty prefix. The write-through PUT path is unaffected — a truncated upload is never cached. See [Partial Range Commit Ratio](CONFIGURATION.md#partial-range-commit-ratio) for tuning.
+This matters for high-throughput clients like the AWS CLI CRT transfer client, which opens many parallel range connections — any of which can be cut short by the proxy's mid-stream idle watchdog or by CRT's adaptive part reassignment. Without salvage, the received bytes from those interrupted ranges are discarded entirely. The salvaged range is recorded with its true byte bounds, so it is never served as if it were the full requested range: a later request for the missing tail fetches it from S3 and merges with the cached prefix (see [Range Merging](#intelligent-range-merging)). `1.0` keeps the exact-only behavior (any short range discarded); `0.0` commits any non-empty prefix. The write-through PUT path is unaffected — a truncated upload is never cached. See [Partial Range Commit Ratio](CONFIGURATION.md#partial-range-commit-ratio) for tuning.
 
 ### Cache Entry Structure
 
@@ -843,7 +846,7 @@ The proxy handles conditional headers in three semantically distinct ways, confi
 
 ### Opt-out: always forward to S3 for condition evaluation (`evaluate_conditions_from_cache = false`)
 
-Requests on the GET/HEAD path that carry `If-Match`, `If-None-Match`, `If-Modified-Since`, or `If-Unmodified-Since` are forwarded to S3 with the client's headers intact, regardless of whether they also carry a `Range` header. The SigV4 signature is preserved, so the conditional reaches S3 exactly as the client signed it. S3 is the sole judge (forward-and-cache). The proxy takes cache action based only on S3's response:
+Requests on the GET/HEAD path that carry `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, or `If-Range` are forwarded to S3 with the client's headers intact, regardless of whether they also carry a `Range` header. The SigV4 signature is preserved, so the conditional reaches S3 exactly as the client signed it. S3 is the sole judge (forward-and-cache). The proxy takes cache action based only on S3's response:
 
 - **S3 returns 200 OK / 206 Partial Content** → return the data to the client and cache the fresh response (full object or range). This is the path the AWS CLI CRT client takes — every CRT ranged GET of a multi-part download carries `If-Match` — so CRT downloads of large objects now populate the cache. If the object changed, the stale cached ranges/entry are dropped by ETag-mismatch invalidation during the cache lookup, not by a blanket purge.
 - **S3 returns 304 Not Modified** → return 304 to the client, cache unchanged. TTL is refreshed only if S3's response ETag equals the cached ETag; if the ETags differ, the cached copy is stale and is invalidated on the next non-conditional miss (a `304` has no body to replace it with now).
@@ -858,7 +861,11 @@ Strict RFC 7232 compliance and strongest consistency — the proxy cannot serve 
 
 When `If-Match` is the only conditional header on a GET or range request, and the proxy holds the requested data in cache with a matching ETag, the proxy serves the response directly from cache without contacting S3. The client's `If-Match` value is the freshness assertion — if the proxy has that exact ETag cached, it is the correct version by definition. TTL is refreshed on serve.
 
-For `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` — in any combination, or combined with `If-Match` — the proxy always forwards the full conditional request to S3. These headers are caller-supplied negative-match or timestamp assertions that only S3 can answer authoritatively; a local answer could be based on a stale cached validator.
+A lone `If-Range` is treated the same way, for the same reason: when its validator strong-matches the cached ETag, the client has named the exact version the cache holds, so the range is sliced from cache with no S3 call. Unlike `If-Match`, a matching `If-Range` does **not** refresh the TTL or bypass expiry — `If-Range` asserts which version a `Range` applies to, not that the representation is fresh (RFC 7233 §3.2), so an expired entry still revalidates normally.
+
+An `If-Range` **mismatch** always forwards, and this is the one asymmetry with `If-Match`: a failed `If-Match` is a bodyless `412` the proxy could answer locally, whereas a failed `If-Range` requires the `Range` to be ignored and the **full current representation** returned with `200` — a body the proxy may not hold. The same applies when the validator is an HTTP-date or a weak ETag (not locally comparable against a cached ETag), or when nothing is cached.
+
+For `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` — in any combination, or combined with `If-Match` or `If-Range` — the proxy always forwards the full conditional request to S3. These headers are caller-supplied negative-match or timestamp assertions that only S3 can answer authoritatively; a local answer could be based on a stale cached validator. `If-Match` combined with `If-Range` also forwards: the two validators can disagree, and only S3 can resolve "precondition passes but the range validator is stale".
 
 | Conditional | Has full cache hit with matching ETag | Action |
 |---|---|---|
@@ -867,6 +874,8 @@ For `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` — in any c
 | `If-None-Match` | Any | Always forward to S3 |
 | `If-Modified-Since` | Any | Always forward to S3 |
 | `If-Unmodified-Since` | Any | Always forward to S3 |
+| `If-Range` only | Yes | Serve the range from cache — no S3 call (TTL not refreshed) |
+| `If-Range` only | No (miss / mismatch / weak or date validator) | Forward to S3 → `206` or `200`-full |
 | Mixed (`If-Match` + any other) | Any | Forward to S3 |
 
 This is the recommended setting for the AWS CLI CRT client: CRT stamps `If-Match` on every ranged GET to pin parts to the same object version, so with the default `true` a warm CRT download is served from cache with no S3 round trips. With `evaluate_conditions_from_cache: false`, every CRT ranged GET re-contacts S3.
@@ -879,6 +888,8 @@ Regardless of the `evaluate_conditions_from_cache` setting, the proxy injects co
 
 1. **TTL-expired revalidation**: when cached data is accessed past its TTL under lazy expiration, the proxy sends `If-None-Match: <cached-etag>` + `If-Modified-Since: <cached-last-modified>` to get a 304 on match (RFC 7232 §3.2).
 2. **Partial-cache merge**: when partial cached ranges exist for a request and the proxy must fetch the missing bytes from S3, it injects `If-Match: <cached-etag>` so S3 refuses (412) rather than return data from a newer object version — which would corrupt the merged response. On 412, the proxy invalidates the stale cache and retries once without `If-Match`. The client never sees the 412.
+
+   A Mode B `If-Range` cache serve uses this same pin: the client's `If-Range` is replaced with the proxy-injected `If-Match` on the ETag it just matched, so it never travels on to a gap fetch. This is a cost decision as well as a consistency one — a stale `If-Range` on a gap fetch makes S3 ignore `Range` and return the **full object** with `200`, and the gap-fetch path buffers a response body in memory before inspecting its status, so that full object is read in full and then discarded for being a non-`206`. The `If-Match` form fails with a bodyless `412` instead. The swap is skipped when `If-Range` appears in `SignedHeaders`, since removing a signed header would invalidate the client's signature.
 
 Client-supplied conditional headers are always preserved exactly; proxy-injected headers are internal and never visible to the client.
 
@@ -1399,11 +1410,11 @@ The proxy handles conditional headers in three semantically distinct ways. The f
 
 #### 1. Client-supplied conditional headers (forward-and-cache)
 
-Conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) are dispatched by header class and by the `evaluate_conditions_from_cache` setting:
+Conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range`) are dispatched by header class and by the `evaluate_conditions_from_cache` setting:
 
 **`evaluate_conditions_from_cache = false`:** Every conditional request is forwarded to S3 with all headers intact (SigV4 signature preserved). S3 evaluates the precondition. `200`/`206` success is cached via the normal caching pipeline. `304`/`412` are forwarded to the client without caching. No conditional is served from a cache hit with this setting.
 
-**`evaluate_conditions_from_cache = true` (default):** An `If-Match` request where the cached ETag matches the `If-Match` value AND the data is fully cached is served from cache (TTL refreshed, no S3 call). `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` always forward to S3, exactly as the `false` setting.
+**`evaluate_conditions_from_cache = true` (default):** An `If-Match` request where the cached ETag matches the `If-Match` value AND the data is fully cached is served from cache (TTL refreshed, no S3 call). A lone `If-Range` whose validator strong-matches the cached ETag is likewise served from cache, but without refreshing TTL. `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` always forward to S3, exactly as the `false` setting.
 
 **TTL/version reconciliation:** When a forwarded conditional returns `200`/`206`, the body is cached under S3's response ETag; if that ETag differs from a stale cached entry, the cache lookup invalidates all of the old ranges and **replaces** the object with the fresh content (ETag-mismatch invalidation, `range_handler.rs`). When it returns `304` (no body to cache), the cached entry's TTL is refreshed only if the `304`'s ETag equals the cached ETag; if they differ, the TTL is not refreshed and the stale entry is invalidated on the next non-conditional miss.
 
@@ -1446,7 +1457,7 @@ The client never sees the 412 caused by the proxy-injected header. A client-supp
 
 ### Supported Conditional Headers
 
-All four standard headers from RFC 7232 are detected and forwarded: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`. S3 evaluates precedence per RFC 7232 §6; the proxy does not re-evaluate.
+All four standard headers from RFC 7232 are detected: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, plus `If-Range` (RFC 7233 §3.2). S3 evaluates precedence per RFC 7232 §6; the proxy does not re-evaluate. The two exceptions where a matching validator is answered from cache instead of forwarded are described above.
 
 ### Performance Impact
 
@@ -1799,8 +1810,6 @@ Proxy: Lookup part_ranges[2], serve from cache if available
 
 #### Per-Instance Part Request Deduplication
 
-#### Per-Instance Part Request Deduplication
-
 Concurrent part requests for the same object are handled by the InFlightTracker (download coordination). When multiple requests arrive for the same part, only one fetches from S3 while others wait. See [Download Coordination](#download-coordination) for details.
 
 ### Write-Through Cache
@@ -1830,8 +1839,10 @@ Caches objects during PUT operations using the range storage format, enabling su
 
 Write-cached objects have a separate TTL (default: 1 day) that is refreshed when accessed:
 
-- Initial PUT: TTL set to `put_ttl` (default: 1 day)
-- GET access: TTL refreshed to current time + `put_ttl`
+- Initial PUT: TTL set to `put_ttl` (default 1 hour)
+- First GET access: the entry transitions from `put_ttl` to `get_ttl`. This is a
+  one-time transition, not a repeating refresh, and it runs before the freshness check
+  so `get_ttl: 0` revalidates against S3 on that first GET
 - No access within TTL: Object expires and is removed
 
 This keeps frequently accessed objects in cache while allowing rarely-read uploads to expire.
@@ -2018,7 +2029,7 @@ The write cache implements robust error handling to ensure that S3 operation fai
 
 #### Core Principle: Only Cache on S3 Success
 
-**Requirement 9.1**: The write cache follows the fundamental principle of "only cache on S3 success." This ensures that:
+The write cache follows the fundamental principle of "only cache on S3 success." This ensures that:
 - Authentication failures (403 Forbidden) don't create cache entries
 - Authorization failures don't cache data the client shouldn't access
 - Network errors don't result in partial cache data
@@ -2040,7 +2051,7 @@ if status.is_success() {
     // S3 success - store as single range with write cache metadata
     // ... caching logic here ...
 } else {
-    // S3 returned error - don't cache (Requirement 9.1)
+    // S3 returned error - don't cache
     debug!(
         "S3 error response, not caching PUT: cache_key={}, status={}",
         cache_key, status
@@ -2070,7 +2081,7 @@ When CompleteMultipartUpload receives a 403 error:
 if status.is_success() {
     // ... finalize cache metadata linking all parts ...
 } else {
-    // Mark upload as incomplete but don't delete parts (Requirement 5.5, 8.2, 9.3)
+    // Mark upload as incomplete but don't delete parts
     error!(
         "CompleteMultipartUpload S3 error: bucket={}, key={}, status={}",
         bucket, key, status.as_u16()
@@ -2157,6 +2168,74 @@ ERROR CompleteMultipartUpload S3 error: bucket=my-bucket, key=large-file.bin, st
 6. **Reliability**: No partial or corrupted cache entries
 
 This error handling ensures that the write cache enhances performance without compromising security, consistency, or reliability.
+
+## Page-Aligned Range Caching
+
+Page-aligned range caching (also called *range read widening*) widens an eligible small ranged GET into a fixed-size, page-aligned fetch, caches the whole page (disk and RAM), and serves the client exactly the bytes it requested. Later small reads that fall in the same page — from the same reader, a re-run, or a different reader sharing the cache — are served with no S3 round trip, and concurrent small reads in the same page coalesce onto a single fetch.
+
+This is the access pattern of analytics readers (Parquet, ORC): a trailing footer read followed by clustered column-chunk reads. Footer/tail caching is simply the special case where the read lands in the object's last page — the proxy never parses object content to detect this; it works purely from request byte offsets.
+
+### Off by default, per-key opt-in
+
+Widening is **never enabled globally** and **off unless a `cache_rules.json` rule explicitly turns it on** for matching keys, via the `page_widening` and `page_size` rule fields (see [Cache Rules](#cache-rules) and [CONFIGURATION.md](CONFIGURATION.md#cache-rules)):
+
+```json
+{ "pattern": "**/*.parquet", "page_widening": true, "page_size": 16777216 }
+```
+
+- `page_widening` (bool, default `false`): enables widening for keys the rule matches.
+- `page_size` (bytes, default `16777216` = 16 MiB when the rule enables widening without specifying it): the fixed page size `P` for the grid, in bytes. Must be `> 0` and `<= 67108864` (64 MiB) — the RAM admission ceiling described below.
+
+### Operator warning: amplification is workload-dependent
+
+Widening every small read to a full page is a large win when reads **cluster** within pages (analytics column scans, footers) and a real **cost** when reads are **scattered** — a 4 KiB random read against a key with a 16 MiB page size becomes a 16 MiB fetch. Only enable `page_widening` for key patterns whose access pattern clusters reads within pages. See [`docs/examples/page-aligned-parquet-rules.json`](examples/page-aligned-parquet-rules.json) for a worked example.
+
+### Mechanism
+
+A request is eligible for widening only when: the rule's `page_widening` is `true` for the key, the method is `GET` with a byte `Range` header, the requested length is smaller than `P`, the `Range` is not part of the request's SigV4 signed headers (a Signed_Range is forwarded unmodified — its bytes cannot be safely rewritten), and the request does not carry a `partNumber` query parameter (served by the separate part-caching path, unaffected by widening).
+
+For an eligible request:
+
+1. The requested byte range is mapped to the **Page(s)** it overlaps on a fixed grid anchored at offset 0: `page_index = floor(start / P)`, `page = [page_index * P, page_index * P + P - 1]`, clamped to the object's last byte on the final page. A request landing near a page boundary overlaps two Pages.
+2. A `Range: bytes=-N` suffix request is converted to its absolute range once the object size is known (from cached metadata) and then mapped to overlapping Page(s) the same way — never widened to a single fixed "last page", since that could be smaller than the requested suffix. When the size is not yet known, the proxy issues `bytes=-P` instead (a superset of the requested bytes, end-anchored but not grid-aligned); once the size is learned, later suffix reads take the grid-aligned path.
+3. Conditional range requests (`If-Range`, or `If-Match`/`If-None-Match` accompanying a `Range`) are widened the same way. A `206` response is sliced to the client's original sub-range and the Page is cached; a `304`, `412`, or `200`-full response (condition not met) is passed through to the client unchanged — it is never sliced or treated as a cacheable Page.
+4. **Only genuinely missing, not-in-flight bytes are fetched** — the proxy never re-requests bytes it already holds or bytes another in-flight fetch is already retrieving for the same Page (coalesced via the same in-flight tracker used for other cache misses). When a request overlaps two Pages, each Page is fetched independently and **concurrently**, never sequentially — parallelizing across S3 connections rather than merging into one larger request.
+5. If the widened/Page fetch fails (error status or network error), the proxy retries the client's original, un-widened range, serves it normally, and skips caching for that request — widening never turns a request that would otherwise succeed into a failure.
+6. The client always receives exactly the bytes it requested: a `206 Partial Content` response with `Content-Range`/`Content-Length` computed against its original request, sliced from the widened Page data.
+
+### Disk footprint
+
+A page is stored through the same range-store path as any other cached range — there is no new on-disk format, and it composes with the existing range-merge/consolidation logic. However, enabling `page_widening` for a key means a single small read caches an entire page rather than only the requested bytes, **increasing per-object disk footprint** for that key relative to unwidened range caching. Size the disk cache (`max_cache_size`) with this in mind for keys where widening is enabled.
+
+### RAM cache uses the Page as its unit
+
+When widening is enabled for a key, the RAM cache stores and looks up data by the containing Page's bounds, not the client's requested sub-range — a sub-page read is served by looking up the deterministic containing Page and slicing the requested bytes from it. Promotion to RAM (whether from a disk hit or, for the Page path, only on a subsequent disk-hit read rather than the initial cold fetch) promotes the whole Page. RAM cache heat (access recency/frequency) is recorded against the whole Page, so any sub-page hit keeps the entire Page resident. When widening is **not** enabled for a key, RAM caching remains per-range exactly as before.
+
+**64 MiB RAM admission ceiling.** The proxy unconditionally guarantees that any single RAM cache entry up to a hardcoded 64 MiB (`RAM_CACHE_ADMISSION_CEILING = 67108864` bytes, a compile-time constant, not a config field) is admitted rather than silently dropped — regardless of whether page-aligned range caching is used for any key. It does this by clamping the effective number of RAM cache shards so `max_ram_cache_size / effective_shard_count >= 64 MiB`, logging a warning when the clamp reduces concurrency below the configured `ram_cache_shard_count`. See [CONFIGURATION.md — RAM Sizing and the Admission Ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling) for the sizing guidance and shard-clamp formula, and [`config/config.example.yaml`](../config/config.example.yaml) for a worked example.
+
+### Coalescing and coherency
+
+Concurrent small reads that overlap the same Page on the same instance are coalesced onto a single upstream fetch — the in-flight fetch is keyed on the Page's bounds, not the client's requested sub-range — and served from the resulting cached Page. Cached Pages use the object's normal, object-level `get_ttl`; there is no separate per-Page TTL, so all Pages of an object expire together and an ETag/version mismatch purges the whole object, cached Pages included, exactly like any other cached range.
+
+### Metrics
+
+Widening exposes the following counters (see [Monitoring](#monitoring) and the dashboard):
+
+| Metric | Meaning |
+|---|---|
+| `page_cache.widened_requests` | Small reads widened to a Page fetch |
+| `page_cache.bytes_prefetched` | Bytes fetched beyond what the client requested (plus a derived amplification ratio) |
+| `page_cache.page_hits` | Small reads served from an already-cached Page with no S3 fetch |
+| `page_cache.skipped_signed_range` | Requests that would otherwise be eligible but were left unmodified because the Range was signed |
+| `page_cache.fallbacks` | Widened/Page fetches that failed and fell back to the client's original range |
+| `page_cache.ram_page_promotions` | Pages successfully promoted to the RAM cache |
+| `page_cache.ram_page_promotion_skipped` | Pages not promoted to RAM (e.g. exceeded the applicable RAM budget) |
+
+A widened request is also logged at `DEBUG` with the cache key, the original requested range, and the widened Page range.
+
+### Non-goals
+
+The proxy never parses object content (no Parquet/ORC footer, Thrift metadata, or magic-byte parsing) — every decision is based on request metadata only (the key's glob match and byte offsets/lengths). There is no chunk prediction, no widening of reads already `>= P`, and no cross-instance coordination of Page fetches.
 
 ## Cache Rules
 
@@ -2693,13 +2772,13 @@ cache:
   write_cache_max_object_size: 536870912  # 512MB max per PUT
   
   # Multipart uploads use same capacity limits
-  # Incomplete uploads cleaned up after 1 hour (hardcoded)
+  # Incomplete uploads cleaned up after incomplete_upload_ttl (default 1 day, range 1h-7d)
 ```
 
 **Multipart Behavior:**
 - Multipart uploads share the same `write_cache_percent` capacity
 - If cumulative parts exceed capacity, upload is bypassed automatically
-- Incomplete uploads are cleaned up after 1 hour
+- Incomplete uploads are cleaned up after `incomplete_upload_ttl` (default 1 day)
 - Completed multipart uploads support range requests immediately
 
 ### Cache Efficiency Optimization
@@ -2767,7 +2846,8 @@ The proxy automatically invalidates cache when:
 3. **CreateMultipartUpload to Same Key**: New multipart upload invalidates old cache (conflict handling)
 4. **DELETE Request**: Removes cache entry
 5. **S3 Returns New Data**: When S3 returns 200 OK for conditional requests, indicating cached data is stale
-6. **Incomplete Upload Timeout**: Uploads in-progress for >1 hour are removed
+6. **Incomplete Upload Timeout**: Uploads in-progress for longer than
+   `incomplete_upload_ttl` (default 1 day) are removed
 
 ### Conflict Handling
 
@@ -3041,7 +3121,7 @@ Consolidator: Read all journals → Acquire lock → Apply to metadata → Trunc
 - `AccessUpdate`: Increments `access_count` and updates `last_accessed`
 
 **JournalConsolidator (Background Task)**:
-- Runs every 30 seconds (configurable)
+- Runs every 5 seconds by default (`shared_storage.consolidation_interval`, range 1-60s)
 - Reads entries from all instance journals
 - Groups entries by cache key
 - Acquires exclusive lock on metadata file
@@ -3064,9 +3144,12 @@ Attempt 3: Try lock → Success → Apply updates
 - Max backoff: 5 seconds
 - Jitter factor: 0.3 (±30% randomization)
 
-#### Single-Instance Mode Optimization
+#### One Path for Single- and Multi-Instance
 
-When `shared_storage.enabled: false`, cache-hit updates bypass the journal system and write directly to metadata files. This provides better performance for single-instance deployments where race conditions are not a concern.
+Journal-based metadata writes are always enabled. Single-instance and multi-instance
+deployments use the same code path, which keeps behaviour consistent and means there
+is no mode to select. An earlier `shared_storage.enabled` switch that bypassed the
+journal for single-instance deployments was removed in 1.1.0.
 
 #### Data Flow
 
@@ -3280,25 +3363,26 @@ cache_dir/
 ```yaml
 cache:
   max_cache_size: 10737418240  # 10GB
-  
-  # Distributed eviction coordination
-  distributed_eviction:
-    enabled: true                    # Enable distributed lock coordination
-    lock_timeout_seconds: 60         # Lock timeout (30-3600 valid range)
+
+shared_storage:
+  eviction_lock_timeout: "60s"  # How long a held eviction lock is honoured
 ```
 
 **Configuration Options**:
 
-- **enabled** (default: `false`): Enable distributed eviction coordination
-  - Set to `true` for multi-instance deployments with shared cache
-  - Set to `false` for single-instance deployments (no coordination overhead)
-  
-- **lock_timeout_seconds** (default: `60`): Maximum time a lock can be held
-  - Valid range: 30-3600 seconds
-  - If a lock holder crashes, other instances can forcibly acquire after timeout
-  - Recommended: 60 seconds for most deployments
+- **`shared_storage.eviction_lock_timeout`** (default: `"60s"`): How long an eviction
+  lock is honoured before another instance may treat it as stale and take over. If the
+  holder crashes, other instances recover after this interval.
+  - Set to 2-3x your typical eviction duration
+  - Too low and a slow-but-healthy eviction gets its lock stolen mid-pass; too high and
+    a crashed holder blocks eviction for longer
 
-**Backward Compatibility**: If `distributed_eviction` is not configured, it defaults to disabled for backward compatibility with existing single-instance deployments.
+Distributed eviction coordination is always on — single-instance and multi-instance
+deployments run the same code path, so there is no `enabled` switch. The lock is
+additionally UUID-fenced: the holder re-reads the lockfile to confirm its own UUID
+before each batch of filesystem mutations and aborts the pass if it lost ownership,
+which protects against NFS lock-daemon resets where two hosts could both believe they
+hold it.
 
 ### Lock Lifecycle
 
@@ -3409,7 +3493,7 @@ If a lock holder crashes or hangs, other instances can recover:
 
 **Solutions**:
 1. Investigate why instances are crashing (check logs)
-2. Increase `lock_timeout_seconds` if eviction legitimately takes longer
+2. Increase `shared_storage.eviction_lock_timeout` if eviction legitimately takes longer
 3. Monitor instance health and restart unhealthy instances
 4. Check shared storage performance (NFS latency)
 
@@ -3472,29 +3556,18 @@ The following metrics are exposed via the `/metrics` endpoint:
 
 ### Best Practices
 
-#### Single-Instance Deployments
+Distributed eviction locking is always active — it is not something you enable or
+disable. The only knob is how long a held lock is honoured before it is treated as
+stale:
 
 ```yaml
-cache:
-  distributed_eviction:
-    enabled: false  # No coordination overhead
-```
-
-Disable distributed eviction for single-instance deployments to avoid unnecessary filesystem operations.
-
-#### Multi-Instance Deployments
-
-```yaml
-cache:
-  distributed_eviction:
-    enabled: true
-    lock_timeout_seconds: 60  # Adjust based on eviction duration
+shared_storage:
+  eviction_lock_timeout: "60s"  # Adjust based on eviction duration
 ```
 
 **Recommendations**:
-- Enable distributed eviction for all multi-instance deployments
-- Set timeout to 2-3x typical eviction duration
-- Monitor metrics to tune timeout value
+- Set the timeout to 2-3x typical eviction duration
+- Monitor metrics to tune the value
 - Use high-performance shared NFS storage
 
 #### Lock Timeout Tuning
@@ -3521,16 +3594,14 @@ cache:
 
 ### Performance Characteristics
 
-Comprehensive performance testing has validated the distributed eviction lock implementation. See `EVICTION_LOCK_PERFORMANCE_REPORT.md` for detailed results.
+**Measured Performance** (from the performance test suite):
 
-**Measured Performance** (from performance test suite):
-
-| Operation | Average | P95 | Design Target | Status |
-|-----------|---------|-----|---------------|--------|
-| Lock Acquisition | 410µs | 565µs | 1-5ms | ✅ Exceeds |
-| Lock Release | 466µs | 584µs | 1-5ms | ✅ Exceeds |
-| Stale Lock Check | 1.6ms | 3.7ms | ~1ms | ✅ Meets |
-| Full Cycle | 875µs | 1.2ms | 2-10ms | ✅ Exceeds |
+| Operation | Average | P95 | Design Target |
+|-----------|---------|-----|---------------|
+| Lock Acquisition | 410µs | 565µs | 1-5ms |
+| Lock Release | 466µs | 584µs | 1-5ms |
+| Stale Lock Check | 1.6ms | 3.7ms | ~1ms |
+| Full Cycle | 875µs | 1.2ms | 2-10ms |
 
 **Key Findings**:
 - Lock operations are **4-10x faster** than design targets
@@ -3752,6 +3823,15 @@ cache:
 - `cache.part_stores`: Parts cached as ranges
 - `cache.part_evictions`: Parts evicted from cache
 - `cache.part_errors`: Part caching operation errors
+- `page_cache.widened_requests`: Ranged GETs widened to a page-aligned fetch
+- `page_cache.bytes_prefetched`: Bytes fetched beyond what the client requested (with a
+  derived amplification ratio — the cost side of page widening)
+- `page_cache.page_hits`: Requests served from an already-cached page
+- `page_cache.skipped_signed_range`: Requests not widened because the range was signed
+- `page_cache.fallbacks`: Widened fetches that failed and fell back to the client's
+  original range
+- `page_cache.ram_page_promotions`: Pages promoted into the RAM tier
+- `page_cache.ram_page_promotion_skipped`: Page promotions declined
 - `range_merge.operations_total`: Total range merge operations performed
 - `range_merge.cache_efficiency_avg`: Average cache efficiency percentage
 - `range_merge.segments_merged_avg`: Average segments per merge operation
@@ -3924,9 +4004,13 @@ The proxy uses file locking and atomic operations to ensure cache coherency duri
 
 **Lock Timeout Configuration:**
 ```yaml
-cache:
-  metadata_lock_timeout_seconds: 60  # Default: 60 seconds
+shared_storage:
+  metadata_lock_timeout_ms: 30000  # Default: 30000 (30 seconds)
 ```
+
+This timeout is what makes a lock held by *another host* recoverable: local staleness
+is decided by checking whether the owning PID still exists, but a lock owned by a
+different instance can only be judged by wall clock, so it uses this value.
 
 **Lock Recovery:**
 - If a process crashes while holding a lock, other processes can recover after timeout
@@ -4395,10 +4479,9 @@ cache:
   - Longer intervals: Less frequent updates, larger batches
   - Valid range: 1-60 seconds
 
-- **validation_time_of_day**: Time of day for daily validation in 24-hour format "HH:MM" (default: "00:00" = midnight local time)
-  - Examples: "00:00" (midnight), "03:30" (3:30 AM), "14:00" (2:00 PM)
-  - Fixed 1-hour jitter is automatically applied to prevent thundering herd
-  - Validation runs once per 24-hour period globally (across all instances)
+Daily validation runs at midnight local time with a fixed 1-hour jitter to prevent a
+thundering herd, once per 24-hour period globally across all instances. The time of
+day is not configurable — it is an internal default, not a YAML field.
 
 - **validation_threshold_warn**: Drift percentage that triggers a warning (default: 5.0%)
 - **validation_threshold_error**: Drift percentage that triggers an error (default: 20.0%)
@@ -4792,7 +4875,7 @@ Unlike object-level eviction, the proxy evicts individual ranges:
 
 ### Multi-Instance Coordination
 
-In shared storage deployments (`shared_storage.enabled: true`), eviction uses distributed locking:
+Eviction uses distributed locking:
 
 - Global eviction lock prevents concurrent eviction across instances
 - Only one instance performs eviction at a time
@@ -4821,5 +4904,4 @@ Per-range and per-object deletion details are logged at DEBUG level.
 ## See Also
 
 - [Connection Pooling](CONNECTION_POOLING.md) - S3 connection optimization
-- [Docker Deployment](README-Docker.md) - Container deployment guide
 - [OTLP Metrics](OTLP_METRICS.md) - Observability and monitoring

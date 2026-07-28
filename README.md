@@ -49,6 +49,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Upload via multipart, download as full object or byte ranges—all served from cache
 - Request part 5 of a multipart object, then request overlapping byte range—cache serves both
 - Partial cache hits fetch only missing bytes from S3, merging with cached data
+- Page-aligned range caching—opt in per key to widen small ranged GETs to a fixed, page-aligned fetch and cache the whole page, so clustered reads (Parquet/ORC footer plus column chunks) hit cache instead of returning to S3. Off by default, since the tradeoff depends on whether reads cluster; the client always receives exactly the bytes it requested
 - Resumable downloads—if a transfer is interrupted, the client can resume and the proxy serves already-cached ranges locally while fetching only the remainder from S3
 
 **Designed for On-Premises Deployments**
@@ -58,7 +59,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Stateless instances—no direct communication between nodes; all coordination via shared storage makes instances ephemeral and replaceable
 - Journal-based metadata updates—each instance writes cache updates to its own journal file, and a background consolidator merges them atomically, eliminating race conditions on shared storage without inter-node communication
 - Content-aware LZ4 compression—2-10x space savings, automatically skips already-compressed formats
-- Glob-based cache rules—configure TTLs, read/write caching, compression, and RAM cache eligibility for keys matching a glob pattern via a single hot-reloadable `cache_rules.json`
+- Glob-based cache rules—configure TTLs, read/write caching, compression, RAM cache eligibility, page-aligned range caching, and local conditional-request evaluation for keys matching a glob pattern via a single hot-reloadable `cache_rules.json`
 - Flexible expiration modes—lazy (fixed capacity) or active (elastic storage)
 - Cache storage is flexible—a single proxy with local disk may be suitable on a hypervisor platform that provides high availability. Multi-proxy deployments use any NFS-compatible shared storage: a dedicated NAS appliance, a file server VM within the cluster, or file services built into a hypervisor platform
 - **Download bandwidth QoS**—cap the aggregate cache-miss origin download rate and share it fairly across callers (User-Agent app-id) or buckets using deficit round-robin scheduling; static `cap/N` fleet sharing; disabled by default
@@ -124,7 +125,7 @@ The `--endpoint-url http://...` is required so the SDK signs the request against
 
 **Alternative: DNS or hosts file routing** — For multi-instance deployments with HA via DNS multi-value routing, or for clients that can't set `HTTP_PROXY`, point S3 hostnames at the proxy via DNS or `/etc/hosts` and run on standard ports 80/443. With the optional TLS proxy listener enabled, clients on other hosts can use `HTTP_PROXY=https://proxy-host:3129` for encrypted client-to-proxy traffic with full caching. See the [Getting Started Guide](docs/GETTING_STARTED.md) for configuration details.
 
-**Deployment**: `target/release/s3-proxy` is a single portable binary (same arch and Linux, glibc ≥ build host). Upgrading is rebuild, replace the binary, restart — config is backward-compatible across versions. See [Binary Portability](docs/GETTING_STARTED.md#binary-portability) and [Upgrading](docs/GETTING_STARTED.md#upgrading).
+**Deployment**: `target/release/s3-proxy` is a single portable binary (same arch and Linux, glibc ≥ build host). Upgrading is rebuild, replace the binary, restart — config is backward-compatible across versions. See [Binary Portability](docs/GETTING_STARTED.md#binary-portability) and [Upgrading](docs/UPGRADING.md).
 
 **Next Steps**: See [Getting Started Guide](docs/GETTING_STARTED.md) for detailed installation and configuration.
 

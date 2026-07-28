@@ -40,28 +40,21 @@ Implementation details, architectural decisions, and technical notes for Hybrid 
 
 ### Module Organization
 
+For the module inventory, see
+[ARCHITECTURE.md — Module Organization](ARCHITECTURE.md#module-organization). It is
+grouped by subsystem (proxy/protocol, caching, journal, streaming, observability) and
+is the maintained reference; this guide does not repeat it. To list the current modules
+directly:
+
+```bash
+ls src/*.rs
 ```
-src/
-├── main.rs              # Entry point, server initialization
-├── lib.rs               # Library exports, module declarations
-├── cache.rs             # Unified cache manager with part caching (3500+ lines)
-├── cache_types.rs       # Cache data structures
-├── disk_cache.rs        # Disk cache with streaming support
-├── ram_cache.rs         # RAM cache with LRU/frequency-recency eviction
-├── metadata_cache.rs    # RAM cache for NewCacheMetadata objects
-├── http_proxy.rs        # HTTP proxy with streaming (1500+ lines)
-├── s3_client.rs         # S3 client wrapper with streaming
-├── tee_stream.rs        # TeeStream for simultaneous streaming/caching
-├── compression.rs       # LZ4 compression with content-aware detection
-├── connection_pool.rs   # Connection pooling and load balancing
-├── range_handler.rs     # Range request parsing and merging
-├── logging.rs           # Access and application logging
-├── metrics.rs           # Metrics collection
-├── otlp.rs              # OpenTelemetry Protocol export
-├── config.rs            # Configuration management
-├── error.rs             # Error types
-└── shutdown.rs          # Graceful shutdown coordination
-```
+
+The two largest modules are `cache.rs` and `http_proxy.rs`. Both contain several
+similar-looking range read paths whose cache-tier behaviour is not visible at the call
+site — see
+[ARCHITECTURE.md — Range Read-Path Map](ARCHITECTURE.md#3a-range-read-path-map) before
+changing any of them.
 
 ## Key Design Decisions
 
@@ -233,7 +226,6 @@ pub async fn complete_multipart_upload(&self, path: &str) -> Result<()> {
 - Combines access frequency and recency in eviction scoring
 - Sliding window tracks recent accesses
 - HashMap-based frequency counting (not a probabilistic sketch)
-- TTL-aware eviction (expired entries prioritized)
 
 **Note**: This is a simplified implementation, not the full TinyLFU algorithm from the research paper. It lacks:
 - Count-Min Sketch for O(1) memory frequency estimation
@@ -242,23 +234,22 @@ pub async fn complete_multipart_upload(&self, path: &str) -> Result<()> {
 
 **Implementation** (`src/ram_cache.rs`):
 ```rust
-// Unified eviction across GET and HEAD entries
+// Unified eviction across GET and HEAD entries.
+// Note: victim selection does NOT sort expired entries first — see
+// "TTL Expiration Prioritization" under Known Limitations.
 fn find_tinylfu_victim(&self) -> Option<String> {
-    // First, try to evict expired entries (both GET and HEAD)
-    if let Some(expired_key) = self.find_expired_entries().first() {
-        return Some(expired_key.clone());
-    }
-    
-    // Then use TinyLFU across all entry types
+    // Score all entry types
     let get_candidates = self.entries.iter().map(|(k, v)| (k, v.last_accessed, "GET"));
     let head_candidates = self.head_entries.iter().map(|(k, v)| (k, v.last_accessed, "HEAD"));
     
     get_candidates.chain(head_candidates)
         .min_by_key(|(key, last_accessed, _)| {
-            let frequency = self.tinylfu_frequencies.get(*key).unwrap_or(&1);
-            let recency_factor = now.duration_since(*last_accessed)
-                .unwrap_or_default().as_secs().max(1);
-            frequency * 1000 / recency_factor
+            // Frequency decayed by idle time: halves per TINYLFU_HALF_LIFE_SECS.
+            // Do NOT divide frequency by recency — that inverts the ranking and
+            // evicts hot-but-idle entries ahead of fresh one-hit reads (fixed in 2.3.1).
+            let idle_secs = now.duration_since(*last_accessed)
+                .unwrap_or_default().as_secs();
+            decayed_frequency(self.access_count_for(*key), idle_secs)
         })
         .map(|(key, _, _)| key.clone())
 }
@@ -905,53 +896,47 @@ let bypass_admission_window = current_size > max_cache_size * 1.10;
 
 **Problem**: Frequent eviction at exact capacity limits caused performance degradation.
 
-**Solution**: Trigger eviction at 95%, target 90% capacity
+**Solution**: Once over capacity, free down to a target *below* it, so eviction runs in
+batches rather than on every write at the boundary.
+
+The target is `eviction_target_percent`, default **80**:
+
 ```rust
-let trigger_threshold = max_cache_size * 0.95;
-let target_size = max_cache_size * (1.0 - config.cache.eviction_buffer_percent as f64 / 100.0);
+let target_size = (max_size as f64 * (self.eviction_target_percent as f64 / 100.0)) as u64;
+let bytes_to_free = current_size.saturating_sub(target_size);
 ```
 
-**Configuration**:
-```yaml
-cache:
-  eviction_buffer_percent: 5  # Default: 5% buffer
-```
+`cache.eviction_buffer_percent` is **deprecated and has no effect**. It still parses for
+backward compatibility, and the proxy logs a startup warning if it is set to a
+non-default value. Use `eviction_target_percent`.
 
 **Benefits**:
 - Reduces eviction frequency (amortizes overhead)
-- Prevents cache thrashing at capacity boundary  
-- Configurable buffer size for different workloads
+- Prevents cache thrashing at the capacity boundary
 - Better sustained performance under high load
 
 ### 4. Conditional Header Injection Optimization
 
 **Problem**: Client conditional headers (If-None-Match, If-Modified-Since) required careful handling to maintain HTTP compliance.
 
-**Solution**: Smart conditional forwarding with cache optimization
-```rust
-// Detect conditional headers in client request
-fn has_conditional_headers(headers: &HeaderMap) -> bool {
-    headers.contains_key("if-match") ||
-    headers.contains_key("if-none-match") ||
-    headers.contains_key("if-modified-since") ||
-    headers.contains_key("if-unmodified-since")
-}
+**Solution**: Conditional handling is governed by `evaluate_conditions_from_cache`,
+which defaults to `true` (since 2.2.0) and is settable per key via `cache_rules.json`.
 
-// For If-None-Match and If-Modified-Since: optimize with cache
-if let Some(etag) = cached_metadata.etag {
-    if client_if_none_match == etag {
-        return Ok(Response::builder()
-            .status(304)
-            .body(Body::empty())?);
-    }
-}
-```
+- **Local evaluation on**: `If-Match` is answered from cached metadata when the cached
+  ETag matches and the data is fully cached.
+- **Otherwise**: the request is forwarded and S3 decides.
 
-**Benefits**:
-- Maintains HTTP compliance (always forwards to S3 when needed)
-- Optimizes common cases (If-None-Match, If-Modified-Since) from cache
-- Eliminates unnecessary S3 requests for 304 responses
-- Preserves cache TTL refresh on conditional hits
+Generating a local 304 for `If-None-Match` from cached metadata was removed in 2.2.0.
+It looked like a free optimization but it answered the client without S3 seeing the
+request, which skips S3-side authorization on that request and can serve a 304 against
+an ETag the caller is no longer entitled to. Do not reintroduce it.
+
+**Consequences**:
+- Requests answered locally do not revalidate credentials with S3 — this is the
+  documented trade-off of `evaluate_conditions_from_cache`, which is why it is settable
+  per key and why the dashboard surfaces which rules enable it
+- Comma-separated ETag lists are parsed per RFC 7232, so `If-Match: "a", "b", W/"c"`
+  matches on any entry (fixed in 1.16.0)
 
 ### 5. Lazy Directory Creation
 
@@ -973,23 +958,22 @@ if let Some(parent) = path.parent() {
 
 **Solution**: TinyLFU algorithm with unified eviction across GET and HEAD entries
 ```rust
-// Unified eviction across GET and HEAD entries
+// Unified eviction across GET and HEAD entries.
+// Note: victim selection does NOT sort expired entries first — see
+// "TTL Expiration Prioritization" under Known Limitations.
 fn find_tinylfu_victim(&self) -> Option<String> {
-    // First, try to evict expired entries (both GET and HEAD)
-    if let Some(expired_key) = self.find_expired_entries().first() {
-        return Some(expired_key.clone());
-    }
-    
-    // Then use TinyLFU across all entry types
+    // Score all entry types
     let get_candidates = self.entries.iter().map(|(k, v)| (k, v.last_accessed, "GET"));
     let head_candidates = self.head_entries.iter().map(|(k, v)| (k, v.last_accessed, "HEAD"));
     
     get_candidates.chain(head_candidates)
         .min_by_key(|(key, last_accessed, _)| {
-            let frequency = self.tinylfu_frequencies.get(*key).unwrap_or(&1);
-            let recency_factor = now.duration_since(*last_accessed)
-                .unwrap_or_default().as_secs().max(1);
-            frequency * 1000 / recency_factor
+            // Frequency decayed by idle time: halves per TINYLFU_HALF_LIFE_SECS.
+            // Do NOT divide frequency by recency — that inverts the ranking and
+            // evicts hot-but-idle entries ahead of fresh one-hit reads (fixed in 2.3.1).
+            let idle_secs = now.duration_since(*last_accessed)
+                .unwrap_or_default().as_secs();
+            decayed_frequency(self.access_count_for(*key), idle_secs)
         })
         .map(|(key, _, _)| key.clone())
 }
@@ -1137,7 +1121,7 @@ let client = Client::builder(TokioExecutor::new())
 - Better S3 throughput utilization
 - Reduced total latency for multi-range requests
 
-### 5. Metadata Cache Performance Optimizations
+### 11. Metadata Cache Performance Optimizations
 
 **LRU Eviction**: Simple LRU for uniform-size metadata entries
 ```rust
@@ -1188,71 +1172,32 @@ fn calculate_entry_size(entry: &MetadataCacheEntry) -> u64 {
 - **Unified storage**: HEAD and GET share same `.meta` file
 - **Per-key locking**: Prevents thundering herd on cache miss
 
-### 6. Eviction Buffer
-
-Trigger eviction at 95%, target 90%:
-```rust
-let trigger_threshold = max_cache_size * 0.95;
-let target_size = max_cache_size * 0.90;
-```
-
-**Benefits**:
-- Reduces eviction frequency
-- Amortizes eviction overhead
-- Prevents thrashing
-
-### 7. Disk Cache Admission Window
-
-Newly cached ranges are protected from eviction for 60 seconds:
-
-```rust
-// In collect_candidates_from_metadata_file_with_options()
-if !bypass_admission_window {
-    let now = SystemTime::now();
-    let admission_window = std::time::Duration::from_secs(60);
-    if let Ok(age) = now.duration_since(range_spec.last_accessed) {
-        if age < admission_window {
-            // Skip this range as eviction candidate
-            continue;
-        }
-    }
-}
-```
-
-**Rationale**:
-- Prevents cache thrashing during large file downloads
-- New ranges have zero access history in TinyLFU
-- Without protection, newly cached ranges would be evicted immediately
-- 60 seconds allows ranges to accumulate access statistics
-
-**Critical Capacity Bypass**:
-
-When cache exceeds 110% of limit, admission window is bypassed:
-
-```rust
-let bypass_admission_window = current_size > max_cache_size * 1.10;
-let candidates = self.collect_range_candidates_for_eviction_with_options(bypass_admission_window).await?;
-```
-
-**Why 110%**:
-- Normal eviction at 95% respects admission window
-- Extreme scenarios (burst traffic) can exceed limit faster than eviction
-- Critical bypass ensures disk space exhaustion is prevented
-- All ranges become eviction candidates regardless of age
-
 ## Known Limitations
 
 ### 1. Write-Through Caching
 
-Write-through caching is enabled by default.
+Write-through caching is enabled by default (`cache.write_cache_enabled`) and is
+complete. An object PUT through the proxy is cached on the way to S3, so it is
+readable from cache immediately after the upload succeeds — the read-after-write
+consistency property described in the project README.
 
-**Issues**:
-- Multipart upload capacity checking incomplete
-- Conflict invalidation edge cases
-- TTL transition timing
-- Not fully tested or validated
+The three defects previously listed here have since been addressed and the notes are
+retained only to explain what changed:
 
-**Recommendation**: Do not enable. Feature is incomplete and not ready for use.
+- **Capacity accounting** is atomic. Reservation goes through
+  `try_reserve_write_cache()`, which returns an RAII `WriteReservation` that releases
+  on drop, so a cancelled or panicking upload cannot leak capacity. This replaced a
+  racy check-then-reserve pair in 1.16.0. Multipart uploads reserve against the
+  declared content length on the same path.
+- **The write-cache-to-read-cache TTL transition** now runs before the freshness
+  check rather than asynchronously after it, so the first GET of a
+  write-through-cached object honours `get_ttl` — including `get_ttl: 0`, which
+  revalidates against S3. Fixed in 2.0.0.
+- **Conflict invalidation** is exercised by the multipart correctness gates described
+  in [MULTIPART_UPLOAD.md](MULTIPART_UPLOAD.md): on any per-part ETag mismatch at
+  `CompleteMultipartUpload`, cache finalization is skipped and the in-progress
+  directory is cleaned up, so the cache declines to retain an object it cannot prove
+  matches S3.
 
 ### 2. Versioned Requests
 
@@ -1395,17 +1340,20 @@ pub async fn get_or_load<F, Fut>(&self, cache_key: &str, loader: F) -> Result<Ne
 - High-concurrency workloads (per-key locking prevents thundering herd)
 - NFS shared cache (stale handle recovery)
 
-### 4. TTL Expiration Prioritization
+### 5. TTL Expiration Prioritization
 
 **Issue**: Eviction doesn't prioritize expired entries
 
-**Current Behavior**: Eviction uses LRU/LFU/TinyLFU without checking TTL expiration
+**Current Behavior**: Victim selection scores entries by decayed frequency and recency
+without consulting TTL expiry first. In the RAM tier, expired entries are dropped
+lazily as they are encountered on subsequent `put()` calls rather than being swept
+ahead of live data.
 
 **Impact**: Valid data may be evicted before expired data
 
-**Future**: Sort expired entries first during eviction
+**Possible improvement**: Sort expired entries first during eviction
 
-### 5. Single-Threaded Eviction
+### 6. Single-Threaded Eviction
 
 **Issue**: Eviction scans all entries sequentially (O(N))
 
@@ -1542,19 +1490,23 @@ valgrind --tool=massif ./target/release/s3-proxy -c config.yaml
 
 ### Test Specific Scenarios
 
+These assume the proxy is running in proxy-only mode on port 3128 (the no-sudo local
+setup from [GETTING_STARTED.md](GETTING_STARTED.md#proxy-only-mode-no-sudo-required)).
+Adjust the port if you run the standard port-80 listener.
+
 ```bash
 # Test cache hit
-aws s3 cp s3://bucket/key ./test1.txt --endpoint-url "http://localhost:8081"
-aws s3 cp s3://bucket/key ./test2.txt --endpoint-url "http://localhost:8081"
+aws s3 cp s3://bucket/key ./test1.txt --endpoint-url "http://localhost:3128"
+aws s3 cp s3://bucket/key ./test2.txt --endpoint-url "http://localhost:3128"
 
 # Test range request
-curl -H "Range: bytes=0-1023" http://localhost:8081/bucket/key
+curl -H "Range: bytes=0-1023" http://localhost:3128/bucket/key
 
 # Test part number request
-aws s3api get-object --bucket bucket --key large-file.bin --part-number 1 ./part1.bin --endpoint-url "http://localhost:8081"
+aws s3api get-object --bucket bucket --key large-file.bin --part-number 1 ./part1.bin --endpoint-url "http://localhost:3128"
 
 # Test multipart upload
-aws s3 cp large-file.zip s3://bucket/key --endpoint-url "http://localhost:8081"
+aws s3 cp large-file.zip s3://bucket/key --endpoint-url "http://localhost:3128"
 ```
 
 ## Code Style Guidelines

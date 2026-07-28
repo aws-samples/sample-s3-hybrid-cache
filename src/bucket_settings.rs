@@ -34,6 +34,12 @@ use crate::config::duration_serde;
 /// driver is match fan-out per key, not total rule count. Confirmed by benchmark.
 pub const DEFAULT_MAX_RULES: usize = 1024;
 
+/// Default page size for page-aligned range caching (widening): 16 MiB.
+/// Used when a rule enables `page_widening` without specifying `page_size`.
+///
+/// Spec: page-aligned-range-cache Requirement 1.4.
+pub const DEFAULT_PAGE_SIZE: u64 = 16 * 1024 * 1024;
+
 /// Custom deserializer for optional Duration fields in rule JSON.
 /// Handles both string values ("30s", "5m") and null/missing fields.
 fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -184,6 +190,20 @@ pub struct CacheRule {
     pub ram_cache_eligible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluate_conditions_from_cache: Option<bool>,
+
+    /// Enables page-aligned range caching (widening) for keys matching this
+    /// rule. Off by default — never enabled globally, only per-key via an
+    /// explicit rule. Spec: page-aligned-range-cache Requirement 1.1, 1.2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_widening: Option<bool>,
+
+    /// Per-key page size (in bytes) for page-aligned range caching. When a
+    /// rule enables `page_widening` without specifying this, resolution falls
+    /// back to [`DEFAULT_PAGE_SIZE`] (16 MiB). Must be `> 0` and
+    /// `<= 64 MiB` for any rule enabling widening (validated at startup).
+    /// Spec: page-aligned-range-cache Requirement 1.4, 7.9.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u64>,
 }
 
 /// The on-disk `cache_rules.json` shape.
@@ -200,7 +220,9 @@ pub struct CacheRules {
 
 impl CacheRules {
     /// Validate the rule set. Returns a list of human-readable errors; empty = valid.
-    /// Checks: non-empty patterns, compilable globs, and the rule-count cap.
+    /// Checks: non-empty patterns, compilable globs, the rule-count cap, and (for
+    /// any rule enabling `page_widening`) that `page_size` is `0 < page_size <= 64 MiB`
+    /// (Spec: page-aligned-range-cache Requirement 7.9).
     pub fn validate(&self, max_rules: usize) -> Vec<String> {
         let mut errors = Vec::new();
 
@@ -220,6 +242,32 @@ impl CacheRules {
                     }
                 }
                 Err(e) => errors.push(format!("rules[{}]: {}", i, e)),
+            }
+        }
+
+        // A rule that enables page_widening must carry a page_size within
+        // (0, RAM_CACHE_ADMISSION_CEILING] — a Page can never exceed the fixed
+        // 64 MiB RAM admission ceiling (Requirement 7.9). A rule that leaves
+        // page_size unset falls back to DEFAULT_PAGE_SIZE at resolution time
+        // and is always valid; only an explicit out-of-range value is rejected
+        // here.
+        for (i, rule) in self.rules.iter().enumerate() {
+            if rule.page_widening == Some(true) {
+                if let Some(page_size) = rule.page_size {
+                    if page_size == 0 {
+                        errors.push(format!(
+                            "rules[{}]: page_size must be greater than 0 when page_widening is enabled",
+                            i
+                        ));
+                    } else if page_size > crate::ram_cache::RAM_CACHE_ADMISSION_CEILING as u64 {
+                        errors.push(format!(
+                            "rules[{}]: page_size {} exceeds the maximum of {} bytes (64 MiB)",
+                            i,
+                            page_size,
+                            crate::ram_cache::RAM_CACHE_ADMISSION_CEILING
+                        ));
+                    }
+                }
             }
         }
 
@@ -246,6 +294,14 @@ pub struct ResolvedSettings {
     pub compression_from_rule: bool,
     pub ram_cache_eligible: bool,
     pub evaluate_conditions_from_cache: bool,
+    /// Whether page-aligned range caching (widening) is enabled for this key.
+    /// Off unless an explicit rule sets `page_widening: true` (first-match-per-field).
+    /// Spec: page-aligned-range-cache Requirement 1.1, 1.2, 1.3.
+    pub page_widening: bool,
+    /// Per-key page size (bytes) used when `page_widening` is enabled. Falls
+    /// back to [`DEFAULT_PAGE_SIZE`] (16 MiB) when no rule sets it explicitly.
+    /// Spec: page-aligned-range-cache Requirement 1.4.
+    pub page_size: u64,
     /// Tracks which layer provided the dominant settings.
     pub source: SettingsSource,
 }
@@ -277,6 +333,8 @@ impl Default for ResolvedSettings {
             compression_from_rule: false,
             ram_cache_eligible: true,
             evaluate_conditions_from_cache: true,
+            page_widening: false,
+            page_size: DEFAULT_PAGE_SIZE,
             source: SettingsSource::Global,
         }
     }
@@ -354,6 +412,9 @@ impl RuleSet {
         let first_dur = |pick: &dyn Fn(&CacheRule) -> Option<Duration>| -> Option<Duration> {
             matched.iter().find_map(|&i| pick(&self.rules[i].rule))
         };
+        let first_u64 = |pick: &dyn Fn(&CacheRule) -> Option<u64>| -> Option<u64> {
+            matched.iter().find_map(|&i| pick(&self.rules[i].rule))
+        };
 
         let get_ttl = first_dur(&|r| r.get_ttl).unwrap_or(g.get_ttl);
         let head_ttl = first_dur(&|r| r.head_ttl).unwrap_or(g.head_ttl);
@@ -368,6 +429,10 @@ impl RuleSet {
             first(&|r| r.ram_cache_eligible).unwrap_or(g.ram_cache_enabled);
         let evaluate_conditions_from_cache = first(&|r| r.evaluate_conditions_from_cache)
             .unwrap_or(g.evaluate_conditions_from_cache);
+        // page_widening is off by default — never enabled globally, only via
+        // an explicit rule (Requirement 1.2). There is no global fallback.
+        let page_widening = first(&|r| r.page_widening).unwrap_or(false);
+        let page_size = first_u64(&|r| r.page_size).unwrap_or(DEFAULT_PAGE_SIZE);
 
         // Post-resolution invariants (unchanged from prior behaviour):
         // - Zero get_ttl → RAM range cache ineligible (RAM cache bypasses revalidation)
@@ -389,6 +454,8 @@ impl RuleSet {
             compression_from_rule,
             ram_cache_eligible,
             evaluate_conditions_from_cache,
+            page_widening,
+            page_size,
             source,
         }
     }
@@ -1163,6 +1230,189 @@ mod tests {
         assert!(find_legacy_settings_files(tmp.path()).is_empty());
         // The public warning entry point must not panic in this common case.
         warn_if_legacy_settings_present(tmp.path());
+    }
+
+    // ---- page-aligned range caching rule fields (page_widening / page_size) ----
+    // Spec: page-aligned-range-cache Requirements 1.1-1.5, 7.9
+
+    #[test]
+    fn rule_parses_without_page_fields() {
+        let json = r#"{"pattern": "**"}"#;
+        let rule: CacheRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.page_widening, None);
+        assert_eq!(rule.page_size, None);
+    }
+
+    #[test]
+    fn rule_parses_with_page_fields() {
+        let json = r#"{"pattern": "*.parquet", "page_widening": true, "page_size": 33554432}"#;
+        let rule: CacheRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.page_widening, Some(true));
+        assert_eq!(rule.page_size, Some(33554432));
+    }
+
+    #[tokio::test]
+    async fn resolve_no_rule_page_widening_defaults_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("my-bucket/some/key").await;
+        assert!(!r.page_widening);
+        assert_eq!(r.page_size, DEFAULT_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn resolve_rule_enables_page_widening_with_default_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**/*.parquet", "page_widening": true}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("bucket/file.parquet").await;
+        assert!(r.page_widening);
+        assert_eq!(r.page_size, DEFAULT_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn resolve_rule_enables_page_widening_with_explicit_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**/*.orc", "page_widening": true, "page_size": 8388608}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("bucket/file.orc").await;
+        assert!(r.page_widening);
+        assert_eq!(r.page_size, 8388608);
+    }
+
+    #[tokio::test]
+    async fn resolve_page_widening_first_match_per_field_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Rule 0 (specific) sets only page_widening; rule 1 (broad) sets page_size.
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [
+                {"pattern": "b/special/**", "page_widening": true},
+                {"pattern": "**", "page_size": 4194304}
+            ]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+
+        let r = mgr.resolve("b/special/x").await;
+        // page_widening from rule 0 (earlier wins); page_size from rule 1
+        // (rule 0 didn't set it, falls through to next matched rule).
+        assert!(r.page_widening);
+        assert_eq!(r.page_size, 4194304);
+
+        // A key only matching the broad rule: page_widening stays off (no
+        // rule enabled it), page_size still comes from rule 1.
+        let r = mgr.resolve("b/other/y").await;
+        assert!(!r.page_widening);
+        assert_eq!(r.page_size, 4194304);
+    }
+
+    #[tokio::test]
+    async fn resolve_page_widening_hot_reload_picks_up_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        std::fs::write(
+            &path,
+            r#"{"rules": [{"pattern": "**", "page_widening": false}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager_always_reload(tmp.path());
+        assert!(!mgr.resolve("b/k").await.page_widening);
+
+        std::fs::write(
+            &path,
+            r#"{"rules": [{"pattern": "**", "page_widening": true, "page_size": 1048576}]}"#,
+        )
+        .unwrap();
+        let r = mgr.resolve("b/k").await;
+        assert!(r.page_widening);
+        assert_eq!(r.page_size, 1048576);
+    }
+
+    #[test]
+    fn validate_rejects_page_size_zero_when_widening_enabled() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "*.parquet".to_string(),
+                page_widening: Some(true),
+                page_size: Some(0),
+                ..Default::default()
+            }],
+        };
+        let errors = rules.validate(DEFAULT_MAX_RULES);
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("page_size must be greater than 0")));
+    }
+
+    #[test]
+    fn validate_rejects_page_size_over_64mib_when_widening_enabled() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "*.parquet".to_string(),
+                page_widening: Some(true),
+                page_size: Some(64 * 1024 * 1024 + 1),
+                ..Default::default()
+            }],
+        };
+        let errors = rules.validate(DEFAULT_MAX_RULES);
+        assert!(errors.iter().any(|e| e.contains("exceeds the maximum")));
+    }
+
+    #[test]
+    fn validate_accepts_page_size_at_64mib_boundary() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "*.parquet".to_string(),
+                page_widening: Some(true),
+                page_size: Some(64 * 1024 * 1024),
+                ..Default::default()
+            }],
+        };
+        assert!(rules.validate(DEFAULT_MAX_RULES).is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_widening_enabled_without_explicit_page_size() {
+        // No page_size set → falls back to DEFAULT_PAGE_SIZE at resolution
+        // time, which is always valid; validation must not reject this.
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "*.parquet".to_string(),
+                page_widening: Some(true),
+                page_size: None,
+                ..Default::default()
+            }],
+        };
+        assert!(rules.validate(DEFAULT_MAX_RULES).is_empty());
+    }
+
+    #[test]
+    fn validate_ignores_page_size_when_widening_not_enabled() {
+        // page_widening false/absent: an out-of-range page_size is harmless
+        // (never used), so validation should not reject it.
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "*.parquet".to_string(),
+                page_widening: Some(false),
+                page_size: Some(0),
+                ..Default::default()
+            }],
+        };
+        assert!(rules.validate(DEFAULT_MAX_RULES).is_empty());
     }
 
     // ---- rules_health() reload counters ----

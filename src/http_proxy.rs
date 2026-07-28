@@ -13,14 +13,17 @@ use crate::{
     inflight_tracker::{FetchGuard, FetchRole, InFlightTracker},
     logging::{mask_presigned_params, LoggerManager},
     metrics::{resolve_traffic_key, RequestType},
-    range_handler::{RangeHandler, RangeParseResult, RangeSpec},
+    range_handler::{
+        overlapping_pages, suffix_page_target, RangeHandler, RangeParseResult, RangeSpec,
+        SuffixPageTarget,
+    },
     s3_client::{
         build_s3_request_context, build_s3_request_context_with_operation, S3Client, S3ClientApi,
         S3RequestContext, S3ResponseBody,
     },
     tee_stream::TeeStream,
     throttle_stream::ThrottleStream,
-    Result,
+    ProxyError, Result,
 };
 use bytes::Bytes;
 use hickory_resolver::TokioResolver;
@@ -405,6 +408,36 @@ pub fn etag_list_strong_match(header_value: &str, target: &str) -> bool {
     parse_etag_list(header_value)
         .iter()
         .any(|entry| entry.strong_matches(target))
+}
+
+/// Strong comparison of a single `If-Range` validator against a cached ETag
+/// (RFC 7233 §3.2).
+///
+/// Deliberately not `etag_list_strong_match`: `If-Range` differs from
+/// `If-Match` in three ways that matter for a local answer.
+///
+/// - It carries exactly ONE validator — never a comma-separated list, never
+///   `*`. A value containing a comma is malformed for this header, so it is
+///   reported as "no local match" and left for S3 to rule on.
+/// - The validator may be an HTTP-date instead of an entity-tag, which cannot
+///   be compared against an ETag at all. Only the quoted entity-tag form is
+///   accepted here; `classify_etag_entry` would otherwise tolerate a bare
+///   HTTP-date as an unquoted strong tag and compare a date against an ETag.
+/// - The comparison must be strong, so a weak (`W/`) validator never matches.
+///
+/// A `false` return means "cannot confirm locally" — NOT "precondition
+/// failed". The caller must forward to S3 in that case.
+pub fn if_range_strong_match(if_range_value: &str, cached_etag: &str) -> bool {
+    let value = if_range_value.trim();
+    if value.is_empty() || value == "*" || value.contains(',') {
+        return false;
+    }
+    if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
+        return false;
+    }
+    parse_etag_list(value)
+        .iter()
+        .any(|entry| entry.strong_matches(cached_etag))
 }
 
 /// List-aware weak ETag match per RFC 7232.
@@ -1762,6 +1795,107 @@ impl HttpProxy {
             || headers.contains_key("if-unmodified-since")
     }
 
+    /// Detect the conditional headers, other than `If-Match`, that only the
+    /// origin can evaluate: `If-None-Match`, `If-Modified-Since`,
+    /// `If-Unmodified-Since`, `If-Range`.
+    ///
+    /// Drives the `other_conditional` half of the conditional dispatch in
+    /// `handle_request`: when true the request is forwarded to S3 so S3
+    /// evaluates the precondition, and the Mode B pure-`If-Match`
+    /// serve-from-cache fast path is disqualified.
+    ///
+    /// `pub` (like the sibling `handle_range_request`) so integration tests can
+    /// compute the same `forward_to_s3` value `handle_request` would, instead of
+    /// hard-coding an assumption about it.
+    pub fn has_non_if_match_conditional(headers: &HashMap<String, String>) -> bool {
+        Self::has_temporal_or_negative_conditional(headers) || headers.contains_key("if-range")
+    }
+
+    /// The conditional headers only S3 can ever evaluate: `If-None-Match`,
+    /// `If-Modified-Since`, `If-Unmodified-Since`. Unlike `If-Match` and
+    /// `If-Range`, none of these has a case the cache can answer locally, so
+    /// their presence disqualifies every Mode B fast path.
+    fn has_temporal_or_negative_conditional(headers: &HashMap<String, String>) -> bool {
+        headers.contains_key("if-none-match")
+            || headers.contains_key("if-modified-since")
+            || headers.contains_key("if-unmodified-since")
+    }
+
+    /// Replace a client `If-Range` with a proxy-injected `If-Match` pinning the
+    /// cached ETag the validator just matched. Returns whether the swap happened.
+    ///
+    /// Called only after the Mode B `If-Range` evaluation has committed to serving
+    /// from cache, where the client's `If-Range` has already done its job. See the
+    /// call site for why carrying it further is expensive (a partially cached range
+    /// fetches its gaps through `fetch_missing_ranges`, whose non-`206` rejection
+    /// discards an already-buffered full object).
+    ///
+    /// No swap when `If-Range` is in `SignedHeaders`: removing a signed header
+    /// invalidates the client's SigV4 signature. The caller then forwards it
+    /// untouched.
+    ///
+    /// `pub` for the same reason as the sibling classifiers: this decision is
+    /// asserted directly by tests rather than reconstructed.
+    pub fn pin_if_range_serve_to_cached_etag(
+        headers: &mut HashMap<String, String>,
+        cached_etag: &str,
+    ) -> bool {
+        if cached_etag.is_empty()
+            || crate::signed_request_proxy::is_header_signed(headers, "if-range")
+        {
+            return false;
+        }
+        headers.remove("if-range");
+        headers.insert("if-match".to_string(), cached_etag.to_string());
+        headers.insert("x-proxy-injected-if-match".to_string(), "1".to_string());
+        true
+    }
+
+    /// Decide whether a pure-`If-Range` GET must be forwarded to S3.
+    ///
+    /// Mode B (`evaluate_conditions_from_cache`) can answer the MATCH case
+    /// locally: when the cached ETag strong-matches the client's `If-Range`
+    /// validator, the client has asserted the exact version the cache holds, so
+    /// the cached bytes are correct by definition and the `Range` is honoured
+    /// from cache — the same reasoning as the Mode B `If-Match` fast path.
+    ///
+    /// Everything else forwards, because only the origin can produce the answer:
+    ///
+    /// - **Mismatch.** RFC 7233 §3.2 requires `Range` to be ignored and the FULL
+    ///   current representation returned with `200`. The proxy may hold no copy
+    ///   of the current object, so it cannot construct that response. This is
+    ///   the one asymmetry with `If-Match`, whose mismatch is a bodyless `412`
+    ///   the proxy could in principle answer locally.
+    /// - **HTTP-date or weak validator, or no cached ETag.** Not locally
+    ///   comparable — see `if_range_strong_match`.
+    /// - **Mode A.** S3 is the sole judge of every precondition.
+    ///
+    /// `pub` for the same reason as `has_non_if_match_conditional`: integration
+    /// tests compute the real decision rather than assuming one.
+    pub fn if_range_requires_forward(
+        mode_b: bool,
+        if_range_value: &str,
+        cached_etag: Option<&str>,
+    ) -> bool {
+        if !mode_b {
+            return true;
+        }
+        match cached_etag {
+            Some(etag) if !etag.is_empty() => !if_range_strong_match(if_range_value, etag),
+            _ => true,
+        }
+    }
+
+    /// Detect the conditional headers relevant to a Range request: `If-Range`,
+    /// `If-Match`, `If-None-Match` (Requirement 2.6). Used by the page-widening
+    /// path to force a conditional round-trip to S3 rather than serving a
+    /// cached Page straight from RAM/disk — see `fill_page`.
+    fn has_range_conditional_headers(headers: &HashMap<String, String>) -> bool {
+        headers.contains_key("if-range")
+            || headers.contains_key("if-match")
+            || headers.contains_key("if-none-match")
+    }
+
     /// Evaluate client conditional headers against cached metadata (Mode B).
     ///
     /// Called only when `evaluate_conditions_from_cache` is enabled and the cache has
@@ -1918,8 +2052,10 @@ impl HttpProxy {
         let path = uri.path();
         let headers = req.headers();
 
-        // Convert headers to HashMap for easier processing
-        let header_map: HashMap<String, String> = headers
+        // Convert headers to HashMap for easier processing.
+        // `mut` for the Mode B If-Range → proxy-injected If-Match swap in the
+        // conditional dispatch below; nothing else rewrites it.
+        let mut header_map: HashMap<String, String> = headers
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
@@ -2072,7 +2208,18 @@ impl HttpProxy {
         // Classify the request's conditional headers:
         //   if_match_header   — raw If-Match header value (list-aware, kept intact for S3).
         //   other_conditional — true when any of If-None-Match / If-Modified-Since /
-        //                       If-Unmodified-Since is present.
+        //                       If-Unmodified-Since / If-Range is present.
+        //
+        // `If-Range` is included deliberately. The cache holds no record of what an
+        // `If-Range` outcome would be, so it can only be evaluated by the origin: when
+        // the validator does not match, RFC 7233 §3.2 requires the `Range` header to be
+        // ignored and the FULL representation returned with 200. Before this was
+        // classified as a conditional, an `If-Range`-only Range GET reached the range
+        // pipeline with `forward_to_s3 = false`, and a cached object was sliced and
+        // returned as a 206 — the precondition never evaluated (fleet T36j).
+        // `If-Range` is also grouped with `other_conditional` (rather than handled
+        // separately) so it disqualifies the Mode B pure-If-Match cache-serve fast path,
+        // which likewise cannot evaluate it locally.
         //
         // Dispatch rules:
         //   Mode B + pure If-Match (no other_conditional):
@@ -2080,7 +2227,12 @@ impl HttpProxy {
         //       (CRT fast path: serve from cache, refresh TTL, return).
         //     → forward_to_s3 = true   when no cache entry, ETag mismatch, or not fully cached
         //       (S3 returns 412 or a cacheable 200/206).
-        //   Mode A (default), Mode B non-If-Match, or mixed conditional:
+        //   Mode B + pure If-Range:
+        //     → forward_to_s3 = false  only when the cached ETag strong-matches the
+        //       validator (Range honoured from cache; no TTL bypass — see the branch).
+        //     → forward_to_s3 = true   otherwise, including every mismatch, because
+        //       RFC 7233 §3.2 then requires the FULL current body with 200.
+        //   Mode A (default), Mode B non-If-Match/If-Range, or mixed conditional:
         //     → forward_to_s3 = true   (S3 evaluates the precondition; fixes T6 and T8).
         //   Non-conditional:
         //     → forward_to_s3 = false  (normal cache-hit logic unchanged).
@@ -2089,10 +2241,16 @@ impl HttpProxy {
         // The cache-hit arm uses this flag to bypass the TTL expiry check (the client's
         // If-Match is the freshness assertion — RFC 7232 §3.1) and to refresh TTL on serve.
         let if_match_header: Option<String> = header_map.get("if-match").cloned();
-        let other_conditional = header_map.contains_key("if-none-match")
-            || header_map.contains_key("if-modified-since")
-            || header_map.contains_key("if-unmodified-since");
+        let if_range_header: Option<String> = header_map.get("if-range").cloned();
+        let other_conditional = Self::has_non_if_match_conditional(&header_map);
         let has_any_conditional = if_match_header.is_some() || other_conditional;
+        // `If-Range` alone — no `If-Match` (a combined request must go to S3: the
+        // two validators can disagree, and only S3 can resolve "precondition
+        // passes but the range validator is stale") and none of the
+        // origin-only conditionals.
+        let pure_if_range = if_range_header.is_some()
+            && if_match_header.is_none()
+            && !Self::has_temporal_or_negative_conditional(&header_map);
 
         if has_any_conditional {
             // Log conditional headers for observability (preserved from previous code).
@@ -2104,6 +2262,7 @@ impl HttpProxy {
                         || key == "if-none-match"
                         || key == "if-modified-since"
                         || key == "if-unmodified-since"
+                        || key == "if-range"
                 })
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
@@ -2234,6 +2393,68 @@ impl HttpProxy {
                     forward_to_s3 = true;
                     mode_b_if_match_serve = false;
                 }
+            } else if mode_b && pure_if_range {
+                // Mode B + pure If-Range: the MATCH case is answerable from cache,
+                // the mismatch case is not — see `if_range_requires_forward`.
+                //
+                // `read_cache_enabled = false` always forwards: there is no cached
+                // copy we are permitted to serve, so S3 must answer.
+                let cached_etag = if resolved_settings.read_cache_enabled {
+                    cache_manager
+                        .get_metadata_cached(&cache_key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|meta| meta.object_metadata.etag)
+                } else {
+                    None
+                };
+                let if_range_value = if_range_header.as_deref().unwrap_or_default();
+                forward_to_s3 =
+                    Self::if_range_requires_forward(true, if_range_value, cached_etag.as_deref());
+
+                // Serving from cache: the client's `If-Range` has now done its job, and
+                // carrying it further is actively expensive. If the requested range turns
+                // out to be only PARTIALLY cached, the pipeline fetches the gaps via
+                // `fetch_missing_ranges`, which forwards client headers as-is. Should the
+                // object have changed since this metadata was cached, S3 answers that gap
+                // fetch by ignoring `Range` and returning the FULL object with `200` —
+                // and because that path sets `allow_streaming = false`, `s3_client` buffers
+                // the entire body into memory before the status is even inspected, only for
+                // `fetch_missing_ranges` to reject the non-`206` and discard it. On a
+                // multi-GB object that is a multi-GB allocation thrown away.
+                //
+                // `If-Range` is the only conditional with that profile: every other
+                // precondition fails with a small `304`/`412` body. So swap it for the
+                // proxy's own `If-Match` on the ETag we just matched — the documented
+                // partial-cache merge pin. It expresses the same "this exact version"
+                // intent, and a changed object now costs a bodyless `412` that
+                // `fetch_complete_range_from_s3`'s sentinel branch already recovers from
+                // (invalidate, retry once without the injected header).
+                //
+                // Only when `If-Range` is NOT in `SignedHeaders`: stripping a signed header
+                // would invalidate the client's signature. A signed `If-Range` is forwarded
+                // untouched, accepting the buffering cost in that rare case.
+                if !forward_to_s3 {
+                    if let Some(ref etag) = cached_etag {
+                        if Self::pin_if_range_serve_to_cached_etag(&mut header_map, etag) {
+                            debug!(
+                                "Mode B: swapped client If-Range for proxy-injected If-Match on the matched ETag: cache_key={}",
+                                cache_key
+                            );
+                        }
+                    }
+                }
+                // NOT a TTL bypass, unlike the Mode B If-Match path. `If-Range` is
+                // not a precondition on the representation (RFC 7233 §3.2 — it only
+                // decides whether `Range` applies), so it asserts nothing about
+                // freshness and must not refresh TTL or skip expiry checks. An
+                // expired entry still revalidates through the normal path.
+                mode_b_if_match_serve = false;
+                debug!(
+                    "Mode B: pure If-Range, cached_etag={:?}, forward_to_s3={}: cache_key={}",
+                    cached_etag, forward_to_s3, cache_key
+                );
             } else {
                 // Mode A (default) OR Mode B with If-None-Match / If-Modified-Since /
                 // If-Unmodified-Since OR mixed conditional (If-Match + other):
@@ -4669,9 +4890,1277 @@ impl HttpProxy {
         Ok(response_builder.body(body).unwrap())
     }
 
-    /// Handle range requests with caching and conditional headers - Requirements 3.1, 3.2, 3.3, 3.4, 3.6, 3.7, 3.8
+    /// Page-aligned range widening eligibility gate + orchestration
+    /// (page-aligned-range-cache spec, Task 4).
+    ///
+    /// Returns `Some(response)` when the request was handled entirely by the
+    /// widening path (a widened fetch, a page-cache hit, a passthrough of a
+    /// non-`206` conditional outcome, or a failure fallback to the client's
+    /// original range) — the caller must return this value directly. Returns
+    /// `None` when the request is not eligible for widening (signed Range,
+    /// length `>= P`, unparseable range, or size-unknown suffix `>= P` after
+    /// the size-free fallback) — the caller continues with the pre-existing
+    /// (un-widened) range path unchanged.
+    ///
+    /// Eligibility (Requirement 2): GET with a `Range` header, requested
+    /// length `< P`, and the Range is not in `SignedHeaders`. Conditional
+    /// headers (`If-Range` / `If-Match` / `If-None-Match`) are widened on the
+    /// same terms — the response handler branches on status rather than
+    /// assuming a sliceable Page (Requirement 2.6).
     #[allow(clippy::too_many_arguments)]
-    async fn handle_range_request(
+    async fn try_widened_range_request(
+        cache_key: &str,
+        range_header: &str,
+        client_headers: &HashMap<String, String>,
+        content_length: Option<u64>,
+        current_etag: Option<&str>,
+        cache_manager: &Arc<CacheManager>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        config: &Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        inflight_tracker: &Arc<InFlightTracker>,
+        metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        proxy_referer: &Option<String>,
+    ) -> Option<std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible>> {
+        // Signed Range: never rewritten — forward unchanged (Requirement 2.3).
+        if crate::signed_request_proxy::is_range_signed(client_headers) {
+            debug!(
+                "[page-widening] skipped: signed range not eligible for widening: cache_key={}",
+                cache_key
+            );
+            if let Some(ref mm) = metrics_manager {
+                mm.read().await.record_page_skipped_signed_range().await;
+            }
+            return None;
+        }
+
+        let page_size = resolved.page_size;
+        let trimmed = range_header.trim();
+
+        // Determine the widening target: either the overlapping grid page(s) for
+        // an absolute range / size-known suffix, or a size-free `bytes=-P`
+        // rewrite for a size-unknown suffix (Requirement 3.2, 3.3).
+        enum Target {
+            /// Overlapping page(s) plus the client's original absolute range.
+            Pages(smallvec::SmallVec<[(u64, u64); 2]>, RangeSpec),
+            /// Size unknown — issue a size-free `bytes=-P` suffix fetch. The
+            /// client's original requested length (`n`) is retained so the
+            /// response can be sliced correctly once the size is learned.
+            SizeUnknownSuffix { n: u64 },
+        }
+
+        let target = if let Some(n_str) = trimmed.strip_prefix("bytes=-") {
+            // Suffix range: bytes=-N
+            let n: u64 = match n_str.parse() {
+                Ok(n) if n > 0 => n,
+                _ => return None, // Malformed — let the existing parser produce the error.
+            };
+            match content_length {
+                Some(size) => {
+                    if n >= page_size {
+                        return None; // Already >= P — forward unchanged (Requirement 2.4).
+                    }
+                    match suffix_page_target(n, page_size, Some(size)) {
+                        SuffixPageTarget::Pages(pages) => {
+                            let original = RangeSpec {
+                                start: size.saturating_sub(n),
+                                end: size - 1,
+                            };
+                            Target::Pages(pages, original)
+                        }
+                        SuffixPageTarget::SizeUnknown => unreachable!("size was Some"),
+                    }
+                }
+                None => {
+                    if n >= page_size {
+                        return None; // Already >= P — nothing to widen.
+                    }
+                    Target::SizeUnknownSuffix { n }
+                }
+            }
+        } else {
+            // Absolute range: bytes=start-end or bytes=start-
+            let range_result = range_handler.parse_range_header(trimmed, content_length);
+            match range_result {
+                RangeParseResult::SingleRange(range_spec) => {
+                    let len = range_spec.len();
+                    if len >= page_size {
+                        return None; // Requirement 2.4: already >= P, forward unchanged.
+                    }
+                    // Grid page bounds only need the object size to clamp the LAST
+                    // page. When the size is not yet known, use a sentinel large
+                    // enough that no real object triggers the clamp; S3 accepts
+                    // (and clamps) a Range extending past end-of-object on its own
+                    // (Requirement 3.6), so widening can safely proceed without
+                    // waiting for the size to be learned.
+                    let size = content_length.unwrap_or(u64::MAX);
+                    let pages =
+                        overlapping_pages(range_spec.start, range_spec.end, page_size, size);
+                    Target::Pages(pages, range_spec)
+                }
+                _ => return None, // Not a single absolute range — let the caller handle it.
+            }
+        };
+
+        match target {
+            Target::SizeUnknownSuffix { n } => {
+                debug!(
+                    "[page-widening] size-unknown suffix widened: cache_key={}, original_suffix={}, widened=bytes=-{}",
+                    cache_key, n, page_size
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read()
+                        .await
+                        .record_page_widened_request(n, page_size)
+                        .await;
+                }
+                Some(
+                    Self::fetch_widened_suffix_size_unknown(
+                        cache_key,
+                        n,
+                        page_size,
+                        client_headers,
+                        range_handler,
+                        s3_client,
+                        host,
+                        uri,
+                        resolved,
+                        metrics_manager,
+                        proxy_referer,
+                    )
+                    .await,
+                )
+            }
+            Target::Pages(pages, original_range) => {
+                debug!(
+                    "[page-widening] request widened: cache_key={}, original_range={}-{}, pages={:?}",
+                    cache_key, original_range.start, original_range.end, &pages[..]
+                );
+                if let Some(ref mm) = metrics_manager {
+                    let requested_bytes = original_range.len();
+                    let widened_bytes: u64 = pages
+                        .iter()
+                        .map(|&(page_start, page_end)| page_end - page_start + 1)
+                        .sum();
+                    mm.read()
+                        .await
+                        .record_page_widened_request(requested_bytes, widened_bytes)
+                        .await;
+                }
+                Some(
+                    Self::serve_widened_pages(
+                        cache_key,
+                        &original_range,
+                        &pages,
+                        client_headers,
+                        current_etag,
+                        cache_manager,
+                        range_handler,
+                        s3_client,
+                        host,
+                        uri,
+                        config,
+                        resolved,
+                        inflight_tracker,
+                        metrics_manager,
+                        proxy_referer,
+                    )
+                    .await,
+                )
+            }
+        }
+    }
+
+    /// Size-unknown suffix widening (Requirement 3.3): issue `bytes=-P` upstream
+    /// (no caching-target page computation possible without the size), then
+    /// slice the client's originally requested last-`n`-bytes from the response.
+    /// Non-`206` outcomes (conditional mismatch, full 200) are passed through
+    /// unchanged per Requirement 2.6.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_widened_suffix_size_unknown(
+        cache_key: &str,
+        n: u64,
+        page_size: u64,
+        client_headers: &HashMap<String, String>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        proxy_referer: &Option<String>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let mut headers = client_headers.clone();
+        headers.retain(|k, _| k.to_lowercase() != "range");
+        headers.insert("Range".to_string(), format!("bytes=-{}", page_size));
+
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
+        maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
+
+        let mut context =
+            build_s3_request_context(Method::GET, uri.clone(), headers, None, host.to_string());
+        context.allow_streaming = false; // We need to buffer to slice + learn the size.
+
+        let s3_response = match s3_client.forward_request(context).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Failure fallback (Requirement 5): retry with the client's
+                // original suffix range before surfacing any error.
+                debug!(
+                    "[page-widening] widened suffix fetch failed ({}), retrying original range: cache_key={}",
+                    e, cache_key
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read().await.record_page_fallback().await;
+                }
+                return Self::fallback_original_suffix_range(
+                    cache_key,
+                    n,
+                    client_headers,
+                    s3_client,
+                    host,
+                    uri,
+                    proxy_referer,
+                )
+                .await;
+            }
+        };
+
+        Self::handle_widened_suffix_response(
+            s3_response,
+            cache_key,
+            n,
+            client_headers,
+            range_handler,
+            s3_client,
+            host,
+            uri,
+            resolved,
+            metrics_manager,
+            proxy_referer,
+        )
+        .await
+    }
+
+    /// Retry with the client's original (un-widened) suffix range on widened-fetch
+    /// failure (Requirement 5.1, 5.2). Serves the response but does not attempt to
+    /// re-enter the widening/caching path — a single retry is enough to guarantee
+    /// widening never causes a request to fail that would otherwise have succeeded.
+    async fn fallback_original_suffix_range(
+        cache_key: &str,
+        n: u64,
+        client_headers: &HashMap<String, String>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        proxy_referer: &Option<String>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let mut headers = client_headers.clone();
+        headers.retain(|k, _| k.to_lowercase() != "range");
+        headers.insert("Range".to_string(), format!("bytes=-{}", n));
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
+        maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
+
+        let mut context =
+            build_s3_request_context(Method::GET, uri.clone(), headers, None, host.to_string());
+        context.allow_streaming = false;
+
+        match s3_client.forward_request(context).await {
+            Ok(s3_response) => Self::convert_s3_response_to_http(s3_response),
+            Err(e) => {
+                warn!(
+                    "[page-widening] fallback original suffix range also failed: cache_key={}, error={}",
+                    cache_key, e
+                );
+                Ok(Self::s3_forward_error_response(
+                    uri,
+                    &Method::GET,
+                    &e,
+                    "Failed to fetch original range from S3 after widening failure",
+                ))
+            }
+        }
+    }
+
+    /// Handle the S3 response for a size-unknown widened suffix fetch: branch on
+    /// status (Requirement 2.6), cache the returned page-ish range on `206`, and
+    /// slice the client's originally requested last-`n` bytes.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_widened_suffix_response(
+        s3_response: crate::s3_client::S3Response,
+        cache_key: &str,
+        n: u64,
+        client_headers: &HashMap<String, String>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        proxy_referer: &Option<String>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let status = s3_response.status;
+
+        // Non-206 outcomes are passed through unchanged (Requirement 2.6): a
+        // 304/412 conditional mismatch, or a 200-full response (e.g. object
+        // smaller than the requested suffix, or a stale If-Range). We do not
+        // attempt to slice these.
+        if status != StatusCode::PARTIAL_CONTENT {
+            if status == StatusCode::OK {
+                // The full object is smaller than the widened bytes=-P suffix
+                // (or S3 chose to return the whole object). Cache it as any
+                // full-object GET would and return it as-is — this already
+                // contains at least the client's requested suffix (S3 returns
+                // the whole object which is >= the requested tail).
+                return Self::convert_s3_response_to_http(s3_response);
+            }
+            return Self::convert_s3_response_to_http(s3_response);
+        }
+
+        // 206: extract the returned range bounds from Content-Range so we can
+        // slice the client's requested last-n bytes and learn the object size.
+        let content_range = s3_response
+            .headers
+            .get("content-range")
+            .or_else(|| s3_response.headers.get("Content-Range"))
+            .cloned();
+
+        let Some((returned_start, returned_end, total_size)) =
+            content_range.as_deref().and_then(parse_content_range)
+        else {
+            // Can't determine bounds — fail safe by returning what S3 gave us
+            // rather than risk slicing garbage.
+            warn!(
+                "[page-widening] widened suffix response missing/unparseable Content-Range: cache_key={}",
+                cache_key
+            );
+            return Self::convert_s3_response_to_http(s3_response);
+        };
+
+        let body_bytes = match s3_response.body {
+            Some(body) => match body.into_bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(
+                        "[page-widening] failed to buffer widened suffix body: {}",
+                        e
+                    );
+                    return Ok(Self::build_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        "Failed to read widened range response body.",
+                        None,
+                    ));
+                }
+            },
+            None => Bytes::new(),
+        };
+
+        // Cache the returned range as an ordinary range (Requirement 3.7): it
+        // composes with the existing merge path exactly like any other range.
+        let mut object_metadata =
+            s3_client.extract_object_metadata_from_response(&s3_response.headers);
+        object_metadata.upload_state = crate::cache_types::UploadState::Complete;
+        object_metadata.cumulative_size = returned_end - returned_start + 1;
+        let compression_enabled = range_handler.get_cache_manager().effective_compression(
+            resolved,
+            cache_key,
+            returned_end - returned_start + 1,
+        );
+        {
+            let cache_key_owned = cache_key.to_string();
+            let range_handler_clone = range_handler.clone();
+            let data_clone = body_bytes.to_vec();
+            let ttl = resolved.get_ttl;
+            tokio::spawn(async move {
+                if let Err(e) = range_handler_clone
+                    .store_range_new_storage(
+                        &cache_key_owned,
+                        returned_start,
+                        returned_end,
+                        &data_clone,
+                        object_metadata,
+                        ttl,
+                        compression_enabled,
+                    )
+                    .await
+                {
+                    warn!(
+                        "[page-widening] failed to cache widened suffix range {}-{}: {}",
+                        returned_start, returned_end, e
+                    );
+                }
+            });
+        }
+
+        // Slice the client's originally requested last-n bytes from the returned data.
+        let requested_start = total_size.saturating_sub(n);
+        let requested_end = total_size.saturating_sub(1);
+        if requested_start < returned_start || requested_end > returned_end {
+            // Should not happen (widening is always a superset), but guard defensively.
+            warn!(
+                "[page-widening] widened suffix response did not cover requested bytes: cache_key={}, requested={}-{}, returned={}-{}",
+                cache_key, requested_start, requested_end, returned_start, returned_end
+            );
+            if let Some(ref mm) = metrics_manager {
+                mm.read().await.record_page_fallback().await;
+            }
+            return Self::fallback_original_suffix_range(
+                cache_key,
+                n,
+                client_headers,
+                s3_client,
+                host,
+                uri,
+                proxy_referer,
+            )
+            .await;
+        }
+        let slice_start = (requested_start - returned_start) as usize;
+        let slice_end = slice_start + (requested_end - requested_start + 1) as usize;
+        if slice_end > body_bytes.len() {
+            warn!(
+                "[page-widening] widened suffix slice out of bounds: cache_key={}, slice_end={}, body_len={}",
+                cache_key, slice_end, body_bytes.len()
+            );
+            if let Some(ref mm) = metrics_manager {
+                mm.read().await.record_page_fallback().await;
+            }
+            return Self::fallback_original_suffix_range(
+                cache_key,
+                n,
+                client_headers,
+                s3_client,
+                host,
+                uri,
+                proxy_referer,
+            )
+            .await;
+        }
+        let sliced = body_bytes.slice(slice_start..slice_end);
+
+        let content_range_value =
+            format!("bytes {}-{}/{}", requested_start, requested_end, total_size);
+        let mut response_builder = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("content-length", sliced.len().to_string())
+            .header("content-range", content_range_value)
+            .header("accept-ranges", "bytes");
+        if let Some(etag) = s3_response
+            .headers
+            .get("etag")
+            .or_else(|| s3_response.headers.get("ETag"))
+        {
+            response_builder = response_builder.header("etag", etag);
+        }
+        if let Some(lm) = s3_response
+            .headers
+            .get("last-modified")
+            .or_else(|| s3_response.headers.get("Last-Modified"))
+        {
+            response_builder = response_builder.header("last-modified", lm);
+        }
+
+        Ok(response_builder
+            .body(Full::new(sliced).map_err(|never| match never {}).boxed())
+            .unwrap())
+    }
+
+    /// Fetch/serve the overlapping Page(s) for a widened absolute (or
+    /// size-known-suffix) request, then slice the client's original sub-range.
+    ///
+    /// Each overlapping Page is handled independently (Requirement 3.4): cached
+    /// bytes are served, in-flight bytes are coalesced via the standard
+    /// `InFlightTracker` wait/resubscribe behaviour, and only genuinely missing
+    /// bytes are fetched — one upstream request per Page. Multi-Page targets
+    /// (boundary straddle) are fetched **concurrently** (Requirement 3.5), not
+    /// sequentially.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_widened_pages(
+        cache_key: &str,
+        original_range: &RangeSpec,
+        pages: &[(u64, u64)],
+        client_headers: &HashMap<String, String>,
+        current_etag: Option<&str>,
+        cache_manager: &Arc<CacheManager>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        config: &Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        inflight_tracker: &Arc<InFlightTracker>,
+        metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        proxy_referer: &Option<String>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        // Fill each overlapping Page concurrently. Each future resolves to the
+        // Page's full byte buffer, built from cached + freshly fetched data —
+        // NOT via a subsequent disk re-lookup, which would race the
+        // journal-only metadata write this same call may have just performed
+        // (mirrors the existing miss-forward path, which also serves the
+        // freshly merged bytes directly rather than re-reading from disk).
+        let wait_timeout = config.cache.download_coordination.wait_timeout();
+        let page_futures = pages.iter().map(|&(page_start, page_end)| {
+            Self::fill_page(
+                cache_key,
+                page_start,
+                page_end,
+                client_headers,
+                current_etag,
+                cache_manager,
+                range_handler,
+                s3_client,
+                host,
+                uri,
+                resolved,
+                inflight_tracker,
+                metrics_manager,
+                proxy_referer,
+                wait_timeout,
+            )
+        });
+        let page_results: Vec<Result<Vec<u8>>> = futures::future::join_all(page_futures).await;
+
+        // If any Page failed, fall back to the client's original (un-widened)
+        // range: retry once and skip page caching for this request (Requirement 5).
+        let mut page_bytes: Vec<Vec<u8>> = Vec::with_capacity(page_results.len());
+        for result in page_results {
+            match result {
+                Ok(bytes) => page_bytes.push(bytes),
+                Err(err) => {
+                    warn!(
+                        "[page-widening] page fetch failed, falling back to original range: cache_key={}, range={}-{}, error={}",
+                        cache_key, original_range.start, original_range.end, err
+                    );
+                    if let Some(ref mm) = metrics_manager {
+                        mm.read().await.record_page_fallback().await;
+                    }
+                    return Self::fallback_original_absolute_range(
+                        cache_key,
+                        original_range,
+                        client_headers,
+                        s3_client,
+                        host,
+                        uri,
+                        proxy_referer,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // Pages are contiguous and sorted by start (1 or 2). Concatenate to
+        // form the widened target buffer, then slice the client's original
+        // sub-range from it.
+        let target_start = pages[0].0;
+        let mut widened_data = Vec::new();
+        for buf in &page_bytes {
+            widened_data.extend_from_slice(buf);
+        }
+
+        let slice_start = (original_range.start - target_start) as usize;
+        let slice_len = (original_range.end - original_range.start + 1) as usize;
+        if slice_start + slice_len > widened_data.len() {
+            warn!(
+                "[page-widening] widened buffer too short after fill: cache_key={}, range={}-{}, widened_len={}",
+                cache_key, original_range.start, original_range.end, widened_data.len()
+            );
+            if let Some(ref mm) = metrics_manager {
+                mm.read().await.record_page_fallback().await;
+            }
+            return Self::fallback_original_absolute_range(
+                cache_key,
+                original_range,
+                client_headers,
+                s3_client,
+                host,
+                uri,
+                proxy_referer,
+            )
+            .await;
+        }
+        let sliced = widened_data[slice_start..slice_start + slice_len].to_vec();
+
+        // Resolve headers (ETag / Last-Modified / total size) from the now
+        // (asynchronously) cached metadata, falling back to whatever the
+        // fetch populated in cache_manager's in-memory metadata cache. If not
+        // yet visible, fall back to a minimal header set — the client still
+        // gets exactly the requested bytes.
+        let cached_metadata = Self::resolve_cached_metadata(None, cache_manager, cache_key).await;
+        let total_object_size = if cached_metadata.content_length > 0 {
+            cached_metadata.content_length
+        } else {
+            original_range.end + 1
+        };
+
+        let content_range_value =
+            range_handler.build_content_range_header(original_range, total_object_size);
+        let mut response_builder = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("content-length", sliced.len().to_string())
+            .header("content-range", &content_range_value)
+            .header("accept-ranges", "bytes");
+        response_builder = Self::add_cached_s3_headers(
+            response_builder,
+            &cached_metadata,
+            original_range,
+            total_object_size,
+        );
+
+        Ok(response_builder
+            .body(
+                Full::new(Bytes::from(sliced))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap())
+    }
+
+    /// Fill a single Page: serve from cache if fully cached, coalesce with an
+    /// in-flight fetch for the same Page if one is running, otherwise fetch the
+    /// Page's missing bytes from S3 and cache them (Requirement 3.4, 6.1).
+    /// Returns the Page's full byte buffer (`page_end - page_start + 1` bytes).
+    ///
+    /// Conditional headers (`If-Range` / `If-Match` / `If-None-Match`) are
+    /// forwarded as-is; a non-`206` outcome (304/412/200-full) is treated as a
+    /// page-fill failure so the caller falls back to the client's original
+    /// range rather than attempting to cache/slice a non-sliceable response
+    /// (Requirement 2.6).
+    #[allow(clippy::too_many_arguments)]
+    async fn fill_page(
+        cache_key: &str,
+        page_start: u64,
+        page_end: u64,
+        client_headers: &HashMap<String, String>,
+        current_etag: Option<&str>,
+        cache_manager: &Arc<CacheManager>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        inflight_tracker: &Arc<InFlightTracker>,
+        metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+        proxy_referer: &Option<String>,
+        wait_timeout: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        let page_range = RangeSpec {
+            start: page_start,
+            end: page_end,
+        };
+
+        // Conditional Range requests (`If-Range` / `If-Match` / `If-None-Match`,
+        // Requirement 2.6) must have their precondition evaluated by S3 on
+        // every request, exactly like the non-widened path's Mode A default —
+        // the cache holds no record of what an `If-Range`/`If-Match` outcome
+        // would be, so a cache-hit fast path here would silently skip
+        // precondition evaluation whenever the Page happens to already be
+        // warm. Both fast paths below (RAM hit and fully-cached disk hit)
+        // are therefore gated on the ABSENCE of a range-conditional header;
+        // when one is present we fall through to the S3-fetch/coordination
+        // path unconditionally, which already forwards these headers as-is
+        // (see `fetch_and_cache_page_missing_ranges`) and branches on the
+        // returned status (206 cached + sliced; 304/412/200-full passed
+        // through by the caller).
+        let has_range_conditional = Self::has_range_conditional_headers(client_headers);
+
+        // RAM lookup (Requirement 7.1, 7.2): the Page is the RAM cache unit
+        // when widening is enabled. Look up the containing Page — keyed by
+        // its page bounds, not the client's sub-range — before consulting
+        // disk. A sub-page hit is served from the whole cached Page (and,
+        // via `ShardedRamCache::get`'s existing access tracking, counts as a
+        // Page access — Requirement 7.4 — with no additional code here).
+        if !has_range_conditional {
+            if let Some(ram_data) =
+                cache_manager.get_range_from_ram_cache(cache_key, page_start, page_end)
+            {
+                debug!(
+                    "[page-widening] RAM page hit: cache_key={}, page={}-{}",
+                    cache_key, page_start, page_end
+                );
+                if let Some(ref mm) = metrics_manager {
+                    mm.read().await.record_page_hit().await;
+                }
+                return Ok(ram_data);
+            }
+        }
+
+        // Check what's already cached / missing for this Page. When a
+        // range-conditional header is present, treat the whole Page as
+        // missing regardless of what is actually on disk/RAM — the fetch
+        // path below re-sends the client's conditional header to S3 so the
+        // precondition is evaluated fresh on every request (Requirement 2.6).
+        let overlap = if has_range_conditional {
+            crate::range_handler::RangeOverlap {
+                cached_ranges: Vec::new(),
+                missing_ranges: vec![page_range.clone()],
+                can_serve_from_cache: false,
+            }
+        } else {
+            Self::find_page_overlap(cache_key, &page_range, current_etag, range_handler).await?
+        };
+
+        if overlap.can_serve_from_cache {
+            // Fully cached — load and merge the cached segments into the
+            // Page's contiguous buffer (Requirement 3.4). No S3 fetch, so
+            // record the page-hit metric (Requirement 8.3).
+            if let Some(ref mm) = metrics_manager {
+                mm.read().await.record_page_hit().await;
+            }
+            return Self::load_page_from_cache(
+                cache_key,
+                &page_range,
+                &overlap,
+                range_handler,
+                cache_manager,
+                resolved,
+                metrics_manager,
+            )
+            .await;
+        }
+
+        // Key the in-flight fetch on the Page, not the client's sub-range
+        // (Requirement 6.1), so concurrent Small_Reads overlapping this Page
+        // coalesce onto a single upstream fetch.
+        let flight_key = InFlightTracker::make_range_key(cache_key, page_start, page_end);
+
+        loop {
+            match inflight_tracker.try_register(&flight_key) {
+                FetchRole::Fetcher(guard) => {
+                    let result = Self::fetch_and_cache_page_missing_ranges(
+                        cache_key,
+                        &page_range,
+                        &overlap,
+                        client_headers,
+                        cache_manager,
+                        range_handler,
+                        s3_client,
+                        host,
+                        uri,
+                        resolved,
+                        proxy_referer,
+                    )
+                    .await;
+                    match &result {
+                        Ok(_) => guard.complete_success(),
+                        Err(e) => guard.complete_error(e.to_string()),
+                    }
+                    return result;
+                }
+                FetchRole::Waiter(mut rx) => {
+                    if let Some(ref mm) = metrics_manager {
+                        mm.read().await.record_coalesce_wait().await;
+                    }
+                    match tokio::time::timeout(wait_timeout, rx.recv()).await {
+                        Ok(Ok(Ok(()))) => {
+                            // Fetcher completed — load the now-committed Page
+                            // from cache rather than re-fetching from S3.
+                            let overlap = Self::find_page_overlap(
+                                cache_key,
+                                &page_range,
+                                current_etag,
+                                range_handler,
+                            )
+                            .await?;
+                            if overlap.can_serve_from_cache {
+                                return Self::load_page_from_cache(
+                                    cache_key,
+                                    &page_range,
+                                    &overlap,
+                                    range_handler,
+                                    cache_manager,
+                                    resolved,
+                                    metrics_manager,
+                                )
+                                .await;
+                            }
+                            // Not yet visible (journal not consolidated) —
+                            // become a fetcher for the residual gap.
+                            continue;
+                        }
+                        Ok(Ok(Err(e))) => return Err(ProxyError::S3Error(e)),
+                        Ok(Err(_recv_closed)) => {
+                            // Fetcher dropped without completing — become the
+                            // fetcher ourselves on the next loop iteration.
+                            continue;
+                        }
+                        Err(_timeout) => {
+                            if let Some(new_rx) = inflight_tracker.try_resubscribe(&flight_key) {
+                                match tokio::time::timeout(wait_timeout, {
+                                    let mut new_rx = new_rx;
+                                    async move { new_rx.recv().await }
+                                })
+                                .await
+                                {
+                                    Ok(Ok(Ok(()))) => {
+                                        let overlap = Self::find_page_overlap(
+                                            cache_key,
+                                            &page_range,
+                                            current_etag,
+                                            range_handler,
+                                        )
+                                        .await?;
+                                        if overlap.can_serve_from_cache {
+                                            return Self::load_page_from_cache(
+                                                cache_key,
+                                                &page_range,
+                                                &overlap,
+                                                range_handler,
+                                                cache_manager,
+                                                resolved,
+                                                metrics_manager,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                    Ok(Ok(Err(e))) => return Err(ProxyError::S3Error(e)),
+                                    _ => continue,
+                                }
+                            }
+                            // FetchGuard gone — become the fetcher.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fetch a Page's missing byte ranges from S3 (consolidated to minimize
+    /// requests), cache them as ordinary ranges, and return the Page's full
+    /// contiguous byte buffer built from the cached + freshly fetched
+    /// segments. Never re-fetches bytes already covered by
+    /// `overlap.cached_ranges` (Requirement 3.4).
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_and_cache_page_missing_ranges(
+        cache_key: &str,
+        page_range: &RangeSpec,
+        overlap: &crate::range_handler::RangeOverlap,
+        client_headers: &HashMap<String, String>,
+        cache_manager: &Arc<CacheManager>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        proxy_referer: &Option<String>,
+    ) -> Result<Vec<u8>> {
+        let mut headers = client_headers.clone();
+        // Conditional headers (If-Range / If-Match / If-None-Match) are forwarded
+        // as-is (Requirement 2.6). Strip only the client's Range — we set our
+        // own per-missing-range Range below.
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
+        maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
+
+        let fetched_ranges = if overlap.missing_ranges.is_empty() {
+            Vec::new()
+        } else {
+            range_handler
+                .fetch_missing_ranges(
+                    cache_key,
+                    &overlap.missing_ranges,
+                    s3_client,
+                    host,
+                    uri,
+                    &headers,
+                )
+                .await
+                .map_err(|e| ProxyError::S3Error(format!("page fetch failed: {}", e)))?
+        };
+
+        for (range_spec, data, response_headers) in &fetched_ranges {
+            let mut object_metadata =
+                s3_client.extract_object_metadata_from_response(response_headers);
+            object_metadata.upload_state = crate::cache_types::UploadState::Complete;
+            object_metadata.cumulative_size = range_spec.end - range_spec.start + 1;
+            let compression_enabled = range_handler.get_cache_manager().effective_compression(
+                resolved,
+                cache_key,
+                range_spec.end - range_spec.start + 1,
+            );
+            let _ = cache_manager
+                .evict_if_needed(range_spec.end - range_spec.start + 1)
+                .await;
+            range_handler
+                .store_range_new_storage(
+                    cache_key,
+                    range_spec.start,
+                    range_spec.end,
+                    data,
+                    object_metadata,
+                    resolved.get_ttl,
+                    compression_enabled,
+                )
+                .await
+                .map_err(|e| {
+                    ProxyError::CacheError(format!("failed to store page range: {}", e))
+                })?;
+        }
+
+        // Assemble the Page's contiguous buffer from cached segments plus the
+        // just-fetched segments — in memory, not via a disk re-read (which
+        // could race the metadata write just performed above).
+        let fetched_as_ranges: Vec<(RangeSpec, Vec<u8>, HashMap<String, String>)> =
+            fetched_ranges.into_iter().collect();
+        let merge_result = range_handler
+            .merge_range_segments(
+                cache_key,
+                page_range,
+                &overlap.cached_ranges,
+                &fetched_as_ranges,
+            )
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("page assembly failed: {}", e)))?;
+
+        // Deliberately NOT promoted to RAM here. Everywhere else in the proxy,
+        // RAM is populated on a *disk hit* (the second read), not on the
+        // cold S3-fetch itself — this is what keeps a single one-off read from
+        // occupying RAM. Page mode preserves that: promotion happens only in
+        // `load_page_from_cache` (the disk-hit path). Promoting here would let
+        // a single small (e.g. 4 KiB footer) read pin a whole Page (up to
+        // 16 MiB default) in RAM on its very first access.
+
+        Ok(merge_result.data)
+    }
+
+    /// Look up a Page's cache overlap, falling back to the shared-storage
+    /// journal when no `.meta` file exists yet.
+    ///
+    /// `RangeHandler::find_cached_ranges` only consults
+    /// `DiskCacheManager::find_pending_journal_ranges` (the not-yet-consolidated
+    /// journal fallback) when a `.meta` file for the key already exists; when
+    /// metadata is entirely absent it short-circuits to "no cached entry"
+    /// without checking journals. Under widening's page-scoped
+    /// coalescing, a first small read commits its Page via a journal-only
+    /// write with no prior `.meta` file, so a second read landing in the
+    /// journal-not-yet-consolidated window must check the journal directly to
+    /// see the Page as cached rather than re-fetching from S3 (Requirement 6.1
+    /// — page hits with no S3 fetch).
+    ///
+    /// **Requirement 7.6 (RAM-disk coherency / ETag mismatch invalidation)**:
+    /// the metadata-backed path is `range_handler.find_cached_ranges`, which
+    /// already performs the ETag comparison and calls
+    /// `disk_cache.invalidate_all_ranges` on mismatch — traced directly above
+    /// in `find_cached_ranges` (`range_handler.rs`), not merely inferred. This
+    /// Page path therefore inherits that check for free through the shared
+    /// call; no separate Page-specific ETag check is needed on the
+    /// metadata-backed branch. The journal fallback branch below has no ETag
+    /// to compare (see its own comment) and is handled instead by refusing
+    /// RAM promotion when the ETag is unknown (Requirement 7.6's RAM-tier
+    /// half, enforced in `load_page_from_cache`).
+    async fn find_page_overlap(
+        cache_key: &str,
+        page_range: &RangeSpec,
+        current_etag: Option<&str>,
+        range_handler: &Arc<RangeHandler>,
+    ) -> Result<crate::range_handler::RangeOverlap> {
+        let overlap = range_handler
+            .find_cached_ranges(cache_key, page_range, current_etag, None)
+            .await?;
+        if overlap.can_serve_from_cache || !overlap.cached_ranges.is_empty() {
+            return Ok(overlap);
+        }
+
+        // No metadata-backed overlap — check the journal directly for a
+        // not-yet-consolidated write of this exact Page.
+        let disk_cache = range_handler.get_disk_cache_manager().read().await;
+        let journal_ranges = disk_cache
+            .find_pending_journal_ranges(cache_key, page_range.start, page_range.end)
+            .await?;
+        drop(disk_cache);
+
+        if journal_ranges.is_empty() {
+            return Ok(overlap);
+        }
+
+        // The journal has no per-entry ETag/Last-Modified (only start/end/
+        // compression), so the only real ETag available here is whatever the
+        // caller already knows (`current_etag`, from a prior HEAD/GET
+        // response). When that is `None` these ranges carry an empty ETag —
+        // `load_page_from_cache` treats an empty ETag as "unknown" and skips
+        // RAM promotion for it (Requirement 7.6), rather than promoting with
+        // a placeholder that would silently defeat the ETag-keyed RAM-disk
+        // coherency check. `last_modified` is never known from the journal
+        // and is likewise left empty.
+        let cached_ranges: Vec<crate::cache::Range> = journal_ranges
+            .iter()
+            .map(|r| crate::cache::Range {
+                start: r.start,
+                end: r.end,
+                data: Vec::new(),
+                etag: current_etag.unwrap_or_default().to_string(),
+                last_modified: String::new(),
+                compression_algorithm: r.compression_algorithm.clone(),
+            })
+            .collect();
+        let covered: Vec<RangeSpec> = journal_ranges
+            .iter()
+            .map(|r| RangeSpec {
+                start: std::cmp::max(page_range.start, r.start),
+                end: std::cmp::min(page_range.end, r.end),
+            })
+            .collect();
+        let missing_ranges = Self::calculate_missing_ranges_for_page(page_range, &covered);
+        let can_serve_from_cache = missing_ranges.is_empty();
+
+        Ok(crate::range_handler::RangeOverlap {
+            cached_ranges,
+            missing_ranges,
+            can_serve_from_cache,
+        })
+    }
+
+    /// Compute the gaps in `page_range` not covered by `covered` (sorted or
+    /// unsorted, possibly overlapping). Mirrors
+    /// `RangeHandler::calculate_missing_ranges` (private to that type).
+    fn calculate_missing_ranges_for_page(
+        page_range: &RangeSpec,
+        covered: &[RangeSpec],
+    ) -> Vec<RangeSpec> {
+        if covered.is_empty() {
+            return vec![page_range.clone()];
+        }
+        let mut sorted: Vec<RangeSpec> = covered.to_vec();
+        sorted.sort_by_key(|r| r.start);
+        let mut merged: Vec<RangeSpec> = Vec::new();
+        for r in sorted {
+            if let Some(last) = merged.last_mut() {
+                if r.start <= last.end.saturating_add(1) {
+                    last.end = std::cmp::max(last.end, r.end);
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+
+        let mut missing = Vec::new();
+        let mut cursor = page_range.start;
+        for r in &merged {
+            if cursor < r.start {
+                missing.push(RangeSpec {
+                    start: cursor,
+                    end: r.start - 1,
+                });
+            }
+            cursor = std::cmp::max(cursor, r.end + 1);
+        }
+        if cursor <= page_range.end {
+            missing.push(RangeSpec {
+                start: cursor,
+                end: page_range.end,
+            });
+        }
+        missing
+    }
+
+    /// Load an already-fully-cached Page's contiguous byte buffer via the
+    /// existing merge path (no S3 fetch — `overlap.missing_ranges` is empty).
+    #[allow(clippy::too_many_arguments)]
+    async fn load_page_from_cache(
+        cache_key: &str,
+        page_range: &RangeSpec,
+        overlap: &crate::range_handler::RangeOverlap,
+        range_handler: &Arc<RangeHandler>,
+        cache_manager: &Arc<CacheManager>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+    ) -> Result<Vec<u8>> {
+        let merge_result = range_handler
+            .merge_range_segments(cache_key, page_range, &overlap.cached_ranges, &[])
+            .await
+            .map_err(|e| ProxyError::CacheError(format!("page load failed: {}", e)))?;
+
+        // Promote the whole Page to RAM on a disk hit (Requirement 7.3),
+        // mirroring the existing disk-hit-promotes-to-RAM behaviour
+        // (`load_range_data_with_cache`). Gated by `ram_cache_eligible`
+        // exactly as the non-widened path (Requirement 7.5's counterpart for
+        // widening-enabled keys). Only promoted when both the ETag AND
+        // Last-Modified are known (Requirement 7.6) — a Page promoted with a
+        // synthesised/empty ETag would defeat RAM-disk coherency checking,
+        // which keys on ETag.
+        let (etag, last_modified) = overlap
+            .cached_ranges
+            .first()
+            .map(|r| (r.etag.clone(), r.last_modified.clone()))
+            .unwrap_or_default();
+        if etag.is_empty() {
+            debug!(
+                "[page-widening] skipping RAM page promotion for {}: no known ETag (likely journal fallback)",
+                cache_key
+            );
+            if let Some(ref mm) = metrics_manager {
+                mm.read().await.record_ram_page_promotion_skipped().await;
+            }
+        } else {
+            Self::promote_page_to_ram(
+                cache_key,
+                page_range.start,
+                page_range.end,
+                merge_result.data.clone(),
+                etag,
+                last_modified,
+                cache_manager,
+                resolved,
+                metrics_manager,
+            );
+        }
+
+        Ok(merge_result.data)
+    }
+
+    /// Promote a fully-assembled Page buffer to the RAM cache as a single
+    /// whole-Page entry (Requirement 7.3), keyed by the Page's bounds rather
+    /// than any client sub-range. Skips promotion when `ram_cache_eligible`
+    /// is false (e.g. `get_ttl = 0`), exactly as the non-widened per-range
+    /// promotion path does (Requirement 7.5's gate, applied here for
+    /// widening-enabled keys).
+    ///
+    /// Unlike the non-widened promotion path (which promotes the verbatim
+    /// on-disk frame of a single stored range), a Page's contiguous buffer
+    /// may be assembled from multiple stored range files with independent
+    /// compression decisions, so there is no single "on-disk frame" to reuse
+    /// verbatim. Instead this compresses the merged Page buffer fresh, using
+    /// the same effective-compression decision the disk write path uses —
+    /// but, since that compression can take non-trivial time for a
+    /// multi-MiB Page, the work is spawned off the response path (mirroring
+    /// the existing streaming promotion site) rather than run inline before
+    /// `fill_page` returns the client's bytes. Compression is skipped
+    /// entirely (store-mode frame only) when `effective_compression` returns
+    /// false, so store-mode Pages — the expected case for `.parquet`/`.orc`
+    /// — are promoted without paying any LZ4 cost.
+    #[allow(clippy::too_many_arguments)]
+    fn promote_page_to_ram(
+        cache_key: &str,
+        page_start: u64,
+        page_end: u64,
+        data: Vec<u8>,
+        etag: String,
+        last_modified: String,
+        cache_manager: &Arc<CacheManager>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
+    ) {
+        if !resolved.ram_cache_eligible {
+            debug!(
+                "[page-widening] skipping RAM page promotion for {}: ram_cache_eligible=false (source={:?})",
+                cache_key, resolved.source
+            );
+            if let Some(ref mm) = metrics_manager {
+                let mm = mm.clone();
+                tokio::spawn(async move {
+                    mm.read().await.record_ram_page_promotion_skipped().await;
+                });
+            }
+            return;
+        }
+        if data.is_empty() {
+            return;
+        }
+
+        let compression_enabled =
+            cache_manager.effective_compression(resolved, cache_key, data.len() as u64);
+        let cache_manager = cache_manager.clone();
+        let cache_key = cache_key.to_string();
+        let metrics_manager = metrics_manager.clone();
+
+        // Off the response path (Defect 2): the caller has already returned
+        // (or is about to return) the client's sliced bytes — this task's
+        // completion is not on the critical path for the response.
+        tokio::spawn(async move {
+            // `get_compression_handler()` snapshots the shared stats Arc, so
+            // any failures/compressions this clone records still land on the
+            // live counters exposed via `/metrics` (the `stats` field is
+            // itself `Arc`-backed and shared across clones — see
+            // `CompressionHandler`).
+            let mut handler = (*cache_manager.get_compression_handler()).clone();
+            let compression_result =
+                handler.compress_with_metadata(&data, &cache_key, compression_enabled);
+
+            let promoted = cache_manager.promote_range_to_ram_cache_frame(
+                &cache_key,
+                (page_start, page_end),
+                compression_result.data,
+                compression_result.algorithm,
+                etag,
+                last_modified,
+            );
+
+            if let Some(ref mm) = metrics_manager {
+                if promoted {
+                    mm.read().await.record_ram_page_promotion().await;
+                } else {
+                    mm.read().await.record_ram_page_promotion_skipped().await;
+                }
+            }
+        });
+    }
+
+    /// Failure fallback (Requirement 5): retry the client's ORIGINAL absolute
+    /// range, unwidened, and serve it directly without attempting to cache the
+    /// page again.
+    async fn fallback_original_absolute_range(
+        cache_key: &str,
+        original_range: &RangeSpec,
+        client_headers: &HashMap<String, String>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &hyper::Uri,
+        proxy_referer: &Option<String>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        let mut headers = client_headers.clone();
+        headers.retain(|k, _| k.to_lowercase() != "range");
+        headers.insert(
+            "Range".to_string(),
+            format!("bytes={}-{}", original_range.start, original_range.end),
+        );
+        let auth_header_owned: Option<String> = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
+            .cloned();
+        maybe_add_referer(&mut headers, proxy_referer, auth_header_owned.as_deref());
+
+        let mut context =
+            build_s3_request_context(Method::GET, uri.clone(), headers, None, host.to_string());
+        context.allow_streaming = false;
+
+        match s3_client.forward_request(context).await {
+            Ok(s3_response) => Self::convert_s3_response_to_http(s3_response),
+            Err(e) => {
+                warn!(
+                    "[page-widening] fallback original absolute range also failed: cache_key={}, error={}",
+                    cache_key, e
+                );
+                Ok(Self::s3_forward_error_response(
+                    uri,
+                    &Method::GET,
+                    &e,
+                    "Failed to fetch original range from S3 after widening failure",
+                ))
+            }
+        }
+    }
+
+    /// Handle range requests with caching and conditional headers - Requirements 3.1, 3.2, 3.3, 3.4, 3.6, 3.7, 3.8
+    ///
+    /// `pub` (like the sibling `forward_range_with_coordination`) so integration
+    /// tests can drive the page-aligned range widening path end-to-end against
+    /// the `StubS3Client` harness without needing a real `Request<Incoming>`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_range_request(
         method: Method,
         cache_key: String,
         range_header: &str,
@@ -4725,6 +6214,36 @@ impl HttpProxy {
                 (None, None)
             }
         };
+
+        // Page-aligned range widening eligibility gate (Requirement 2). Tried before the
+        // normal parse/cache-lookup path below so an eligible request never falls through
+        // to the un-widened logic. Returns `Some(response)` when this request was handled
+        // by the widening path (success or fallback); `None` means "not eligible, or
+        // eligible-but-normalize-to-legacy-path", and the caller continues unchanged below.
+        // Spec: page-aligned-range-cache.
+        if resolved.page_widening && method == Method::GET {
+            if let Some(widened) = Self::try_widened_range_request(
+                &cache_key,
+                range_header,
+                &client_headers,
+                content_length,
+                current_etag.as_deref(),
+                &cache_manager,
+                &range_handler,
+                &s3_client,
+                &host,
+                &uri,
+                &config,
+                resolved,
+                &inflight_tracker,
+                &metrics_manager,
+                proxy_referer,
+            )
+            .await
+            {
+                return widened;
+            }
+        }
 
         // Parse range header with content_length if available
         debug!("[DIAGNOSTIC] Parsing range header: {}", range_header);

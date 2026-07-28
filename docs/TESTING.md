@@ -24,12 +24,7 @@ The S3 proxy includes comprehensive Rust integration tests in the `tests/` direc
 
 ### Required Software
 
-1. **Python 3** with required packages:
-   ```bash
-   pip install boto3 requests
-   ```
-
-2. **AWS CLI** installed and configured:
+1. **AWS CLI** installed and configured:
    ```bash
    # Install AWS CLI
    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -40,7 +35,7 @@ The S3 proxy includes comprehensive Rust integration tests in the `tests/` direc
    aws configure
    ```
 
-3. **Environment Setup (Recommended)**:
+2. **Environment Setup (Recommended)**:
    ```bash
    # Set to automatically route S3 traffic through proxy
    export AWS_ENDPOINT_URL_S3=http://s3.us-east-1.amazonaws.com
@@ -130,14 +125,20 @@ cargo test --release -- --nocapture
 ```bash
 $ cargo test --release
 
-running 87 tests
 test cache_statistics_test::test_cache_hit_rate ... ok
 test disk_cache_test::test_disk_cache_operations ... ok
 test integration_test::test_basic_get_request ... ok
 test range_get_test::test_range_request_handling ... ok
 ...
 
-test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. N passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Each integration test file compiles to its own binary, so the run emits one
+`test result:` line per binary rather than a single total. To count them:
+
+```bash
+cargo test --release 2>&1 | grep -c "^test .* ok$"
 ```
 
 ## Test Output Format
@@ -147,7 +148,18 @@ The Rust test suite provides standard cargo test output with pass/fail status fo
 ## Key Validation Points
 
 ### Conditional Request Compliance
-- All conditional requests are forwarded to S3 (not decided by proxy)
+
+Which side answers a conditional request depends on `evaluate_conditions_from_cache`,
+which has defaulted to `true` since 2.2.0. Tests must assert against the mode they
+configure, not against a single fixed expectation:
+
+- **Local evaluation (default)**: `If-Match` requests are answered from cached
+  metadata when the cached ETag matches and the data is fully cached. No S3 round trip,
+  so no S3-side credential revalidation for those requests.
+- **Forward to S3** (`evaluate_conditions_from_cache: false`, or any request the local
+  path declines): the condition is decided by S3.
+
+When the request does reach S3:
 - S3 responses are correctly returned to client
 - Cache is managed based on S3 response:
   - 200 OK → invalidate old cache, cache new data
@@ -195,9 +207,9 @@ The Rust test suite provides standard cargo test output with pass/fail status fo
    - Try different endpoint URL
 
 5. **Region-related errors**:
-   - The script auto-detects bucket region via HeadBucket operation
-   - If auto-detection fails, specify region explicitly: `-r us-west-2`
    - Ensure your AWS credentials have access to the bucket in its region
+   - When targeting a bucket outside your configured default region, pass
+     `--region` to the AWS CLI so the request is signed for the right region
 
 ### Debug Mode
 
@@ -211,7 +223,9 @@ RUST_LOG=debug cargo test --release -- --nocapture
 
 For a properly functioning proxy:
 
-- **All conditional requests** should be forwarded to S3
+- **Conditional requests** should be answered by whichever side the configured
+  `evaluate_conditions_from_cache` mode selects — from cache when local evaluation is
+  enabled (the default) and the cached ETag matches, otherwise forwarded to S3
 - **Cache invalidation** should only occur on S3 200 responses
 - **304 responses** should refresh cache TTL without invalidation
 - **412 responses** should not modify cache state

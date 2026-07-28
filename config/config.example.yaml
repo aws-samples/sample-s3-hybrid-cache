@@ -66,13 +66,24 @@ cache:
   cache_dir: "./tmp/cache"  # Local development; use absolute path for production (e.g., "/mnt/cache")
   max_cache_size: 524288000  # 500MB in bytes
   ram_cache_enabled: true
-  max_ram_cache_size: 104857600  # 100MB in bytes
+  # Default: 512MB (raised from 256MB). At 8 shards this yields exactly the
+  # 64 MiB RAM_CACHE_ADMISSION_CEILING per shard, preserving 8-way concurrency
+  # while guaranteeing any single entry up to 64 MiB is admitted rather than
+  # silently dropped. See "Number of independent shards" below.
+  max_ram_cache_size: 536870912  # 512MB in bytes
   # Number of independent shards in the RAM cache (default: 8).
   # Each shard has its own lock, so concurrent requests hitting different shards
   # never contend with each other.
   #
-  # Per-shard capacity = max_ram_cache_size / ram_cache_shard_count
-  # Example: 100MB / 8 shards = 12.5MB per shard
+  # Per-shard capacity = max_ram_cache_size / effective_shard_count, where
+  # effective_shard_count = min(ram_cache_shard_count, max(1, max_ram_cache_size / 67108864)).
+  # The proxy unconditionally clamps the shard count so per-shard capacity never
+  # falls below the hardcoded 64 MiB (67108864 byte) admission ceiling — this
+  # guarantees any single entry up to 64 MiB is admitted to RAM rather than
+  # silently dropped, independent of whether page-aligned range caching is used.
+  # Example: 512MB / 8 shards = 64MB per shard (no clamp; exactly the ceiling).
+  # Example: 256MB / 8 shards would be 32MB per shard, so it clamps to 4
+  # effective shards (256MB / 64MB) and logs a warning.
   #
   # Objects larger than the per-shard capacity are silently dropped from the RAM
   # cache. The proxy logs a warning at startup if per-shard capacity falls below
@@ -82,7 +93,8 @@ cache:
   # Tuning guidance:
   #   Higher values (e.g. 32, 64) — lower contention under extreme concurrency
   #     (hundreds of parallel requests hitting distinct keys); most deployments
-  #     see no additional gain beyond 8–16 shards.
+  #     see no additional gain beyond 8–16 shards. Raise max_ram_cache_size
+  #     alongside the shard count to avoid the 64 MiB clamp reducing it back down.
   #   Lower values (e.g. 1, 2) — larger per-shard capacity buckets; useful for
   #     very small caches or workloads dominated by a few large objects.
   #
@@ -93,7 +105,8 @@ cache:
   # Write-through caching for PUT operations and multipart uploads
   # When enabled, PUT operations and multipart uploads are cached so subsequent
   # GET requests can be served from cache immediately without fetching from S3
-  # Write cache TTL is refreshed when objects are accessed via GET
+  # On the first GET the entry transitions from put_ttl to get_ttl (one-time, not a
+  # repeating refresh)
   # When disabled, PUT operations are forwarded directly to S3 without caching
   write_cache_enabled: true  # Enable write-through caching (enabled by default)
   
@@ -106,10 +119,12 @@ cache:
   # Objects larger than this are not cached on PUT
   write_cache_max_object_size: 268435456  # 256MB in bytes
   
-  # TTL for write-cached objects (default: 1 day)
-  # Write cache TTL is refreshed when objects are accessed via GET
+  # TTL for write-cached objects (default: 1 hour)
+  # On the first GET the entry transitions from put_ttl to get_ttl (one-time, not a
+  # repeating refresh), so this bounds how long a written object stays cached before
+  # it is first read.
   # Valid range: 1 minute ("1m") to 30 days ("30d")
-  put_ttl: "1d"  # 1 day
+  put_ttl: "3600s"  # 1 hour
   
   # TTL for incomplete multipart uploads before automatic cleanup (default: 1 day)
   # Valid range: 1 hour ("1h") to 7 days ("7d")
@@ -569,8 +584,8 @@ connection_pool:
 compression:
   enabled: true
   # Size floor in bytes below which writes always skip compression, regardless
-  # of extension or any cache_rules.json override.
-  threshold: 4096
+  # of extension or any cache_rules.json override. (default: 1024)
+  threshold: 1024
   preferred_algorithm: "lz4"  # only "lz4" is implemented; parsed but otherwise inert
   # `content_aware` has been removed — it never had any effect (content-aware
   # filtering, i.e. the built-in extension denylist, was always applied

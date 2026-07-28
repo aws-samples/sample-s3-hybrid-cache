@@ -115,6 +115,16 @@ fn test_system_metrics() -> SystemMetrics {
             waiter_conditional_error: 0,
         }),
         cache_rules: None,
+        page_cache: s3_proxy::metrics::PageCacheMetrics {
+            widened_requests: 0,
+            bytes_prefetched: 0,
+            amplification_ratio: 1.0,
+            page_hits: 0,
+            skipped_signed_range: 0,
+            fallbacks: 0,
+            ram_page_promotions: 0,
+            ram_page_promotion_skipped: 0,
+        },
         request_metrics: RequestMetrics {
             total_requests: 1000,
             successful_requests: 990,
@@ -252,6 +262,16 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
         consolidation: None,
         coalescing: None,
         cache_rules: None,
+        page_cache: s3_proxy::metrics::PageCacheMetrics {
+            widened_requests: 0,
+            bytes_prefetched: 0,
+            amplification_ratio: 1.0,
+            page_hits: 0,
+            skipped_signed_range: 0,
+            fallbacks: 0,
+            ram_page_promotions: 0,
+            ram_page_promotion_skipped: 0,
+        },
         request_metrics: RequestMetrics {
             total_requests: 0,
             successful_requests: 0,

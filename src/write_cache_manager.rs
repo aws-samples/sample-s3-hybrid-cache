@@ -575,18 +575,22 @@ impl WriteCacheManager {
                     .as_secs()
             }
             CacheEvictionAlgorithm::TinyLFU => {
-                // TinyLFU: Combine frequency and recency
-                // For write cache, we use access count from ranges if available
+                // TinyLFU: frequency decayed by idle time. Higher score = keep longer.
+                //
+                // Must use the same `decayed_frequency` helper as the RAM tier
+                // (`shard_find_tinylfu_victim`) and the disk tier
+                // (`RangeSpec::tinylfu_score`). Dividing frequency by recency inverts the
+                // ranking — it drives a hot-but-idle entry's score toward zero, so it is
+                // evicted ahead of a freshly-read one-hit-wonder. That inversion was
+                // fixed in the other two tiers in 2.3.1; this call site was missed.
                 let total_access_count: u64 = metadata.ranges.iter().map(|r| r.access_count).sum();
 
-                let recency_factor = SystemTime::now()
+                let idle_secs = SystemTime::now()
                     .duration_since(last_accessed)
                     .unwrap_or_default()
-                    .as_secs()
-                    .max(1);
+                    .as_secs();
 
-                // Higher score = keep longer
-                total_access_count.saturating_mul(1000) / recency_factor
+                crate::cache::decayed_frequency(total_access_count, idle_secs)
             }
         }
     }
@@ -1581,5 +1585,122 @@ mod property_tests {
 
             TestResult::passed()
         })
+    }
+}
+
+#[cfg(test)]
+mod write_cache_tinylfu_scoring_tests {
+    use super::*;
+    use crate::cache_types::NewCacheMetadata;
+    use tempfile::TempDir;
+
+    fn manager_with(algorithm: CacheEvictionAlgorithm) -> (TempDir, WriteCacheManager) {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            10 * 1024 * 1024 * 1024,
+            10.0,
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            algorithm,
+            256 * 1024 * 1024,
+        );
+        (temp_dir, manager)
+    }
+
+    fn metadata_with_access_count(
+        access_count: u64,
+        last_accessed: SystemTime,
+    ) -> NewCacheMetadata {
+        let range_spec = crate::cache_types::RangeSpec {
+            start: 0,
+            end: 1023,
+            file_path: "test.bin".to_string(),
+            compression_algorithm: crate::compression::CompressionAlgorithm::default(),
+            compressed_size: 1024,
+            uncompressed_size: 1024,
+            created_at: last_accessed,
+            last_accessed,
+            access_count,
+        };
+
+        NewCacheMetadata {
+            cache_key: "bucket/key".to_string(),
+            object_metadata: crate::cache_types::ObjectMetadata::default(),
+            ranges: vec![range_spec],
+            created_at: last_accessed,
+            expires_at: SystemTime::now() + Duration::from_secs(86400),
+            compression_info: crate::cache_types::CompressionInfo::default(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression test for the TinyLFU inversion fixed in the RAM and disk tiers in
+    /// 2.3.1 but missed here: a genuinely hot entry that has been idle a while must
+    /// still outrank a freshly-read one-hit-wonder, so it is NOT evicted first.
+    ///
+    /// The old formula was `access_count * 1000 / idle_secs`, which gave the hot-but-idle
+    /// entry 100 * 1000 / 7200 = 13 and the fresh single-read entry 1 * 1000 / 1 = 1000 —
+    /// inverted, so the hot entry was evicted first.
+    #[test]
+    fn hot_but_idle_entry_outranks_fresh_one_hit_wonder() {
+        let (_tmp, manager) = manager_with(CacheEvictionAlgorithm::TinyLFU);
+        let now = SystemTime::now();
+
+        // Accessed 100 times, but idle for 2 hours (two half-lives).
+        let hot_idle = metadata_with_access_count(100, now - Duration::from_secs(7200));
+        // Accessed once, just now.
+        let fresh_cold = metadata_with_access_count(1, now);
+
+        let hot_score =
+            manager.calculate_eviction_score(&hot_idle, now - Duration::from_secs(7200));
+        let fresh_score = manager.calculate_eviction_score(&fresh_cold, now);
+
+        // Higher score = keep longer. 100 >> 2 == 25, versus 1 >> 0 == 1.
+        assert_eq!(hot_score, 25, "two half-lives of decay should quarter 100");
+        assert_eq!(fresh_score, 1);
+        assert!(
+            hot_score > fresh_score,
+            "hot-but-idle entry (score {hot_score}) must outrank fresh one-hit read \
+             (score {fresh_score}); dividing frequency by recency inverts this"
+        );
+    }
+
+    /// The score must never increase as idle time grows, so eviction ranking is stable.
+    #[test]
+    fn score_is_monotonic_non_increasing_in_idle_time() {
+        let (_tmp, manager) = manager_with(CacheEvictionAlgorithm::TinyLFU);
+        let now = SystemTime::now();
+        let mut previous = u64::MAX;
+
+        for hours in 0..6 {
+            let accessed_at = now - Duration::from_secs(hours * 3600);
+            let metadata = metadata_with_access_count(64, accessed_at);
+            let score = manager.calculate_eviction_score(&metadata, accessed_at);
+            assert!(
+                score <= previous,
+                "score rose from {previous} to {score} after {hours}h idle"
+            );
+            previous = score;
+        }
+    }
+
+    /// Sanity check that the write-cache path agrees with the shared helper the other
+    /// two tiers use, so the three cannot drift apart again.
+    #[test]
+    fn agrees_with_shared_decayed_frequency_helper() {
+        let (_tmp, manager) = manager_with(CacheEvictionAlgorithm::TinyLFU);
+        let now = SystemTime::now();
+
+        for (count, idle_secs) in [(1u64, 0u64), (10, 3600), (100, 7200), (5, 100_000)] {
+            let accessed_at = now - Duration::from_secs(idle_secs);
+            let metadata = metadata_with_access_count(count, accessed_at);
+            assert_eq!(
+                manager.calculate_eviction_score(&metadata, accessed_at),
+                crate::cache::decayed_frequency(count, idle_secs),
+                "write-cache scoring diverged from decayed_frequency for \
+                 count={count} idle={idle_secs}"
+            );
+        }
     }
 }

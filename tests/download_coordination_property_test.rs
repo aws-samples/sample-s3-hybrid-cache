@@ -44,6 +44,21 @@ const FETCHER_BODY: &[u8] = b"FETCHER-OBJECT-BODY-DATA";
 const CACHED_ETAG: &str = "\"cached-etag-prop1\"";
 const CACHED_LAST_MODIFIED: &str = "Wed, 01 Jan 2025 00:00:00 GMT";
 
+/// How long the stub holds an authoritative (non-conditional) response,
+/// keeping the fetcher's `InFlightTracker` flight open so the other
+/// participants register as waiters on it instead of finding a vacant key and
+/// electing themselves additional fetchers.
+///
+/// The stub is fully in-process and otherwise returns in microseconds, so
+/// without this the flight can open and close before the staggered waiters are
+/// even scheduled. Each late arrival then correctly issues its own
+/// authoritative request — right behaviour from the proxy, but it breaks the
+/// "one authoritative transfer per flight" assertion and made this test fail
+/// only under CPU contention. Sized as a wide margin over scheduler jitter,
+/// which was measured in the microsecond-to-low-millisecond range even on a
+/// heavily loaded machine.
+const FETCHER_FLIGHT_HOLD: Duration = Duration::from_millis(100);
+
 /// Request method variants for the property generator.
 #[derive(Debug, Clone, Copy)]
 enum RequestMethod {
@@ -882,7 +897,14 @@ async fn run_expired_flight_single_authoritative(group_size: usize, seed: u64) -
             StubResponse::ok(Bytes::from_static(FETCHER_BODY))
                 .with_header("etag", CACHED_ETAG)
                 .with_header("last-modified", CACHED_LAST_MODIFIED)
-                .with_header("content-type", "application/octet-stream"),
+                .with_header("content-type", "application/octet-stream")
+                // Hold the authoritative response so the fetcher's flight stays
+                // open for the whole stampede. Without this the staggered
+                // waiters can arrive after it closed and each elect itself a
+                // fetcher, inflating authoritative_count below. The 304
+                // conditional route above is deliberately left undelayed —
+                // those are the round-trips this property counts.
+                .with_delay(FETCHER_FLIGHT_HOLD),
         );
 
     let s3_client = stub.clone().into_trait_object();

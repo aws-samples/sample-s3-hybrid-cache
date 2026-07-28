@@ -1424,7 +1424,10 @@ impl Default for CacheConfig {
             cache_dir: PathBuf::from("/cache"),
             max_cache_size: 10 * 1024 * 1024 * 1024, // 10GB
             ram_cache_enabled: false,
-            max_ram_cache_size: 256 * 1024 * 1024, // 256MB
+            // 512MB: yields 8 effective shards (512MiB / 64MiB admission ceiling) out
+            // of the box, preserving the pre-clamp default shard concurrency.
+            // Spec: page-aligned-range-cache Resolved Question 4.
+            max_ram_cache_size: 512 * 1024 * 1024, // 512MB
             eviction_algorithm: EvictionAlgorithm::default(),
             write_cache_enabled: true,
             write_cache_percent: 10.0,
@@ -2347,7 +2350,10 @@ impl Default for Config {
                 cache_dir: PathBuf::from("/cache"),
                 max_cache_size: 10 * 1024 * 1024 * 1024, // 10GB
                 ram_cache_enabled: false,
-                max_ram_cache_size: 256 * 1024 * 1024, // 256MB
+                // 512MB: yields 8 effective shards (512MiB / 64MiB admission ceiling)
+                // out of the box, preserving the pre-clamp default shard concurrency.
+                // Spec: page-aligned-range-cache Resolved Question 4.
+                max_ram_cache_size: 512 * 1024 * 1024, // 512MB
                 eviction_algorithm: EvictionAlgorithm::default(), // LRU for both RAM and disk
                 write_cache_enabled: true, // Enabled by default - write caching is complete
                 write_cache_percent: 10.0,
@@ -7411,11 +7417,14 @@ mod rolling_validation_config_property_tests {
         assert_eq!(config.cache.cache_dir.to_str().unwrap(), "./tmp/cache");
         assert_eq!(config.cache.max_cache_size, 524_288_000);
         assert!(config.cache.ram_cache_enabled);
-        assert_eq!(config.cache.max_ram_cache_size, 104_857_600);
+        assert_eq!(config.cache.max_ram_cache_size, 536_870_912);
         assert!(config.cache.write_cache_enabled);
         assert_eq!(config.cache.write_cache_percent, 10.0);
         assert_eq!(config.cache.write_cache_max_object_size, 268_435_456);
-        assert_eq!(config.cache.put_ttl, Duration::from_secs(86_400));
+        // The example now carries the built-in default (1 hour) rather than a value
+        // that diverges from it — see the 2.4.0 CHANGELOG entry.
+        assert_eq!(config.cache.put_ttl, Duration::from_secs(3_600));
+        assert_eq!(config.cache.put_ttl, CacheConfig::default().put_ttl);
         assert_eq!(config.cache.get_ttl, Duration::from_secs(315_360_000));
         assert_eq!(config.cache.head_ttl, Duration::from_secs(60));
         assert!(!config.cache.actively_remove_cached_data);
@@ -7559,7 +7568,12 @@ mod rolling_validation_config_property_tests {
 
         // --- compression section ---
         assert!(config.compression.enabled);
-        assert_eq!(config.compression.threshold, 4096);
+        // The example now carries the built-in default rather than diverging from it.
+        assert_eq!(config.compression.threshold, 1024);
+        assert_eq!(
+            config.compression.threshold,
+            CompressionConfig::default().threshold
+        );
         assert_eq!(
             config.compression.preferred_algorithm,
             CompressionAlgorithm::Lz4

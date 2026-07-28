@@ -209,6 +209,36 @@ pub struct CoalescingMetrics {
     pub waiter_conditional_error: u64,
 }
 
+/// Page-aligned range caching (widening) observability metrics.
+/// Spec: page-aligned-range-cache. Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageCacheMetrics {
+    /// Total requests widened into a page-aligned fetch (Requirement 8.1)
+    pub widened_requests: u64,
+    /// Bytes fetched beyond what the client requested, summed across all
+    /// widened requests (Requirement 8.2)
+    pub bytes_prefetched: u64,
+    /// Amplification ratio derived from `bytes_prefetched`:
+    /// `(bytes_requested + bytes_prefetched) / bytes_requested`, i.e. how many
+    /// times larger the widened fetch was than what the client asked for.
+    /// `1.0` when no widened bytes have been requested yet (Requirement 8.2)
+    pub amplification_ratio: f64,
+    /// Small_Reads served from an already-cached Page with no S3 fetch
+    /// (Requirement 8.3)
+    pub page_hits: u64,
+    /// Requests declined widening because the Range was signed
+    /// (Requirement 8.4)
+    pub skipped_signed_range: u64,
+    /// Widened/page fetches that failed and fell back to the client's
+    /// original range (Requirement 8.5)
+    pub fallbacks: u64,
+    /// Pages successfully promoted to the RAM cache (Requirement 8.6)
+    pub ram_page_promotions: u64,
+    /// Pages not promoted to RAM because they exceeded the applicable RAM
+    /// budget (Requirement 8.6, see Requirement 7.7)
+    pub ram_page_promotion_skipped: u64,
+}
+
 /// System-wide metrics
 /// Journal consolidation metrics
 /// Requirements: 3.3, 3.4, 3.5 - Dashboard and metrics integration
@@ -255,6 +285,9 @@ pub struct SystemMetrics {
     pub consolidation: Option<ConsolidationMetrics>,
     pub coalescing: Option<CoalescingMetrics>,
     pub cache_rules: Option<CacheRulesMetrics>,
+    /// Page-aligned range caching (widening) metrics.
+    /// Spec: page-aligned-range-cache. Requirements: 8.1-8.6
+    pub page_cache: PageCacheMetrics,
     pub request_metrics: RequestMetrics,
     /// Per-bucket (or per-bucket+prefix) traffic counters.
     /// Key: `"bucket"` (no prefix) or `"bucket/prefix"` (prefix attribution active).
@@ -448,6 +481,9 @@ pub struct MetricsManager {
     connection_keepalive_stats: Arc<RwLock<ConnectionKeepaliveStats>>,
     atomic_metadata_stats: Arc<RwLock<AtomicMetadataStats>>,
     coalescing_stats: Arc<RwLock<CoalescingStats>>,
+    /// Page-aligned range caching (widening) statistics.
+    /// Spec: page-aligned-range-cache. Requirements: 8.1-8.6
+    page_cache_stats: Arc<RwLock<PageCacheStats>>,
     /// Per-bucket cache hit/miss counters (all buckets, keyed by bucket name)
     bucket_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
     /// Per-rule cache hit/miss counters keyed by the rule's glob pattern
@@ -640,6 +676,34 @@ pub struct CoalescingStats {
     pub waiter_conditional_error: u64,
 }
 
+/// Page-aligned range caching (widening) statistics tracking.
+/// Spec: page-aligned-range-cache. Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
+#[derive(Debug, Default, Clone)]
+pub struct PageCacheStats {
+    /// Total requests widened into a page-aligned fetch (Requirement 8.1)
+    pub widened_requests: u64,
+    /// Bytes actually requested by the client across all widened requests
+    /// (used with `bytes_prefetched` to derive the amplification ratio)
+    pub bytes_requested: u64,
+    /// Bytes fetched beyond what the client requested, summed across all
+    /// widened requests (Requirement 8.2)
+    pub bytes_prefetched: u64,
+    /// Small_Reads served from an already-cached Page with no S3 fetch
+    /// (Requirement 8.3)
+    pub page_hits: u64,
+    /// Requests declined widening because the Range was signed
+    /// (Requirement 8.4)
+    pub skipped_signed_range: u64,
+    /// Widened/page fetches that failed and fell back to the client's
+    /// original range (Requirement 8.5)
+    pub fallbacks: u64,
+    /// Pages successfully promoted to the RAM cache (Requirement 8.6)
+    pub ram_page_promotions: u64,
+    /// Pages not promoted to RAM because they exceeded the applicable RAM
+    /// budget (Requirement 8.6, see Requirement 7.7)
+    pub ram_page_promotion_skipped: u64,
+}
+
 impl Default for MetricsManager {
     fn default() -> Self {
         Self::new()
@@ -668,6 +732,7 @@ impl MetricsManager {
             connection_keepalive_stats: Arc::new(RwLock::new(ConnectionKeepaliveStats::default())),
             atomic_metadata_stats: Arc::new(RwLock::new(AtomicMetadataStats::default())),
             coalescing_stats: Arc::new(RwLock::new(CoalescingStats::default())),
+            page_cache_stats: Arc::new(RwLock::new(PageCacheStats::default())),
             bucket_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             rule_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             bucket_traffic_stats: Arc::new(RwLock::new(HashMap::new())),
@@ -811,6 +876,10 @@ impl MetricsManager {
         // Requirements: 19.1, 19.2, 19.3, 19.4, 19.5
         let coalescing_metrics = self.collect_coalescing_metrics().await;
 
+        // Collect page-aligned range caching (widening) metrics.
+        // Spec: page-aligned-range-cache. Requirements: 8.1-8.6
+        let page_cache_metrics = self.collect_page_cache_metrics().await;
+
         // Collect cache rules health metrics
         let cache_rules_metrics = self
             .cache_manager
@@ -837,6 +906,7 @@ impl MetricsManager {
             consolidation: consolidation_metrics,
             coalescing: coalescing_metrics,
             cache_rules: cache_rules_metrics,
+            page_cache: page_cache_metrics,
             request_metrics,
             bucket_traffic,
             download_bandwidth: crate::bandwidth_limiter::global_limiter().snapshot(),
@@ -1101,6 +1171,29 @@ impl MetricsManager {
             consolidation_count: size_state.consolidation_count,
             last_consolidation_timestamp,
         })
+    }
+
+    /// Collect page-aligned range caching (widening) metrics.
+    /// Spec: page-aligned-range-cache. Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
+    async fn collect_page_cache_metrics(&self) -> PageCacheMetrics {
+        let stats = self.page_cache_stats.read().await;
+
+        let amplification_ratio = if stats.bytes_requested > 0 {
+            (stats.bytes_requested + stats.bytes_prefetched) as f64 / stats.bytes_requested as f64
+        } else {
+            1.0
+        };
+
+        PageCacheMetrics {
+            widened_requests: stats.widened_requests,
+            bytes_prefetched: stats.bytes_prefetched,
+            amplification_ratio,
+            page_hits: stats.page_hits,
+            skipped_signed_range: stats.skipped_signed_range,
+            fallbacks: stats.fallbacks,
+            ram_page_promotions: stats.ram_page_promotions,
+            ram_page_promotion_skipped: stats.ram_page_promotion_skipped,
+        }
     }
 
     /// Collect coalescing metrics
@@ -2095,6 +2188,78 @@ impl MetricsManager {
         debug!(
             "Recorded coalesce waiter conditional error (total: {})",
             stats.waiter_conditional_error
+        );
+    }
+
+    // =========================================================================
+    // Page-Aligned Range Caching (Widening) Metrics
+    // Spec: page-aligned-range-cache. Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
+    // =========================================================================
+
+    /// Record a request that was widened into a page-aligned fetch, along
+    /// with the client-requested byte length and the total widened (Page)
+    /// byte length, so the amplification ratio can be derived
+    /// (Requirement 8.1, 8.2).
+    pub async fn record_page_widened_request(&self, bytes_requested: u64, bytes_widened: u64) {
+        let mut stats = self.page_cache_stats.write().await;
+        stats.widened_requests += 1;
+        stats.bytes_requested += bytes_requested;
+        stats.bytes_prefetched += bytes_widened.saturating_sub(bytes_requested);
+        debug!(
+            "Recorded page widened request (total: {}, bytes_prefetched: {})",
+            stats.widened_requests, stats.bytes_prefetched
+        );
+    }
+
+    /// Record a Small_Read served from an already-cached Page with no S3
+    /// fetch (Requirement 8.3).
+    pub async fn record_page_hit(&self) {
+        let mut stats = self.page_cache_stats.write().await;
+        stats.page_hits += 1;
+        debug!("Recorded page cache hit (total: {})", stats.page_hits);
+    }
+
+    /// Record a request declined widening because the Range was signed
+    /// (Requirement 8.4).
+    pub async fn record_page_skipped_signed_range(&self) {
+        let mut stats = self.page_cache_stats.write().await;
+        stats.skipped_signed_range += 1;
+        debug!(
+            "Recorded page widening skipped (signed range) (total: {})",
+            stats.skipped_signed_range
+        );
+    }
+
+    /// Record a widened/page fetch failure that fell back to the client's
+    /// original range (Requirement 8.5).
+    pub async fn record_page_fallback(&self) {
+        let mut stats = self.page_cache_stats.write().await;
+        stats.fallbacks += 1;
+        debug!(
+            "Recorded page widening fallback (total: {})",
+            stats.fallbacks
+        );
+    }
+
+    /// Record a Page successfully promoted to the RAM cache
+    /// (Requirement 8.6).
+    pub async fn record_ram_page_promotion(&self) {
+        let mut stats = self.page_cache_stats.write().await;
+        stats.ram_page_promotions += 1;
+        debug!(
+            "Recorded RAM page promotion (total: {})",
+            stats.ram_page_promotions
+        );
+    }
+
+    /// Record a Page that was not promoted to RAM because it exceeded the
+    /// applicable RAM budget (Requirement 8.6, see Requirement 7.7).
+    pub async fn record_ram_page_promotion_skipped(&self) {
+        let mut stats = self.page_cache_stats.write().await;
+        stats.ram_page_promotion_skipped += 1;
+        debug!(
+            "Recorded RAM page promotion skipped (total: {})",
+            stats.ram_page_promotion_skipped
         );
     }
     /// Record a per-bucket cache hit. Tracked for all buckets.

@@ -2,11 +2,16 @@
 //!
 //! Handles HTTP Range requests for partial content retrieval with caching support.
 //! Implements range header parsing, validation, overlap detection, and merging.
+//!
+//! Also home to the page-geometry helpers used by page-aligned range caching
+//! (widening) — see [`page_bounds`], [`overlapping_pages`], and
+//! [`suffix_page_target`]. Spec: `page-aligned-range-cache`.
 
 use crate::cache::{CacheManager, Range};
 use crate::cache_types::ObjectMetadata;
 use crate::disk_cache::DiskCacheManager;
 use crate::{ProxyError, Result};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -150,6 +155,144 @@ impl RangeSpec {
 
         Ok(())
     }
+}
+
+/// Sentinel returned by [`suffix_page_target`] when the object size is not yet
+/// known and the caller must fall back to issuing `bytes=-P` upstream (a
+/// size-free, end-anchored widening — Requirement 3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuffixPageTarget {
+    /// Size is known; these are the overlapping grid page(s) (1 or 2) that
+    /// cover the absolutized suffix range `[size - n, size - 1]`.
+    Pages(SmallVec<[(u64, u64); 2]>),
+    /// Size is unknown. The caller MUST issue `bytes=-page_size` upstream
+    /// instead of computing grid pages (Requirement 3.3).
+    SizeUnknown,
+}
+
+/// Compute the page grid bounds `(page_start, page_end)` containing `start`.
+///
+/// The grid is anchored at offset 0: `page_index = floor(start / page_size)`,
+/// `page_start = page_index * page_size`, `page_end = page_start + page_size - 1`.
+/// The last page is clamped so `page_end` never exceeds `size - 1` — the grid
+/// itself is uniform, but the returned bounds are truncated to the object's
+/// actual extent (S3 clamps the fetch to the object; we cache what returns).
+///
+/// # Panics
+/// Panics if `page_size` is 0 or `size` is 0 (both are validated at config
+/// load time — see `bucket_settings::CacheRules::validate` — so a 0 reaching
+/// here indicates a caller bug, not a runtime/user-input condition).
+///
+/// # Example
+/// ```
+/// # use s3_proxy::range_handler::page_bounds;
+/// // A 100 MiB object, 16 MiB pages: offset 20 MiB falls in the second page.
+/// let p = 16 * 1024 * 1024;
+/// let size = 100 * 1024 * 1024;
+/// assert_eq!(page_bounds(20 * 1024 * 1024, p, size), (p, 2 * p - 1));
+/// ```
+///
+/// Spec: page-aligned-range-cache Requirement 3.1, Page model (design.md).
+pub fn page_bounds(start: u64, page_size: u64, size: u64) -> (u64, u64) {
+    assert!(page_size > 0, "page_size must be > 0");
+    assert!(size > 0, "size must be > 0");
+
+    let page_index = start / page_size;
+    let page_start = page_index * page_size;
+    let page_end = (page_start + page_size - 1).min(size - 1);
+    (page_start, page_end)
+}
+
+/// Compute the grid page(s) that an absolute-offset range `[start, end]`
+/// overlaps: normally one page, or two when the range straddles a page
+/// boundary.
+///
+/// Returns a `SmallVec` sized so the common (single-page) case never
+/// allocates on the heap.
+///
+/// # Panics
+/// Panics if `end < start` (empty/invalid range), or if `page_size` / `size`
+/// is 0 — see [`page_bounds`].
+///
+/// # Example
+/// ```
+/// # use s3_proxy::range_handler::overlapping_pages;
+/// let p = 16 * 1024 * 1024;
+/// let size = 100 * 1024 * 1024;
+/// // A read that straddles the boundary between page 0 and page 1.
+/// let pages = overlapping_pages(p - 10, p + 10, p, size);
+/// assert_eq!(pages.len(), 2);
+/// assert_eq!(pages[0], (0, p - 1));
+/// assert_eq!(pages[1], (p, 2 * p - 1));
+/// ```
+///
+/// Spec: page-aligned-range-cache Requirement 3.1, 3.5.
+pub fn overlapping_pages(
+    start: u64,
+    end: u64,
+    page_size: u64,
+    size: u64,
+) -> SmallVec<[(u64, u64); 2]> {
+    assert!(end >= start, "range end must be >= start");
+
+    let first = page_bounds(start, page_size, size);
+    let last = page_bounds(end, page_size, size);
+
+    let mut pages = SmallVec::new();
+    pages.push(first);
+    if last != first {
+        pages.push(last);
+    }
+    pages
+}
+
+/// Compute the widening target for an eligible Suffix_Range (`bytes=-n`).
+///
+/// When the object size is already known, the suffix is absolutized to
+/// `[size - n, size - 1]` and mapped to its overlapping grid page(s) via
+/// [`overlapping_pages`] — never a single fixed "last page", because when the
+/// object size is just over a page multiple, the last grid page's remainder
+/// can be *smaller* than the requested suffix, which would under-fetch
+/// (widening must always be a superset of the requested bytes, never a
+/// subset — Requirement 3.2).
+///
+/// When the size is unknown, returns [`SuffixPageTarget::SizeUnknown`]: the
+/// caller must issue `bytes=-page_size` upstream instead (Requirement 3.3).
+///
+/// `n` is clamped to `size` if it exceeds it, matching how a suffix range
+/// larger than the object resolves to the whole object.
+///
+/// # Panics
+/// Panics if `n` is 0, or if `page_size` is 0 when `size` is `Some`.
+///
+/// # Example
+/// ```
+/// # use s3_proxy::range_handler::{suffix_page_target, SuffixPageTarget};
+/// let p = 16 * 1024 * 1024;
+/// // Size unknown: caller must fall back to bytes=-P.
+/// assert_eq!(suffix_page_target(1024, p, None), SuffixPageTarget::SizeUnknown);
+///
+/// // Size known: resolves to the overlapping grid page(s).
+/// match suffix_page_target(1024, p, Some(100 * p)) {
+///     SuffixPageTarget::Pages(pages) => assert_eq!(pages.len(), 1),
+///     SuffixPageTarget::SizeUnknown => panic!("size was known"),
+/// }
+/// ```
+///
+/// Spec: page-aligned-range-cache Requirement 3.2, 3.3.
+pub fn suffix_page_target(n: u64, page_size: u64, size: Option<u64>) -> SuffixPageTarget {
+    assert!(n > 0, "suffix length must be > 0");
+
+    let Some(size) = size else {
+        return SuffixPageTarget::SizeUnknown;
+    };
+    assert!(page_size > 0, "page_size must be > 0");
+    assert!(size > 0, "size must be > 0");
+
+    let n = n.min(size);
+    let start = size - n;
+    let end = size - 1;
+    SuffixPageTarget::Pages(overlapping_pages(start, end, page_size, size))
 }
 
 /// Range request parsing result
@@ -1033,6 +1176,19 @@ impl RangeHandler {
     /// - Offset or length parameters are invalid
     ///
     /// Returns (data, ram_hit) where ram_hit indicates if data came from RAM cache
+    ///
+    /// **This is the RAM cache entry point for merged reads.** Despite the
+    /// "extract bytes" name suggesting pure in-memory byte slicing, this
+    /// method calls `CacheManager::load_range_data_with_cache` below, which
+    /// checks RAM first, falls back to disk on a miss, and promotes disk hits
+    /// to RAM — the same tiered lookup any other range read gets. Every
+    /// segment `merge_range_segments` assembles from a cached range goes
+    /// through here, so a merged/multi-range read participates in the RAM
+    /// tier per segment, keyed on that segment's stored-range bounds. A plain
+    /// `grep ram_cache src/range_handler.rs` finds nothing in this file
+    /// because the RAM access happens one level down, inside
+    /// `CacheManager` — see the steering note on tracing call chains instead
+    /// of grepping for tier participation (page-aligned-range-cache Task 10).
     pub async fn extract_bytes_from_cached_range(
         &self,
         cache_key: &str,
@@ -1082,7 +1238,9 @@ impl RangeHandler {
             )));
         }
 
-        // Load the cached range data with RAM cache support
+        // Load the cached range data with RAM cache support. This is the RAM
+        // tier access described in the doc comment above: RAM hit, disk hit
+        // + promote, or disk miss, per segment.
         debug!("Loading range data with RAM cache support");
         let (range_data, ram_hit) = self
             .cache_manager
@@ -1330,6 +1488,17 @@ impl RangeHandler {
     ///
     /// # Returns
     /// RangeMergeResult containing merged data and efficiency metrics
+    ///
+    /// **Every cached segment consults the RAM cache tier.** Each entry in
+    /// `cached_ranges` is loaded through [`Self::extract_bytes_from_cached_range`],
+    /// which calls `CacheManager::load_range_data_with_cache` — checking RAM,
+    /// falling back to disk on a miss, and promoting disk hits to RAM. So a
+    /// merged/multi-range read is not disk-only: it consults RAM, may promote
+    /// to RAM, and records hit statistics, once per cached segment, keyed on
+    /// that segment's stored-range bounds (not the overall requested range).
+    /// `RangeMergeResult::ram_hit` (threaded from each segment's `ram_hit`
+    /// into `all_ram_hits` below) is the only signal of this at this call
+    /// site — nothing else here mentions RAM.
     ///
     /// Requirements: 1.5, 2.1, 2.4, 3.5, 8.1, 8.2, 8.3, 8.4
     pub async fn merge_range_segments(
@@ -2428,5 +2597,321 @@ mod tests {
         assert_eq!(offset, 0);
         assert_eq!(length, 8388608);
         assert_eq!(offset + length, 8388608);
+    }
+}
+
+#[cfg(test)]
+mod page_geometry_tests {
+    use super::*;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+
+    const P: u64 = 16 * 1024 * 1024; // default page size
+    const SIZE: u64 = 100 * 1024 * 1024; // object larger than several pages
+
+    #[test]
+    fn page_bounds_first_page() {
+        assert_eq!(page_bounds(0, P, SIZE), (0, P - 1));
+        assert_eq!(page_bounds(P - 1, P, SIZE), (0, P - 1));
+    }
+
+    #[test]
+    fn page_bounds_second_page() {
+        assert_eq!(page_bounds(P, P, SIZE), (P, 2 * P - 1));
+        assert_eq!(page_bounds(P + 100, P, SIZE), (P, 2 * P - 1));
+        assert_eq!(page_bounds(2 * P - 1, P, SIZE), (P, 2 * P - 1));
+    }
+
+    #[test]
+    fn page_bounds_last_page_clamped_to_size_minus_one() {
+        // Object size is not an exact multiple of P; last page must clamp.
+        let size = 3 * P + 100; // remainder page is only 100 bytes
+        let last_page_start = 3 * P;
+        assert_eq!(
+            page_bounds(last_page_start, P, size),
+            (last_page_start, size - 1)
+        );
+        // A start within the remainder still clamps to size-1, not
+        // last_page_start + P - 1 (which would exceed the object).
+        assert_eq!(page_bounds(size - 1, P, size), (last_page_start, size - 1));
+    }
+
+    #[test]
+    fn page_bounds_object_smaller_than_a_page() {
+        // Object entirely within a single (clamped) page.
+        let size = 1000;
+        assert_eq!(page_bounds(0, P, size), (0, size - 1));
+        assert_eq!(page_bounds(500, P, size), (0, size - 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "page_size must be > 0")]
+    fn page_bounds_panics_on_zero_page_size() {
+        page_bounds(0, 0, SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "size must be > 0")]
+    fn page_bounds_panics_on_zero_size() {
+        page_bounds(0, P, 0);
+    }
+
+    #[test]
+    fn overlapping_pages_single_page_read() {
+        let pages = overlapping_pages(10, 20, P, SIZE);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0], (0, P - 1));
+    }
+
+    #[test]
+    fn overlapping_pages_straddle_returns_two_pages_in_order() {
+        // Read spans the boundary between page 0 and page 1.
+        let pages = overlapping_pages(P - 10, P + 10, P, SIZE);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], (0, P - 1));
+        assert_eq!(pages[1], (P, 2 * P - 1));
+    }
+
+    #[test]
+    fn overlapping_pages_straddle_across_three_or_more_pages_still_returns_endpoints() {
+        // A read spanning page 0 through page 2 (unusual for a Small_Read,
+        // since Small_Read is length < P, but the helper itself is generic
+        // over any [start, end] and must still return the correct first/last
+        // page bounds without panicking).
+        let pages = overlapping_pages(10, 2 * P + 10, P, SIZE);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], (0, P - 1));
+        assert_eq!(pages[1], (2 * P, 3 * P - 1));
+    }
+
+    #[test]
+    fn overlapping_pages_exactly_at_boundary_start_is_single_page() {
+        // [P, P+10] starts exactly on a page boundary and stays within it.
+        let pages = overlapping_pages(P, P + 10, P, SIZE);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0], (P, 2 * P - 1));
+    }
+
+    #[test]
+    fn overlapping_pages_last_page_clamp_reflected_in_result() {
+        let size = 3 * P + 100;
+        let pages = overlapping_pages(size - 50, size - 1, P, size);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0], (3 * P, size - 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "range end must be >= start")]
+    fn overlapping_pages_panics_on_inverted_range() {
+        overlapping_pages(10, 5, P, SIZE);
+    }
+
+    #[test]
+    fn suffix_page_target_size_unknown_returns_sentinel() {
+        assert_eq!(
+            suffix_page_target(1024, P, None),
+            SuffixPageTarget::SizeUnknown
+        );
+    }
+
+    #[test]
+    fn suffix_page_target_size_known_cold_maps_to_last_page() {
+        // A small footer read comfortably within the last page's remainder.
+        match suffix_page_target(1024, P, Some(SIZE)) {
+            SuffixPageTarget::Pages(pages) => {
+                assert_eq!(pages.len(), 1);
+                // SIZE = 100 MiB is not an exact multiple of P = 16 MiB, so
+                // the last grid page starts at floor(SIZE / P) * P.
+                let expected_last_page_start = (SIZE / P) * P;
+                assert_eq!(pages[0], (expected_last_page_start, SIZE - 1));
+            }
+            SuffixPageTarget::SizeUnknown => panic!("size was provided"),
+        }
+    }
+
+    #[test]
+    fn suffix_page_target_warm_footer_larger_than_remainder_spans_two_pages() {
+        // Object size is just over a page multiple: the last grid page's
+        // remainder (100 bytes) is smaller than the requested footer
+        // (1000 bytes), so the suffix must straddle into the prior page too
+        // (never under-fetch — Requirement 3.2).
+        let size = 3 * P + 100;
+        match suffix_page_target(1000, P, Some(size)) {
+            SuffixPageTarget::Pages(pages) => {
+                assert_eq!(pages.len(), 2);
+                assert_eq!(pages[0], (2 * P, 3 * P - 1));
+                assert_eq!(pages[1], (3 * P, size - 1));
+            }
+            SuffixPageTarget::SizeUnknown => panic!("size was provided"),
+        }
+    }
+
+    #[test]
+    fn suffix_page_target_n_larger_than_size_clamps_to_whole_object() {
+        let size = 1000u64;
+        match suffix_page_target(5000, P, Some(size)) {
+            SuffixPageTarget::Pages(pages) => {
+                assert_eq!(pages.len(), 1);
+                assert_eq!(pages[0], (0, size - 1));
+            }
+            SuffixPageTarget::SizeUnknown => panic!("size was provided"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "suffix length must be > 0")]
+    fn suffix_page_target_panics_on_zero_n() {
+        suffix_page_target(0, P, Some(SIZE));
+    }
+
+    // ---- Property tests ----
+    // **Validates: Requirements 3.1, 3.2, 3.3**
+
+    /// For any start offset and page size/object size (all non-zero, start
+    /// within the object), `page_bounds` returns a page that contains `start`
+    /// and never extends past `size - 1`.
+    #[quickcheck]
+    fn prop_page_bounds_contains_start_and_never_exceeds_size(
+        start: u64,
+        page_size: u64,
+        size: u64,
+    ) -> TestResult {
+        if page_size == 0 || size == 0 {
+            return TestResult::discard();
+        }
+        // Keep inputs in a sane range to avoid overflow in the test itself.
+        let page_size = (page_size % (64 * 1024 * 1024)).max(1);
+        let size = (size % (1024 * 1024 * 1024)).max(1);
+        let start = start % size;
+
+        let (page_start, page_end) = page_bounds(start, page_size, size);
+
+        TestResult::from_bool(
+            page_start <= start && start <= page_end && page_end < size && page_start <= page_end,
+        )
+    }
+
+    /// A read that straddles a page boundary always yields exactly 2 pages;
+    /// a read fully within one page always yields exactly 1.
+    #[quickcheck]
+    fn prop_straddle_detection_matches_page_index_equality(
+        start: u64,
+        len: u64,
+        page_size: u64,
+    ) -> TestResult {
+        if page_size == 0 || len == 0 {
+            return TestResult::discard();
+        }
+        let page_size = (page_size % (64 * 1024 * 1024)).max(1);
+        // Keep the read shorter than the page so this mirrors a real
+        // Small_Read, and keep the whole thing comfortably within bounds.
+        let len = (len % page_size).max(1);
+        let size = 1024 * page_size; // plenty of pages, no clamp interference
+        let start = start % (size - len);
+        let end = start + len - 1;
+
+        let pages = overlapping_pages(start, end, page_size, size);
+        let start_page_index = start / page_size;
+        let end_page_index = end / page_size;
+
+        let expected_len = if start_page_index == end_page_index {
+            1
+        } else {
+            2
+        };
+
+        TestResult::from_bool(pages.len() == expected_len)
+    }
+
+    /// The widened target from `overlapping_pages` is always a superset of
+    /// the requested `[start, end]` range — the global "never a subset"
+    /// invariant from the requirements' Resolved Decisions.
+    #[quickcheck]
+    fn prop_overlapping_pages_is_superset_of_requested_range(
+        start: u64,
+        len: u64,
+        page_size: u64,
+    ) -> TestResult {
+        if page_size == 0 || len == 0 {
+            return TestResult::discard();
+        }
+        let page_size = (page_size % (64 * 1024 * 1024)).max(1);
+        let len = (len % (4 * page_size)).max(1);
+        let size = 1024 * page_size;
+        let start = start % (size - len);
+        let end = start + len - 1;
+
+        let pages = overlapping_pages(start, end, page_size, size);
+        let target_start = pages.first().unwrap().0;
+        let target_end = pages.last().unwrap().1;
+
+        TestResult::from_bool(target_start <= start && target_end >= end)
+    }
+
+    /// Suffix widening (size known) is always a superset of the requested
+    /// `[size - n, size - 1]` bytes, never a subset — even when the object
+    /// size is just over a page multiple and the last page's remainder is
+    /// smaller than `n`.
+    #[quickcheck]
+    fn prop_suffix_page_target_is_superset_of_requested_suffix(
+        n: u64,
+        page_size: u64,
+        size: u64,
+    ) -> TestResult {
+        if n == 0 || page_size == 0 || size == 0 {
+            return TestResult::discard();
+        }
+        let page_size = (page_size % (64 * 1024 * 1024)).max(1);
+        let size = (size % (1024 * 1024 * 1024)).max(page_size);
+        let n = (n % size).max(1);
+
+        let requested_start = size - n;
+        let requested_end = size - 1;
+
+        match suffix_page_target(n, page_size, Some(size)) {
+            SuffixPageTarget::Pages(pages) => {
+                let target_start = pages.first().unwrap().0;
+                let target_end = pages.last().unwrap().1;
+                TestResult::from_bool(
+                    target_start <= requested_start && target_end >= requested_end,
+                )
+            }
+            SuffixPageTarget::SizeUnknown => TestResult::failed(),
+        }
+    }
+
+    /// Suffix widening never returns more than 2 pages (Requirement 3.2:
+    /// "the overlapping grid page(s) — 1 or 2").
+    #[quickcheck]
+    fn prop_suffix_page_target_returns_one_or_two_pages(
+        n: u64,
+        page_size: u64,
+        size: u64,
+    ) -> TestResult {
+        if n == 0 || page_size == 0 || size == 0 {
+            return TestResult::discard();
+        }
+        let page_size = (page_size % (64 * 1024 * 1024)).max(1);
+        let size = (size % (1024 * 1024 * 1024)).max(page_size);
+        let n = (n % size).max(1);
+
+        match suffix_page_target(n, page_size, Some(size)) {
+            SuffixPageTarget::Pages(pages) => {
+                TestResult::from_bool(pages.len() == 1 || pages.len() == 2)
+            }
+            SuffixPageTarget::SizeUnknown => TestResult::failed(),
+        }
+    }
+
+    /// Size-unknown suffix widening always returns the sentinel, regardless
+    /// of `n`/`page_size` (Requirement 3.3).
+    #[quickcheck]
+    fn prop_suffix_page_target_size_unknown_always_sentinel(n: u64, page_size: u64) -> TestResult {
+        if n == 0 {
+            return TestResult::discard();
+        }
+        TestResult::from_bool(
+            suffix_page_target(n, page_size, None) == SuffixPageTarget::SizeUnknown,
+        )
     }
 }

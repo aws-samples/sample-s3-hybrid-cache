@@ -5,6 +5,151 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-07-29
+
+**Upgrade impact:** the `max_ram_cache_size` default rises from 256 MiB to
+512 MiB (+256 MiB RAM per instance), and a client-supplied `If-Range` whose
+validator does not match the cached ETag now costs an S3 round trip instead of
+being answered from cache. No config change required; see the two entries below.
+
+Adds page-aligned range caching (range read widening), an opt-in, per-key
+optimization for analytics-style access patterns (Parquet/ORC footer +
+column-chunk reads). Also lands a RAM cache admission guarantee — any single
+entry up to 64 MiB is now always admitted — which required raising the
+default `max_ram_cache_size`.
+
+### Added
+
+- **Page-aligned range caching (range read widening).** A small ranged GET
+  (requested length below a configurable page size `P`, default 16 MiB) can
+  now be widened to a fixed-size, page-aligned fetch on a per-key basis via
+  two new `cache_rules.json` rule fields: `page_widening` (bool, default
+  `false`) and `page_size` (bytes, default 16 MiB, must be `<= 64 MiB`). The
+  whole page is cached (disk and RAM); the client is always served exactly
+  the bytes it requested. Off by default and never enabled globally — only
+  a matching rule turns it on, because amplification is workload-dependent
+  (a large win when reads cluster within a page; a cost when reads are
+  scattered). Only genuinely missing, not-in-flight bytes are fetched from
+  S3; concurrent sub-page reads coalesce onto a single fetch; a failed
+  widened fetch falls back to the client's original range so widening never
+  turns a would-be-successful request into a failure. See
+  [`docs/CACHING.md` — Page-Aligned Range Caching](docs/CACHING.md#page-aligned-range-caching)
+  and [`docs/examples/page-aligned-parquet-rules.json`](docs/examples/page-aligned-parquet-rules.json).
+- **New `page_cache.*` metrics**: `widened_requests`, `bytes_prefetched`
+  (plus a derived amplification ratio), `page_hits`, `skipped_signed_range`,
+  `fallbacks`, `ram_page_promotions`, `ram_page_promotion_skipped`. Available
+  from the `/metrics` endpoint and the dashboard's `/api/cache-stats` payload;
+  there is no dedicated dashboard card for them, and they are not OTLP-exported.
+- **RAM cache 64 MiB admission ceiling.** The proxy now unconditionally
+  guarantees that any single RAM cache entry up to 64 MiB
+  (`RAM_CACHE_ADMISSION_CEILING = 67108864` bytes, a compile-time constant,
+  not a config field) is admitted rather than silently dropped — regardless
+  of whether page-aligned range caching is enabled for any key. It works by
+  clamping the effective RAM cache shard count so
+  `max_ram_cache_size / effective_shard_count >= 64 MiB`, logging a warning
+  when this reduces concurrency below the configured
+  `ram_cache_shard_count`. Admission is not retention: to keep `N` concurrent
+  hot large entries resident, size `max_ram_cache_size >= N * 64 MiB`.
+- **Dashboard rule settings now show the remaining per-rule fields.** The
+  "Settings" expander on each cache-rule row lists page widening, page size,
+  and "Local conditions" (`evaluate_conditions_from_cache`) for rules that
+  set them. `evaluate_conditions_from_cache` was settable but invisible in
+  the dashboard; when on, the proxy answers conditional requests for matching
+  keys from cached metadata instead of forwarding them to S3, so this matters
+  when auditing which prefixes skip S3-side credential revalidation.
+
+### Fixed
+
+- **`If-Range` precondition ignored on a cache hit.** The GET/HEAD conditional
+  dispatch classified only `If-Match`, `If-None-Match`, `If-Modified-Since`, and
+  `If-Unmodified-Since`, so a Range GET carrying `If-Range` alone was served
+  from cache as a `206` without the precondition ever being evaluated — even
+  when the client's validator did not match the current object, where RFC 7233
+  §3.2 requires `Range` to be ignored and the full representation returned with
+  `200`. `If-Range` is now classified as a conditional, and is dispatched on the
+  same terms as `If-Match` under `evaluate_conditions_from_cache` (Mode B, the
+  default): when the cached ETag strong-matches the validator the range is
+  served from cache with no S3 round trip; every other case — mismatch, an
+  HTTP-date or weak validator, nothing cached, or Mode A — forwards to S3. A
+  mismatch must forward because RFC 7233 §3.2 then requires the full current
+  body, which the cache may not hold. Unlike `If-Match`, a matching `If-Range`
+  does not refresh TTL or bypass expiry: it asserts which version a `Range`
+  applies to, not that the representation is fresh. When the range turns out to
+  be only partially cached, the gap fetches are pinned with a proxy-injected
+  `If-Match` on the matched ETag rather than the client's `If-Range` (unless
+  `If-Range` was signed, where stripping it would break the signature): a stale
+  `If-Range` on a gap fetch makes S3 return the full object with `200`, which the
+  buffered fetch path reads into memory in full before discarding it as a
+  non-`206`. Regression tests cover the stale and matching cases, each
+  non-comparable validator form, and the partial-cache gap fetch.
+- **TinyLFU inversion in the write-cache eviction path.** The scoring fix
+  shipped in 2.3.1 covered the RAM tier (`shard_find_tinylfu_victim`) and the
+  disk tier (`RangeSpec::tinylfu_score`), but missed a third site:
+  `WriteCacheManager::calculate_eviction_score` still computed
+  `access_count * 1000 / idle_secs`, which inverts the ranking: a write-cached
+  entry accessed 100 times but idle for two hours scored 13, against 1000 for a
+  fresh single-read entry, so the hot entry was evicted first. All three tiers
+  now use the shared `decayed_frequency` helper
+  (`access_count >> min(idle_secs / 3600, 63)`).
+
+  Affects write-cached objects only when `eviction_algorithm: "tinylfu"` is
+  configured; LRU is unaffected. Regression tests cover the hot-versus-fresh
+  ordering, monotonicity in idle time, and agreement with the shared helper.
+
+### Changed
+
+- **`config/config.example.yaml` now matches the built-in defaults.** Two fields in
+  the shipped example disagreed with the code defaults: `put_ttl` was `1d` against a
+  default of 1 hour, and `compression.threshold` was `4096` against a default of
+  `1024`. The example now carries the default values.
+
+  **No behaviour change for an existing deployment** — an existing `config.yaml`
+  states these fields explicitly and keeps its own values. New deployments copying
+  the example get 1 hour and 1024; set the fields explicitly to keep the previous
+  example values. A test now asserts each example value equals its `Default` impl, so
+  this cannot drift again.
+
+  The example's description of the write-cache TTL as "refreshed when objects are
+  accessed via GET" was also incorrect: the `put_ttl` to `get_ttl` move is a one-time
+  transition on the first GET, not a repeating refresh.
+
+- **Documentation corrections across `docs/`.** Every file was checked against `src/`
+  and `config/config.example.yaml`. The corrections an operator may have configured
+  against:
+
+  - Config fields that do not exist were removed: the `cache.distributed_eviction`
+    block, `metadata_lock_timeout_seconds`, `shared_storage.enabled`, and
+    `validation_time_of_day`. The real controls are
+    `shared_storage.eviction_lock_timeout` and
+    `shared_storage.metadata_lock_timeout_ms`. Troubleshooting no longer suggests
+    tuning `max_connections_per_ip`, which has no effect.
+  - Corrected defaults: dashboard `bind_address` `127.0.0.1` (was documented
+    `0.0.0.0`; health and metrics do default to `0.0.0.0`),
+    `range_merge_gap_threshold` 1 MiB (was 256 KB), `max_idle_per_host` 100 (was 10),
+    `idle_timeout` 55s (was 60s), `consolidation_interval` 5s (was 30s),
+    `incomplete_upload_ttl` 1 day and configurable (was described as hardcoded
+    1 hour), eviction target 80% via `eviction_target_percent` (was 90% via the
+    deprecated `eviction_buffer_percent`).
+  - Write-through caching is documented as enabled by default and complete;
+    `DEVELOPER.md` previously recommended against it over three defects fixed in
+    1.16.0 and 2.0.0.
+  - Descriptions of removed behaviour are gone: pre-2.3.1 TinyLFU scoring, local 304
+    generation for `If-None-Match`, and waiter fallback to a duplicate S3 fetch.
+
+  The remaining changes are editorial — the 2.4.0 metrics and RAM-default reference
+  pages, `docs/README.md` indexing, link fixes, and removal of internal task IDs and
+  status markers.
+
+- **Default `max_ram_cache_size` raised from 256 MiB to 512 MiB.** This is a
+  binary-only-upgrade footprint increase: a deployment that does not pin
+  `max_ram_cache_size` explicitly will use +256 MiB of RAM per instance
+  after upgrading. The new default keeps the default `ram_cache_shard_count`
+  of 8 at 8 *effective* shards under the new 64 MiB admission-ceiling clamp
+  (512 MiB / 8 = 64 MiB per shard — no clamp), preserving pre-upgrade RAM
+  cache concurrency. Memory-constrained fleets that must stay at 256 MiB
+  should pin `max_ram_cache_size: 268435456` explicitly and will run with 4
+  effective shards.
+
 ## [2.3.1] - 2026-07-27
 
 Fixes a TinyLFU eviction-scoring inversion present in both cache tiers (RAM
@@ -2283,20 +2428,16 @@ First stable 1.0.0 release with production-ready multi-instance cache coordinati
   - Prevents serving wrong version data when requesting specific object versions
   - Prevents cache pollution with version-specific data that may not be the "current" version
   - New metrics: `versioned_request_mismatch` and `versioned_request_no_cache` for monitoring
-
-### Fixed
-- **Version ID Cache Correctness**: Previously, versioned GET requests would incorrectly use cached data regardless of version
-  - Old behavior: `GET /bucket/object?versionId=v2` could return cached data from version v1
-  - New behavior: Only serves from cache if `x-amz-version-id` in cached metadata matches requested `versionId`
-
-## [0.7.4] - 2026-01-04
-
-### Changed
 - **Zero-Copy Cache Writes**: Eliminated unnecessary data copy in CacheWriter when compression is disabled
   - Previously: `data.to_vec()` copied every chunk even without compression
   - Now: Writes directly from original slice when no compression needed
   - Reduces memory allocations and CPU usage during cache-miss streaming
   - Improves throughput for large file transfers
+
+### Fixed
+- **Version ID Cache Correctness**: Previously, versioned GET requests would incorrectly use cached data regardless of version
+  - Old behavior: `GET /bucket/object?versionId=v2` could return cached data from version v1
+  - New behavior: Only serves from cache if `x-amz-version-id` in cached metadata matches requested `versionId`
 
 ## [0.7.3] - 2026-01-04
 

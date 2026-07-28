@@ -24,7 +24,9 @@ Complete configuration guide for Hybrid Cache for Amazon S3 including cache beha
 - [Eviction Configuration](#eviction-configuration)
 - [Multi-Instance Coordination](#multi-instance-coordination)
   - [Validation Scan](#validation-scan)
-- [Cache Size Tracking Configuration](#cache-size-tracking-configuration)
+- [Cache Hit Performance Tuning](#cache-hit-performance-tuning)
+- [Download Coordination](#download-coordination)
+- [Cache Size Tracking](#cache-size-tracking)
 - [Compression Configuration](#compression-configuration)
 - [Connection Pooling](#connection-pooling)
 - [DNS Server Configuration](#dns-server-configuration)
@@ -43,6 +45,7 @@ Complete configuration guide for Hybrid Cache for Amazon S3 including cache beha
 - [Environment Variable Reference](#environment-variable-reference)
 - [Example Configurations](#example-configurations)
 - [Troubleshooting](#troubleshooting)
+- [Download Bandwidth QoS Configuration](#download-bandwidth-qos-configuration)
 - [See Also](#see-also)
 
 ---
@@ -221,7 +224,7 @@ cache:
   cache_dir: "./tmp/cache"
   max_cache_size: 10737418240     # 10GB in bytes
   ram_cache_enabled: true
-  max_ram_cache_size: 268435456   # 256MB in bytes
+  max_ram_cache_size: 536870912   # 512MB in bytes (default; raised from 256MB — see "RAM Sizing and the Admission Ceiling" below)
   ram_cache_shard_count: 8        # Number of independent RAM cache shards (default: 8, range: 1–256)
   eviction_algorithm: "tinylfu"   # Options: lru, tinylfu
 ```
@@ -232,7 +235,7 @@ cache:
 
 **`ram_cache_shard_count`** (`usize`, default `8`, range `1–256`)
 
-Divides the RAM cache into this many independent shards, each with its own lock. Concurrent requests targeting different shards proceed in parallel without contention. Per-shard capacity is `max_ram_cache_size / ram_cache_shard_count` — for example, 256 MB / 8 shards = 32 MB per shard.
+Divides the RAM cache into this many independent shards, each with its own lock. Concurrent requests targeting different shards proceed in parallel without contention. Per-shard capacity is `max_ram_cache_size / effective_shard_count` (see the admission-ceiling clamp below) — for example, at the default 512 MB / 8 shards = 64 MB per shard.
 
 Objects larger than the per-shard capacity are silently dropped from the RAM cache. The proxy logs a warning at startup if per-shard capacity falls below 1 MB.
 
@@ -241,6 +244,22 @@ Tuning:
 - Lower values (e.g. 1, 2) — larger per-shard capacity per bucket; useful for very small caches or workloads dominated by a few large objects.
 
 Skew caveat: each shard evicts independently. When a shard reaches capacity it evicts regardless of free space in other shards, so effective RAM cache utilization may be lower than the configured maximum for workloads with uneven key distributions or very large objects.
+
+#### RAM Sizing and the Admission Ceiling
+
+The proxy unconditionally guarantees that any single RAM cache entry up to a hardcoded **64 MiB admission ceiling** (`RAM_CACHE_ADMISSION_CEILING = 67108864` bytes — a compile-time constant, not a config field) is admitted to the RAM cache rather than silently dropped. This applies regardless of whether [page-aligned range caching](CACHING.md#page-aligned-range-caching) is enabled for any key — it also covers plain large range reads.
+
+It works by clamping the **effective** shard count so per-shard capacity never falls below the ceiling:
+
+```
+effective_shard_count = min(ram_cache_shard_count, max(1, max_ram_cache_size / 67108864))
+```
+
+When this clamps the effective shard count below the configured `ram_cache_shard_count`, the proxy logs a warning at startup naming the reduced concurrency and suggesting a larger `max_ram_cache_size`.
+
+**Default `max_ram_cache_size` is 512 MiB** (`536870912` bytes), which at the default `ram_cache_shard_count: 8` yields exactly 8 effective shards (512 MiB / 8 = 64 MiB per shard — no clamp). Deployments pinning a smaller value keep it and accept the clamp's reduced shard count with a warning — e.g. 256 MiB / 8 configured shards clamps to 4 effective shards (256 MiB / 64 MiB).
+
+Admission is not the same as retention: a shard sized at the 64 MiB ceiling holds few large entries, so shard skew can evict a hot entry even while other shards are idle. To keep `N` concurrent hot large (up to 64 MiB) entries resident, size `max_ram_cache_size >= N * 67108864`. This is documented guidance, not an enforced invariant.
 
 **Eviction Algorithms**
 
@@ -405,7 +424,7 @@ cache:
   write_cache_enabled: true          # Enable write-through caching (enabled by default)
   write_cache_percent: 10.0           # Percentage of disk cache for writes (1-50%)
   write_cache_max_object_size: 268435456  # 256MB max object size
-  put_ttl: "1d"                       # Write cache TTL (refreshed on read)
+  put_ttl: "3600s"                    # Write cache TTL (default 1 hour)
   incomplete_upload_ttl: "1d"         # Incomplete multipart upload TTL
 ```
 
@@ -413,7 +432,7 @@ cache:
 
 **Full PUT Operations**:
 - Object data stored as a single range (0 to content-length-1)
-- Write cache TTL set (default: 1 day)
+- Write cache TTL set (default: 1 hour)
 - S3 response returned to client unchanged
 
 **Multipart Uploads**:
@@ -514,7 +533,7 @@ cache:
   # Cache objects up to 512MB
   write_cache_max_object_size: 536870912
   
-  # Keep write-cached objects for 1 day (refreshed on read)
+  # Keep write-cached objects for 1 day before their first read
   put_ttl: "1d"
   
   # Clean up incomplete uploads after 6 hours
@@ -567,7 +586,13 @@ The file holds an optional `$schema` reference plus an ordered `rules` array. Ea
 }
 ```
 
-**Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`
+**Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`
+
+**`page_widening` / `page_size` (page-aligned range caching / range read widening).** `page_widening` (bool, default `false`) enables widening a small ranged GET for matching keys into a fixed-size, page-aligned fetch; `page_size` (bytes, default `16777216` = 16 MiB when `page_widening` is enabled without specifying it) sets the page size `P`. `page_size` must be `> 0` and `<= 67108864` (64 MiB) for any rule enabling `page_widening` — validated at startup and on hot reload; an out-of-range value invalidates the rule set (see [Validation](#validation)). Off by default and never enabled globally — only via an explicit rule, since amplification is workload-dependent. See [CACHING.md — Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching) for the full mechanism, and [`docs/examples/page-aligned-parquet-rules.json`](examples/page-aligned-parquet-rules.json) for a worked example:
+
+```json
+{ "pattern": "**/*.parquet", "page_widening": true, "page_size": 16777216 }
+```
 
 **`compression_enabled` is rules-win.** The proxy has a built-in default
 denylist of already-compressed extensions (images, video, audio, archives,
@@ -681,6 +706,7 @@ Resolved settings are re-evaluated against the current rules on each read reques
 - A glob that cannot be translated to a valid regex → rule set rejected
 - More than the maximum number of rules (default 1024) → rule set rejected
 - An unparseable duration → rule set rejected
+- A rule with `page_widening: true` and a `page_size` of `0` or greater than `67108864` (64 MiB) → rule set rejected
 
 On any validation failure the proxy applies the reload error behavior above: it keeps the last-known-good rule set (or starts with an empty rule set if the file was invalid at first startup) and logs a warning.
 
@@ -883,7 +909,7 @@ Maximum duration for the consolidation cycle (discovery + per-key processing + c
 
 ```yaml
 cache:
-  range_merge_gap_threshold: 262144  # 256KB
+  range_merge_gap_threshold: 1048576  # 1MiB (default)
 ```
 
 **Purpose**: Consolidate missing ranges to minimize S3 requests
@@ -898,8 +924,8 @@ cache:
 
 **Tuning guide**:
 - **Smaller threshold** (64KB): More granular fetching, less wasted bandwidth
-- **Larger threshold** (1MB): Fewer S3 requests, more wasted bandwidth on gaps
-- **Default 256KB**: Good balance for most workloads
+- **Larger threshold** (4MB): Fewer S3 requests, more wasted bandwidth on gaps
+- **Default 1MiB**: Good balance for most workloads
 
 **Considerations**:
 - Network latency vs bandwidth: Higher latency favors larger threshold
@@ -1026,9 +1052,7 @@ This is the single knob for self-tuning mode selection. The proxy adapts automat
 
 **Monitoring**: Check `journalctl -u s3-proxy` for validation scan logs. The proxy logs the selected mode, reason, time budget, directories scanned, objects validated, scan rate, and cursor position at INFO level.
 
-## Cache Size Tracking Configuration
-
-### Download Coordination
+## Download Coordination
 
 Controls request coalescing for concurrent cache misses:
 
@@ -1039,7 +1063,9 @@ cache:
     wait_timeout_secs: 30   # Waiter timeout in seconds (default: 30, range: 5-120)
 ```
 
-When multiple requests arrive for the same uncached resource (full object, byte range, or part number), only one request fetches from S3 while others wait. Waiters serve from cache after the fetcher completes, or fall back to their own S3 fetch on timeout or error.
+When multiple requests arrive for the same uncached resource (full object, byte range, or part number), only one request fetches from S3 while others wait. Waiters serve from cache after the fetcher completes.
+
+On waiter timeout the proxy does **not** launch an independent duplicate fetch — that behaviour was removed in 1.16.0 because it defeated the point of coalescing under load. A timed-out waiter is re-subscribed to the still-in-flight fetch, up to `download_coordination.max_waiter_resubscriptions` (default 3); once that budget is exhausted the waiter receives HTTP 504.
 
 Disable for single-instance deployments with no concurrent duplicate requests, or when debugging cache behavior.
 
@@ -1062,6 +1088,31 @@ cache:
     consolidation_interval: "5s"     # How often to consolidate and update size
 ```
 
+**Other `shared_storage` fields**
+
+These have defaults and rarely need changing, but were previously undocumented:
+
+**`metadata_lock_timeout_ms`** (`u64`, default `30000` = 30 seconds)
+
+How long a metadata lock held by another instance is honoured before it is treated as
+stale. Only wall-clock time can decide staleness for a lock owned by a different host —
+a local lock is checked by testing whether the owning PID still exists — so this value
+governs cross-host takeover only.
+
+**`orphan_recovery_enabled`** (`bool`, default `true`)
+
+Background sweep that finds range (`.bin`) files with no referencing metadata — left by
+crashed writers or consolidation lag — and either reconciles them into metadata or
+removes them. Scans one shard per cycle to spread I/O.
+
+**`orphan_recovery_interval`** (`Duration`, default `"300s"`, range 60-3600s)
+
+Interval between orphan recovery scans.
+
+**`orphan_scan_timeout`** (`Duration`, default `"30s"`, range 5-300s)
+
+Maximum time spent scanning per cycle, so a long scan cannot block other operations.
+
 **Deprecated Options** (removed):
 - `size_tracking_flush_interval` - replaced by `shared_storage.consolidation_interval`
 - `size_tracking_buffer_size` - no longer needed, accumulator tracks size changes in memory
@@ -1077,9 +1128,13 @@ cache:
 ```yaml
 compression:
   enabled: true
-  threshold: 4096                    # Size floor in bytes; smaller writes always skip compression
+  threshold: 1024                    # Size floor in bytes; smaller writes always skip compression
   preferred_algorithm: "lz4"         # Options: lz4 (parsed but otherwise inert)
 ```
+
+**`threshold`** (`usize`, default `1024`) — size floor in bytes. Writes smaller than
+this always skip compression, regardless of extension or any `cache_rules.json`
+override.
 
 ### Content-Aware Compression (Built-In Denylist)
 
@@ -1120,14 +1175,13 @@ Each cache entry stores which algorithm was used:
 
 ```yaml
 connection_pool:
-  max_connections_per_ip: 50
   dns_refresh_interval: "60s"
   connection_timeout: "10s"
-  idle_timeout: "60s"
-  
+  idle_timeout: "55s"        # Just under S3's ~60s server-side timeout
+
   # HTTP Connection Keepalive
   keepalive_enabled: true
-  max_idle_per_host: 10
+  max_idle_per_host: 100
   max_lifetime: "300s"
   pool_check_interval: "10s"
   
@@ -1184,7 +1238,7 @@ Pre-stream retry budget. Number of times to retry the upstream fetch when `upstr
 
 | Setting | Low Value | High Value | Recommendation |
 |---------|-----------|------------|----------------|
-| max_idle_per_host | Less memory/FDs | More concurrent reuse | 10 (default), reduce for memory-constrained environments |
+| max_idle_per_host | Less memory/FDs | More concurrent reuse | 100 (default), reduce for memory-constrained environments |
 | max_lifetime | More frequent rotation | Less overhead | 300s (5 min) for stable endpoints |
 | pool_check_interval | More responsive cleanup | Less CPU overhead | 10s for balanced performance |
 
@@ -1558,7 +1612,7 @@ Optional per-bucket prefix lists for prefix-level attribution. When configured, 
 dashboard:
   enabled: true                        # Enable dashboard server (default: true)
   port: 8081                          # Dashboard server port (default: 8081)
-  bind_address: "0.0.0.0"             # Bind address (default: 0.0.0.0 for all interfaces)
+  bind_address: "127.0.0.1"           # Bind address (default: 127.0.0.1, loopback only)
   cache_stats_refresh_interval: "5s"   # Auto-refresh interval for cache statistics (default: 5s)
   logs_refresh_interval: "10s"         # Auto-refresh interval for application logs (default: 10s)
   max_log_entries: 100                 # Maximum number of log entries to display (default: 100)
@@ -1593,8 +1647,14 @@ The dashboard provides a web-based interface for monitoring proxy status:
 dashboard:
   enabled: true          # Set to false to disable dashboard completely
   port: 8081            # Change if port conflicts with other services
-  bind_address: "0.0.0.0"  # Set to "127.0.0.1" for localhost-only access
+  bind_address: "127.0.0.1"  # Default. Set to "0.0.0.0" to expose beyond loopback
 ```
+
+The dashboard defaults to loopback only, unlike the health and metrics servers which
+default to `0.0.0.0`. The dashboard is unauthenticated, so exposing it beyond
+loopback makes cache statistics and recent application log lines readable by anyone
+who can reach the port — restrict it at the firewall or security group if you change
+this.
 
 **Refresh Intervals**:
 ```yaml
@@ -1625,7 +1685,7 @@ dashboard:
 **Resource Usage**:
 - Minimal overhead when no users are connected
 - Uses <10MB additional memory
-- Supports up to 10 concurrent dashboard users
+- Accepts up to 50 concurrent dashboard connections (see [DASHBOARD.md](DASHBOARD.md))
 - Does not impact main proxy performance
 
 **Optimization**:
@@ -1651,13 +1711,9 @@ dashboard:
 
 ### Environment Variables
 
-Dashboard configuration can be overridden via environment variables:
-
-| Variable | Configuration Path | Example |
-|----------|-------------------|---------|
-| `DASHBOARD_ENABLED` | `dashboard.enabled` | `DASHBOARD_ENABLED=true` |
-| `DASHBOARD_PORT` | `dashboard.port` | `DASHBOARD_PORT=8081` |
-| `DASHBOARD_BIND_ADDRESS` | `dashboard.bind_address` | `DASHBOARD_BIND_ADDRESS=127.0.0.1` |
+Dashboard settings can be overridden via environment variables — see
+[Environment Variable Reference](#environment-variable-reference) for the
+`DASHBOARD_*` entries alongside every other supported variable.
 
 ### Example Configurations
 
@@ -1703,7 +1759,7 @@ dashboard:
 **Performance Issues**:
 - Increase refresh intervals to reduce update frequency
 - Reduce `max_log_entries` for faster log loading
-- Monitor dashboard connection count (max 10 concurrent users)
+- Monitor dashboard connection count (50 concurrent connections accepted)
 
 ## Health Check Configuration
 
@@ -1943,7 +1999,7 @@ dashboard:
 ### Connection Issues
 
 - Increase `connection_timeout`
-- Increase `max_connections_per_ip`
+- Increase `max_idle_per_host` (or `max_idle_per_ip` when IP distribution is enabled)
 - Check `dns_refresh_interval`
 - Monitor connection pool metrics
 
@@ -1958,19 +2014,11 @@ dashboard:
 **Dashboard Performance Issues**:
 - Increase `cache_stats_refresh_interval` and `logs_refresh_interval`
 - Reduce `max_log_entries` for faster log loading
-- Limit concurrent dashboard users (max 10 supported)
+- Limit concurrent dashboard connections (50 accepted before new ones are rejected)
 
 **Dashboard Port Conflicts**:
 - Change `dashboard.port` if 8081 conflicts with health check or other services
 - Ensure dashboard, health check, and metrics use different ports
-
-## See Also
-
-- [CACHING.md](CACHING.md) - Cache architecture details
-- [COMPRESSION.md](COMPRESSION.md) - Compression algorithms
-- [CONNECTION_POOLING.md](CONNECTION_POOLING.md) - Connection management
-- [OTLP_METRICS.md](OTLP_METRICS.md) - Metrics and observability
-- [config/config.example.yaml](../config/config.example.yaml) - Complete configuration with all options documented
 
 ## Download Bandwidth QoS Configuration
 
@@ -2006,3 +2054,11 @@ See [BANDWIDTH_QOS.md](BANDWIDTH_QOS.md) for the full guide.
 
 **`download_bandwidth.fleet.refresh_interval`** (duration, default `"30s"`)
 - Cold-path cadence for the heartbeat touch and `qos/heartbeats/` readdir.  Floor: 10 s.
+
+## See Also
+
+- [CACHING.md](CACHING.md) - Cache architecture details
+- [COMPRESSION.md](COMPRESSION.md) - Compression algorithms
+- [CONNECTION_POOLING.md](CONNECTION_POOLING.md) - Connection management
+- [OTLP_METRICS.md](OTLP_METRICS.md) - Metrics and observability
+- [config/config.example.yaml](../config/config.example.yaml) - Complete configuration with all options documented
