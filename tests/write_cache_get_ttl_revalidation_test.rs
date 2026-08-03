@@ -43,7 +43,8 @@ fn create_cache_manager(
         1_048_576,
         false,
         Duration::from_secs(10),
-        64, // ram_cache_shard_count
+        64,                                // ram_cache_shard_count
+        std::time::Duration::from_secs(5), // upstream_first_byte_timeout
     )
 }
 

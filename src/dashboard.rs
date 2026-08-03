@@ -1553,6 +1553,9 @@ function appendSettingsRow(row, settings, rowKey) {
     if (s.evaluate_conditions_from_cache != null) items.push('Local conditions: ' + (s.evaluate_conditions_from_cache ? 'On' : 'Off'));
     if (s.page_widening != null) items.push('Page widening: ' + (s.page_widening ? 'On' : 'Off'));
     if (s.page_size != null) items.push('Page size: ' + formatBytes(s.page_size));
+    if (s.hedging_enabled != null) items.push('Hedging: ' + (s.hedging_enabled ? 'On' : 'Off'));
+    if (s.hedge_trigger_after != null) items.push('Hedge trigger: ' + escapeHtml(s.hedge_trigger_after));
+    if (s.hedge_max_per_request != null) items.push('Hedge budget: ' + s.hedge_max_per_request);
     td.innerHTML = '<div class="stats-detail">' + items.join('<span class="detail-sep">·</span>') + '</div>';
     detail.appendChild(td);
     row.after(detail);
@@ -1806,7 +1809,9 @@ impl ApiHandler {
             let disk_only_get_misses = cache_stats.get_misses;
 
             // Get uptime and PUT request count from metrics manager if available
-            let (uptime_seconds, put_total, page_cache) = if let Some(metrics_manager) =
+            let (uptime_seconds, put_total, page_cache, hedged_requests) = if let Some(
+                metrics_manager,
+            ) =
                 metrics_manager_guard.as_ref()
             {
                 debug!("Metrics manager is available, getting uptime");
@@ -1827,6 +1832,7 @@ impl ApiHandler {
                     fresh_metrics.uptime_seconds.max(1),
                     put_total,
                     fresh_metrics.page_cache,
+                    fresh_metrics.hedged_requests,
                 )
             } else {
                 warn!("Metrics manager not available in dashboard, this indicates a configuration issue");
@@ -1844,6 +1850,7 @@ impl ApiHandler {
                         ram_page_promotions: 0,
                         ram_page_promotion_skipped: 0,
                     },
+                    crate::metrics::HedgingStats::default(),
                 )
             };
 
@@ -1978,6 +1985,7 @@ impl ApiHandler {
                 },
                 last_consolidation,
                 page_cache,
+                hedged_requests,
             }
         } else {
             // Return service unavailable if cache manager is not available
@@ -2187,6 +2195,11 @@ impl ApiHandler {
                     evaluate_conditions_from_cache: r.evaluate_conditions_from_cache,
                     page_widening: r.page_widening,
                     page_size: r.page_size,
+                    hedging_enabled: r.hedging_enabled,
+                    hedge_trigger_after: r
+                        .hedge_trigger_after
+                        .map(crate::bucket_settings::format_duration),
+                    hedge_max_per_request: r.hedge_max_per_request,
                     head_hit_count: rs.map_or(0, |s| s.head_hit_count),
                     head_miss_count: rs.map_or(0, |s| s.head_miss_count),
                     get_hit_count: rs.map_or(0, |s| s.get_hit_count),
@@ -2612,6 +2625,10 @@ pub struct CacheStatsResponse {
     /// Page-aligned range caching (widening) metrics.
     /// Spec: page-aligned-range-cache. Requirements: 8.1-8.6
     pub page_cache: crate::metrics::PageCacheMetrics,
+    /// Hedged upstream request metrics.
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    #[serde(default)]
+    pub hedged_requests: crate::metrics::HedgingStats,
 }
 
 /// Write cache statistics (MPUs in progress and PUT objects not yet read)
@@ -2780,6 +2797,18 @@ pub struct RuleStatsEntry {
     /// Spec: page-aligned-range-cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u64>,
+    /// Hedged upstream requests opt-in for this rule.
+    /// Spec: hedged-upstream-requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedging_enabled: Option<bool>,
+    /// TTFB threshold after which a hedge is issued.
+    /// Spec: hedged-upstream-requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedge_trigger_after: Option<String>,
+    /// Per-request hedge budget.
+    /// Spec: hedged-upstream-requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedge_max_per_request: Option<usize>,
     // Per-rule hit/miss stats
     pub head_hit_count: u64,
     pub head_miss_count: u64,

@@ -586,12 +586,18 @@ The file holds an optional `$schema` reference plus an ordered `rules` array. Ea
 }
 ```
 
-**Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`
+**Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`, `hedging_enabled`, `hedge_trigger_after`, `hedge_max_per_request`
 
 **`page_widening` / `page_size` (page-aligned range caching / range read widening).** `page_widening` (bool, default `false`) enables widening a small ranged GET for matching keys into a fixed-size, page-aligned fetch; `page_size` (bytes, default `16777216` = 16 MiB when `page_widening` is enabled without specifying it) sets the page size `P`. `page_size` must be `> 0` and `<= 67108864` (64 MiB) for any rule enabling `page_widening` — validated at startup and on hot reload; an out-of-range value invalidates the rule set (see [Validation](#validation)). Off by default and never enabled globally — only via an explicit rule, since amplification is workload-dependent. See [CACHING.md — Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching) for the full mechanism, and [`docs/examples/page-aligned-parquet-rules.json`](examples/page-aligned-parquet-rules.json) for a worked example:
 
 ```json
 { "pattern": "**/*.parquet", "page_widening": true, "page_size": 16777216 }
+```
+
+**`hedging_enabled` / `hedge_trigger_after` / `hedge_max_per_request` (hedged upstream requests).** `hedging_enabled` (bool, default `false`) enables hedged upstream requests for matching keys: when the original upstream fetch has not returned its first byte within `hedge_trigger_after`, the proxy issues a second identical fetch and serves whichever responds first, cancelling the loser. `hedge_trigger_after` (duration, default `250ms` when `hedging_enabled` is true without specifying it) sets the TTFB threshold; must be `> 0` and strictly less than `connection_pool.upstream_first_byte_timeout` (default `5s`) — validated on every rules load. `hedge_max_per_request` (integer, default `1`) caps the number of hedges per client request; for range GETs fanning out into N parallel sub-fetches this budget is shared across all N. Off by default and never enabled globally — only via an explicit rule, since hedging trades bounded S3 request cost for lower tail latency and the right threshold depends on the workload's TTFB distribution. See [CONNECTION_POOLING.md](CONNECTION_POOLING.md) for the mechanism:
+
+```json
+{ "pattern": "analytics-bucket/hot-prefix/**", "hedging_enabled": true, "hedge_trigger_after": "250ms", "hedge_max_per_request": 1 }
 ```
 
 **`compression_enabled` is rules-win.** The proxy has a built-in default
@@ -707,6 +713,7 @@ Resolved settings are re-evaluated against the current rules on each read reques
 - More than the maximum number of rules (default 1024) → rule set rejected
 - An unparseable duration → rule set rejected
 - A rule with `page_widening: true` and a `page_size` of `0` or greater than `67108864` (64 MiB) → rule set rejected
+- A rule with `hedging_enabled: true` and a `hedge_trigger_after` of `0` or greater than or equal to `connection_pool.upstream_first_byte_timeout` (default `5s`) → rule set rejected
 
 On any validation failure the proxy applies the reload error behavior above: it keeps the last-known-good rule set (or starts with an empty rule set if the file was invalid at first startup) and logs a warning.
 
@@ -1224,13 +1231,27 @@ Mid-stream idle watchdog: if no bytes are received from upstream for this durati
 
 Pre-stream retry budget. Number of times to retry the upstream fetch when `upstream_first_byte_timeout` fires before any bytes have been sent to the client. Uses the existing connection-pool IP failover for each retry. After exhausting retries, the proxy returns an error response rather than hanging.
 
+### Hedged Requests Governor
+
+Fleet-wide cost cap for hedged upstream requests. Hedging itself is enabled per key pattern in `cache_rules.json` via `hedging_enabled`, `hedge_trigger_after`, and `hedge_max_per_request` — there is no fleet-wide on/off toggle here. This section only limits the per-instance ratio of in-flight hedges to in-flight fetches, bounding cost amplification across all hedging-enabled keys.
+
+```yaml
+connection_pool:
+  hedged_requests:
+    max_inflight_fraction: 0.1
+```
+
+**`max_inflight_fraction`** (`f64`, default `0.1`)
+
+Maximum fraction of in-flight upstream fetches that may be hedges. When `(in_flight_hedges + 1) / max(in_flight_fetches, 1)` exceeds this value, new hedges are suppressed and the original fetch is served alone (degrade to non-hedged behaviour). The first hedge attempt is always admitted when no other hedges are in flight ("first-is-free"), so single-request workloads benefit from hedging without needing a high fraction. Valid range: `[0.0, 1.0]`. Setting `0.0` effectively disables hedging on this instance without touching rule files (except for the first-is-free slot). This cap is per-instance (each proxy enforces it independently); there is no cross-instance coordination.
+
 ### Connection Keepalive
 
 **Purpose**: Reuse TCP/TLS connections to eliminate handshake overhead
 
 **Benefits**:
-- 150-200ms latency reduction per request
-- 50-100% throughput increase
+- 150-200ms latency reduction per request (based on internal testing with synthetic workloads)
+- 50-100% throughput increase (based on internal testing with synthetic workloads)
 - First request: Full handshake (~250-350ms)
 - Subsequent requests: Reuse connection (~100-150ms)
 
@@ -1270,22 +1291,40 @@ connection_pool:
 
 **Use cases**:
 - Corporate environments with internal DNS
-- S3 PrivateLink (interface VPC endpoints) — see below
+- S3 PrivateLink (interface VPC endpoints), for on-premises proxies only — see below. Proxies running in the VPC that holds the endpoint should use `endpoint_overrides` instead, because any resolver in that VPC answers from the hosted zone that routes clients to the proxy.
+
+Whichever resolver you configure, it must not be one that resolves S3 hostnames to the proxy itself. That is the same override clients rely on, and pointing the proxy at it creates a loop.
 
 ## S3 PrivateLink (Interface VPC Endpoints)
 
 When using S3 interface VPC endpoints (PrivateLink), the proxy must resolve S3 endpoints to the PrivateLink ENI IPs instead of public S3 IPs. The default external DNS servers (Google, Cloudflare) return public IPs, bypassing PrivateLink entirely.
 
-Configure `dns_servers` to point at Route 53 Resolver inbound endpoints in the VPC. These return PrivateLink IPs when private DNS is enabled on the interface endpoint, and are reachable from on-premises over VPN or Direct Connect.
+Which mechanism to use depends on **where the proxy runs**, because the two cases need opposite settings for private DNS on the endpoint.
+
+### Proxies in AWS, in the VPC holding the endpoint
+
+Use `endpoint_overrides` to map the S3 hostnames to the endpoint's ENI IPs, taking DNS out of the path entirely, and **leave private DNS disabled on the endpoint**.
+
+Private DNS works by creating a private hosted zone for `s3.<region>.amazonaws.com` in that VPC — the same name a Route 53 private hosted zone must resolve to the proxy fleet for client routing. The two collide, and where a zone for the name already exists AWS rejects the endpoint with a conflicting-domain error. For the same reason, do not point `dns_servers` at the VPC resolver or at a Route 53 Resolver inbound endpoint in that VPC: both answer from the associated hosted zone and return the proxy's own address, forming a loop.
+
+An ENI IP excluded by health tracking is not restored until restart, because static overrides have no DNS refresh — see [PrivateLink (endpoint_overrides) Interaction](#privatelink-endpoint_overrides-interaction).
+
+### Proxies on-premises, reaching S3 over Direct Connect or VPN
+
+Point `dns_servers` at Route 53 Resolver inbound endpoints in the VPC, and **enable private DNS on the interface endpoint** so the VPC's internal resolver returns the ENI IPs. The inbound endpoint ENIs sit on your private subnets and are reachable from on-premises over the VPN or Direct Connect link.
 
 ```yaml
 connection_pool:
   dns_servers: ["10.0.1.50", "10.0.2.50"]  # Route 53 Resolver inbound endpoint IPs
 ```
 
-The proxy cannot use your on-prem DNS server for this — on-prem DNS resolves S3 endpoints to the proxy's own IP, which would create a loop. Route 53 Resolver inbound endpoints provide a separate resolution path.
+The proxy cannot use your on-prem DNS server for this — that is where the override sending clients to the proxy lives, so it resolves S3 endpoints to the proxy's own IP and forms a loop. The inbound endpoint provides a separate resolution path. Nothing hijacks the name inside the VPC in this topology, so the VPC's view is clean and private DNS is what makes it return ENI IPs.
 
-**Alternative: Static IP overrides**: If Route 53 Resolver inbound endpoints are not available, use `endpoint_overrides` to map S3 hostnames directly to PrivateLink ENI IPs, bypassing DNS entirely:
+`endpoint_overrides` also works here, and is the fallback when Resolver inbound endpoints are unavailable.
+
+### Static IP overrides
+
+Map S3 hostnames directly to PrivateLink ENI IPs, bypassing DNS:
 
 ```yaml
 connection_pool:

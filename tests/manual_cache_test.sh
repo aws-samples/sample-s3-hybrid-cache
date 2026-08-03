@@ -5,8 +5,8 @@
 
 set -e
 
-# Configuration
-TEST_BUCKET="egummett-testing-source-1"
+# Configuration — replace TEST_BUCKET with your own bucket before running
+TEST_BUCKET="${TEST_BUCKET:-my-test-bucket}"
 TEST_OBJECT="bigfiles/100MB"
 S3_ENDPOINT="http://s3.eu-west-1.amazonaws.com"
 PROXY_PORT=80

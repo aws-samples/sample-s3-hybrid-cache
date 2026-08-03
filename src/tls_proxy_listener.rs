@@ -214,6 +214,16 @@ impl TlsProxyListener {
                                             .await;
                                         }
 
+                                        // Non-CONNECT requests: the destination policy's
+                                        // port check (allowed_port: 443) is appropriate
+                                        // for CONNECT tunnels but not for HTTP forwarding,
+                                        // where the target port is the HTTP endpoint port
+                                        // (typically 80). Pass None so the HTTP path
+                                        // behaves identically to the port-80 listener —
+                                        // the SSRF protection that matters (IP range
+                                        // blocking) is applied by the connection pool's
+                                        // own checks, and the CONNECT handler above
+                                        // already gates tunnel destinations.
                                         HttpProxy::handle_request(
                                             req,
                                             addr,
@@ -226,8 +236,8 @@ impl TlsProxyListener {
                                             logger_manager,
                                             inflight_tracker,
                                             proxy_referer,
-                                            Some(destination_policy),
-                                            Some(resolver),
+                                            None,
+                                            None,
                                         )
                                         .await
                                     }

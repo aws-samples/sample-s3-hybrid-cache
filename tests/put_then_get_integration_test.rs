@@ -39,6 +39,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     )
 }
 

@@ -63,6 +63,7 @@ fn global_defaults() -> GlobalDefaults {
         compression_enabled: false,
         ram_cache_enabled: true,
         evaluate_conditions_from_cache: false,
+        upstream_first_byte_timeout: Duration::from_secs(5),
     }
 }
 

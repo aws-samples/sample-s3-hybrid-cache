@@ -8,8 +8,8 @@
 //! authoritative revalidation per expired-cache flight) against real AWS SigV4,
 //! real IAM, and real S3 response semantics.
 //!
-//! **Test bucket**: `s3-proxy-stampede-test-407092780826-us-west-2` in us-west-2.
-//! Hard-coded with fail-loud guard.
+//! **Test bucket**: `s3-proxy-stampede-test-111122223333-us-west-2` in us-west-2.
+//! Replace with your own bucket name before running.
 //!
 //! Gate: `RUN_INTEGRATION_TESTS=1` env var (early return if not set).
 //!
@@ -57,7 +57,7 @@ use s3_proxy::S3ClientApi;
 // Constants
 // =========================================================================
 
-const TEST_BUCKET: &str = "s3-proxy-stampede-test-407092780826-us-west-2";
+const TEST_BUCKET: &str = "s3-proxy-stampede-test-111122223333-us-west-2";
 const TEST_REGION: &str = "us-west-2";
 const TEST_OBJECT_KEY: &str = "stampede-test/coordination-stampede-object-4mib.bin";
 const OBJECT_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
@@ -276,6 +276,7 @@ async fn make_stampede_cache(
         config.cache.evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(

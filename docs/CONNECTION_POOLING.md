@@ -164,3 +164,93 @@ The watchdog timers are armed only after the proxy owns the upstream byte stream
 #### Cache safety
 
 An aborted mid-stream fetch never commits a *truncated full range* to cache — partial bytes are never served as if they satisfied a larger request. As of v2.2.0, however, the proxy does commit the received bytes as a **smaller valid sub-range** when at least `cache.partial_range_commit_ratio` (default `0.5`) of the requested bytes arrived in order before the abort. The incremental writer detects the size shortfall: if the received fraction meets the threshold it renames the temp file with clamped bounds and journals it as a valid sub-range `[start, start + received - 1]`; if it falls below the threshold the temp file is deleted and nothing is cached. See `cache.partial_range_commit_ratio` in `CONFIGURATION.md`.
+
+### Hedged Upstream Requests
+
+When a full-object GET, range GET, or HEAD is slow to return its first byte, the proxy can issue a second identical fetch (a "hedge") and serve whichever responds first, cancelling the loser. This trades a bounded amount of extra S3 request cost for lower p99/p99.9 latency on cache-miss fetches.
+
+Hedging is **off by default** and enabled per key pattern via `cache_rules.json` — there is no fleet-wide toggle. Only idempotent GET and HEAD requests are hedged (PUT, POST, DELETE, and multipart mutations are never hedged).
+
+#### How it works
+
+1. A cache-miss GET/HEAD enters the first-byte retry loop.
+2. The proxy checks the key's resolved `hedging_enabled` setting. If `false` (the default), the existing non-hedged path runs unchanged.
+3. If `true`, the proxy selects two distinct upstream IPs (best-effort; falls back to one or zero IPs without suppressing the hedge), seeds a per-request budget from `hedge_max_per_request`, and enters the retry loop.
+4. Inside each retry attempt, `race_first_byte` launches the original fetch pinned to IP[0], waits `hedge_trigger_after`, then conditionally launches a hedge pinned to IP[1] if the original has not yet returned and the budget + global governor allow.
+5. The first fetch to return a response status (any status code) wins. The loser is cancelled immediately (no body bytes streamed), so at most one cache write and one client response occur per request.
+6. If both arms time out, the retry loop advances (consuming a retry). A hedge in flight when the original times out is kept alive and may still win — the original's abort does not short-circuit the logical fetch.
+
+#### Relationship to existing timeouts
+
+Hedging sits **beneath** the existing three upstream timers and never replaces them:
+
+| Timer | Scope | Hedging interaction |
+|-------|-------|---------------------|
+| `hedge_trigger_after` (per rule) | TTFB of original fetch | Issues the hedge; original keeps running |
+| `upstream_first_byte_timeout` (startup) | Connect → first byte per arm | Each arm has its own independent timer |
+| `upstream_idle_timeout` (startup) | Mid-stream gap | Applied only to the winner's body stream |
+| `server.request_timeout` (startup) | Whole request wall | Not reset by hedging; covers both arms |
+
+`hedge_trigger_after` must be strictly less than `upstream_first_byte_timeout` (validated on every rules load).
+
+#### Configuration
+
+Enablement and per-key knobs live in `cache_rules.json`:
+
+```json
+{
+  "rules": [
+    {
+      "pattern": "analytics-data/*",
+      "hedging_enabled": true,
+      "hedge_trigger_after": "250ms",
+      "hedge_max_per_request": 1
+    }
+  ]
+}
+```
+
+The single process-global knob lives in startup config:
+
+```yaml
+connection_pool:
+  hedged_requests:
+    max_inflight_fraction: 0.1  # Suppress new hedges when in-flight ratio exceeds this
+```
+
+#### Cost bounds
+
+- `hedge_max_per_request` (per rule, default 1): caps hedges per client request. For range GETs with multiple parallel missing-range sub-fetches, this is a **shared budget** across all sub-fetches — not per sub-fetch.
+- `max_inflight_fraction` (startup config, default 0.1): suppresses new hedges when the ratio of in-flight hedges to in-flight fetches exceeds the cap. The first hedge is always admitted when none are in flight ("first-is-free"), so single-request workloads always benefit.
+- When a cost bound is exceeded, the proxy serves the original fetch without hedging (degrades to today's behaviour).
+
+#### Range and part GET hedging
+
+Range GETs are hedged on the same terms as full-object GETs (Req 2.3). There are **two** range fetch paths and both hedge:
+
+- **Complete range miss** — none of the requested bytes are cached. The range is streamed straight from the origin; it never reaches the missing-range fan-out. This is the cold path for a small-range-read workload, so it is the one hedging matters most for.
+- **Partial range hit** — some bytes are cached. The gaps are consolidated and fetched as N parallel missing-range sub-fetches, each independently racing an original against a hedge.
+
+Key differences from the full-object path:
+
+- **No first-byte timeout.** Both range paths pass `first_byte_timeout: None` — hedging does not introduce a first-byte-timeout regime where none existed. The existing 30s `request_timeout` remains the ceiling for each arm.
+- **Shared per-request budget.** One client range GET gets one budget. In the fan-out case all N sub-fetches share a single `hedge_max_per_request` budget (default 1), and only sub-fetches still lacking a first byte at `hedge_trigger_after` attempt a claim, so the budget lands on a genuinely slow sub-fetch. Operators with routinely multi-range workloads can raise this on the prefix's rule.
+- **Independent IP pairs.** Each fetch selects its own 2-IP pair via `get_distinct_distributed_ips`, independently of other sub-fetches.
+- **Streamed on a complete miss, buffered on a partial hit.** A complete range miss streams the winner's body to the client and cache as today, so proxy memory stays bounded regardless of range size. A partial hit buffers the winner (as today) for merge with cached data. Either way the loser is dropped at header time — no partial merge data retained, no body bytes read from it.
+
+Part-number GETs (`?partNumber=N`) are hedged through the full-object fetcher (`forward_get_head_to_s3_and_cache`), which already includes hedging from the full-object path.
+
+**With `page_widening` enabled on the same prefix**, the widened Page fill hedges too, and the hedge re-sends the *widened* (page-aligned) upstream Range rather than the client's original sub-range — the two features compose rather than one disabling the other. Enabling both on one prefix is the expected combination, since both target small range reads over large objects. A client range GET that straddles a Page boundary fills multiple Pages concurrently; all of those Page fills, and all the missing-range sub-fetches beneath them, share the single `hedge_max_per_request` budget for that one client request. Page coordination is unaffected: concurrent readers of the same Page still coalesce onto one logical fetch, and only the winning arm's bytes are committed to the Page.
+
+#### Connection diversity
+
+The hedge prefers a different upstream IP than the original (via `get_distinct_distributed_ips`). If only one healthy IP is available, both arms use that IP on separate connections. If the destination matches an `upstream_overrides` entry, no IP pin is applied — both arms go through the normal override path.
+
+#### Metrics
+
+Three counters exposed at `/metrics` under `hedged_requests`:
+- `issued`: count of hedges launched (= duplicate S3 request cost)
+- `won`: count of times the hedge beat the original
+- `suppressed`: count of hedges not issued due to cost bounds
+
+The payoff ratio `won / issued` is the primary tuning signal for `hedge_trigger_after`.

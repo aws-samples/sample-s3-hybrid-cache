@@ -49,6 +49,7 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     ));
 
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(DiskCacheManager::new(
@@ -166,6 +167,7 @@ async fn test_invalidate_stale_ranges() -> Result<()> {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/test-object.txt";
@@ -260,6 +262,7 @@ async fn test_invalidate_stale_ranges_no_mismatch() -> Result<()> {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/test-object.txt";
@@ -343,6 +346,7 @@ async fn test_invalidate_stale_ranges_no_metadata() -> Result<()> {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/nonexistent-object.txt";

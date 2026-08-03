@@ -5,12 +5,14 @@ Deep-dive reference documentation for Hybrid Cache for Amazon S3. For an overvie
 ## Getting Started
 
 - [Quick Start Guide](GETTING_STARTED.md) - Installation and first run
+- [Deploying on AWS for Distant Origins](AWS_DEPLOYMENT.md) - Reference architecture and FSx for OpenZFS sizing for cross-region and non-AWS origins
 - [Upgrading](UPGRADING.md) - Per-release manual steps and default changes
 - [Configuration Reference](CONFIGURATION.md) - Complete configuration options
 
 ## Core Concepts
 
 - [Architecture Overview](ARCHITECTURE.md) - Technical architecture and design principles
+- [Security Considerations](ARCHITECTURE.md#security-considerations) - Shared cache access model, what a cleartext hop exposes, trust and integrity model
 - [Caching System](CACHING.md) - Multi-tier caching with RAM and disk
 - [Compression](COMPRESSION.md) - LZ4 compression and content detection
 - [Connection Pooling](CONNECTION_POOLING.md) - Connection management and load balancing

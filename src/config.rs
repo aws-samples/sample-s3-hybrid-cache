@@ -1139,6 +1139,16 @@ impl ConnectionPoolConfig {
             ));
         }
 
+        // Validate hedged_requests.max_inflight_fraction [0.0, 1.0]
+        if self.hedged_requests.max_inflight_fraction < 0.0
+            || self.hedged_requests.max_inflight_fraction > 1.0
+        {
+            return Err(format!(
+                "hedged_requests.max_inflight_fraction must be between 0.0 and 1.0, got {}",
+                self.hedged_requests.max_inflight_fraction
+            ));
+        }
+
         Ok(())
     }
 }
@@ -1708,6 +1718,35 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Per-instance hedged-request governor configuration.
+///
+/// Lives at `connection_pool.hedged_requests` in `config.yaml`. Hedging itself is
+/// enabled per key pattern in `cache_rules.json` (`hedging_enabled`, `hedge_trigger_after`,
+/// `hedge_max_per_request`); this struct holds only the single process-global knob that
+/// governs the in-flight hedge ratio across all keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HedgedRequestsConfig {
+    /// Maximum fraction of in-flight fetches that may be hedges (default: 0.1).
+    /// When `(in_flight_hedges + 1) / max(in_flight_fetches, 1)` exceeds this
+    /// value, new hedges are suppressed and the original fetch is served alone.
+    /// Valid range: [0.0, 1.0].
+    #[serde(default = "default_max_inflight_fraction")]
+    pub max_inflight_fraction: f64,
+}
+
+fn default_max_inflight_fraction() -> f64 {
+    0.1
+}
+
+impl Default for HedgedRequestsConfig {
+    fn default() -> Self {
+        Self {
+            max_inflight_fraction: default_max_inflight_fraction(),
+        }
+    }
+}
+
 /// Connection pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1836,6 +1875,12 @@ pub struct ConnectionPoolConfig {
     /// fetch when first-byte timeout fires before any bytes are sent to the client.
     #[serde(default = "default_upstream_idle_retries")]
     pub upstream_idle_retries: usize,
+    /// Per-instance hedged-request governor. Hedging is enabled per key pattern in
+    /// `cache_rules.json` — see `hedging_enabled`, `hedge_trigger_after`, and
+    /// `hedge_max_per_request` in the rules schema. This section holds only the
+    /// process-global in-flight fraction cap.
+    #[serde(default)]
+    pub hedged_requests: HedgedRequestsConfig,
 }
 
 fn default_dns_servers() -> Vec<String> {
@@ -1940,6 +1985,7 @@ impl Default for ConnectionPoolConfig {
             upstream_first_byte_timeout: default_upstream_first_byte_timeout(),
             upstream_idle_timeout: default_upstream_idle_timeout(),
             upstream_idle_retries: default_upstream_idle_retries(),
+            hedged_requests: HedgedRequestsConfig::default(),
         }
     }
 }
@@ -2426,6 +2472,7 @@ impl Default for Config {
                 upstream_first_byte_timeout: default_upstream_first_byte_timeout(),
                 upstream_idle_timeout: default_upstream_idle_timeout(),
                 upstream_idle_retries: default_upstream_idle_retries(),
+                hedged_requests: HedgedRequestsConfig::default(),
             },
             compression: CompressionConfig {
                 enabled: true,
@@ -4317,6 +4364,11 @@ logging:
             config.download_bandwidth.fleet.refresh_interval,
             Duration::from_secs(30)
         );
+        // Hedged requests governor default (hedged-upstream-requests spec, Req 6.2).
+        assert_eq!(
+            config.connection_pool.hedged_requests.max_inflight_fraction, 0.1,
+            "hedged_requests.max_inflight_fraction must default to 0.1"
+        );
     }
 
     #[test]
@@ -4417,6 +4469,47 @@ logging:
         assert!(
             config.connection_pool.validate().is_ok(),
             "connection pool config must validate when upstream_overrides is omitted"
+        );
+    }
+
+    #[test]
+    fn test_hedged_requests_max_inflight_fraction_out_of_range_rejected() {
+        // Validation must reject max_inflight_fraction outside [0.0, 1.0].
+        let mut pool_config = ConnectionPoolConfig::default();
+
+        // Above 1.0
+        pool_config.hedged_requests.max_inflight_fraction = 1.5;
+        let result = pool_config.validate();
+        assert!(result.is_err(), "fraction > 1.0 must be rejected");
+        assert!(
+            result.unwrap_err().contains("max_inflight_fraction"),
+            "error message must mention the field"
+        );
+
+        // Below 0.0
+        pool_config.hedged_requests.max_inflight_fraction = -0.1;
+        let result = pool_config.validate();
+        assert!(result.is_err(), "fraction < 0.0 must be rejected");
+
+        // Boundary: 0.0 is valid
+        pool_config.hedged_requests.max_inflight_fraction = 0.0;
+        assert!(
+            pool_config.validate().is_ok(),
+            "fraction 0.0 must be accepted"
+        );
+
+        // Boundary: 1.0 is valid
+        pool_config.hedged_requests.max_inflight_fraction = 1.0;
+        assert!(
+            pool_config.validate().is_ok(),
+            "fraction 1.0 must be accepted"
+        );
+
+        // Default 0.1 is valid
+        pool_config.hedged_requests.max_inflight_fraction = 0.1;
+        assert!(
+            pool_config.validate().is_ok(),
+            "default 0.1 must be accepted"
         );
     }
 

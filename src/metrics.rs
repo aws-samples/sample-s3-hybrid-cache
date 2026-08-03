@@ -7,6 +7,7 @@ use crate::cache_size_tracker::{CacheSizeMetrics, CacheSizeTracker};
 use crate::compression::CompressionHandler;
 use crate::config::OtlpConfig;
 use crate::connection_pool::ConnectionPoolManager;
+use crate::hedged_fetch::HedgeMetrics;
 use crate::otlp::OtlpExporter;
 use crate::{ProxyError, Result};
 use hyper::{Request, Response, StatusCode};
@@ -298,6 +299,24 @@ pub struct SystemMetrics {
     /// all sub-fields reflect the current state whether enabled or not.
     /// Spec: download-bandwidth-qos. Requirements: 8.1, 8.2, 8.3, 8.4, 8.5
     pub download_bandwidth: crate::bandwidth_limiter::BandwidthLimiterSnapshot,
+    /// Hedged upstream request metrics.
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    pub hedged_requests: HedgingStats,
+}
+
+/// Hedged upstream request statistics.
+///
+/// Exposed as `hedged_requests.{issued,won,suppressed}` in the `/metrics` JSON.
+/// - `issued`: count of hedges launched (= duplicate S3 requests billed).
+/// - `won`: count of requests where the hedge, not the original, was the Winner.
+/// - `suppressed`: count of would-be hedges not issued due to cost bounds.
+///
+/// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HedgingStats {
+    pub issued: u64,
+    pub won: u64,
+    pub suppressed: u64,
 }
 
 /// Request processing metrics
@@ -505,6 +524,9 @@ pub struct MetricsManager {
     active_connections: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Maximum concurrent requests from config
     max_concurrent_requests: usize,
+    /// Shared hedging metrics counters (owned by the HedgeGovernor/startup, read here).
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    hedge_metrics: Option<Arc<HedgeMetrics>>,
 }
 
 /// Internal request statistics tracking
@@ -742,6 +764,7 @@ impl MetricsManager {
             otlp_exporter: None,
             active_connections: None,
             max_concurrent_requests: 200,
+            hedge_metrics: None,
         }
     }
 
@@ -804,6 +827,54 @@ impl MetricsManager {
     ) {
         self.active_connections = Some(active_connections);
         self.max_concurrent_requests = max_concurrent_requests;
+    }
+
+    /// Set the shared hedge metrics reference.
+    ///
+    /// The `HedgeMetrics` instance is created at startup alongside the
+    /// `HedgeGovernor` and shared with both `race_first_byte` (which increments
+    /// counters) and `MetricsManager` (which reads them during collection).
+    ///
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    pub fn set_hedge_metrics(&mut self, hedge_metrics: Arc<HedgeMetrics>) {
+        self.hedge_metrics = Some(hedge_metrics);
+    }
+
+    /// Record a hedge issued (convenience — delegates to the shared `HedgeMetrics`).
+    /// Spec: hedged-upstream-requests. Requirement: 8.1
+    pub fn record_hedge_issued(&self) {
+        if let Some(hm) = &self.hedge_metrics {
+            hm.record_issued();
+        }
+    }
+
+    /// Record a hedge win (convenience — delegates to the shared `HedgeMetrics`).
+    /// Spec: hedged-upstream-requests. Requirement: 8.2
+    pub fn record_hedge_won(&self) {
+        if let Some(hm) = &self.hedge_metrics {
+            hm.record_won();
+        }
+    }
+
+    /// Record a hedge suppressed (convenience — delegates to the shared `HedgeMetrics`).
+    /// Spec: hedged-upstream-requests. Requirement: 8.3
+    pub fn record_hedge_suppressed(&self) {
+        if let Some(hm) = &self.hedge_metrics {
+            hm.record_suppressed();
+        }
+    }
+
+    /// Collect hedging stats from the shared `HedgeMetrics` counters.
+    /// Returns zeroes when hedge metrics have not been wired in.
+    fn collect_hedging_metrics(&self) -> HedgingStats {
+        match &self.hedge_metrics {
+            Some(hm) => HedgingStats {
+                issued: hm.issued.load(std::sync::atomic::Ordering::Relaxed),
+                won: hm.won.load(std::sync::atomic::Ordering::Relaxed),
+                suppressed: hm.suppressed.load(std::sync::atomic::Ordering::Relaxed),
+            },
+            None => HedgingStats::default(),
+        }
     }
 
     /// Record a request completion
@@ -910,6 +981,7 @@ impl MetricsManager {
             request_metrics,
             bucket_traffic,
             download_bandwidth: crate::bandwidth_limiter::global_limiter().snapshot(),
+            hedged_requests: self.collect_hedging_metrics(),
         };
 
         // Cache the result
@@ -4473,5 +4545,96 @@ mod bandwidth_metrics_tests {
             json.contains("\"class_bytes\""),
             "download_bandwidth must contain class_bytes"
         );
+    }
+
+    /// Test that record_hedge_* methods increment the right counters.
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    #[tokio::test]
+    async fn test_hedging_metrics_record_and_collect() {
+        use crate::hedged_fetch::HedgeMetrics;
+        use std::sync::Arc;
+
+        let mut metrics_manager = MetricsManager::new();
+        let hedge_metrics = Arc::new(HedgeMetrics::new());
+        metrics_manager.set_hedge_metrics(hedge_metrics.clone());
+
+        // Verify initial state is zero.
+        let stats = metrics_manager.collect_hedging_metrics();
+        assert_eq!(stats.issued, 0);
+        assert_eq!(stats.won, 0);
+        assert_eq!(stats.suppressed, 0);
+
+        // Record some events via the MetricsManager convenience methods.
+        metrics_manager.record_hedge_issued();
+        metrics_manager.record_hedge_issued();
+        metrics_manager.record_hedge_won();
+        metrics_manager.record_hedge_suppressed();
+        metrics_manager.record_hedge_suppressed();
+        metrics_manager.record_hedge_suppressed();
+
+        let stats = metrics_manager.collect_hedging_metrics();
+        assert_eq!(stats.issued, 2, "issued should be 2");
+        assert_eq!(stats.won, 1, "won should be 1");
+        assert_eq!(stats.suppressed, 3, "suppressed should be 3");
+    }
+
+    /// Test that the /metrics JSON carries the `hedged_requests` section.
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    #[tokio::test]
+    async fn test_hedging_metrics_json_shape() {
+        use crate::hedged_fetch::HedgeMetrics;
+        use std::sync::Arc;
+
+        let mut metrics_manager = MetricsManager::new();
+        let hedge_metrics = Arc::new(HedgeMetrics::new());
+        metrics_manager.set_hedge_metrics(hedge_metrics.clone());
+
+        // Increment each counter so they are non-zero in the JSON.
+        metrics_manager.record_hedge_issued();
+        metrics_manager.record_hedge_won();
+        metrics_manager.record_hedge_suppressed();
+
+        let system_metrics = metrics_manager.collect_metrics().await;
+
+        // Verify the struct fields.
+        assert_eq!(system_metrics.hedged_requests.issued, 1);
+        assert_eq!(system_metrics.hedged_requests.won, 1);
+        assert_eq!(system_metrics.hedged_requests.suppressed, 1);
+
+        // Verify JSON serialization contains the hedged_requests section.
+        let json_str =
+            serde_json::to_string_pretty(&system_metrics).expect("SystemMetrics should serialize");
+        let json_value: serde_json::Value =
+            serde_json::from_str(&json_str).expect("JSON should parse");
+
+        let hr = json_value
+            .get("hedged_requests")
+            .expect("JSON must have hedged_requests field");
+        assert_eq!(hr.get("issued").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(hr.get("won").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(hr.get("suppressed").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    /// Test that without hedge_metrics set, collect returns zeroes.
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    #[tokio::test]
+    async fn test_hedging_metrics_without_wiring() {
+        let metrics_manager = MetricsManager::new();
+
+        // No hedge_metrics set — convenience methods are no-ops.
+        metrics_manager.record_hedge_issued();
+        metrics_manager.record_hedge_won();
+        metrics_manager.record_hedge_suppressed();
+
+        let stats = metrics_manager.collect_hedging_metrics();
+        assert_eq!(stats.issued, 0);
+        assert_eq!(stats.won, 0);
+        assert_eq!(stats.suppressed, 0);
+
+        // SystemMetrics still has the field (zeroed).
+        let system_metrics = metrics_manager.collect_metrics().await;
+        assert_eq!(system_metrics.hedged_requests.issued, 0);
+        assert_eq!(system_metrics.hedged_requests.won, 0);
+        assert_eq!(system_metrics.hedged_requests.suppressed, 0);
     }
 }

@@ -569,7 +569,7 @@ See [AWS S3 endpoints documentation](https://docs.aws.amazon.com/general/latest/
 
 Front a fleet of proxy instances with a Layer 4 (TCP) load balancer to give clients a single stable endpoint with centralised health checking and failover. The proxy is protocol-agnostic behind the load balancer — it sees whatever bytes the load balancer forwards. Any L4 load balancer works: a cloud-managed TCP load balancer (for example AWS Network Load Balancer), HAProxy in TCP mode, nginx's `stream` module, F5 LTM, or similar.
 
-Two deployment patterns, depending on where TLS terminates.
+Three deployment patterns, depending on where TLS terminates. **The choice determines whether the load-balancer-to-proxy hop crosses your network in cleartext**, so read [Which Pattern to Choose](#which-pattern-to-choose) before picking one.
 
 ##### Pattern 1: Load Balancer Terminates TLS → Proxy Serves HTTP
 
@@ -595,6 +595,8 @@ aws s3 cp s3://your-bucket/key ./local \
 SigV4 signs against the real S3 Host header (e.g., `s3.us-east-1.amazonaws.com`) — the load balancer hostname only determines where the TCP connection goes. Clients must trust the LB's certificate. If using a managed certificate service (AWS ACM, Let's Encrypt via cert-manager, internal CA), trust is usually already in place.
 
 This pattern is the simplest: one certificate managed on the load balancer, no cert distribution to instances, no TLS config in the proxy.
+
+> **Security: the LB→proxy hop is cleartext.** The client connection is encrypted only as far as the load balancer. From there to the proxy, the request travels in plain HTTP across your network — including the object key, the `Authorization` header with the caller's access key ID, and the object payload in both directions. Anything that can observe that segment can read all S3 traffic on it and replay captured requests against S3. See [What a Cleartext Hop Exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes) for the full exposure and replay windows. Choose this pattern only where you accept that segment as trusted; otherwise use Pattern 3 (same cert convenience, encrypted hop) or Pattern 2.
 
 ##### Pattern 2: Load Balancer TCP Passthrough → Proxy Terminates TLS
 
@@ -636,18 +638,52 @@ aws s3 cp s3://your-bucket/key ./local \
 
 The proxy listens on `tls_proxy_port` (3129 by default). Either point the LB's TCP listener at port 3129 on the backends and advertise the LB on port 443 (so clients use the default port), or expose the LB on port 3129 directly.
 
+##### Pattern 3: Load Balancer Terminates and Re-encrypts → Proxy Terminates TLS
+
+```
+Client (HTTPS) → Load Balancer (TLS, cert on LB) → [re-encrypted] → Proxy (TLS :3129, terminates) → S3
+```
+
+The load balancer terminates the client's TLS using its own certificate, then opens a **second** TLS connection to the proxy. Two independent TLS sessions, no cleartext on either. This combines Pattern 1's certificate convenience with Pattern 2's encrypted internal hop, and is the best default for most deployments.
+
+The reason it costs so little: the load balancer **does not validate the backend certificate**. On an AWS NLB, [a target group configured with the TLS protocol connects to targets using the certificates installed on them, without validating those certificates](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-target-groups) — so the proxy's certificate can be self-signed and long-lived, and needs no SAN matching the client-facing name. (Content rephrased for compliance with licensing restrictions.) Most software load balancers offer the same (HAProxy `ssl verify none`, nginx `proxy_ssl_verify off`).
+
+Typical load balancer configuration:
+- TLS listener on port 443 with a server certificate attached (ACM, internal CA, Let's Encrypt)
+- Target/backend pool with protocol **TLS**, forwarding to the proxy's `tls_proxy_port` (default 3129)
+- Health check against `:8080/health`
+
+Proxy config is the same as Pattern 2 (`tls.enabled: true` with `cert_path`/`key_path`), but the certificate requirements are looser — generate one self-signed cert, reuse it on every instance, and set the SAN to anything (the instance hostname is conventional):
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+  -days 3650 -nodes -subj "/CN=s3-proxy-backend"  # not validated by the LB; no SAN matching needed
+```
+
+Client configuration is identical to Pattern 1 — clients see only the LB's certificate and need no `AWS_CA_BUNDLE`:
+
+```bash
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url https://<load-balancer-hostname> \
+  --region us-east-1
+```
+
+Because the LB does not validate the backend certificate, this pattern protects against **passive** observation of the internal segment, not against an active attacker who can impersonate a proxy instance on it. Pattern 2 (TCP passthrough) is stronger on that point, because the client validates the proxy's certificate itself end to end.
+
 ##### Which Pattern to Choose
 
-| | Pattern 1 (LB terminates TLS) | Pattern 2 (Proxy terminates TLS) |
-|---|---|---|
-| Cert management | One cert on the LB | Cert on every proxy instance |
-| Cert rotation | Update once at the LB | Update on every instance (automate it) |
-| Proxy config | No TLS needed | `tls.enabled: true` + cert/key paths |
-| Encryption scope | Client-to-LB only | Client-to-proxy |
-| Performance | LB handles TLS (often hardware-accelerated on cloud LBs) | Each proxy burns CPU on TLS |
-| Best for | Most deployments | Strict end-to-end encryption requirements |
+| | Pattern 1 (LB terminates TLS) | Pattern 2 (TCP passthrough) | Pattern 3 (LB re-encrypts) |
+|---|---|---|---|
+| **LB→proxy hop** | **cleartext** | encrypted (client's own TLS) | encrypted (second TLS session) |
+| Cert management | One cert on the LB | Cert on every proxy instance | One cert on the LB + any self-signed cert on instances |
+| Cert rotation | Update once at the LB | Update on every instance (automate it) | Update once at the LB; backend cert can be long-lived |
+| Client trust config | Trusts the LB cert (usually already in place) | Needs `AWS_CA_BUNDLE` for the proxy cert | Trusts the LB cert (usually already in place) |
+| Proxy config | No TLS needed | `tls.enabled: true` + cert/key paths | `tls.enabled: true` + cert/key paths |
+| Backend cert validated? | n/a | yes — by the client, end to end | **no** — LB accepts any cert |
+| Performance | LB handles TLS | Each proxy burns CPU on TLS | TLS at both LB and proxy |
+| Best for | Only where the LB→proxy segment is accepted as trusted | Strict end-to-end encryption; no cert on the LB | **Most deployments** |
 
-Pattern 1 is the default recommendation unless an explicit requirement drives you to Pattern 2.
+**Recommendation**: use **Pattern 3** unless you have a reason not to — it encrypts the internal hop at roughly Pattern 1's operational cost. Use **Pattern 2** when you need the client to validate the proxy's certificate end to end, or cannot attach a certificate to the load balancer. Use **Pattern 1** only where you have consciously accepted the LB→proxy segment as trusted; see [What a Cleartext Hop Exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes).
 
 ##### Load Balancer vs DNS Multi-Value Routing
 
@@ -665,7 +701,7 @@ Use Option B when you want to avoid load balancer infrastructure and all clients
 
 ##### Why Layer 4, Not Layer 7
 
-L7 (HTTP) load balancers like AWS ALB, nginx in HTTP mode, or Envoy in HTTP mode work functionally in Pattern 1, but they add per-request HTTP parsing and re-serialisation overhead that's unnecessary — the proxy already handles HTTP semantics, caching decisions, and range optimisation. L7 load balancers also commonly impose idle timeouts and request/response size limits that can interfere with large streaming transfers. Use a pure TCP (L4) load balancer for best throughput and lowest latency.
+L7 (HTTP) load balancers like AWS ALB, nginx in HTTP mode, or Envoy in HTTP mode work functionally in Patterns 1 and 3, but they add per-request HTTP parsing and re-serialisation overhead that's unnecessary — the proxy already handles HTTP semantics, caching decisions, and range optimisation. L7 load balancers also commonly impose idle timeouts and request/response size limits that can interfere with large streaming transfers. Use a pure TCP (L4) load balancer for best throughput and lowest latency.
 
 #### S3 PrivateLink (Interface VPC Endpoints)
 
@@ -675,16 +711,20 @@ Client-to-proxy DNS routing (Option B or C above) remains unchanged. PrivateLink
 
 **The problem**: By default, the proxy uses external DNS servers (Google DNS, Cloudflare DNS) to resolve S3 endpoints. These public resolvers return public S3 IPs, bypassing your PrivateLink endpoints entirely. Traffic would leave your private network instead of using the private path.
 
-**The fix**: Configure `dns_servers` to point at Route 53 Resolver inbound endpoints in the VPC. These are ENIs on your private subnets, reachable from on-premises over VPN or Direct Connect. The inbound endpoint queries the VPC's internal resolver, which returns PrivateLink IPs when private DNS is enabled on the interface endpoint.
+**The fix depends on where the proxy runs**, and the two cases need opposite settings for private DNS on the endpoint.
+
+**Proxies in AWS, in the VPC holding the endpoint**: use `endpoint_overrides` (below) and leave private DNS **disabled** on the endpoint. Private DNS creates a private hosted zone for `s3.<region>.amazonaws.com` in that VPC — the same name Option B points at the proxy — so the two collide, and AWS rejects the endpoint with a conflicting-domain error where such a zone already exists. Any resolver in that VPC, including a Route 53 Resolver inbound endpoint, answers from the hosted zone and returns the proxy's own address, forming a loop.
+
+**Proxies on-premises, reaching S3 over Direct Connect or VPN**: configure `dns_servers` to point at Route 53 Resolver inbound endpoints in the VPC, and **enable** private DNS on the interface endpoint. The inbound endpoint ENIs sit on your private subnets, reachable from on-premises over the VPN or Direct Connect link, and query the VPC's internal resolver, which returns PrivateLink IPs. Nothing hijacks the S3 name inside the VPC in this topology, so its view is clean.
 
 ```yaml
 connection_pool:
   dns_servers: ["10.0.1.50", "10.0.2.50"]  # Route 53 Resolver inbound endpoint IPs
 ```
 
-The proxy cannot use your on-prem DNS server for this, because on-prem DNS resolves S3 endpoints to the proxy's own IP (for client routing). Pointing `dns_servers` at on-prem DNS would create a loop. The Route 53 Resolver inbound endpoint provides a separate resolution path that returns the PrivateLink IPs.
+The proxy cannot use your on-prem DNS server for this, because that is where the override sending clients to the proxy lives — it resolves S3 endpoints to the proxy's own IP, so pointing `dns_servers` at it creates a loop. The Route 53 Resolver inbound endpoint provides a separate resolution path that returns the PrivateLink IPs.
 
-**Requirement**: This approach requires Route 53 Resolver inbound endpoints in the VPC. If you don't have Route 53 Resolver, use `endpoint_overrides` to map S3 hostnames directly to PrivateLink ENI IPs:
+**Static IP overrides**: required for proxies in the endpoint's VPC, and the fallback on-premises when Route 53 Resolver inbound endpoints are unavailable. Map S3 hostnames directly to PrivateLink ENI IPs:
 
 ```yaml
 connection_pool:
@@ -699,17 +739,23 @@ Keys starting with `*.` are suffix patterns — they match any hostname ending w
 
 When any `endpoint_overrides` are configured, outbound TLS is locked to version 1.2 for VPC interface endpoint compatibility.
 
-**Verifying PrivateLink resolution**: From the proxy host, confirm the inbound endpoint returns private IPs for S3 endpoints:
+**Verifying resolution (`dns_servers` route)**: from the proxy host, confirm the inbound endpoint returns private IPs for S3 endpoints:
 
 ```bash
 dig +short s3.us-west-2.amazonaws.com @10.0.1.50
 ```
 
-This should return private IPs (e.g., `10.0.x.x` or `172.x.x.x`) from the interface endpoint ENIs, not public S3 IPs.
+This should return private IPs (e.g., `10.0.x.x` or `172.x.x.x`) from the interface endpoint ENIs, not public S3 IPs. If it returns public IPs, private DNS is disabled on the interface endpoint — enable it, or switch to `endpoint_overrides`.
 
-**Private DNS disabled**: If the interface endpoint has private DNS disabled, S3 endpoints resolve to public IPs even through the VPC resolver. In this case, use the endpoint-specific DNS names (e.g., `*.vpce-0abc123def456.s3.us-west-2.vpce.amazonaws.com`) or enable private DNS on the endpoint.
+Note that the endpoint-specific DNS names (`*.vpce-0abc123def456.s3.us-west-2.vpce.amazonaws.com`) are not usable as a substitute here. The proxy takes the upstream hostname from the client's signed `Host` header and has no setting to replace it, so reaching an endpoint without private DNS means resolving those names yourself and listing the resulting IPs in `endpoint_overrides`.
 
-**HTTPS passthrough**: The `dns_servers` config applies to the HTTP connection pool. The HTTPS passthrough handler (port 443) uses its own DNS resolver hardcoded to Google/Cloudflare DNS. For full PrivateLink coverage of HTTPS traffic, ensure the proxy instances can reach the PrivateLink ENIs via network routing, or use HTTP endpoints for all cached traffic.
+**Verifying resolution (`endpoint_overrides` route)**: a `dig` test proves nothing, since overrides bypass DNS. Request an object through the proxy, then confirm on the proxy host that the established upstream connections land on the ENI IPs rather than public S3 addresses:
+
+```bash
+ss -tn state established '( dport = :443 )'
+```
+
+**HTTPS passthrough**: `endpoint_overrides` apply to the HTTPS passthrough handler (port 443) as well as the HTTP caching path, so the overrides route covers both. `dns_servers` does not — the passthrough handler uses its own resolver fixed to Google/Cloudflare DNS. On the `dns_servers` route, either ensure the proxy instances can reach the PrivateLink ENIs by network routing, or use HTTP endpoints for all cached traffic.
 
 #### Access Point and MRAP Endpoint Requirements
 
@@ -947,7 +993,7 @@ mount-s3 --endpoint-url http://s3.us-east-1.amazonaws.com \
 
 **Mountpoint caching**: When using Mountpoint with the proxy, configure Mountpoint's [metadata TTL](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#metadata-cache) but disable Mountpoint's [data cache](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#data-cache). The proxy provides data caching, so Mountpoint's data cache would be redundant. Use `--metadata-ttl` to control how long Mountpoint caches file metadata.
 
-**Performance**: Testing showed 2x faster cached downloads, with the proxy handling Mountpoint's HEAD and range requests efficiently.
+**Performance**: Internal testing with synthetic workloads showed 2x faster cached downloads, with the proxy handling Mountpoint's HEAD and range requests efficiently.
 
 ### Shell Profile Configuration
 

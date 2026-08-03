@@ -40,6 +40,22 @@ pub const DEFAULT_MAX_RULES: usize = 1024;
 /// Spec: page-aligned-range-cache Requirement 1.4.
 pub const DEFAULT_PAGE_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Default TTFB threshold after which a hedge is issued: 250ms.
+/// Used when a rule enables `hedging_enabled` without specifying
+/// `hedge_trigger_after`. Sits well below the 5s `upstream_first_byte_timeout`
+/// default so both the constant and the ceiling are valid out of the box.
+///
+/// Spec: hedged-upstream-requests Requirement 3.1.
+pub const DEFAULT_HEDGE_TRIGGER_AFTER: Duration = Duration::from_millis(250);
+
+/// Default per-request hedge budget: 1.
+/// Used when a rule enables `hedging_enabled` without specifying
+/// `hedge_max_per_request`. For a range GET fanning out into N parallel
+/// sub-fetches this budget is shared across all N — at most one hedge fires.
+///
+/// Spec: hedged-upstream-requests Requirement 6.1.
+pub const DEFAULT_HEDGE_MAX_PER_REQUEST: usize = 1;
+
 /// Custom deserializer for optional Duration fields in rule JSON.
 /// Handles both string values ("30s", "5m") and null/missing fields.
 fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -204,6 +220,32 @@ pub struct CacheRule {
     /// Spec: page-aligned-range-cache Requirement 1.4, 7.9.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u64>,
+
+    /// Enables hedged upstream requests for keys matching this rule. Off by
+    /// default — never enabled globally, only per-key via an explicit rule.
+    /// Spec: hedged-upstream-requests Requirement 1.1, 1.2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedging_enabled: Option<bool>,
+
+    /// Per-key TTFB threshold after which a Hedge is issued. Falls back to
+    /// [`DEFAULT_HEDGE_TRIGGER_AFTER`] (250ms). Must be > 0 and strictly less
+    /// than `connection_pool.upstream_first_byte_timeout` for any rule enabling
+    /// hedging (validated on every rules load).
+    /// Spec: hedged-upstream-requests Requirement 3.1, 9.2.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hedge_trigger_after: Option<Duration>,
+
+    /// Per-key cap on Hedges for one client request, shared across the parallel
+    /// missing-range sub-fetches of a range GET. Falls back to
+    /// [`DEFAULT_HEDGE_MAX_PER_REQUEST`] (1).
+    /// Spec: hedged-upstream-requests Requirement 6.1, 6.5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedge_max_per_request: Option<usize>,
 }
 
 /// The on-disk `cache_rules.json` shape.
@@ -220,10 +262,12 @@ pub struct CacheRules {
 
 impl CacheRules {
     /// Validate the rule set. Returns a list of human-readable errors; empty = valid.
-    /// Checks: non-empty patterns, compilable globs, the rule-count cap, and (for
+    /// Checks: non-empty patterns, compilable globs, the rule-count cap, (for
     /// any rule enabling `page_widening`) that `page_size` is `0 < page_size <= 64 MiB`
-    /// (Spec: page-aligned-range-cache Requirement 7.9).
-    pub fn validate(&self, max_rules: usize) -> Vec<String> {
+    /// (Spec: page-aligned-range-cache Requirement 7.9), and (for any rule
+    /// enabling `hedging_enabled`) that `hedge_trigger_after` is > 0 and <
+    /// `upstream_first_byte_timeout` (Spec: hedged-upstream-requests Requirement 9.2).
+    pub fn validate(&self, max_rules: usize, upstream_first_byte_timeout: Duration) -> Vec<String> {
         let mut errors = Vec::new();
 
         if self.rules.len() > max_rules {
@@ -271,6 +315,32 @@ impl CacheRules {
             }
         }
 
+        // Hedging validation (Req 9.2): for any rule enabling hedging, an
+        // explicit hedge_trigger_after of 0 or >= upstream_first_byte_timeout
+        // is rejected. A rule that leaves hedge_trigger_after unset resolves to
+        // the DEFAULT_HEDGE_TRIGGER_AFTER constant and is always valid against
+        // the 5s default — only explicit out-of-range values are rejected,
+        // exactly the page_size pattern.
+        for (i, rule) in self.rules.iter().enumerate() {
+            if rule.hedging_enabled == Some(true) {
+                if let Some(trigger) = rule.hedge_trigger_after {
+                    if trigger.is_zero() {
+                        errors.push(format!(
+                            "rules[{}]: hedge_trigger_after must be greater than 0 when hedging is enabled",
+                            i
+                        ));
+                    } else if trigger >= upstream_first_byte_timeout {
+                        errors.push(format!(
+                            "rules[{}]: hedge_trigger_after ({}) must be strictly less than upstream_first_byte_timeout ({})",
+                            i,
+                            format_duration(trigger),
+                            format_duration(upstream_first_byte_timeout),
+                        ));
+                    }
+                }
+            }
+        }
+
         errors
     }
 }
@@ -302,6 +372,18 @@ pub struct ResolvedSettings {
     /// back to [`DEFAULT_PAGE_SIZE`] (16 MiB) when no rule sets it explicitly.
     /// Spec: page-aligned-range-cache Requirement 1.4.
     pub page_size: u64,
+    /// Whether hedged upstream requests are enabled for this key. Off unless
+    /// an explicit rule sets `hedging_enabled: true` (first-match-per-field).
+    /// Spec: hedged-upstream-requests Requirement 1.1, 1.2, 1.3.
+    pub hedging_enabled: bool,
+    /// Per-key TTFB threshold after which a Hedge is issued. Falls back to
+    /// [`DEFAULT_HEDGE_TRIGGER_AFTER`] (250ms) when no rule sets it explicitly.
+    /// Spec: hedged-upstream-requests Requirement 3.1.
+    pub hedge_trigger_after: Duration,
+    /// Per-key cap on Hedges for one client request. Falls back to
+    /// [`DEFAULT_HEDGE_MAX_PER_REQUEST`] (1) when no rule sets it explicitly.
+    /// Spec: hedged-upstream-requests Requirement 6.1.
+    pub hedge_max_per_request: usize,
     /// Tracks which layer provided the dominant settings.
     pub source: SettingsSource,
 }
@@ -335,6 +417,9 @@ impl Default for ResolvedSettings {
             evaluate_conditions_from_cache: true,
             page_widening: false,
             page_size: DEFAULT_PAGE_SIZE,
+            hedging_enabled: false,
+            hedge_trigger_after: DEFAULT_HEDGE_TRIGGER_AFTER,
+            hedge_max_per_request: DEFAULT_HEDGE_MAX_PER_REQUEST,
             source: SettingsSource::Global,
         }
     }
@@ -350,6 +435,10 @@ pub struct GlobalDefaults {
     pub compression_enabled: bool,
     pub ram_cache_enabled: bool,
     pub evaluate_conditions_from_cache: bool,
+    /// The `connection_pool.upstream_first_byte_timeout` value, threaded here
+    /// so `CacheRules::validate` can enforce Req 9.2 (hedge_trigger_after <
+    /// first-byte timeout) without a separate parameter channel.
+    pub upstream_first_byte_timeout: Duration,
 }
 
 /// A rule plus its compiled regex index. The regex itself lives in the shared
@@ -434,6 +523,17 @@ impl RuleSet {
         let page_widening = first(&|r| r.page_widening).unwrap_or(false);
         let page_size = first_u64(&|r| r.page_size).unwrap_or(DEFAULT_PAGE_SIZE);
 
+        // Hedging is off by default — never enabled globally, only per-key
+        // via an explicit rule (hedged-upstream-requests Requirement 1.2).
+        let hedging_enabled = first(&|r| r.hedging_enabled).unwrap_or(false);
+        let hedge_trigger_after =
+            first_dur(&|r| r.hedge_trigger_after).unwrap_or(DEFAULT_HEDGE_TRIGGER_AFTER);
+        let first_usize = |pick: &dyn Fn(&CacheRule) -> Option<usize>| -> Option<usize> {
+            matched.iter().find_map(|&i| pick(&self.rules[i].rule))
+        };
+        let hedge_max_per_request =
+            first_usize(&|r| r.hedge_max_per_request).unwrap_or(DEFAULT_HEDGE_MAX_PER_REQUEST);
+
         // Post-resolution invariants (unchanged from prior behaviour):
         // - Zero get_ttl → RAM range cache ineligible (RAM cache bypasses revalidation)
         // - Read cache disabled → RAM range cache ineligible
@@ -456,6 +556,9 @@ impl RuleSet {
             evaluate_conditions_from_cache,
             page_widening,
             page_size,
+            hedging_enabled,
+            hedge_trigger_after,
+            hedge_max_per_request,
             source,
         }
     }
@@ -650,7 +753,10 @@ impl BucketSettingsManager {
         match tokio::fs::read_to_string(&path).await {
             Ok(contents) => match serde_json::from_str::<CacheRules>(&contents) {
                 Ok(parsed) => {
-                    let errors = parsed.validate(self.max_rules);
+                    let errors = parsed.validate(
+                        self.max_rules,
+                        self.global_config.upstream_first_byte_timeout,
+                    );
                     if errors.is_empty() {
                         match RuleSet::build(parsed.rules.clone()) {
                             Ok(ruleset) => {
@@ -821,6 +927,7 @@ mod tests {
             compression_enabled: true,
             ram_cache_enabled: true,
             evaluate_conditions_from_cache: true,
+            upstream_first_byte_timeout: Duration::from_secs(5),
         }
     }
 
@@ -915,7 +1022,9 @@ mod tests {
                 ..Default::default()
             }],
         };
-        assert!(!rules.validate(DEFAULT_MAX_RULES).is_empty());
+        assert!(!rules
+            .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+            .is_empty());
     }
 
     #[test]
@@ -931,10 +1040,10 @@ mod tests {
             ],
         };
         assert!(rules
-            .validate(4)
+            .validate(4, Duration::from_secs(5))
             .iter()
             .any(|e| e.contains("exceeds maximum")));
-        assert!(rules.validate(5).is_empty());
+        assert!(rules.validate(5, Duration::from_secs(5)).is_empty());
     }
 
     // ---- resolution (Property 1, 2, 5) ----
@@ -1348,7 +1457,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let errors = rules.validate(DEFAULT_MAX_RULES);
+        let errors = rules.validate(DEFAULT_MAX_RULES, Duration::from_secs(5));
         assert!(errors
             .iter()
             .any(|e| e.contains("page_size must be greater than 0")));
@@ -1365,7 +1474,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let errors = rules.validate(DEFAULT_MAX_RULES);
+        let errors = rules.validate(DEFAULT_MAX_RULES, Duration::from_secs(5));
         assert!(errors.iter().any(|e| e.contains("exceeds the maximum")));
     }
 
@@ -1380,7 +1489,9 @@ mod tests {
                 ..Default::default()
             }],
         };
-        assert!(rules.validate(DEFAULT_MAX_RULES).is_empty());
+        assert!(rules
+            .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+            .is_empty());
     }
 
     #[test]
@@ -1396,7 +1507,9 @@ mod tests {
                 ..Default::default()
             }],
         };
-        assert!(rules.validate(DEFAULT_MAX_RULES).is_empty());
+        assert!(rules
+            .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+            .is_empty());
     }
 
     #[test]
@@ -1412,7 +1525,235 @@ mod tests {
                 ..Default::default()
             }],
         };
-        assert!(rules.validate(DEFAULT_MAX_RULES).is_empty());
+        assert!(rules
+            .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+            .is_empty());
+    }
+
+    // ---- hedged upstream request rule fields (hedging_enabled / hedge_trigger_after / hedge_max_per_request) ----
+    // Spec: hedged-upstream-requests Requirements 1.1-1.5, 3.1, 6.1, 9.2
+
+    #[test]
+    fn rule_parses_without_hedging_fields() {
+        let json = r#"{"pattern": "**"}"#;
+        let rule: CacheRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.hedging_enabled, None);
+        assert_eq!(rule.hedge_trigger_after, None);
+        assert_eq!(rule.hedge_max_per_request, None);
+    }
+
+    #[test]
+    fn rule_parses_with_hedging_fields() {
+        let json = r#"{"pattern": "a/**", "hedging_enabled": true, "hedge_trigger_after": "250ms", "hedge_max_per_request": 2}"#;
+        let rule: CacheRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.hedging_enabled, Some(true));
+        assert_eq!(rule.hedge_trigger_after, Some(Duration::from_millis(250)));
+        assert_eq!(rule.hedge_max_per_request, Some(2));
+    }
+
+    #[tokio::test]
+    async fn resolve_hedging_enabled_true_for_matching_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "hot/**", "hedging_enabled": true}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("hot/key.parquet").await;
+        assert!(r.hedging_enabled);
+        assert_eq!(r.hedge_trigger_after, DEFAULT_HEDGE_TRIGGER_AFTER);
+        assert_eq!(r.hedge_max_per_request, DEFAULT_HEDGE_MAX_PER_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn resolve_hedging_enabled_false_for_non_matching_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "hot/**", "hedging_enabled": true}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("cold/key.txt").await;
+        assert!(!r.hedging_enabled);
+    }
+
+    #[tokio::test]
+    async fn resolve_no_hedging_fields_defaults_to_false_250ms_1() {
+        // Backward compatibility: omitting all three fields resolves to (false, 250ms, 1).
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("any-bucket/any-key").await;
+        assert!(!r.hedging_enabled);
+        assert_eq!(r.hedge_trigger_after, Duration::from_millis(250));
+        assert_eq!(r.hedge_max_per_request, 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_hedging_explicit_overrides_win_over_constants() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [{"pattern": "**", "hedging_enabled": true, "hedge_trigger_after": "500ms", "hedge_max_per_request": 3}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+        let r = mgr.resolve("b/k").await;
+        assert!(r.hedging_enabled);
+        assert_eq!(r.hedge_trigger_after, Duration::from_millis(500));
+        assert_eq!(r.hedge_max_per_request, 3);
+    }
+
+    #[tokio::test]
+    async fn resolve_hedging_first_match_per_field_ordering() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Rule 0 sets hedging_enabled only; rule 1 sets hedge_trigger_after.
+        std::fs::write(
+            tmp.path().join("cache_rules.json"),
+            r#"{"rules": [
+                {"pattern": "b/special/**", "hedging_enabled": true},
+                {"pattern": "**", "hedge_trigger_after": "1s", "hedge_max_per_request": 5}
+            ]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager(tmp.path());
+
+        let r = mgr.resolve("b/special/x").await;
+        // hedging_enabled from rule 0; trigger + budget from rule 1 (rule 0 didn't set them).
+        assert!(r.hedging_enabled);
+        assert_eq!(r.hedge_trigger_after, Duration::from_secs(1));
+        assert_eq!(r.hedge_max_per_request, 5);
+    }
+
+    #[test]
+    fn validate_rejects_hedge_trigger_zero_when_hedging_enabled() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "**".to_string(),
+                hedging_enabled: Some(true),
+                hedge_trigger_after: Some(Duration::ZERO),
+                ..Default::default()
+            }],
+        };
+        let errors = rules.validate(DEFAULT_MAX_RULES, Duration::from_secs(5));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("hedge_trigger_after must be greater than 0")));
+    }
+
+    #[test]
+    fn validate_rejects_hedge_trigger_at_first_byte_timeout() {
+        // 6s trigger against 5s first-byte timeout.
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "**".to_string(),
+                hedging_enabled: Some(true),
+                hedge_trigger_after: Some(Duration::from_secs(6)),
+                ..Default::default()
+            }],
+        };
+        let errors = rules.validate(DEFAULT_MAX_RULES, Duration::from_secs(5));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("must be strictly less than upstream_first_byte_timeout")));
+    }
+
+    #[test]
+    fn validate_rejects_hedge_trigger_equal_to_first_byte_timeout() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "**".to_string(),
+                hedging_enabled: Some(true),
+                hedge_trigger_after: Some(Duration::from_secs(5)),
+                ..Default::default()
+            }],
+        };
+        let errors = rules.validate(DEFAULT_MAX_RULES, Duration::from_secs(5));
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_hedge_trigger_250ms() {
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "**".to_string(),
+                hedging_enabled: Some(true),
+                hedge_trigger_after: Some(Duration::from_millis(250)),
+                ..Default::default()
+            }],
+        };
+        assert!(rules
+            .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+            .is_empty());
+    }
+
+    #[test]
+    fn validate_ignores_out_of_range_trigger_when_hedging_not_enabled() {
+        // hedging_enabled is false/absent: an out-of-range hedge_trigger_after
+        // is harmless (never used), so validation should not reject it.
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "**".to_string(),
+                hedging_enabled: Some(false),
+                hedge_trigger_after: Some(Duration::from_secs(6)),
+                ..Default::default()
+            }],
+        };
+        assert!(rules
+            .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+            .is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_hedging_enabled_without_explicit_trigger() {
+        // No hedge_trigger_after set → falls back to DEFAULT_HEDGE_TRIGGER_AFTER
+        // at resolution time, which is always valid; validation must not reject.
+        let rules = CacheRules {
+            schema: None,
+            rules: vec![CacheRule {
+                pattern: "**".to_string(),
+                hedging_enabled: Some(true),
+                hedge_trigger_after: None,
+                ..Default::default()
+            }],
+        };
+        assert!(rules
+            .validate(DEFAULT_MAX_RULES, Duration::from_secs(5))
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_invalid_hedging_rule_keeps_previous_valid() {
+        // The T21 pattern: an invalid live edit is rejected with the previous
+        // rules retained.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_rules.json");
+        std::fs::write(
+            &path,
+            r#"{"rules": [{"pattern": "**", "hedging_enabled": true, "hedge_trigger_after": "250ms"}]}"#,
+        )
+        .unwrap();
+        let mgr = test_manager_always_reload(tmp.path());
+        let r = mgr.resolve("b/k").await;
+        assert!(r.hedging_enabled);
+        assert_eq!(r.hedge_trigger_after, Duration::from_millis(250));
+
+        // Write an invalid rule (trigger >= first-byte timeout).
+        std::fs::write(
+            &path,
+            r#"{"rules": [{"pattern": "**", "hedging_enabled": true, "hedge_trigger_after": "6s"}]}"#,
+        )
+        .unwrap();
+        let r = mgr.resolve("b/k").await;
+        // Previous valid retained.
+        assert!(r.hedging_enabled);
+        assert_eq!(r.hedge_trigger_after, Duration::from_millis(250));
     }
 
     // ---- rules_health() reload counters ----

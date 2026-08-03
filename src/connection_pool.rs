@@ -180,6 +180,27 @@ impl IpDistributor {
     pub fn get_ips(&self) -> Vec<IpAddr> {
         self.ips.clone()
     }
+
+    /// Select the next IP address using round-robin distribution, skipping excluded IPs.
+    ///
+    /// Returns `None` if the IP set is empty or every IP is in the exclusion list.
+    /// Advances the internal counter by 1 regardless of how many IPs are skipped,
+    /// so subsequent calls continue round-robin from a fresh position.
+    pub fn select_ip_excluding(&self, exclude: &[IpAddr]) -> Option<IpAddr> {
+        if self.ips.is_empty() {
+            return None;
+        }
+        let len = self.ips.len();
+        let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
+        // Scan up to `len` positions to find a non-excluded IP
+        for offset in 0..len {
+            let candidate = self.ips[(start + offset) % len];
+            if !exclude.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +625,43 @@ impl ConnectionPoolManager {
         self.ip_distributors
             .get(endpoint)
             .and_then(|d| d.select_ip())
+    }
+
+    /// Get up to `n` distinct healthy IPs for the given endpoint.
+    ///
+    /// Uses `select_ip` for the first pick, then `select_ip_excluding` for each
+    /// subsequent pick to ensure distinctness. Returns an empty `Vec` when the
+    /// endpoint has no distributor (DNS not yet resolved).
+    ///
+    /// A result shorter than `n` is **not** an error — the caller handles:
+    /// - 2 IPs → pin original and hedge to distinct IPs
+    /// - 1 IP → pin both arms to the same IP (separate connections)
+    /// - 0 IPs → run both arms unpinned
+    pub fn get_distinct_distributed_ips(&self, host: &str, n: usize) -> Vec<IpAddr> {
+        let distributor = match self.ip_distributors.get(host) {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+
+        let mut result = Vec::with_capacity(n);
+
+        // First pick: normal round-robin
+        if let Some(first) = distributor.select_ip() {
+            result.push(first);
+        } else {
+            return result;
+        }
+
+        // Subsequent picks: exclude already-selected IPs
+        for _ in 1..n {
+            if let Some(ip) = distributor.select_ip_excluding(&result) {
+                result.push(ip);
+            } else {
+                break;
+            }
+        }
+
+        result
     }
 
     /// Look up the endpoint hostname that owns a given IP address.
@@ -1291,5 +1349,127 @@ mod tests {
         // Re-registering the same endpoint is a no-op (dedup), does not count toward cap
         manager.register_endpoint("endpoint-a.example.com").await;
         assert_eq!(manager.resolved_ips.len(), 1);
+    }
+
+    // --- IpDistributor::select_ip_excluding tests ---
+
+    #[test]
+    fn test_select_ip_excluding_skips_excluded_ips() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+        ];
+        let distributor = IpDistributor::new(ips.clone());
+
+        let exclude = vec![ips[0]];
+        // Call multiple times — should never return the excluded IP
+        for _ in 0..10 {
+            let picked = distributor.select_ip_excluding(&exclude);
+            assert!(picked.is_some());
+            assert_ne!(picked.unwrap(), ips[0]);
+        }
+    }
+
+    #[test]
+    fn test_select_ip_excluding_returns_none_when_all_excluded() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        ];
+        let distributor = IpDistributor::new(ips.clone());
+
+        let result = distributor.select_ip_excluding(&ips);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_select_ip_excluding_returns_none_on_empty_distributor() {
+        let distributor = IpDistributor::new(vec![]);
+        let exclude = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))];
+        assert_eq!(distributor.select_ip_excluding(&exclude), None);
+    }
+
+    #[test]
+    fn test_select_ip_excluding_with_empty_exclude_list() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        ];
+        let distributor = IpDistributor::new(ips.clone());
+
+        // With no exclusions, behaves like select_ip
+        let result = distributor.select_ip_excluding(&[]);
+        assert!(result.is_some());
+        assert!(ips.contains(&result.unwrap()));
+    }
+
+    // --- ConnectionPoolManager::get_distinct_distributed_ips tests ---
+
+    #[test]
+    fn test_get_distinct_distributed_ips_returns_2_for_3_ip_endpoint() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+        ];
+        let config = crate::config::ConnectionPoolConfig::default();
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+        manager.ip_distributors.insert(
+            "s3.us-west-2.amazonaws.com".to_string(),
+            IpDistributor::new(ips.clone()),
+        );
+
+        let result = manager.get_distinct_distributed_ips("s3.us-west-2.amazonaws.com", 2);
+        assert_eq!(result.len(), 2);
+        assert_ne!(result[0], result[1], "IPs must be distinct");
+    }
+
+    #[test]
+    fn test_get_distinct_distributed_ips_returns_1_for_1_ip_endpoint() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))];
+        let config = crate::config::ConnectionPoolConfig::default();
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+        manager.ip_distributors.insert(
+            "s3.eu-west-1.amazonaws.com".to_string(),
+            IpDistributor::new(ips.clone()),
+        );
+
+        let result = manager.get_distinct_distributed_ips("s3.eu-west-1.amazonaws.com", 2);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], ips[0]);
+    }
+
+    #[test]
+    fn test_get_distinct_distributed_ips_returns_empty_for_unknown_endpoint() {
+        let config = crate::config::ConnectionPoolConfig::default();
+        let manager = ConnectionPoolManager::new_with_config(config).unwrap();
+
+        let result = manager.get_distinct_distributed_ips("unknown.example.com", 2);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_distinct_distributed_ips_all_distinct() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)),
+        ];
+        let config = crate::config::ConnectionPoolConfig::default();
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+        manager.ip_distributors.insert(
+            "s3.us-west-2.amazonaws.com".to_string(),
+            IpDistributor::new(ips),
+        );
+
+        let result = manager.get_distinct_distributed_ips("s3.us-west-2.amazonaws.com", 3);
+        assert_eq!(result.len(), 3);
+        // All elements must be distinct
+        let mut unique = result.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3);
     }
 }

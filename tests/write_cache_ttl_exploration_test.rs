@@ -55,7 +55,8 @@ fn create_cache_manager_get_ttl_zero(
         1_048_576,
         false,
         Duration::from_secs(10),
-        64, // ram_cache_shard_count
+        64,                                // ram_cache_shard_count
+        std::time::Duration::from_secs(5), // upstream_first_byte_timeout
     )
 }
 async fn store_write_cached_object(cache_manager: &CacheManager, cache_key: &str) {

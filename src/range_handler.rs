@@ -13,7 +13,9 @@ use crate::disk_cache::DiskCacheManager;
 use crate::{ProxyError, Result};
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 /// Parsed HTTP Range specification
@@ -1915,6 +1917,7 @@ impl RangeHandler {
     /// The HashMap contains S3 response headers including ETag
     ///
     /// Requirements: 1.1, 1.4
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_missing_ranges(
         &self,
         cache_key: &str,
@@ -1923,6 +1926,9 @@ impl RangeHandler {
         host: &str,
         uri: &hyper::Uri,
         headers: &HashMap<String, String>,
+        hedge_budget: Option<&Arc<AtomicUsize>>,
+        hedge_trigger_after: Duration,
+        max_inflight_fraction: f64,
     ) -> Result<Vec<(RangeSpec, Vec<u8>, HashMap<String, String>)>> {
         if missing_ranges.is_empty() {
             debug!("No missing ranges to fetch");
@@ -1945,6 +1951,7 @@ impl RangeHandler {
                 let headers = headers.clone();
                 let range_spec = range_spec.clone();
                 let cache_key = cache_key.to_string();
+                let hedge_budget = hedge_budget.cloned();
 
                 async move {
                     let fetch_start = std::time::Instant::now();
@@ -1972,13 +1979,29 @@ impl RangeHandler {
                         uri,
                         s3_headers,
                         None,
-                        host,
+                        host.clone(),
                     );
                     // Don't use streaming for fetch_missing_ranges - we need to buffer the data
                     // to merge it with cached data before sending to client
                     context.allow_streaming = false;
 
-                    match s3_client.forward_request(context).await {
+                    // Hedging path: when a budget is provided (rule-enabled), race this
+                    // sub-fetch against a hedge. Each sub-fetch selects its own IP pair
+                    // and claims from the single per-request budget shared across all N
+                    // parallel sub-fetches. `None` budget → the existing unhedged path,
+                    // byte-identical to previous behaviour (Req 1.3, 2.3, 6.1, 6.5).
+                    let s3_response = crate::hedged_fetch::fetch_maybe_hedged(
+                        s3_client.as_ref(),
+                        context,
+                        &host,
+                        hedge_budget.as_deref(),
+                        hedge_trigger_after,
+                        max_inflight_fraction,
+                        &cache_key,
+                    )
+                    .await;
+
+                    match s3_response {
                         Ok(s3_response) => {
                             if s3_response.status == hyper::StatusCode::PARTIAL_CONTENT {
                                 if let Some(body) = s3_response.body {

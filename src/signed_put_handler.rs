@@ -1089,6 +1089,15 @@ impl SignedPutHandler {
     ) -> Result<()> {
         use crate::cache_types::MultipartUploadTracker;
 
+        // Validate upload_id from upstream response (defense-in-depth against
+        // attacker-controlled upstreams returning path-traversal characters).
+        if !crate::path_safety::is_safe_path_component(upload_id) {
+            return Err(ProxyError::CacheError(format!(
+                "Unsafe upload_id from upstream response: {}",
+                upload_id
+            )));
+        }
+
         // Create directory for this upload
         let upload_dir = self.cache_dir.join("mpus_in_progress").join(upload_id);
         tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {

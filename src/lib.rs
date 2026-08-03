@@ -22,6 +22,7 @@ pub mod destination_policy;
 pub mod disk_cache;
 pub mod error;
 pub mod health;
+pub mod hedged_fetch;
 pub mod http_proxy;
 pub mod https_connector;
 pub mod https_proxy;

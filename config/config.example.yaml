@@ -581,6 +581,16 @@ connection_pool:
   # fires before any bytes have been sent to the client.
   # upstream_idle_retries: 2
 
+  # Hedged upstream requests — per-instance governor. Hedging is ENABLED per key pattern
+  # in cache_rules.json (hedging_enabled, hedge_trigger_after, hedge_max_per_request).
+  # There is no fleet-wide on/off toggle; this section only caps the global in-flight
+  # hedge ratio to bound cost amplification.
+  # hedged_requests:
+  #   # Maximum fraction of in-flight fetches that may be hedges (default: 0.1).
+  #   # When the ratio exceeds this value, new hedges are suppressed.
+  #   # Valid range: [0.0, 1.0].
+  #   max_inflight_fraction: 0.1
+
 compression:
   enabled: true
   # Size floor in bytes below which writes always skip compression, regardless

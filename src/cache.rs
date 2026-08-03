@@ -985,6 +985,7 @@ impl CacheManager {
             false,                              // Default: don't evaluate conditions from cache
             std::time::Duration::from_secs(10), // Default 10s flush interval (Req 19)
             64,                                 // Default 64 shards
+            std::time::Duration::from_secs(5),  // Default 5s upstream_first_byte_timeout
         )
     }
 
@@ -1015,6 +1016,7 @@ impl CacheManager {
         evaluate_conditions_from_cache: bool,
         ram_cache_flush_interval: std::time::Duration,
         ram_cache_shard_count: usize,
+        upstream_first_byte_timeout: std::time::Duration,
     ) -> Self {
         // Create ShardedRamCache if enabled with the specified eviction algorithm.
         // Warn if per-shard capacity is small — objects larger than the per-shard limit are
@@ -1072,6 +1074,7 @@ impl CacheManager {
             compression_enabled,
             ram_cache_enabled,
             evaluate_conditions_from_cache,
+            upstream_first_byte_timeout,
         };
         let bucket_settings_manager = Arc::new(crate::bucket_settings::BucketSettingsManager::new(
             cache_dir.clone(),

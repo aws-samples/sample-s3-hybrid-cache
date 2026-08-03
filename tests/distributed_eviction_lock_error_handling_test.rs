@@ -55,6 +55,7 @@ fn create_shared_storage_cache_manager(cache_dir: std::path::PathBuf) -> CacheMa
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     )
 }
 

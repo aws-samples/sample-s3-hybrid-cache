@@ -149,6 +149,7 @@ async fn make_test_cache(config: &Config) -> (TempDir, Arc<CacheManager>, Arc<Ra
         config.cache.evaluate_conditions_from_cache,
         Duration::from_secs(10),
         64,
+        Duration::from_secs(5),
     ));
     let disk_cache_manager = Arc::new(tokio::sync::RwLock::new(
         cache_manager.create_configured_disk_cache_manager(),

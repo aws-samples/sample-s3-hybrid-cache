@@ -132,6 +132,28 @@ pub trait S3ClientApi: Send + Sync {
     /// Forward a request to S3 with connection pooling and retries.
     async fn forward_request(&self, context: S3RequestContext) -> Result<S3Response>;
 
+    /// Forward a request to S3, optionally pinning the connection to a specific IP.
+    ///
+    /// When `pinned_ip` is `Some(ip)`, the URI authority is rewritten to dial that
+    /// IP directly (skipping round-robin IP selection), while the `Host` header is
+    /// preserved as the original hostname for SigV4 compatibility. When `None`,
+    /// behaves identically to [`forward_request`](Self::forward_request).
+    ///
+    /// The default implementation ignores `pinned_ip` and delegates to
+    /// `forward_request`, so existing test stubs compile unchanged.
+    ///
+    /// **Override behaviour on the concrete `S3Client`:** when the destination
+    /// matches an `upstream_overrides` entry, `pinned_ip` is ignored entirely and
+    /// the existing override path is taken (Req 4.3).
+    async fn forward_request_pinned(
+        &self,
+        context: S3RequestContext,
+        pinned_ip: Option<IpAddr>,
+    ) -> Result<S3Response> {
+        let _ = pinned_ip;
+        self.forward_request(context).await
+    }
+
     /// Extract a compact [`CacheMetadata`] record from an S3 response's headers.
     fn extract_metadata_from_response(&self, headers: &HashMap<String, String>) -> CacheMetadata;
 
@@ -184,6 +206,14 @@ pub trait S3ClientApi: Send + Sync {
 impl S3ClientApi for S3Client {
     async fn forward_request(&self, context: S3RequestContext) -> Result<S3Response> {
         S3Client::forward_request(self, context).await
+    }
+
+    async fn forward_request_pinned(
+        &self,
+        context: S3RequestContext,
+        pinned_ip: Option<IpAddr>,
+    ) -> Result<S3Response> {
+        S3Client::forward_request_pinned(self, context, pinned_ip).await
     }
 
     fn extract_metadata_from_response(&self, headers: &HashMap<String, String>) -> CacheMetadata {
@@ -423,6 +453,191 @@ impl S3Client {
 
         Err(last_error
             .unwrap_or_else(|| ProxyError::S3Error("All retry attempts failed".to_string())))
+    }
+
+    /// Forward a request to S3, optionally pinning the connection to a specific IP.
+    ///
+    /// When `pinned_ip` is `Some(ip)`:
+    /// - If the destination matches an `upstream_overrides` entry, `pinned_ip` is
+    ///   ignored entirely and the override path is taken (Req 4.3).
+    /// - Otherwise, rewrite the URI authority to dial that IP directly (skipping
+    ///   round-robin selection) while preserving the `Host` header as the original
+    ///   hostname for SigV4 compatibility. Health tracking keys on the pinned IP.
+    ///
+    /// When `pinned_ip` is `None`, delegates to the existing `forward_request` path.
+    pub async fn forward_request_pinned(
+        &self,
+        context: S3RequestContext,
+        pinned_ip: Option<IpAddr>,
+    ) -> Result<S3Response> {
+        // If no pin requested, take the normal path (includes IP distribution).
+        let pinned_ip = match pinned_ip {
+            Some(ip) => ip,
+            None => return self.forward_request(context).await,
+        };
+
+        // Overrides win over the pin (Req 4.3). When the destination matches a
+        // configured upstream_overrides entry, ignore pinned_ip entirely and
+        // delegate to the existing path. The override target may already be an IP
+        // literal; a second rewrite would be both wrong and confusing.
+        let upstream_override_matched = context
+            .uri
+            .host()
+            .map(|target_host| {
+                let target_port = context.uri.port_u16().unwrap_or(80);
+                self.upstream_overrides
+                    .resolve(target_host, target_port)
+                    .is_some()
+            })
+            .unwrap_or(false);
+
+        if upstream_override_matched {
+            debug!(
+                host = %context.host,
+                uri = %context.uri,
+                pinned_ip = %pinned_ip,
+                "Upstream override matched; ignoring pinned IP and using override path"
+            );
+            return self.forward_request(context).await;
+        }
+
+        // Pin to the specified IP: rewrite URI authority, keep Host header for SigV4.
+        let start_time = Instant::now();
+
+        let effective_uri = match rewrite_uri_authority(&context.uri, &pinned_ip) {
+            Ok(new_uri) => new_uri,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    host = %context.host,
+                    pinned_ip = %pinned_ip,
+                    "URI authority rewrite for pinned IP failed, forwarding with original hostname"
+                );
+                context.uri.clone()
+            }
+        };
+
+        // Build HTTP request
+        let mut request_builder = Request::builder()
+            .method(&context.method)
+            .uri(&effective_uri);
+
+        // Add headers, ensuring Host header is set to the original hostname for SigV4
+        let has_body = context.body.is_some();
+        let mut host_header_set = false;
+        for (key, value) in &context.headers {
+            if has_body && key.to_lowercase() == "content-length" {
+                continue;
+            }
+            if key.to_lowercase() == "host" {
+                host_header_set = true;
+            }
+            request_builder = request_builder.header(key, value);
+        }
+
+        // When the URI authority is rewritten to an IP, always ensure the Host header
+        // carries the original hostname so the SigV4 signature remains valid.
+        if !host_header_set {
+            request_builder = request_builder.header("host", &context.host);
+        }
+
+        let body = match &context.body {
+            Some(bytes) => Full::new(bytes.clone()),
+            None => Full::new(Bytes::new()),
+        };
+
+        let request = request_builder
+            .body(body)
+            .map_err(|e| ProxyError::HttpError(format!("Failed to build request: {}", e)))?;
+
+        debug!(
+            method = %context.method,
+            uri = %context.uri,
+            pinned_ip = %pinned_ip,
+            effective_uri = %effective_uri,
+            "Sending pinned request"
+        );
+
+        // Send request through Hyper client
+        let response = tokio::time::timeout(self.request_timeout, self.client.request(request))
+            .await
+            .map_err(|_| ProxyError::TimeoutError("Request timeout".to_string()))?
+            .map_err(|e| {
+                // Record failure for health tracking on the pinned IP
+                if self.health_tracker.record_failure(&pinned_ip) {
+                    warn!(
+                        ip = %pinned_ip,
+                        host = %context.host,
+                        "IP failure threshold reached, excluding from distributor"
+                    );
+                    let pool_manager = self.pool_manager.clone();
+                    let host = context.host.clone();
+                    let ip = pinned_ip;
+                    tokio::spawn(async move {
+                        let mut pm = pool_manager.write().await;
+                        if let Some(dist) = pm.get_distributor_mut(&host) {
+                            dist.remove_ip(ip, "consecutive failures");
+                        }
+                    });
+                }
+                if let Some(tls_err) = Self::recover_upstream_tls_validation_error(&e) {
+                    return tls_err;
+                }
+                ProxyError::HttpError(format!("Failed to send request: {}", e))
+            })?;
+
+        // Record success for the pinned IP
+        self.health_tracker.record_success(&pinned_ip);
+
+        // Read response
+        let (parts, body) = response.into_parts();
+
+        let mut headers = HashMap::new();
+        for (key, value) in parts.headers.iter() {
+            if let Ok(value_str) = value.to_str() {
+                headers.insert(key.to_string(), value_str.to_string());
+            }
+        }
+
+        let content_length = headers
+            .get("content-length")
+            .and_then(|v| v.parse::<u64>().ok());
+
+        let should_stream = context.allow_streaming;
+
+        let response_body = if should_stream {
+            Some(S3ResponseBody::Streaming(body))
+        } else {
+            let body_bytes = body
+                .collect()
+                .await
+                .map_err(|e| ProxyError::HttpError(format!("Failed to read response body: {}", e)))?
+                .to_bytes();
+
+            if body_bytes.is_empty() {
+                None
+            } else {
+                Some(S3ResponseBody::Buffered(body_bytes))
+            }
+        };
+
+        let response = S3Response {
+            status: parts.status,
+            headers,
+            body: response_body,
+            request_duration: start_time.elapsed(),
+        };
+
+        debug!(
+            status = %response.status,
+            uri = %context.uri,
+            pinned_ip = %pinned_ip,
+            content_length = ?content_length,
+            streaming = should_stream,
+            "Received pinned response"
+        );
+
+        Ok(response)
     }
 
     /// Try to forward a single request to S3 using Hyper client
@@ -1752,5 +1967,83 @@ mod tests {
     fn test_format_authority_host_no_port() {
         // Validates: Requirements 6.1
         assert_eq!(format_authority_host("::1", None), "[::1]");
+    }
+
+    // --- forward_request_pinned override-matching tests (Task 3, Req 4.3) ---
+
+    #[test]
+    fn test_forward_request_pinned_override_matcher_ignores_pin() {
+        // Validates: Requirement 4.3
+        //
+        // When the URI destination matches a configured upstream_overrides entry,
+        // forward_request_pinned MUST ignore pinned_ip and take the override path.
+        // This test validates the decision logic by checking that the override
+        // matcher resolves the target that would be checked in forward_request_pinned.
+        use crate::config::UpstreamScheme;
+        use crate::upstream_overrides::UpstreamOverrides;
+
+        let raw = override_map(&[
+            ("172.31.41.100:9000", UpstreamScheme::Http, true),
+            ("s3.us-west-2.amazonaws.com:80", UpstreamScheme::Http, true),
+        ]);
+        let overrides = UpstreamOverrides::from_config(&raw);
+
+        // A request to an override-matched IP literal: forward_request_pinned
+        // should detect the match and ignore any pinned_ip.
+        let uri: Uri = "http://172.31.41.100:9000/bucket/key".parse().unwrap();
+        let target_host = uri.host().unwrap();
+        let target_port = uri.port_u16().unwrap_or(80);
+        assert!(
+            overrides.resolve(target_host, target_port).is_some(),
+            "IP-literal override must match — pinned_ip would be ignored"
+        );
+
+        // A request to an override-matched hostname: same logic applies.
+        let uri2: Uri = "http://s3.us-west-2.amazonaws.com:80/bucket/key"
+            .parse()
+            .unwrap();
+        let host2 = uri2.host().unwrap();
+        let port2 = uri2.port_u16().unwrap_or(80);
+        assert!(
+            overrides.resolve(host2, port2).is_some(),
+            "hostname override must match — pinned_ip would be ignored"
+        );
+
+        // A request NOT matching any override: forward_request_pinned should
+        // honour the pinned_ip and rewrite the URI authority.
+        let uri3: Uri = "http://s3.us-west-2.amazonaws.com:443/bucket/key"
+            .parse()
+            .unwrap();
+        let host3 = uri3.host().unwrap();
+        let port3 = uri3.port_u16().unwrap_or(80);
+        assert!(
+            overrides.resolve(host3, port3).is_none(),
+            "non-override port must NOT match — pinned_ip should be applied"
+        );
+    }
+
+    #[test]
+    fn test_forward_request_pinned_rewrite_preserves_sigv4_host() {
+        // Validates: Requirements 2.4, 4.1
+        //
+        // When forward_request_pinned(ctx, Some(ip)) applies the pin, the URI
+        // authority is rewritten to the IP but the Host header must stay as the
+        // original hostname for SigV4. Verify rewrite_uri_authority produces the
+        // expected URI and that the host parameter is distinct from the IP.
+        let uri: Uri = "https://s3.us-east-1.amazonaws.com/bucket/key"
+            .parse()
+            .unwrap();
+        let ip: IpAddr = "52.92.17.200".parse().unwrap();
+
+        let rewritten = rewrite_uri_authority(&uri, &ip).unwrap();
+
+        // Authority is the IP
+        assert_eq!(rewritten.host(), Some("52.92.17.200"));
+        // But the original host (which becomes the Host header) is different
+        assert_ne!(rewritten.host().unwrap(), "s3.us-east-1.amazonaws.com");
+        // Path is preserved
+        assert_eq!(rewritten.path(), "/bucket/key");
+        // Scheme is preserved
+        assert_eq!(rewritten.scheme_str(), Some("https"));
     }
 }

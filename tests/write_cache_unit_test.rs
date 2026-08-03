@@ -47,6 +47,7 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     // Test data
@@ -147,6 +148,7 @@ async fn test_upload_state_is_complete() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/complete-state.txt";
@@ -225,6 +227,7 @@ async fn test_put_ttl_is_used_for_expiration() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/ttl-test.txt";
@@ -332,6 +335,7 @@ async fn test_put_cached_objects_not_in_ram_cache() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/no-ram-cache.txt";
@@ -414,6 +418,7 @@ async fn test_put_storage_with_headers() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/with-headers.txt";
@@ -493,6 +498,7 @@ async fn test_multiple_put_operations_same_key() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "/test-bucket/overwrite-test.txt";

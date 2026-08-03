@@ -5,6 +5,67 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-08-03
+
+### Security
+
+- **Documented what a cleartext hop actually exposes, and changed the recommended
+  load-balancer pattern accordingly.** Documentation only — no code or default
+  behaviour changes. Previously every mention of a plaintext hop said only "deploy
+  on a trusted network", which is an instruction rather than a risk statement, so
+  readers had no basis for judging whether their network qualified. Two places
+  understated it: `README.md` claimed the plain-HTTP client→proxy leg worked
+  "without compromising security" (conflating SigV4 *authentication* with
+  *confidentiality*), and `docs/GETTING_STARTED.md` recommended the one
+  load-balancer pattern that forwards cleartext to the proxy as the default for
+  "most deployments", with no security caveat.
+  - New [What a Cleartext Hop Exposes](docs/ARCHITECTURE.md#what-a-cleartext-hop-exposes)
+    section under Security Considerations enumerates what an observer captures
+    (bucket and object key, the `Authorization` header including the caller's access
+    key ID, object payloads both directions, presigned URL parameters), what is not
+    exposed (the secret access key is never transmitted), and what an observer can do
+    — replay a captured request against S3 within the SigV4 15-minute window, or a
+    captured presigned URL for its full remaining validity. Includes a per-hop table
+    of which hops are cleartext and the encrypted alternative for each.
+  - **Added Pattern 3 (load balancer terminates and re-encrypts)** to
+    `docs/GETTING_STARTED.md`, which was previously undocumented. It gives Pattern 1's
+    certificate convenience (client-facing cert stays in ACM, no `AWS_CA_BUNDLE` on
+    clients) with an encrypted internal hop, because an NLB TLS target group does not
+    validate the target's certificate — so the proxy's cert can be self-signed,
+    long-lived, and needs no SAN matching the client-facing name. **Pattern 3 is now
+    the recommended default**; Pattern 1 is documented as appropriate only where the
+    LB→proxy segment has been consciously accepted as trusted. The comparison table
+    gains an explicit "LB→proxy hop" row and a "Backend cert validated?" row.
+  - New `docs/AWS_DEPLOYMENT.md` (see Added below) presents both encrypted NLB
+    configurations (TCP passthrough and TLS re-encrypt) with guidance on choosing,
+    and warns that a `TLS` listener with a `TCP` target group decrypts at the NLB.
+    The security-group section notes that only 3129 need be reachable behind a load
+    balancer using the TLS listener, since leaving port 80 open there is an
+    unnecessary cleartext path.
+  - Added a Security Considerations entry to the docs index (`docs/README.md`), which
+    previously had none.
+  - **Fleet verification now covers the encrypted path it recommends.** New T37 group
+    exercises the TLS proxy listener (port 3129) end to end. Internal test tooling
+    only, no change to the shipped binary.
+  - **Fleet verification now covers hedged upstream requests (T38).** New assertion
+    group validates hedging fires on cache-miss fetches and respects the per-key rule
+    gate. Internal test tooling only, no change to the shipped binary.
+
+### Added
+
+- **Hedged upstream requests** (`cache_rules.json` + `config.yaml`): opt in per key pattern to race a second upstream fetch against a slow original on cache-miss GETs, serving whichever returns first. Reduces p99/p99.9 latency for workloads sensitive to upstream tail latency. Off by default — requires an explicit rule. Three new per-rule fields in `cache_rules.json`: `hedging_enabled` (bool), `hedge_trigger_after` (duration, default 250ms), `hedge_max_per_request` (integer, default 1). One new startup field in `config.yaml`: `connection_pool.hedged_requests.max_inflight_fraction` (default `0.1`) — a per-instance ratio cap that suppresses new hedges when in-flight hedges exceed the fraction of in-flight fetches (the first hedge is always admitted regardless of the cap). Hedging covers all cache-miss fetch paths: full-object GET/HEAD, complete and partial range GETs, page-widened fills, and part-number GETs. PUT/POST/DELETE are never hedged. An existing deployment with no rules file or a config file without the new field behaves exactly as before. Validated on every rules load: `hedge_trigger_after` must be > 0 and < `upstream_first_byte_timeout`; an invalid file is rejected in favour of the last-known-good rule set. Composes with `page_widening` on the same prefix. Documented in `docs/CONFIGURATION.md`, `docs/CONNECTION_POOLING.md`, `docs/cache-rules-schema.json`, and `config/cache_rules.example.json`. Surfaced on the dashboard and `/metrics` JSON (`hedged_requests.{issued, won, suppressed}`).
+
+- **AWS deployment guide** (`docs/AWS_DEPLOYMENT.md`): prescriptive recommendations for deploying against a cross-region S3 bucket or an S3-compatible store outside AWS. Covers FSx for OpenZFS HA sizing (throughput tiers, cached-read multiplier, IOPS), the EFS alternative with a cost break-even model, EC2 fleet bootstrap and service configuration, client routing via Route 53 private hosted zones or NLB with end-to-end encryption (including Auto Scaling patterns for both), origin-specific configuration for both use cases, mount requirements, and CloudWatch monitoring. Includes example userdata scripts for FSx and EFS (`docs/examples/userdata-fsxz.sh`, `docs/examples/userdata-efs.sh`). Added to the docs index (`docs/README.md`).
+
+### Fixed
+
+- **TLS proxy listener rejected HTTP-forwarded requests to port-80 endpoints.**
+  When a client used `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://...`
+  (the recommended encrypted-caching configuration), the TLS listener rejected
+  the request with "port 80 not allowed". The port-80 listener was unaffected.
+  The CONNECT handler on port 3129 continues to enforce its existing destination
+  policy (port 443 only, IP-range blocking, optional hostname allowlist).
+
 ## [2.4.0] - 2026-07-29
 
 **Upgrade impact:** the `max_ram_cache_size` default rises from 256 MiB to

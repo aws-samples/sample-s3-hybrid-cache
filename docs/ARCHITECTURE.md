@@ -461,6 +461,41 @@ For the full multipart upload state machine, correctness gates, concurrency sema
 - **Network Controls**: Use security groups, firewalls, or network segmentation to restrict proxy access to authorized clients only
 - **Encrypted Alternative**: The TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, providing encrypted client-to-proxy traffic with full caching. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com`. See [Getting Started](GETTING_STARTED.md) for configuration details.
 
+#### What a Cleartext Hop Exposes
+
+"Deploy only on a trusted network" is the requirement; this is what it protects against, so you can judge whether a given network qualifies. SigV4 authenticates the request — it proves the request was not forged and cannot be redirected to a different object — but it provides **no confidentiality**. Anything travelling in cleartext is readable by any party that can observe the traffic.
+
+An observer on a cleartext hop captures:
+
+- **The bucket and object key**, from the request line and `Host` header. Over time this reveals your bucket contents, object sizes, and access patterns.
+- **The `Authorization` header**, which contains the caller's **access key ID** (in the `Credential` scope), the `SignedHeaders` list, and the signature.
+- **Object payloads in both directions** — GET response bodies and PUT/UploadPart request bodies, in full.
+- **Presigned URL query parameters**, when clients use presigned URLs, including `X-Amz-Signature` and `X-Amz-Expires`.
+
+The **secret access key is never transmitted** and cannot be recovered from a captured request.
+
+What an observer can then do:
+
+- **Replay the captured request verbatim against S3.** The signature covers the request, not the channel, so a captured signed request is valid until its timestamp ages out — [AWS documents a 15-minute window](https://repost.aws/it/questions/QUwKI3rzGOSgO2fsFrOdPwYw/problem-with-recreation-of-aws-signature), and notes that a party holding a signed request can also alter its *unsigned* portions without invalidating it. A replayed GET returns the object; a replayed PUT rewrites the same content.
+- **Replay a captured presigned URL for its full remaining validity**, which may be hours or days rather than 15 minutes. This is the longer-lived exposure of the two.
+- **Not reach a different object.** Method, path, query, and the signed headers are all covered by the signature, so a captured request cannot be edited to read another key without the secret access key.
+
+**Which hops are affected.** Cleartext applies to a hop only where the traffic crosses a network; the same listener on loopback exposes nothing to the network:
+
+| Hop | Cleartext? |
+|---|---|
+| Client → HTTP listener (`:80`) or forward proxy (`:3128`) across a network | **yes** |
+| Client → either listener on loopback (`127.0.0.1`, sidecar/local-dev) | no — never leaves the host |
+| Load balancer → proxy, where the LB terminates TLS ([Pattern 1](GETTING_STARTED.md#pattern-1-load-balancer-terminates-tls--proxy-serves-http)) | **yes** — encrypted client→LB, cleartext LB→proxy |
+| Client → TLS proxy listener (`:3129`), directly or via LB TCP passthrough | no |
+| Load balancer → proxy, where the LB re-encrypts to `:3129` ([Pattern 3](GETTING_STARTED.md#pattern-3-load-balancer-terminates-and-re-encrypts--proxy-terminates-tls)) | no |
+| Proxy → origin, default | no — verified TLS on 443 |
+| Proxy → origin, with `scheme: http` in [`upstream_overrides`](CONFIGURATION.md#upstream-transport-overrides) | **yes** |
+| Proxy → origin, with `validate_tls: false` | encrypted, but no MITM protection — an interceptor can read and alter it |
+| Client → HTTPS listener (`:443`, TCP passthrough) | no — opaque bytes, and uncacheable for the same reason |
+
+Every affected hop has an encrypted alternative that preserves caching. Where a hop must stay in cleartext, treat every client, load balancer, and host on that network segment as able to read all S3 traffic passing over it and to replay it within the windows above — and size the network controls accordingly.
+
 **TLS Certificate Management**: When TLS is enabled, the proxy loads a certificate and private key from paths specified in the config. For multi-instance deployments with shared storage, store the certificate and key on the shared volume alongside the configuration (e.g., `/mnt/nfs/config/tls/cert.pem` and `/mnt/nfs/config/tls/key.pem`) so all instances use the same certificate. Restrict file permissions on the private key (`chmod 600`). The certificate's Subject Alternative Names (SANs) must match how clients connect — use `IP:` SANs for direct IP connections, or `DNS:` SANs when clients connect through a load balancer or DNS name.
 
 ### Shared Cache Access Model

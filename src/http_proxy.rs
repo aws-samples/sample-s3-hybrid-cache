@@ -10,6 +10,7 @@ use crate::{
     config::Config,
     destination_policy::DestinationPolicy,
     disk_cache::{DiskCacheManager, IncrementalRangeWriter},
+    hedged_fetch::{self, RaceOutcome},
     inflight_tracker::{FetchGuard, FetchRole, InFlightTracker},
     logging::{mask_presigned_params, LoggerManager},
     metrics::{resolve_traffic_key, RequestType},
@@ -687,6 +688,7 @@ impl HttpProxy {
             config.cache.evaluate_conditions_from_cache,
             config.cache.ram_cache_flush_interval,
             config.cache.ram_cache_shard_count,
+            config.connection_pool.upstream_first_byte_timeout,
         );
 
         // Forward the partial-range commit ratio from config before sharing the
@@ -797,6 +799,11 @@ impl HttpProxy {
             Some(config.cache.cache_dir.clone()),
         );
 
+        // Initialize process-global hedge governor and metrics (off-by-default feature;
+        // hedging fires only for keys with an enabling cache_rules.json rule).
+        // Spec: hedged-upstream-requests Requirements 6.2, 8.1-8.3.
+        let _hedge_metrics = hedged_fetch::init_global_hedging();
+
         Ok(Self {
             listen_addr,
             config: Arc::clone(&config),
@@ -827,6 +834,16 @@ impl HttpProxy {
         tokio::spawn(async move {
             s3_client.set_metrics_manager(metrics).await;
         });
+
+        // Wire the process-global HedgeMetrics into MetricsManager for collection.
+        // Spec: hedged-upstream-requests Requirements 8.1, 8.2, 8.3.
+        if let Some(hedge_metrics) = hedged_fetch::get_global_metrics() {
+            let mm = metrics_manager.clone();
+            let hm = hedge_metrics.clone();
+            tokio::spawn(async move {
+                mm.write().await.set_hedge_metrics(hm);
+            });
+        }
     }
 
     /// Set the logger manager for access logging
@@ -5410,6 +5427,18 @@ impl HttpProxy {
         // (mirrors the existing miss-forward path, which also serves the
         // freshly merged bytes directly rather than re-reading from disk).
         let wait_timeout = config.cache.download_coordination.wait_timeout();
+        // Hedging: one client range GET gets one budget, shared across every Page
+        // fill and every missing-range sub-fetch beneath them. A page-widened
+        // prefix is the most likely place for an operator to also enable hedging
+        // (both features target small range reads over large objects), so the
+        // widened fetch must hedge rather than silently opting out.
+        // Spec: hedged-upstream-requests Requirements 2.3, 6.1, 6.5.
+        let hedge_budget: Option<Arc<AtomicUsize>> = if resolved.hedging_enabled {
+            Some(Arc::new(AtomicUsize::new(resolved.hedge_max_per_request)))
+        } else {
+            None
+        };
+        let max_inflight_fraction = config.connection_pool.hedged_requests.max_inflight_fraction;
         let page_futures = pages.iter().map(|&(page_start, page_end)| {
             Self::fill_page(
                 cache_key,
@@ -5427,6 +5456,8 @@ impl HttpProxy {
                 metrics_manager,
                 proxy_referer,
                 wait_timeout,
+                hedge_budget.as_ref(),
+                max_inflight_fraction,
             )
         });
         let page_results: Vec<Result<Vec<u8>>> = futures::future::join_all(page_futures).await;
@@ -5553,6 +5584,8 @@ impl HttpProxy {
         metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
         proxy_referer: &Option<String>,
         wait_timeout: std::time::Duration,
+        hedge_budget: Option<&Arc<AtomicUsize>>,
+        max_inflight_fraction: f64,
     ) -> Result<Vec<u8>> {
         let page_range = RangeSpec {
             start: page_start,
@@ -5649,6 +5682,8 @@ impl HttpProxy {
                         uri,
                         resolved,
                         proxy_referer,
+                        hedge_budget,
+                        max_inflight_fraction,
                     )
                     .await;
                     match &result {
@@ -5755,6 +5790,8 @@ impl HttpProxy {
         uri: &hyper::Uri,
         resolved: &crate::bucket_settings::ResolvedSettings,
         proxy_referer: &Option<String>,
+        hedge_budget: Option<&Arc<AtomicUsize>>,
+        max_inflight_fraction: f64,
     ) -> Result<Vec<u8>> {
         let mut headers = client_headers.clone();
         // Conditional headers (If-Range / If-Match / If-None-Match) are forwarded
@@ -5777,6 +5814,13 @@ impl HttpProxy {
                     host,
                     uri,
                     &headers,
+                    // Shared per-client-request budget, threaded down from
+                    // serve_widened_pages so all Pages and all their missing-range
+                    // sub-fetches draw from one budget. `None` when the key's rule
+                    // does not enable hedging.
+                    hedge_budget,
+                    resolved.hedge_trigger_after,
+                    max_inflight_fraction,
                 )
                 .await
                 .map_err(|e| ProxyError::S3Error(format!("page fetch failed: {}", e)))?
@@ -10468,67 +10512,208 @@ impl HttpProxy {
         let s3_fetch_start = Instant::now();
         let mut last_timeout_err: Option<crate::ProxyError> = None;
 
-        let s3_response = 'retry: {
-            for attempt in 0..=max_retries {
-                let context = build_s3_request_context(
-                    method.clone(),
-                    uri.clone(),
-                    headers.clone(),
-                    None, // GET/HEAD requests have no body
-                    host.clone(),
-                );
+        // Hedging gate: branch on the request's already-resolved hedging_enabled.
+        // Reuse the ResolvedSettings threaded through the request — do not re-resolve.
+        // Hedging only applies to idempotent GET/HEAD (Req 2.1, 2.2).
+        // Spec: hedged-upstream-requests Requirements 1.2, 1.3, 2.1, 2.2, 9.5, 9.7.
+        let hedging_eligible =
+            resolved.hedging_enabled && (method == Method::GET || method == Method::HEAD);
 
-                match tokio::time::timeout(first_byte_timeout, s3_client.forward_request(context))
+        let s3_response = 'retry: {
+            if hedging_eligible {
+                // --- Hedged path ---
+                // Select the IP pair once before the loop (Req 4).
+                let ips = hedged_fetch::select_ip_pair(s3_client.as_ref(), &host).await;
+
+                // Seed per-request budget from the resolved hedge_max_per_request (Req 6.1).
+                let hedge_budget = AtomicUsize::new(resolved.hedge_max_per_request);
+
+                // Access process-global governor and metrics.
+                let governor = hedged_fetch::get_global_governor();
+                let metrics = hedged_fetch::get_global_metrics();
+
+                let max_inflight_fraction =
+                    config.connection_pool.hedged_requests.max_inflight_fraction;
+
+                for attempt in 0..=max_retries {
+                    let context = build_s3_request_context(
+                        method.clone(),
+                        uri.clone(),
+                        headers.clone(),
+                        None,
+                        host.clone(),
+                    );
+
+                    // Take a fetch governor guard for this attempt.
+                    if let (Some(gov), Some(met)) = (governor, metrics) {
+                        let _fetch_guard = gov.start_fetch();
+                        let outcome = hedged_fetch::race_first_byte(
+                            s3_client.as_ref(),
+                            context,
+                            Some(first_byte_timeout),
+                            resolved.hedge_trigger_after,
+                            &hedge_budget,
+                            ips,
+                            gov,
+                            max_inflight_fraction,
+                            met,
+                            &cache_key,
+                        )
+                        .await;
+
+                        match outcome {
+                            RaceOutcome::Winner(response) => {
+                                break 'retry response;
+                            }
+                            RaceOutcome::Error(e) => {
+                                warn!(
+                                    "[UPSTREAM_FIRST_BYTE] Hedged fetch failed (attempt {}): {} cache_key={}",
+                                    attempt + 1, e, cache_key
+                                );
+                                if let Some(guard) = coordination_guard {
+                                    guard.complete_error(format!("S3 request failed: {}", e));
+                                }
+                                return Ok(Self::s3_forward_error_response(
+                                    &uri,
+                                    &method,
+                                    &e,
+                                    "Failed to forward request to S3",
+                                ));
+                            }
+                            RaceOutcome::AllTimedOut => {
+                                // Both arms timed out — retry if budget allows (Req 9.7).
+                                if attempt < max_retries {
+                                    info!(
+                                        "[UPSTREAM_FIRST_BYTE] Hedged fetch timed out, retrying (attempt {}/{}) cache_key={}",
+                                        attempt + 1, max_retries, cache_key
+                                    );
+                                } else {
+                                    warn!(
+                                        "[UPSTREAM_FIRST_BYTE] Hedged fetch timed out, retries exhausted ({}/{}) cache_key={}",
+                                        attempt + 1, max_retries, cache_key
+                                    );
+                                }
+                                last_timeout_err = Some(crate::ProxyError::TimeoutError(format!(
+                                    "upstream first-byte timeout ({}ms) after {} attempts (hedged)",
+                                    first_byte_timeout.as_millis(),
+                                    attempt + 1
+                                )));
+                            }
+                        }
+                    } else {
+                        // Governor/metrics not initialized — fall through to non-hedged path.
+                        // This should not happen in production but handles the edge case gracefully.
+                        match tokio::time::timeout(
+                            first_byte_timeout,
+                            s3_client.forward_request(context),
+                        )
+                        .await
+                        {
+                            Ok(Ok(response)) => {
+                                break 'retry response;
+                            }
+                            Ok(Err(e)) => {
+                                warn!(
+                                    "[UPSTREAM_FIRST_BYTE] S3 request failed (attempt {}): {} cache_key={}",
+                                    attempt + 1, e, cache_key
+                                );
+                                if let Some(guard) = coordination_guard {
+                                    guard.complete_error(format!("S3 request failed: {}", e));
+                                }
+                                return Ok(Self::s3_forward_error_response(
+                                    &uri,
+                                    &method,
+                                    &e,
+                                    "Failed to forward request to S3",
+                                ));
+                            }
+                            Err(_elapsed) => {
+                                if attempt < max_retries {
+                                    info!(
+                                        "[UPSTREAM_FIRST_BYTE] Timeout after {:?}, retrying (attempt {}/{}) cache_key={}",
+                                        first_byte_timeout, attempt + 1, max_retries, cache_key
+                                    );
+                                } else {
+                                    warn!(
+                                        "[UPSTREAM_FIRST_BYTE] Timeout after {:?}, retries exhausted ({}/{}) cache_key={}",
+                                        first_byte_timeout, attempt + 1, max_retries, cache_key
+                                    );
+                                }
+                                last_timeout_err = Some(crate::ProxyError::TimeoutError(format!(
+                                    "upstream first-byte timeout ({}ms) after {} attempts",
+                                    first_byte_timeout.as_millis(),
+                                    attempt + 1
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // --- Non-hedged path (byte-identical to today, Req 1.3) ---
+                for attempt in 0..=max_retries {
+                    let context = build_s3_request_context(
+                        method.clone(),
+                        uri.clone(),
+                        headers.clone(),
+                        None, // GET/HEAD requests have no body
+                        host.clone(),
+                    );
+
+                    match tokio::time::timeout(
+                        first_byte_timeout,
+                        s3_client.forward_request(context),
+                    )
                     .await
-                {
-                    Ok(Ok(response)) => {
-                        // Success — break out of the retry loop
-                        break 'retry response;
-                    }
-                    Ok(Err(e)) => {
-                        // S3 client returned an error (not a first-byte timeout).
-                        // The S3Client has its own retry logic; don't double-retry here.
-                        warn!(
-                            "[UPSTREAM_FIRST_BYTE] S3 request failed (attempt {}): {} cache_key={}",
-                            attempt + 1,
-                            e,
-                            cache_key
-                        );
-                        // S3 request failed — release coordination guard with error
-                        if let Some(guard) = coordination_guard {
-                            guard.complete_error(format!("S3 request failed: {}", e));
+                    {
+                        Ok(Ok(response)) => {
+                            // Success — break out of the retry loop
+                            break 'retry response;
                         }
-                        return Ok(Self::s3_forward_error_response(
-                            &uri,
-                            &method,
-                            &e,
-                            "Failed to forward request to S3",
-                        ));
-                    }
-                    Err(_elapsed) => {
-                        // First-byte timeout fired — retry if budget allows
-                        if attempt < max_retries {
-                            info!(
-                                "[UPSTREAM_FIRST_BYTE] Timeout after {:?}, retrying (attempt {}/{}) cache_key={}",
-                                first_byte_timeout,
-                                attempt + 1,
-                                max_retries,
-                                cache_key
-                            );
-                        } else {
+                        Ok(Err(e)) => {
+                            // S3 client returned an error (not a first-byte timeout).
+                            // The S3Client has its own retry logic; don't double-retry here.
                             warn!(
-                                "[UPSTREAM_FIRST_BYTE] Timeout after {:?}, retries exhausted ({}/{}) cache_key={}",
-                                first_byte_timeout,
+                                "[UPSTREAM_FIRST_BYTE] S3 request failed (attempt {}): {} cache_key={}",
                                 attempt + 1,
-                                max_retries,
+                                e,
                                 cache_key
                             );
+                            // S3 request failed — release coordination guard with error
+                            if let Some(guard) = coordination_guard {
+                                guard.complete_error(format!("S3 request failed: {}", e));
+                            }
+                            return Ok(Self::s3_forward_error_response(
+                                &uri,
+                                &method,
+                                &e,
+                                "Failed to forward request to S3",
+                            ));
                         }
-                        last_timeout_err = Some(crate::ProxyError::TimeoutError(format!(
-                            "upstream first-byte timeout ({}ms) after {} attempts",
-                            first_byte_timeout.as_millis(),
-                            attempt + 1
-                        )));
+                        Err(_elapsed) => {
+                            // First-byte timeout fired — retry if budget allows
+                            if attempt < max_retries {
+                                info!(
+                                    "[UPSTREAM_FIRST_BYTE] Timeout after {:?}, retrying (attempt {}/{}) cache_key={}",
+                                    first_byte_timeout,
+                                    attempt + 1,
+                                    max_retries,
+                                    cache_key
+                                );
+                            } else {
+                                warn!(
+                                    "[UPSTREAM_FIRST_BYTE] Timeout after {:?}, retries exhausted ({}/{}) cache_key={}",
+                                    first_byte_timeout,
+                                    attempt + 1,
+                                    max_retries,
+                                    cache_key
+                                );
+                            }
+                            last_timeout_err = Some(crate::ProxyError::TimeoutError(format!(
+                                "upstream first-byte timeout ({}ms) after {} attempts",
+                                first_byte_timeout.as_millis(),
+                                attempt + 1
+                            )));
+                        }
                     }
                 }
             }
@@ -11745,6 +11930,18 @@ impl HttpProxy {
             consolidated_ranges.len()
         );
 
+        // Hedging: create a shared per-request budget when hedging is enabled (Req 2.3, 6.1, 6.5).
+        // One client range GET = one budget shared across all N parallel sub-fetches.
+        let hedge_budget: Option<Arc<std::sync::atomic::AtomicUsize>> =
+            if resolved.hedging_enabled && method == Method::GET {
+                Some(Arc::new(std::sync::atomic::AtomicUsize::new(
+                    resolved.hedge_max_per_request,
+                )))
+            } else {
+                None
+            };
+        let max_inflight_fraction = config.connection_pool.hedged_requests.max_inflight_fraction;
+
         match range_handler
             .fetch_missing_ranges(
                 &cache_key,
@@ -11753,6 +11950,9 @@ impl HttpProxy {
                 &host,
                 &uri,
                 &headers,
+                hedge_budget.as_ref(),
+                resolved.hedge_trigger_after,
+                max_inflight_fraction,
             )
             .await
         {
@@ -11980,7 +12180,31 @@ impl HttpProxy {
 
         let perf_start = Instant::now();
         let s3_fetch_start = Instant::now();
-        match s3_client.forward_request(context).await {
+
+        // Hedging: a complete range miss is fetched here rather than through
+        // `fetch_missing_ranges` (which only runs when part of the range is already
+        // cached). This is the cold path for the small-range-read workload hedging
+        // targets, so it must hedge too, or Requirement 2.3 only holds for
+        // partially-cached ranges. One client range GET = one budget.
+        // Spec: hedged-upstream-requests Requirements 2.3, 6.1, 6.5.
+        let hedge_budget: Option<AtomicUsize> = if resolved.hedging_enabled && method == Method::GET
+        {
+            Some(AtomicUsize::new(resolved.hedge_max_per_request))
+        } else {
+            None
+        };
+        let s3_fetch_result = hedged_fetch::fetch_maybe_hedged(
+            s3_client.as_ref(),
+            context,
+            &host,
+            hedge_budget.as_ref(),
+            resolved.hedge_trigger_after,
+            config.connection_pool.hedged_requests.max_inflight_fraction,
+            &cache_key,
+        )
+        .await;
+
+        match s3_fetch_result {
             Ok(s3_response) => {
                 let s3_fetch_ms = s3_fetch_start.elapsed().as_millis();
                 debug!(

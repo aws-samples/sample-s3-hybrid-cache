@@ -140,6 +140,7 @@ async fn test_get_object_part_bypasses_cache() -> Result<(), Box<dyn std::error:
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = CacheManager::generate_cache_key("/my-bucket/my-object", None);
@@ -187,6 +188,7 @@ async fn test_metadata_operations_bypass_cache() -> Result<(), Box<dyn std::erro
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = CacheManager::generate_cache_key("/my-bucket/my-object", None);
@@ -234,6 +236,7 @@ async fn test_cache_state_after_bypass_operations() -> Result<(), Box<dyn std::e
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     // Get initial cache statistics
@@ -315,6 +318,7 @@ async fn test_head_object_is_cached() -> Result<(), Box<dyn std::error::Error>> 
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     // Object path (not root) for HeadObject

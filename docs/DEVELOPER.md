@@ -338,7 +338,7 @@ let merged = merge_ranges(&cached_ranges, &fetched, &requested_range)?;
 ```
 
 **Benefits**:
-- 60-90% bandwidth savings for partial cache hits
+- 60-90% bandwidth savings for partial cache hits (based on internal testing with synthetic workloads)
 - Faster response times (less data from S3)
 - Reduced S3 costs (fewer bytes transferred)
 
@@ -365,8 +365,8 @@ let client = Client::builder(TokioExecutor::new())
 ```
 
 **Benefits**:
-- 150-200ms latency reduction per request
-- 50-100% throughput increase
+- 150-200ms latency reduction per request (based on internal testing with synthetic workloads)
+- 50-100% throughput increase (based on internal testing with synthetic workloads)
 - Minimal memory overhead (~50KB per connection)
 
 **Trade-offs**:
@@ -1117,7 +1117,7 @@ let client = Client::builder(TokioExecutor::new())
 
 **Benefits**:
 - Faster partial cache hits (parallel S3 requests)
-- 150-200ms latency reduction per request (connection reuse)
+- 150-200ms latency reduction per request (connection reuse, based on internal testing with synthetic workloads)
 - Better S3 throughput utilization
 - Reduced total latency for multi-range requests
 
@@ -1330,13 +1330,13 @@ pub async fn get_or_load<F, Fut>(&self, cache_key: &str, loader: F) -> Result<Ne
 ```
 
 **Benefits**:
-- **Performance**: 99%+ latency reduction for metadata lookups (1ms vs 10-100ms from disk)
+- **Performance**: 99%+ latency reduction for metadata lookups (1ms vs 10-100ms from disk, based on internal testing with synthetic workloads)
 - **Efficiency**: Unified storage reduces disk space (no separate HEAD cache)
 - **Consistency**: Independent HEAD/GET TTLs in same file
 - **Reliability**: Stale file handle recovery for NFS
 
 **Use Cases**:
-- API Gateway health checks (99%+ reduction in disk I/O)
+- API Gateway health checks (99%+ reduction in disk I/O, based on internal testing with synthetic workloads)
 - High-concurrency workloads (per-key locking prevents thundering herd)
 - NFS shared cache (stale handle recovery)
 

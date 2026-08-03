@@ -4,6 +4,7 @@
     { "pattern": "**/credit-cards/**", "read_cache_enabled": false },
     { "pattern": "**/logs/**", "get_ttl": "0s" },
     { "pattern": "prod-*/static/**", "get_ttl": "7d", "compression_enabled": true },
+    { "pattern": "analytics-bucket/hot-prefix/**", "hedging_enabled": true, "hedge_trigger_after": "250ms" },
     { "pattern": "my-bucket/temp/**", "get_ttl": "0s" },
     { "pattern": "**", "get_ttl": "5m" }
   ]

@@ -34,6 +34,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Read-after-write consistency through write-through caching—objects are immediately available from cache after upload completes
 - RAM caching accelerates repeated access to hot data and metadata (including HEAD responses)
 - HEAD response caching reduces metadata lookup latency for tools like Mountpoint for Amazon S3
+- Hedged upstream requests—opt in per key pattern to race a second fetch against a slow original on cache misses, serving whichever returns first; reduces p99/p99.9 latency for workloads sensitive to upstream tail latency (e.g. analytics column-chunk reads). Off by default
 - Streaming architecture for large files—no buffering or throughput degradation
 - HTTPS passthrough for clients that cannot be configured for HTTP (only HTTP requests use the cache)
 - Optional TLS proxy listener for encrypted client-to-proxy traffic with full caching via `HTTP_PROXY`
@@ -59,10 +60,14 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Stateless instances—no direct communication between nodes; all coordination via shared storage makes instances ephemeral and replaceable
 - Journal-based metadata updates—each instance writes cache updates to its own journal file, and a background consolidator merges them atomically, eliminating race conditions on shared storage without inter-node communication
 - Content-aware LZ4 compression—2-10x space savings, automatically skips already-compressed formats
-- Glob-based cache rules—configure TTLs, read/write caching, compression, RAM cache eligibility, page-aligned range caching, and local conditional-request evaluation for keys matching a glob pattern via a single hot-reloadable `cache_rules.json`
+- Glob-based cache rules—configure TTLs, read/write caching, compression, RAM cache eligibility, page-aligned range caching, hedged upstream requests, and local conditional-request evaluation for keys matching a glob pattern via a single hot-reloadable `cache_rules.json`
 - Flexible expiration modes—lazy (fixed capacity) or active (elastic storage)
 - Cache storage is flexible—a single proxy with local disk may be suitable on a hypervisor platform that provides high availability. Multi-proxy deployments use any NFS-compatible shared storage: a dedicated NAS appliance, a file server VM within the cluster, or file services built into a hypervisor platform
 - **Download bandwidth QoS**—cap the aggregate cache-miss origin download rate and share it fairly across callers (User-Agent app-id) or buckets using deficit round-robin scheduling; static `cap/N` fleet sharing; disabled by default
+
+**Also Runs on AWS**
+
+The same proxy accelerates access to a cross-region Amazon S3 bucket or an S3-compatible store outside AWS. Deploy a fleet of EC2 instances sharing an FSx for OpenZFS or EFS cache volume, front them with Route 53 multi-value DNS or an NLB, and cache hits avoid the cross-region round-trip and per-GB transfer charge entirely. See the **[AWS Deployment Guide](docs/AWS_DEPLOYMENT.md)** for sizing, bootstrap scripts, client routing patterns, and cost modelling.
 
 ## Documentation
 
@@ -70,6 +75,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - **[Getting Started](docs/GETTING_STARTED.md)** - Installation, configuration, and first run
 - **[Configuration](docs/CONFIGURATION.md)** - Complete configuration reference
 - **[Architecture](docs/ARCHITECTURE.md)** - Technical architecture and design principles
+- **[AWS Deployment](docs/AWS_DEPLOYMENT.md)** - Deploying on EC2 with FSx/EFS for cross-region or external origins
 - **[Security Considerations](docs/ARCHITECTURE.md#security-considerations)** - Network security and shared cache access model
 - **[Testing](docs/TESTING.md)** - Test suite and validation procedures
 - **[Developer Guide](docs/DEVELOPER.md)** - Implementation details and development notes
@@ -117,7 +123,7 @@ aws s3 cp s3://your-bucket/key ./local \
   --region us-east-1
 ```
 
-The `--endpoint-url http://...` is required so the SDK signs the request against the real S3 hostname while connecting through the proxy — SigV4 authentication is built into the HTTP request itself, so the client→proxy leg can use plain HTTP without compromising security — TLS is only needed if the proxy is on a different host (where traffic crosses an untrusted network).
+The `--endpoint-url http://...` is required so the SDK signs the request against the real S3 hostname while connecting through the proxy. SigV4 authentication is built into the HTTP request itself, so the plain-HTTP client→proxy leg stays **authenticated** — but SigV4 provides no confidentiality, so it is not **encrypted**. That is acceptable here because this quick start runs the proxy on `127.0.0.1`, where the traffic never leaves the host. Once the proxy is on a different host, that hop crosses a network in cleartext: use the TLS proxy listener (`HTTP_PROXY=https://proxy:3129`) instead. See [What a Cleartext Hop Exposes](docs/ARCHITECTURE.md#what-a-cleartext-hop-exposes).
 
 **Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to avoid passing `--endpoint-url` on every command (works for buckets in that region).
 
@@ -192,6 +198,8 @@ Endpoints:
 ## Security
 
 > **Your Responsibility**: You are responsible for restricting network access to the proxy to only clients authorized to access all objects that may be cached, and for securing file system access to the shared cache volume. This is the same security model as any shared cache — the proxy does not weaken S3's security, but depending on [TTL configuration](docs/CONFIGURATION.md#time-to-live-ttl-configuration), cached data may be accessible without S3 authorization checks.
+
+**Traffic in transit**: SigV4 authenticates every request but provides no confidentiality, so any hop carrying plain HTTP across a network exposes the object key, the caller's access key ID, and the object payload to anything that can observe it — and a captured request can be replayed against S3. The affected hops are the HTTP listener (`:80`) and forward proxy (`:3128`) when reached across a network, a load balancer that terminates TLS and forwards cleartext to the proxy, and a `scheme: http` [upstream override](docs/CONFIGURATION.md#upstream-transport-overrides). Each has an encrypted alternative that keeps full caching. See [What a Cleartext Hop Exposes](docs/ARCHITECTURE.md#what-a-cleartext-hop-exposes) for what is captured, what is not, and the replay windows.
 
 **Network access**: With [TTL](docs/CACHING.md#time-to-live-ttl-configuration) > 0, cache hits bypass S3 entirely — any client that can reach the proxy over the network can read any cached object without IAM authorization checks. Restrict proxy access using security groups, firewalls, or network segmentation. The proxy listens on ports 80 (HTTP with caching), 443 (HTTPS passthrough), 3128 (HTTP forward proxy, proxy_only mode), 3129 (TLS proxy), 8080 (health), 8081 (dashboard), and 9090 (metrics). The admin endpoints (8080, 8081, 9090) are unauthenticated and bind to `127.0.0.1` by default; they require the same network restriction as the data endpoints if exposed beyond localhost. When an operator overrides the dashboard bind address to `0.0.0.0`, the operator is responsible for restricting access via firewall, security group, or reverse proxy.
 

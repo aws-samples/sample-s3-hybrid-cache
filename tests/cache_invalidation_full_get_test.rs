@@ -59,7 +59,7 @@ async fn test_put_then_full_get_uses_cache() {
     disk_cache_manager.write().await.initialize().await.unwrap();
 
     // Use the test bucket and prefix
-    let path = "/egummett-testing-source-1/s3-transparent-proxy-testing/test-cache-lookup.bin";
+    let path = "/my-test-bucket/s3-transparent-proxy-testing/test-cache-lookup.bin";
     let cache_key = CacheManager::generate_cache_key(path, None);
 
     // Step 1: Simulate a PUT operation by storing data in write cache
@@ -260,8 +260,7 @@ async fn test_put_then_full_get_large_object() {
     cache_manager.initialize().await.unwrap();
     disk_cache_manager.write().await.initialize().await.unwrap();
 
-    let path =
-        "/egummett-testing-source-1/s3-transparent-proxy-testing/test-cache-lookup-large.bin";
+    let path = "/my-test-bucket/s3-transparent-proxy-testing/test-cache-lookup-large.bin";
     let cache_key = CacheManager::generate_cache_key(path, None);
 
     // Create a 1MB test file with a pattern
@@ -360,7 +359,7 @@ async fn test_has_cached_ranges_optimization() {
     cache_manager.initialize().await.unwrap();
     disk_cache_manager.write().await.initialize().await.unwrap();
 
-    let path = "/egummett-testing-source-1/s3-transparent-proxy-testing/test-optimization.bin";
+    let path = "/my-test-bucket/s3-transparent-proxy-testing/test-optimization.bin";
     let cache_key = CacheManager::generate_cache_key(path, None);
 
     // Step 1: Store data via PUT (simulating a PUT operation)
@@ -487,7 +486,7 @@ async fn test_head_cache_stores_content_length_in_metadata() {
     let (cache_manager, _disk_cache_manager, _temp_dir) = create_test_cache_manager().await;
     cache_manager.initialize().await.unwrap();
 
-    let path = "/egummett-testing-source-1/s3-transparent-proxy-testing/test-head-metadata.bin";
+    let path = "/my-test-bucket/s3-transparent-proxy-testing/test-head-metadata.bin";
     let cache_key = CacheManager::generate_cache_key(path, None);
 
     // Step 1: Store HEAD cache entry (simulating a HEAD request response)
@@ -578,7 +577,7 @@ async fn test_get_response_stores_content_length_in_metadata() {
     let (cache_manager, _disk_cache_manager, _temp_dir) = create_test_cache_manager().await;
     cache_manager.initialize().await.unwrap();
 
-    let path = "/egummett-testing-source-1/s3-transparent-proxy-testing/test-get-metadata.bin";
+    let path = "/my-test-bucket/s3-transparent-proxy-testing/test-get-metadata.bin";
     let cache_key = CacheManager::generate_cache_key(path, None);
 
     // Step 1: Store full GET response (simulating a full object GET)

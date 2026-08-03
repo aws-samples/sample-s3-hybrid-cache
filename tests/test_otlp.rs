@@ -142,6 +142,11 @@ fn test_system_metrics() -> SystemMetrics {
             class_bytes: HashMap::new(),
             residual_bytes: 0,
         },
+        hedged_requests: s3_proxy::metrics::HedgingStats {
+            issued: 0,
+            won: 0,
+            suppressed: 0,
+        },
     }
 }
 
@@ -288,6 +293,11 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
             failopen_total: 0,
             class_bytes: HashMap::new(),
             residual_bytes: 0,
+        },
+        hedged_requests: s3_proxy::metrics::HedgingStats {
+            issued: 0,
+            won: 0,
+            suppressed: 0,
         },
     };
 

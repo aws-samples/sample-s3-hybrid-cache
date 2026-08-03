@@ -435,7 +435,7 @@ ERROR Stale file handle persisted: cache_key=/bucket/object.txt attempts=3 inval
 Scenario: Load balancer checks object existence every 5 seconds
 Without RAM Metadata Cache: Each check reads from disk
 With RAM Metadata Cache: First check loads to RAM, subsequent served from RAM
-Result: 99%+ reduction in disk I/O, <1ms response time
+Result: 99%+ reduction in disk I/O, <1ms response time (based on internal testing with synthetic workloads)
 ```
 
 **High-Concurrency Workloads:**
@@ -1716,7 +1716,7 @@ All error scenarios fall back to fetching the complete range from S3, ensuring c
 **Typical Performance**:
 - Range merge operation: 10-100ms (depending on number of segments)
 - S3 fetch for missing ranges: 50-200ms (depending on size and latency)
-- Total overhead vs full S3 fetch: Often 2-5x faster for partial cache hits
+- Total overhead vs full S3 fetch: Often 2-5x faster for partial cache hits (based on internal testing with synthetic workloads)
 
 #### Use Cases
 
@@ -2813,8 +2813,8 @@ cache:
 - 70-90% cache efficiency for partial cache hits
 - 100% cache efficiency for multipart upload followed by GET
 - 100% cache efficiency for repeated GetObjectPart requests
-- Reduced S3 bandwidth costs by 50-80%
-- Faster response times (2-5x) compared to full S3 fetches
+- Reduced S3 bandwidth costs by 50-80% (based on internal testing with synthetic workloads)
+- Faster response times (2-5x) compared to full S3 fetches (based on internal testing with synthetic workloads)
 - Eliminated S3 requests for cached parts
 
 **Monitoring:**

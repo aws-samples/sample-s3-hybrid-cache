@@ -41,6 +41,7 @@ fn create_test_cache_manager(temp_dir: &TempDir) -> CacheManager {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     )
 }
 
@@ -161,6 +162,7 @@ async fn test_independent_head_get_ttls() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "test-bucket/ttl-test-object.txt";
@@ -304,6 +306,7 @@ async fn test_metadata_cache_integration() {
         false,                              // evaluate_conditions_from_cache,
         std::time::Duration::from_secs(10), // ram_cache_flush_interval (Req 19)
         64,                                 // ram_cache_shard_count
+        std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
     let cache_key = "test-bucket/metadata-cache-test.txt";

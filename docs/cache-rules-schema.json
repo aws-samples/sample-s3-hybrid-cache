@@ -107,6 +107,30 @@
             33554432,
             67108864
           ]
+        },
+        "hedging_enabled": {
+          "type": "boolean",
+          "description": "Enables hedged upstream requests for keys matching this rule. When true and the original upstream fetch has not returned its first byte within hedge_trigger_after, the proxy issues a second identical fetch and serves whichever responds first. Off by default and never enabled globally - only via an explicit rule, because hedging trades bounded duplicate S3 cost for lower tail latency and the right trigger depends on the workload. See docs/CONNECTION_POOLING.md for the mechanism."
+        },
+        "hedge_trigger_after": {
+          "type": "string",
+          "description": "TTFB threshold after which a hedge is issued, used only when hedging_enabled is true. Must be greater than 0 and strictly less than connection_pool.upstream_first_byte_timeout (default 5s); validated on every rules load. Defaults to 250ms when hedging_enabled is true without specifying this field.",
+          "pattern": "^[0-9]+(ms|millis|milliseconds|s|sec|seconds|m|min|minutes|h|hr|hours|d|days)$",
+          "examples": [
+            "250ms",
+            "500ms",
+            "1s"
+          ]
+        },
+        "hedge_max_per_request": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-request hedge budget: maximum number of hedges per original client request. For a range GET that fans out into N parallel missing-range sub-fetches, this budget is shared across all N (not per sub-fetch). Defaults to 1 when hedging_enabled is true without specifying this field.",
+          "examples": [
+            1,
+            2,
+            3
+          ]
         }
       }
     }
@@ -131,6 +155,12 @@
           "pattern": "**/*.parquet",
           "page_widening": true,
           "page_size": 16777216
+        },
+        {
+          "pattern": "analytics-bucket/hot-prefix/**",
+          "hedging_enabled": true,
+          "hedge_trigger_after": "250ms",
+          "hedge_max_per_request": 1
         },
         {
           "pattern": "**",
