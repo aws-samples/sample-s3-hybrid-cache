@@ -44,12 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unnecessary cleartext path.
   - Added a Security Considerations entry to the docs index (`docs/README.md`), which
     previously had none.
-  - **Fleet verification now covers the encrypted path it recommends.** New T37 group
-    exercises the TLS proxy listener (port 3129) end to end. Internal test tooling
-    only, no change to the shipped binary.
-  - **Fleet verification now covers hedged upstream requests (T38).** New assertion
-    group validates hedging fires on cache-miss fetches and respects the per-key rule
-    gate. Internal test tooling only, no change to the shipped binary.
+
 
 ### Added
 
