@@ -12557,11 +12557,13 @@ impl HttpProxy {
     ///   resolver (or an IP literal directly) — never `/etc/hosts` — and selects
     ///   plaintext, accept-any TLS, or system-roots TLS for the authority port.
     /// - No override → the verified-TLS-on-443 default: a distributed IP plus a
-    ///   system-roots TLS connector (`build_tls_config_for_host`).
+    ///   system-roots TLS connector (`build_tls_config_for_host`). When the host has
+    ///   no distributor yet (fresh process, first signed write before any GET), the
+    ///   endpoint is registered on demand and, failing that, resolved directly —
+    ///   rather than failing the request.
     ///
-    /// Returns `None` when no connect IP is available (the caller maps this to the
-    /// existing 502 "Failed to resolve S3 endpoint"), preserving prior behaviour
-    /// for the no-override path.
+    /// Returns `None` only when the host cannot be resolved at all (the caller maps
+    /// this to a 502 "Failed to resolve S3 endpoint").
     async fn resolve_signed_upstream_transport(
         host: &str,
         authority_port: u16,
@@ -12620,9 +12622,35 @@ impl HttpProxy {
             None => {
                 // Secure_Default_Behaviour: distributed IP + verified TLS on 443.
                 let pool = s3_client.get_connection_pool();
-                let ip = {
+                let mut connect_ip = {
                     let pm = pool.read().await;
-                    pm.get_distributed_ip(host)?
+                    pm.get_distributed_ip(host)
+                };
+                if connect_ip.is_none() {
+                    // Cold start: no distributor for this host yet. Nothing on the
+                    // signed-write path seeds one — the GET path only does so as a
+                    // side effect of its own `None` fallback in
+                    // `S3Client::try_forward_request`, which this path deliberately
+                    // bypasses to keep the SigV4 bytes and Host header intact. So
+                    // register here, awaited: the resolve completes before this
+                    // request proceeds rather than leaving it to 502 while a
+                    // background task catches up.
+                    s3_client.register_endpoint(host).await;
+                    let pm = pool.read().await;
+                    connect_ip = pm.get_distributed_ip(host);
+                }
+
+                let ip = match connect_ip {
+                    Some(ip) => ip,
+                    None => {
+                        // Registration declines to seed a distributor when the host
+                        // matches a *suffix* `endpoint_overrides` pattern or the
+                        // `max_registered_endpoints` cap is reached. Resolve directly
+                        // — override-first, then DNS — as both the override arm above
+                        // and `CustomHttpsConnector` do.
+                        let pm = pool.read().await;
+                        pm.resolve_endpoint(host).await.ok()?.into_iter().next()?
+                    }
                 };
                 let root_store = crate::tls_trust_store::load_root_cert_store().ok()?;
                 let cfg = {
@@ -12675,6 +12703,68 @@ mod tests {
         assert!(
             body.contains("store:9000"),
             "error must name the upstream endpoint host:port; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_signed_write_resolves_upstream_without_a_seeded_distributor() {
+        // Regression: v1.9.0 (aeaa3ec) replaced the signed-write path's active
+        // `get_connection(&host)` — which resolved DNS itself — with a passive
+        // `get_distributed_ip(&host)` map read. Nothing on the signed-write path
+        // seeds that map: only `S3Client::try_forward_request` does, as a side
+        // effect of the GET path's own fallback. So on a fresh process every
+        // signed PUT and every multipart operation 502'd with "Failed to resolve
+        // S3 endpoint" until an unrelated GET had warmed the distributor
+        // (GitHub #15).
+        //
+        // Driven here through a *suffix* `endpoint_overrides` pattern, which is
+        // the deterministic, network-free case with the same shape: suffix
+        // overrides are documented to create distributors lazily on first match,
+        // and `register_endpoint` declines to seed one for them (it returns early
+        // when `resolve_override` matches). So `get_distributed_ip` is empty at
+        // call time exactly as it is on a cold start, and resolution has to come
+        // from the direct-resolve fallback.
+        let override_ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let mut endpoint_overrides = HashMap::new();
+        endpoint_overrides.insert(
+            "*.s3.us-west-2.amazonaws.com".to_string(),
+            vec![override_ip.to_string()],
+        );
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides,
+            ..Default::default()
+        };
+
+        let s3_client: Arc<dyn S3ClientApi + Send + Sync> =
+            Arc::new(crate::s3_client::S3Client::new(&config, None).expect("client builds"));
+        let host = "bucket.s3.us-west-2.amazonaws.com";
+
+        // Precondition: the distributor really is empty for this host, so the
+        // test exercises the fallback rather than passing vacuously.
+        {
+            let pool = s3_client.get_connection_pool();
+            let pm = pool.read().await;
+            assert!(
+                pm.get_distributed_ip(host).is_none(),
+                "precondition: no distributor should be seeded for a suffix-override host"
+            );
+        }
+
+        let transport = HttpProxy::resolve_signed_upstream_transport(host, 443, &s3_client)
+            .await
+            .expect("signed-write resolution must not fail with an unseeded distributor");
+
+        assert_eq!(
+            transport.ip, override_ip,
+            "must resolve to the override IP via the direct-resolve fallback"
+        );
+        assert_eq!(
+            transport.port, 443,
+            "no upstream override → verified TLS on 443"
+        );
+        assert!(
+            transport.tls.is_some(),
+            "the no-override default must stay TLS — the cold-start fix must not downgrade transport security"
         );
     }
 
