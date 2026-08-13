@@ -777,3 +777,188 @@ async fn test_range_no_hedging_when_budget_none() {
         "Without hedging, exactly 2 calls (one per range) expected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Signed range request hedging (fleet-verification-gaps, T38d regression)
+// ---------------------------------------------------------------------------
+//
+// A client that signs its Range header (e.g. the AWS CLI's
+// `aws s3api get-object --range`, which includes `range` in SignedHeaders)
+// routes to `forward_signed_range_request` rather than
+// `stream_range_from_s3_with_caching`/`fetch_missing_ranges`. Before this fix,
+// that path never called into `hedged_fetch` at all, regardless of
+// `resolved.hedging_enabled` — a real coverage gap discovered when the fleet
+// deployment-verification suite's T38d assertion (range GET through a
+// 400ms-delayed origin) failed to observe `hedged_requests.issued`
+// incrementing, while the equivalent full-object GET (T38b) did.
+//
+// These tests dispatch through `forward_range_with_coordination` with
+// `is_signed: true` and coordination disabled, which is the public entry
+// point that reaches the private `forward_signed_range_request` — the same
+// function real signed-range traffic reaches once download coordination
+// (enabled by default in production) has decided this request is the sole
+// fetcher.
+
+/// Req 1.2, 1.3, 2.1, 2.3, 6.1, 6.5: a signed range request with hedging
+/// enabled and a slow original hedges and serves via the hedge, exactly like
+/// the unsigned full-object and range-miss paths already do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_signed_range_hedging_enabled_slow_original_hedge_wins() {
+    hedged_fetch::init_global_hedging();
+
+    let stub = DelayedHedgeStub::new(
+        Duration::from_millis(500), // slow original (will trigger hedge)
+        Duration::from_millis(10),  // fast hedge
+        206,
+        206,
+    );
+    let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(stub.clone());
+
+    let mut config_inner = Config::default();
+    config_inner.connection_pool.upstream_first_byte_timeout = Duration::from_secs(5);
+    config_inner.connection_pool.upstream_idle_retries = 2;
+    config_inner
+        .connection_pool
+        .hedged_requests
+        .max_inflight_fraction = 1.0;
+    config_inner.cache.download_coordination.enabled = false;
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager_for_call, range_handler) = make_test_cache(&config).await;
+
+    let resolved = resolved_with_hedging(true, Duration::from_millis(50), 1);
+    let range_spec = s3_proxy::range_handler::RangeSpec { start: 0, end: 3 };
+    let overlap = s3_proxy::range_handler::RangeOverlap {
+        cached_ranges: Vec::new(),
+        missing_ranges: vec![range_spec.clone()],
+        can_serve_from_cache: false,
+    };
+    let mut signed_headers = HashMap::new();
+    signed_headers.insert(
+        "authorization".to_string(),
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-west-2/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=deadbeef".to_string(), // #gitleaks:allow
+    );
+    signed_headers.insert("range".to_string(), "bytes=0-3".to_string());
+
+    let metrics = hedged_fetch::get_global_metrics().unwrap();
+    let issued_before = metrics.issued.load(Ordering::Relaxed);
+    let won_before = metrics.won.load(Ordering::Relaxed);
+
+    let start = Instant::now();
+    let response = HttpProxy::forward_range_with_coordination(
+        Method::GET,
+        "/test-bucket/signed-range-hedge-key.bin".parse().unwrap(),
+        "s3.amazonaws.com".to_string(),
+        signed_headers,
+        "test-bucket/signed-range-hedge-key.bin".to_string(),
+        range_spec,
+        overlap,
+        cache_manager_for_call,
+        range_handler,
+        s3_client,
+        config,
+        true, // is_signed
+        None,
+        Arc::new(s3_proxy::inflight_tracker::InFlightTracker::new()),
+        None,
+        &resolved,
+        &None,
+    )
+    .await
+    .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "Signed range hedge should serve faster than the 500ms original; elapsed={:?}",
+        elapsed
+    );
+    let issued_after = metrics.issued.load(Ordering::Relaxed);
+    let won_after = metrics.won.load(Ordering::Relaxed);
+    assert!(
+        issued_after > issued_before,
+        "Signed range request should have issued a hedge (Req 2.3 applies to signed ranges too)"
+    );
+    assert!(
+        won_after > won_before,
+        "Hedge should have won the signed range race"
+    );
+}
+
+/// Req 1.3: hedging disabled for a signed range request → byte-identical to
+/// pre-fix behaviour, exactly one upstream call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_signed_range_hedging_disabled_no_hedge_issued() {
+    hedged_fetch::init_global_hedging();
+
+    let stub = DelayedHedgeStub::new(
+        Duration::from_millis(10),
+        Duration::from_millis(5),
+        206,
+        206,
+    );
+    let s3_client: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(stub.clone());
+
+    let mut config_inner = Config::default();
+    config_inner.connection_pool.upstream_first_byte_timeout = Duration::from_secs(5);
+    config_inner.connection_pool.upstream_idle_retries = 2;
+    config_inner.cache.download_coordination.enabled = false;
+    let config = Arc::new(config_inner);
+
+    let (_temp_dir, cache_manager_for_call, range_handler) = make_test_cache(&config).await;
+
+    let resolved = resolved_with_hedging(false, Duration::from_millis(50), 1);
+    let range_spec = s3_proxy::range_handler::RangeSpec { start: 0, end: 3 };
+    let overlap = s3_proxy::range_handler::RangeOverlap {
+        cached_ranges: Vec::new(),
+        missing_ranges: vec![range_spec.clone()],
+        can_serve_from_cache: false,
+    };
+    let mut signed_headers = HashMap::new();
+    signed_headers.insert(
+        "authorization".to_string(),
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-west-2/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=deadbeef".to_string(), // #gitleaks:allow
+    );
+    signed_headers.insert("range".to_string(), "bytes=0-3".to_string());
+
+    let metrics = hedged_fetch::get_global_metrics().unwrap();
+    let issued_before = metrics.issued.load(Ordering::Relaxed);
+
+    let response = HttpProxy::forward_range_with_coordination(
+        Method::GET,
+        "/test-bucket/signed-range-no-hedge-key.bin"
+            .parse()
+            .unwrap(),
+        "s3.amazonaws.com".to_string(),
+        signed_headers,
+        "test-bucket/signed-range-no-hedge-key.bin".to_string(),
+        range_spec,
+        overlap,
+        cache_manager_for_call,
+        range_handler,
+        s3_client.clone(),
+        config,
+        true, // is_signed
+        None,
+        Arc::new(s3_proxy::inflight_tracker::InFlightTracker::new()),
+        None,
+        &resolved,
+        &None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let issued_after = metrics.issued.load(Ordering::Relaxed);
+    assert_eq!(
+        issued_after, issued_before,
+        "No hedge should be issued when hedging is disabled for a signed range request"
+    );
+    let _ = s3_client; // dropped after use; call count is read from the original `stub` handle
+    assert_eq!(
+        stub.calls(),
+        1,
+        "Only the original upstream call should happen"
+    );
+}

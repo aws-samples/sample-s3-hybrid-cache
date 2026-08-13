@@ -50,7 +50,6 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Upload via multipart, download as full object or byte ranges—all served from cache
 - Request part 5 of a multipart object, then request overlapping byte range—cache serves both
 - Partial cache hits fetch only missing bytes from S3, merging with cached data
-- Page-aligned range caching—opt in per key to widen small ranged GETs to a fixed, page-aligned fetch and cache the whole page, so clustered reads (Parquet/ORC footer plus column chunks) hit cache instead of returning to S3. Off by default, since the tradeoff depends on whether reads cluster; the client always receives exactly the bytes it requested
 - Resumable downloads—if a transfer is interrupted, the client can resume and the proxy serves already-cached ranges locally while fetching only the remainder from S3
 
 **Designed for On-Premises Deployments**
@@ -123,9 +122,9 @@ aws s3 cp s3://your-bucket/key ./local \
   --region us-east-1
 ```
 
-The `--endpoint-url http://...` is required so the SDK signs the request against the real S3 hostname while connecting through the proxy. SigV4 authentication is built into the HTTP request itself, so the plain-HTTP client→proxy leg stays **authenticated** — but SigV4 provides no confidentiality, so it is not **encrypted**. That is acceptable here because this quick start runs the proxy on `127.0.0.1`, where the traffic never leaves the host. Once the proxy is on a different host, that hop crosses a network in cleartext: use the TLS proxy listener (`HTTP_PROXY=https://proxy:3129`) instead. See [What a Cleartext Hop Exposes](docs/ARCHITECTURE.md#what-a-cleartext-hop-exposes).
+`HTTP_PROXY` selects the proxy connection. `--endpoint-url http://s3.<region>.amazonaws.com` selects a cacheable HTTP S3 endpoint; otherwise, the AWS CLI defaults to HTTPS and sends a CONNECT tunnel that the proxy cannot cache. The S3 hostname remains the request's signed `Host` value, so do not use the proxy hostname as the endpoint URL. SigV4 authenticates the HTTP request, but does not encrypt the client-to-proxy hop. That is acceptable here because this quick start runs the proxy on `127.0.0.1`, where traffic never leaves the host. Once the proxy is on a different host, use the TLS proxy listener (`HTTP_PROXY=https://proxy:3129`). See [What a Cleartext Hop Exposes](docs/ARCHITECTURE.md#what-a-cleartext-hop-exposes).
 
-**Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to avoid passing `--endpoint-url` on every command (works for buckets in that region).
+**Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to avoid passing `--endpoint-url` on every S3 command for buckets in that Region.
 
 **On EC2 (or any host with IPs you don't want proxied)**, also set `NO_PROXY=169.254.169.254` so IMDS credential retrieval bypasses the proxy. Add other hosts to `NO_PROXY` as needed.
 
@@ -269,7 +268,7 @@ Cache-miss throughput is proxy-limited (S3 fetch + TLS + LZ4 compression + cache
 
 **Q: Why HTTP instead of HTTPS for caching?**
 
-A: The HTTP listener (port 80) uses plaintext HTTP so the proxy can read and cache request/response content. The HTTPS listener (port 443) uses TCP passthrough because the proxy cannot present a trusted certificate for the S3 endpoint — it can only relay encrypted bytes. For encrypted client-to-proxy traffic with caching, the optional TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, then processes the decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com` — the SDK signs against the real S3 hostname at the HTTP level, and the proxy decrypts, caches, and forwards to S3 over HTTPS. By default all proxy-to-S3 communication uses verified TLS (HTTPS) regardless of client connection protocol, except where a destination is configured with a protection-waiving [`upstream_overrides`](docs/CONFIGURATION.md#upstream-transport-overrides) mode (plaintext HTTP, or HTTPS with certificate validation disabled), which is intended for local development or trusted networks only.
+A: The HTTP listener (port 80) uses plaintext HTTP so the proxy can read and cache request/response content. The HTTPS listener (port 443) uses TCP passthrough because the proxy cannot present a trusted certificate for the S3 endpoint — it can only relay encrypted bytes. For encrypted client-to-proxy traffic with caching, the optional TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, then processes decrypted HTTP through the caching pipeline. `HTTP_PROXY=https://proxy:3129` selects that proxy connection; `--endpoint-url http://s3.<region>.amazonaws.com` selects the cacheable HTTP S3 endpoint. Without the HTTP endpoint, the client defaults to HTTPS and sends a CONNECT tunnel that bypasses the cache. The S3 hostname remains the request's signed `Host` value. By default all proxy-to-S3 communication uses verified TLS (HTTPS) regardless of client connection protocol, except where a destination is configured with a protection-waiving [`upstream_overrides`](docs/CONFIGURATION.md#upstream-transport-overrides) mode (plaintext HTTP, or HTTPS with certificate validation disabled), which is intended for local development or trusted networks only.
 
 **Q: How does load balancing and failover work?**
 

@@ -109,6 +109,8 @@ sudo systemctl restart s3-proxy                          # Restart service
 
 If you build on a separate host, copy the binary to each target (see [Binary Portability](#binary-portability)) and run only the last three commands. No Rust toolchain needed on the proxy servers.
 
+Running in a container instead of directly on the host? See [Docker Deployment](DOCKER.md) for a Dockerfile, image choice tradeoffs, and a `docker compose` example.
+
 The proxy also logs its version and build timestamp on startup (`Starting Hybrid Cache for Amazon S3 server v<version> (built: <timestamp>)`), so `journalctl -u s3-proxy | grep Starting` confirms which binary is actually running.
 
 For multi-instance deployments, restart one proxy at a time. Clients using the AWS CRT transfer client fail over to the remaining instances via DNS multi-value routing while each instance restarts. The shared cache is preserved across restarts — the journal system handles concurrent reads and consolidation without coordination.
@@ -267,7 +269,7 @@ aws s3 cp s3://your-bucket/key ./local \
   --region us-east-1
 ```
 
-The `--endpoint-url http://s3.<region>.amazonaws.com` is required so the SDK signs the request against the real S3 hostname (`Host: s3.us-east-1.amazonaws.com`), not the proxy hostname. SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer.
+`HTTP_PROXY` selects the proxy connection. `--endpoint-url http://s3.<region>.amazonaws.com` selects a cacheable HTTP S3 endpoint; otherwise, the AWS CLI defaults to HTTPS and sends a CONNECT tunnel that the proxy cannot cache. The S3 hostname remains the request's signed `Host` value, so do not use the proxy hostname as the endpoint URL. For repeated S3 commands against buckets in one Region, set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` instead of passing `--endpoint-url` each time.
 
 On EC2 — or any host where you need to bypass IMDS or other IPs — set `NO_PROXY`:
 
@@ -1085,7 +1087,7 @@ This starts both listeners — port 3128 (unencrypted) and port 3129 (TLS-termin
 
 ### Client Configuration
 
-Set `HTTP_PROXY` to route S3 traffic through the proxy. Use `--endpoint-url` so the SDK signs requests against the real S3 hostname (not the proxy hostname). SigV4 signatures are computed over HTTP-level content (Host header, path, query string), not the transport layer, so they remain valid regardless of whether the client connects via HTTP or TLS.
+`HTTP_PROXY` selects the proxy connection. `--endpoint-url http://s3.<region>.amazonaws.com` selects a cacheable HTTP S3 endpoint; otherwise, the AWS CLI defaults to HTTPS and sends a CONNECT tunnel that the proxy cannot cache. The S3 hostname remains the request's signed `Host` value, so do not use the proxy hostname as the endpoint URL. For repeated S3 commands against buckets in one Region, set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` instead of passing `--endpoint-url` each time.
 
 **Unencrypted (localhost or private networks):**
 

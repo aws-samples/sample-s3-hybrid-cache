@@ -682,6 +682,8 @@ dashboard:
 #   export NO_PROXY=169.254.169.254
 #   aws s3 cp s3://bucket/key ./local \
 #     --endpoint-url http://s3.us-east-1.amazonaws.com
+#   # For repeated S3 commands against buckets in us-east-1:
+#   export AWS_ENDPOINT_URL_S3=http://s3.us-east-1.amazonaws.com
 #
 # With TLS (encrypted client-to-proxy):
 #

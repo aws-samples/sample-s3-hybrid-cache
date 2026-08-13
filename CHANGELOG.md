@@ -5,6 +5,27 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] - 2026-08-13
+
+### Added
+
+- **Docker deployment guide** (`docs/DOCKER.md`). Documents building and running the
+  proxy in a container as an alternative to the systemd path: a multi-stage
+  Dockerfile with dependency-layer caching, distroless runtime image choice and
+  tradeoffs, environment-variable override reference, cache-volume persistence
+  requirements, non-root privilege model for port binding, a `docker compose`
+  example, bind-address gotchas for containerised services, shared-cache NFS mount
+  options, TLS cert mounting, upgrade flow, and Kubernetes notes.
+
+### Fixed
+
+- **Hedged upstream requests now cover signed range requests.** Clients that
+  sign their `Range` header did not get a hedge when a rule enabled hedging for the key — only unsigned range requests and full-object GETs did. Signed range
+  requests now hedge the same way, so a slow origin triggers a hedged retry
+  regardless of how the client issues its range request.
+
+- **Documentation.** Clarified range header signing in caching.md, and removed headline references to page widening since this feature requires custom or unusual clients.
+
 ## [2.4.2] - 2026-08-11
 
 ### Fixed

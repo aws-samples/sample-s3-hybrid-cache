@@ -1519,7 +1519,7 @@ The proxy implements intelligent range merging to optimize partial cache hits. W
 
 A GET without a `Range` header whose cache has partial coverage can also benefit from the merge path. The proxy synthesizes `Range: bytes=0-{total_size-1}` and routes through the same merge machinery, subject to three hard-coded gates:
 
-1. **Signature preservation**: `range` must not appear in the request's SigV4 SignedHeaders. AWS SDKs do not sign `Range` when no `Range` header is present, so the common hot path passes this gate.
+1. **Signature preservation**: `range` must not appear in the request's SigV4 SignedHeaders. Since this path synthesizes a Range header on a request that had no Range, and AWS SDKs only sign headers present at signing time, this gate passes trivially for the intended use case (full-object GETs with partial cache coverage).
 2. **Cached fraction ≥ 10 %**: sum of cached range bytes must be at least 10 % of `total_size`.
 3. **Object size ≤ 128 MiB**: the merge path buffers the reconstructed response; a 128 MiB cap avoids memory pressure. Larger objects fall through to an unconditional S3 fetch as before.
 
@@ -2173,7 +2173,22 @@ This error handling ensures that the write cache enhances performance without co
 
 Page-aligned range caching (also called *range read widening*) widens an eligible small ranged GET into a fixed-size, page-aligned fetch, caches the whole page (disk and RAM), and serves the client exactly the bytes it requested. Later small reads that fall in the same page — from the same reader, a re-run, or a different reader sharing the cache — are served with no S3 round trip, and concurrent small reads in the same page coalesce onto a single fetch.
 
-This is the access pattern of analytics readers (Parquet, ORC): a trailing footer read followed by clustered column-chunk reads. Footer/tail caching is simply the special case where the read lands in the object's last page — the proxy never parses object content to detect this; it works purely from request byte offsets.
+The access shape it targets is a trailing footer read followed by clustered reads at scattered offsets, as produced by columnar readers (Parquet, ORC). Footer/tail caching is simply the special case where the read lands in the object's last page. The proxy never parses object content to detect any of this; it works purely from request byte offsets.
+
+### Eligibility: which clients can use this
+
+**Read this before enabling.** Widening requires that `range` is **absent** from the request's SigV4 `SignedHeaders`, because widening works by rewriting the upstream `Range` and rewriting a signed header invalidates the client's signature. The proxy has no credentials and cannot re-sign, so this is a hard constraint, not a tuning choice.
+
+The AWS CLI and every official AWS SDK (botocore/boto3, Java, JS v3, Rust, Go v2) sign `Range` — see [Which clients sign Range?](#which-clients-sign-range) for the full breakdown. **A workload made up exclusively of those clients gets no widening at all**, and gets no error saying so: every request falls through to the ordinary un-widened range path and increments `page_cache.skipped_signed_range`.
+
+Widening is therefore useful for:
+
+- **Presigned-URL access patterns** — video streaming with browser range-seeking, PDF viewers, columnar readers fetching via presigned URLs issued by a backend. A presigned URL signs via query-string parameters, so no `SignedHeaders` list containing `range` exists.
+- **rclone** — uses its own SigV4 implementation signing a minimal header set.
+- **Custom HTTP clients** that add `Range` after signing, or sign only the minimum required headers.
+
+Note what this excludes: Spark, Hadoop, Hive, Trino, Flink, `aws s3 cp`, `aws s3api get-object --range`, s5cmd, and Mountpoint. Columnar data read through any of those does not qualify, despite being the access shape the mechanism was designed around.
+
 
 ### Off by default, per-key opt-in
 
@@ -2188,7 +2203,7 @@ Widening is **never enabled globally** and **off unless a `cache_rules.json` rul
 
 ### Operator warning: amplification is workload-dependent
 
-Widening every small read to a full page is a large win when reads **cluster** within pages (analytics column scans, footers) and a real **cost** when reads are **scattered** — a 4 KiB random read against a key with a 16 MiB page size becomes a 16 MiB fetch. Only enable `page_widening` for key patterns whose access pattern clusters reads within pages. See [`docs/examples/page-aligned-parquet-rules.json`](examples/page-aligned-parquet-rules.json) for a worked example.
+Widening every small read to a full page is a large win when reads **cluster** within pages (columnar scans, footers) and a real **cost** when reads are **scattered** — a 4 KiB random read against a key with a 16 MiB page size becomes a 16 MiB fetch. Only enable `page_widening` for key patterns whose access pattern clusters reads within pages.
 
 ### Mechanism
 
@@ -2226,7 +2241,7 @@ Widening exposes the following counters (see [Monitoring](#monitoring) and the d
 | `page_cache.widened_requests` | Small reads widened to a Page fetch |
 | `page_cache.bytes_prefetched` | Bytes fetched beyond what the client requested (plus a derived amplification ratio) |
 | `page_cache.page_hits` | Small reads served from an already-cached Page with no S3 fetch |
-| `page_cache.skipped_signed_range` | Requests that would otherwise be eligible but were left unmodified because the Range was signed |
+| `page_cache.skipped_signed_range` | Requests that would otherwise be eligible but were left unmodified because the Range was signed (expected for AWS CLI/SDK traffic; see [Eligibility](#eligibility-which-clients-can-use-this)) |
 | `page_cache.fallbacks` | Widened/Page fetches that failed and fell back to the client's original range |
 | `page_cache.ram_page_promotions` | Pages successfully promoted to the RAM cache |
 | `page_cache.ram_page_promotion_skipped` | Pages not promoted to RAM (e.g. exceeded the applicable RAM budget) |
@@ -4096,7 +4111,25 @@ Cache coherency operations are designed to have minimal performance impact:
 
 ### Overview
 
-When AWS CLI or SDKs sign GET requests with AWS Signature Version 4 (SigV4), they may include the Range header in the SignedHeaders list. This creates a challenge for the proxy: modifying the Range header to fetch only missing cache portions would invalidate the signature, causing S3 to return 403 Forbidden errors.
+When clients sign GET requests with AWS Signature Version 4 (SigV4), the Range header is included in the SignedHeaders list if it was present at signing time. This creates a challenge for the proxy: modifying the Range header to fetch only missing cache portions would invalidate the signature, causing S3 to return 403 Forbidden errors.
+
+#### Which clients sign Range?
+
+The AWS CLI and all official AWS SDKs (botocore/boto3, Java SDK, JS SDK v3, Rust SDK, Go SDK v2) sign every header not on botocore's internal blocklist. Range is not on that blocklist, so **any request made through an official AWS SDK or CLI with a Range header will have Range signed**. This includes:
+
+- `aws s3api get-object --range`
+- `aws s3 cp` (CRT parallel downloads sign Range + If-Match on each ranged part)
+- s5cmd (uses Go AWS SDK v2)
+- Mountpoint for Amazon S3 (uses CRT `auto_ranged_get`, which signs Range internally)
+
+Clients that typically do **not** sign Range:
+
+- **Presigned URLs with Range added at request time** — the signature was computed before the Range header was added, so Range is not in SignedHeaders
+- **curl / wget / custom HTTP clients** using presigned URLs
+- **rclone** — uses its own SigV4 implementation that signs a minimal header set (host + x-amz-* headers)
+- **Older MinIO Go client** — similar minimal SignedHeaders set
+
+The proxy detects which case applies on every request by parsing the `SignedHeaders` field in the Authorization header, so it handles both signed and unsigned Range transparently.
 
 ### How It Works
 

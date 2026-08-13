@@ -183,7 +183,7 @@ Effect on per-connection memory: the per-connection streaming-cache budget is on
 
 ### TLS Proxy Configuration
 
-The TLS proxy listener terminates TLS on a configurable port and processes decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com`.
+The TLS proxy listener terminates TLS on a configurable port and processes decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:3129` to select the proxy connection and `--endpoint-url http://s3.<region>.amazonaws.com` to select a cacheable HTTP S3 endpoint. For repeated S3 commands against buckets in one Region, set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` instead of repeating `--endpoint-url`.
 
 ```yaml
 server:
@@ -588,7 +588,11 @@ The file holds an optional `$schema` reference plus an ordered `rules` array. Ea
 
 **Optional per-rule fields**: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`, `hedging_enabled`, `hedge_trigger_after`, `hedge_max_per_request`
 
-**`page_widening` / `page_size` (page-aligned range caching / range read widening).** `page_widening` (bool, default `false`) enables widening a small ranged GET for matching keys into a fixed-size, page-aligned fetch; `page_size` (bytes, default `16777216` = 16 MiB when `page_widening` is enabled without specifying it) sets the page size `P`. `page_size` must be `> 0` and `<= 67108864` (64 MiB) for any rule enabling `page_widening` — validated at startup and on hot reload; an out-of-range value invalidates the rule set (see [Validation](#validation)). Off by default and never enabled globally — only via an explicit rule, since amplification is workload-dependent. See [CACHING.md — Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching) for the full mechanism, and [`docs/examples/page-aligned-parquet-rules.json`](examples/page-aligned-parquet-rules.json) for a worked example:
+**`page_widening` / `page_size` (page-aligned range caching / range read widening).** `page_widening` (bool, default `false`) enables widening a small ranged GET for matching keys into a fixed-size, page-aligned fetch; `page_size` (bytes, default `16777216` = 16 MiB when `page_widening` is enabled without specifying it) sets the page size `P`. `page_size` must be `> 0` and `<= 67108864` (64 MiB) for any rule enabling `page_widening` — validated at startup and on hot reload; an out-of-range value invalidates the rule set (see [Validation](#validation)). Off by default and never enabled globally — only via an explicit rule, since amplification is workload-dependent.
+
+**Check eligibility before enabling.** Widening applies only when `range` is absent from the request's SigV4 `SignedHeaders`. The AWS CLI and every official AWS SDK sign `Range`, so enabling this for a CLI/SDK workload has no effect and produces no error: requests fall through to the ordinary range path and increment `page_cache.skipped_signed_range`. Read [CACHING.md — Eligibility: which clients can use this](CACHING.md#eligibility-which-clients-can-use-this) first, then [Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching) for the mechanism.
+
+Field syntax, for a key pattern whose reads cluster within pages:
 
 ```json
 { "pattern": "**/*.parquet", "page_widening": true, "page_size": 16777216 }
@@ -1394,6 +1398,8 @@ Each key is `"host:port"`. The port is part of the key, so the same host on diff
 - A bare `*` matcher is rejected (it would match link-local and internal hosts); the entry is skipped with a warning and does not abort startup.
 
 Hostnames resolve via the proxy's own configured `dns_servers`, not the host's default system resolver — the same resolver the rest of the egress uses. A publicly-resolvable name such as `s3.<region>.amazonaws.com` therefore resolves to its real address — you can override real S3 to plaintext on port 80 the same way you override a local store.
+
+**Blast radius when testing this feature**: because a DNS-name override matches every subdomain at that port, one override entry (e.g. `s3.us-west-2.amazonaws.com:80`) shadows both path-style and virtual-hosted requests to that entire region on that port. In the deployment-verification fleet suite, this is why the default (no-override) code path is not reachable through the suite's primary us-west-2 endpoint once T22's plaintext override is configured — see `nonpublic/shell/deployment-verification.sh`'s T22 and T39 banners. T39 deliberately targets hosts with no matching override entry (`eu-west-2`/`eu-central-1`) to exercise the default, verified-TLS-plus-distributed-IP arm.
 
 ### Security implications
 

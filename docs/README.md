@@ -5,6 +5,7 @@ Deep-dive reference documentation for Hybrid Cache for Amazon S3. For an overvie
 ## Getting Started
 
 - [Quick Start Guide](GETTING_STARTED.md) - Installation and first run
+- [Docker Deployment](DOCKER.md) - Building and running in a container, as an alternative to the systemd path
 - [Deploying on AWS for Distant Origins](AWS_DEPLOYMENT.md) - Reference architecture and FSx for OpenZFS sizing for cross-region and non-AWS origins
 - [Upgrading](UPGRADING.md) - Per-release manual steps and default changes
 - [Configuration Reference](CONFIGURATION.md) - Complete configuration options
@@ -22,7 +23,6 @@ Deep-dive reference documentation for Hybrid Cache for Amazon S3. For an overvie
 - [Write-Through Caching](CACHING.md#write-through-cache) - PUT operation caching
 - [Multipart Upload Caching](MULTIPART_UPLOAD.md) - Multipart upload cache internals and correctness model
 - [Range Request Optimization](CACHING.md#intelligent-range-merging) - Intelligent range handling
-- [Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching) - Opt-in range read widening for analytics workloads
 - [Compression Optimization](COMPRESSION.md#ram-cache-compression-optimization) - Efficient memory usage
 - [Download Bandwidth QoS](BANDWIDTH_QOS.md) - Origin download rate ceiling and fair sharing
 

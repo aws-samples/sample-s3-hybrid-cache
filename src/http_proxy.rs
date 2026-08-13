@@ -11287,6 +11287,25 @@ impl HttpProxy {
         let mut last_error = None;
         let mut coordination_guard = coordination_guard;
 
+        // Hedging: signed range requests forward the client's exact Range header
+        // and cannot be split or re-fetched piecemeal like the unsigned
+        // complete-cache-miss path (`stream_range_from_s3_with_caching`), but the
+        // whole-request fetch itself can still race an original attempt against a
+        // hedge the same way `forward_get_head_to_s3_and_cache` does. Without this,
+        // any client that signs its Range header (e.g. the AWS CLI/SDK's
+        // `GetObject` with `--range`) got zero hedging coverage even when a rule
+        // enabled it, silently narrowing Requirement 2.3 to unsigned ranges only.
+        // One client request = one budget, shared across retries below (a retry
+        // is the same logical request, not a fresh hedging opportunity).
+        // Spec: hedged-upstream-requests Requirements 1.2, 1.3, 2.1, 2.3, 6.1, 6.5.
+        let hedge_budget: Option<AtomicUsize> = if resolved.hedging_enabled && method == Method::GET
+        {
+            Some(AtomicUsize::new(resolved.hedge_max_per_request))
+        } else {
+            None
+        };
+        let max_inflight_fraction = config.connection_pool.hedged_requests.max_inflight_fraction;
+
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
                 // Brief delay before retry (100ms * attempt)
@@ -11308,7 +11327,17 @@ impl HttpProxy {
                 );
                 retry_context.allow_streaming = true;
 
-                match s3_client.forward_request(retry_context).await {
+                match hedged_fetch::fetch_maybe_hedged(
+                    s3_client.as_ref(),
+                    retry_context,
+                    &host,
+                    hedge_budget.as_ref(),
+                    resolved.hedge_trigger_after,
+                    max_inflight_fraction,
+                    &cache_key,
+                )
+                .await
+                {
                     Ok(s3_response) => {
                         if method != Method::HEAD {
                             let s3_fetch_ms = perf_s3_start.elapsed().as_millis();
@@ -11349,7 +11378,17 @@ impl HttpProxy {
                 }
             } else {
                 // First attempt
-                match s3_client.forward_request(context.clone()).await {
+                match hedged_fetch::fetch_maybe_hedged(
+                    s3_client.as_ref(),
+                    context.clone(),
+                    &host,
+                    hedge_budget.as_ref(),
+                    resolved.hedge_trigger_after,
+                    max_inflight_fraction,
+                    &cache_key,
+                )
+                .await
+                {
                     Ok(s3_response) => {
                         if method != Method::HEAD {
                             let s3_fetch_ms = perf_s3_start.elapsed().as_millis();
