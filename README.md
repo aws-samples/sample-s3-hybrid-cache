@@ -35,6 +35,7 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - RAM caching accelerates repeated access to hot data and metadata (including HEAD responses)
 - HEAD response caching reduces metadata lookup latency for tools like Mountpoint for Amazon S3
 - Hedged upstream requests—opt in per key pattern to race a second fetch against a slow original on cache misses, serving whichever returns first; reduces p99/p99.9 latency for workloads sensitive to upstream tail latency (e.g. analytics column-chunk reads). Off by default
+- Download bandwidth QoS—cap aggregate cache-miss download bandwidth and distribute it fairly among callers (by User-Agent app ID) or buckets with deficit round-robin scheduling. Disabled by default
 - Streaming architecture for large files—no buffering or throughput degradation
 - HTTPS passthrough for clients that cannot be configured for HTTP (only HTTP requests use the cache)
 - Optional TLS proxy listener for encrypted client-to-proxy traffic with full caching via `HTTP_PROXY`
@@ -42,8 +43,10 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 **Reduce Data Transfer Costs**
 - Serve cached content locally instead of fetching from S3 repeatedly
 - Download coordination coalesces concurrent requests for the same uncached resource — only one request fetches from S3 while others wait, then all serve from cache
+- Content-aware LZ4 compression saves 2–10× storage for compressible content and skips formats that are already compressed
 - TinyLFU-like eviction algorithm optimizes cache retention for frequently accessed data
 - Separate TTLs for HEAD and GET requests—expired cached objects are automatically revalidated with S3 using If-None-Match, avoiding re-download when unchanged
+- Choose lazy expiration for fixed-capacity storage or active expiration for elastic storage
 
 **Unified Range Storage**
 - All cached data stored in a common format—full objects, byte ranges, and multipart parts are interchangeable
@@ -52,17 +55,17 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 - Partial cache hits fetch only missing bytes from S3, merging with cached data
 - Resumable downloads—if a transfer is interrupted, the client can resume and the proxy serves already-cached ranges locally while fetching only the remainder from S3
 
+**Configure Cache Behavior Per Key Pattern**
+- Set TTLs, read/write caching, compression, RAM-cache eligibility, page-aligned range caching, hedged upstream requests, and local conditional-request evaluation for keys matching a glob pattern
+- Update `cache_rules.json` without restarting the proxy
+
 **Designed for On-Premises Deployments**
 - Deploy multiple cache instances behind shared file storage (e.g., NFS) for high availability
 - Horizontal scaling with coordinated cache access across instances
 - No single point of failure—any instance can serve cached content
 - Stateless instances—no direct communication between nodes; all coordination via shared storage makes instances ephemeral and replaceable
 - Journal-based metadata updates—each instance writes cache updates to its own journal file, and a background consolidator merges them atomically, eliminating race conditions on shared storage without inter-node communication
-- Content-aware LZ4 compression—2-10x space savings, automatically skips already-compressed formats
-- Glob-based cache rules—configure TTLs, read/write caching, compression, RAM cache eligibility, page-aligned range caching, hedged upstream requests, and local conditional-request evaluation for keys matching a glob pattern via a single hot-reloadable `cache_rules.json`
-- Flexible expiration modes—lazy (fixed capacity) or active (elastic storage)
 - Cache storage is flexible—a single proxy with local disk may be suitable on a hypervisor platform that provides high availability. Multi-proxy deployments use any NFS-compatible shared storage: a dedicated NAS appliance, a file server VM within the cluster, or file services built into a hypervisor platform
-- **Download bandwidth QoS**—cap the aggregate cache-miss origin download rate and share it fairly across callers (User-Agent app-id) or buckets using deficit round-robin scheduling; static `cap/N` fleet sharing; disabled by default
 
 **Also Runs on AWS**
 
