@@ -38,8 +38,8 @@ use crate::metrics::{MetricsManager, RequestType};
 use crate::path_safety::is_safe_path_component;
 use crate::s3_client::S3ClientApi;
 use crate::signed_request_proxy::{
-    forward_signed_request, forward_signed_request_streaming, forward_signed_request_with_body,
-    UpstreamTransport,
+    forward_signed_request_streaming, forward_signed_request_streaming_verbatim,
+    forward_signed_request_with_body, UpstreamTransport, STREAMED_BODY_CAP,
 };
 use crate::{ProxyError, Result};
 use bytes::Bytes;
@@ -290,8 +290,6 @@ pub struct SignedPutHandler {
     s3_client: Option<Arc<dyn S3ClientApi + Send + Sync>>,
     /// Proxy identification Referer header value (None when disabled)
     proxy_referer: Option<String>,
-    /// Maximum request body size to buffer into memory (Requirement 11.1)
-    max_buffered_request_body_bytes: u64,
     /// Maximum CompleteMultipartUpload body size (default: 10 MiB).
     /// The Complete XML body is bounded to this cap; bodies exceeding it are rejected
     /// with HTTP 413, preventing unbounded memory consumption.
@@ -312,16 +310,13 @@ impl SignedPutHandler {
     /// * `compression_handler` - Handler for compressing cached data
     /// * `current_cache_usage` - Current cache usage in bytes
     /// * `max_cache_capacity` - Maximum cache capacity in bytes
-    /// * `max_buffered_request_body_bytes` - Maximum request body size to buffer
     /// * `max_complete_body_bytes` - Maximum CompleteMultipartUpload body size
-    #[allow(clippy::too_many_arguments)] // All arguments are required config values
     pub fn new(
         cache_dir: PathBuf,
         compression_handler: CompressionHandler,
         current_cache_usage: u64,
         max_cache_capacity: u64,
         proxy_referer: Option<String>,
-        max_buffered_request_body_bytes: u64,
         max_complete_body_bytes: u64,
         write_cache_tee_channel_depth: usize,
     ) -> Self {
@@ -334,7 +329,6 @@ impl SignedPutHandler {
             cache_manager: None,
             s3_client: None,
             proxy_referer,
-            max_buffered_request_body_bytes,
             max_complete_body_bytes,
             write_cache_tee_channel_depth,
         }
@@ -396,6 +390,32 @@ impl SignedPutHandler {
     /// - Requirement 5.3: Handle CompleteMultipartUpload
     /// - Requirement 4.1: Handle CreateMultipartUpload
     pub async fn handle_signed_put(
+        &mut self,
+        req: Request<hyper::body::Incoming>,
+        cache_key: String,
+        target_host: String,
+        transport: Arc<UpstreamTransport>,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        self.handle_put(req, cache_key, target_host, transport)
+            .await
+    }
+
+    /// Handle a PUT without an Authorization header using the same streaming cache
+    /// pipeline as signed PUTs. A cache-capacity bypass still streams verbatim: the
+    /// request is forward-only, so buffering it would recreate the unsigned-write
+    /// memory cliff.
+    pub async fn handle_unsigned_put(
+        &mut self,
+        req: Request<hyper::body::Incoming>,
+        cache_key: String,
+        target_host: String,
+        transport: Arc<UpstreamTransport>,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        self.handle_put(req, cache_key, target_host, transport)
+            .await
+    }
+
+    async fn handle_put(
         &mut self,
         req: Request<hyper::body::Incoming>,
         cache_key: String,
@@ -505,9 +525,18 @@ impl SignedPutHandler {
                 if let Some(metrics) = &self.metrics_manager {
                     metrics.read().await.record_bypassed_put().await;
                 }
-                // Forward without caching
-                forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
-                    .await
+                // A cache-capacity bypass is forward-only. Stream it verbatim so
+                // cache misses do not buffer an object the cache will not retain.
+                // If the client disconnects mid-upload, S3 sees a partial upload and
+                // rejects it, matching the cached signed PUT streaming path.
+                forward_signed_request_streaming_verbatim(
+                    req,
+                    &target_host,
+                    &transport,
+                    self.proxy_referer.as_deref(),
+                    STREAMED_BODY_CAP,
+                )
+                .await
             }
             CacheDecision::StreamWithCapacityCheck => {
                 info!("Streaming signed PUT with capacity check: {}", cache_key);
@@ -669,7 +698,7 @@ impl SignedPutHandler {
             &target_host,
             &transport,
             self.proxy_referer.as_deref(),
-            self.max_buffered_request_body_bytes,
+            STREAMED_BODY_CAP,
             tee,
         )
         .await;
@@ -993,10 +1022,18 @@ impl SignedPutHandler {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // Forward request to S3
-        let s3_response =
-            forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
-                .await?;
+        // CreateMultipartUpload is forward-only on the request side; only its
+        // response XML is inspected below. Stream its request verbatim. A client
+        // disconnect can therefore reach S3 as a partial request, matching the main
+        // signed PUT streaming path.
+        let s3_response = forward_signed_request_streaming_verbatim(
+            req,
+            &target_host,
+            &transport,
+            self.proxy_referer.as_deref(),
+            STREAMED_BODY_CAP,
+        )
+        .await?;
 
         let status = s3_response.status();
         let response_headers = s3_response.headers().clone();
@@ -1173,11 +1210,15 @@ impl SignedPutHandler {
                 "UploadPart: rejected unsafe uploadId={}, forwarding to S3 without caching",
                 truncate_upload_id(&upload_id)
             );
-            return forward_signed_request(
+            // This reject path does not inspect the body. Stream it verbatim so a
+            // client disconnect reaches S3 as a partial request, matching other
+            // signed forward-only paths.
+            return forward_signed_request_streaming_verbatim(
                 req,
                 &target_host,
                 &transport,
                 self.proxy_referer.as_deref(),
+                STREAMED_BODY_CAP,
             )
             .await;
         }
@@ -1268,7 +1309,7 @@ impl SignedPutHandler {
                     &target_host,
                     &transport,
                     self.proxy_referer.as_deref(),
-                    self.max_buffered_request_body_bytes,
+                    STREAMED_BODY_CAP,
                     tee,
                 )
                 .await;
@@ -1298,8 +1339,18 @@ impl SignedPutHandler {
                 if let Some(metrics) = &self.metrics_manager {
                     metrics.read().await.record_bypassed_put().await;
                 }
-                forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
-                    .await
+                // This bypass arm is forward-only. Stream the original frames
+                // instead of retaining an object the cache declined to store. A
+                // mid-upload disconnect now reaches S3 as a partial upload, matching
+                // the cached UploadPart path.
+                forward_signed_request_streaming_verbatim(
+                    req,
+                    &target_host,
+                    &transport,
+                    self.proxy_referer.as_deref(),
+                    STREAMED_BODY_CAP,
+                )
+                .await
             }
         };
 
@@ -1460,11 +1511,15 @@ impl SignedPutHandler {
                 "CompleteMultipartUpload: rejected unsafe uploadId={}, forwarding to S3 without caching",
                 truncate_upload_id(&upload_id)
             );
-            return forward_signed_request(
+            // This reject path does not inspect the body. Stream it verbatim so a
+            // client disconnect reaches S3 as a partial request, matching other
+            // signed forward-only paths.
+            return forward_signed_request_streaming_verbatim(
                 req,
                 &target_host,
                 &transport,
                 self.proxy_referer.as_deref(),
+                STREAMED_BODY_CAP,
             )
             .await;
         }
@@ -1503,6 +1558,30 @@ impl SignedPutHandler {
             }
         }
 
+        // Reserve against the in-flight ledger for consistency in the ledger
+        // total, even though this cap is already correct and does not change
+        // (design.md → "Already-bounded sites, unchanged"). The Complete XML
+        // is capped at `max_complete_body_bytes` (10 MiB default) with an
+        // up-front Content-Length check above and a mid-collect guard below,
+        // so this reservation is taken for the declared length (or grown per
+        // chunk when absent) purely for observability parity with the other
+        // Buffering_Sites — it is not the primary defense against an oversized
+        // body, which `RequestBodyTooLarge`/413 above and below remains.
+        let ledger = self
+            .s3_client
+            .as_ref()
+            .map(|c| c.get_inflight_ledger())
+            .unwrap_or_else(|| Arc::new(crate::inflight_ledger::InflightLedger::disabled()));
+        let mut mpu_reservation = match ledger.try_reserve(content_length_hint.unwrap_or(0)) {
+            Some(r) => r,
+            None => {
+                return Err(ProxyError::InflightCeilingExceeded {
+                    ceiling_bytes: ledger.ceiling_bytes(),
+                    requested_bytes: content_length_hint.unwrap_or(0),
+                });
+            }
+        };
+
         let mut body = req.into_body();
         let mut accumulated = Vec::with_capacity(
             content_length_hint
@@ -1530,6 +1609,18 @@ impl SignedPutHandler {
                         content_length: content_length_hint,
                         max_bytes,
                     });
+                }
+                let already_reserved = mpu_reservation.held_bytes();
+                let new_total = accumulated.len() as u64 + data.len() as u64;
+                if new_total > already_reserved {
+                    let growth = new_total - already_reserved;
+                    if !mpu_reservation.try_grow(growth) {
+                        ledger.record_aborted_accumulation();
+                        return Err(ProxyError::InflightCeilingExceeded {
+                            ceiling_bytes: ledger.ceiling_bytes(),
+                            requested_bytes: new_total,
+                        });
+                    }
                 }
                 accumulated.extend_from_slice(&data);
             }
@@ -1667,11 +1758,15 @@ impl SignedPutHandler {
                 "AbortMultipartUpload: rejected unsafe uploadId={}, forwarding to S3 without caching",
                 truncate_upload_id(&upload_id)
             );
-            return forward_signed_request(
+            // This reject path does not inspect the body. Stream it verbatim so a
+            // client disconnect reaches S3 as a partial request, matching other
+            // signed forward-only paths.
+            return forward_signed_request_streaming_verbatim(
                 req,
                 &target_host,
                 &transport,
                 self.proxy_referer.as_deref(),
+                STREAMED_BODY_CAP,
             )
             .await;
         }
@@ -1681,10 +1776,17 @@ impl SignedPutHandler {
             cache_key, upload_id
         );
 
-        // Forward request to S3 first
-        let s3_response =
-            forward_signed_request(req, &target_host, &transport, self.proxy_referer.as_deref())
-                .await?;
+        // AbortMultipartUpload is forward-only; cleanup happens after the response,
+        // not from its request body. Stream it verbatim so a mid-upload disconnect
+        // reaches S3 as a partial request, consistent with signed PUT forwarding.
+        let s3_response = forward_signed_request_streaming_verbatim(
+            req,
+            &target_host,
+            &transport,
+            self.proxy_referer.as_deref(),
+            STREAMED_BODY_CAP,
+        )
+        .await?;
 
         // Always clean up cached parts, regardless of S3 response status
         // This ensures we don't leave orphaned cache data
@@ -3557,10 +3659,211 @@ mod tests {
             0,
             10 * 1024 * 1024, // 10MB capacity
             None,
-            128 * 1024 * 1024, // 128 MiB max request body
-            10 * 1024 * 1024,  // 10 MiB max complete body
-            5,                 // write_cache_tee_channel_depth
+            10 * 1024 * 1024, // 10 MiB max complete body
+            5,                // write_cache_tee_channel_depth
         )
+    }
+
+    /// Mock upstream: accept one connection, drain the request (headers + exactly
+    /// `body_len` body bytes), then reply `200 OK`. Modeled on the identical helper
+    /// in `signed_request_proxy.rs`'s own tests.
+    async fn accept_and_ok(listener: tokio::net::TcpListener, body_len: usize) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 65536];
+        let header_end = loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let mut body_read = buf.len() - header_end;
+        while body_read < body_len {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            body_read += n;
+        }
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        let _ = sock.flush().await;
+    }
+
+    /// Drive `body` through a real loopback HTTP/1 connection to obtain a genuine
+    /// `Request<hyper::body::Incoming>` — `Incoming` has no public constructor from
+    /// bytes, so every test needing one goes through a real connection (same pattern
+    /// as `signed_request_proxy.rs`'s inline tests).
+    /// The returned `oneshot::Sender` is a **connection keep-alive guard and must be
+    /// held until the caller has finished reading the returned body.** An `Incoming`
+    /// is fed by the `serve_connection` future that produced it; if that future
+    /// completes, the body stops yielding. Returning the request from the service
+    /// and responding immediately therefore only works while the whole body already
+    /// arrived in the first read — true for a few KiB, false for anything large. At
+    /// 150 MiB it is a race that loses under parallel test load, and it loses by
+    /// hanging in the I/O driver forever rather than failing. The service now parks
+    /// on this channel instead, so the connection keeps draining the socket for as
+    /// long as the caller needs. Dropping the sender releases the connection.
+    async fn incoming_upload_part_request(
+        uri_path_and_query: &str,
+        body: Vec<u8>,
+    ) -> (
+        Request<hyper::body::Incoming>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (req_tx, req_rx) = oneshot::channel::<Request<hyper::body::Incoming>>();
+        let req_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(req_tx)));
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let done_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(done_rx)));
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let req_tx = req_tx.clone();
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                if let Some(tx) = req_tx.lock().unwrap().take() {
+                    let _ = tx.send(req);
+                }
+                // Taken out of the mutex synchronously so no lock is held across the
+                // await below.
+                let parked = done_rx.lock().unwrap().take();
+                async move {
+                    if let Some(parked) = parked {
+                        let _ = parked.await;
+                    }
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let body_len = body.len();
+        let uri_path_and_query = uri_path_and_query.to_string();
+        tokio::spawn(async move {
+            use hyper_util::client::legacy::Client;
+            use hyper_util::rt::TokioExecutor;
+            let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+            let uri = format!("http://{}{}", addr, uri_path_and_query);
+            let req = Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header("content-length", body_len.to_string())
+                .body(Full::new(Bytes::from(body)))
+                .unwrap();
+            let _ = client.request(req).await;
+        });
+
+        (req_rx.await.unwrap(), done_tx)
+    }
+
+    /// Requirement IMA 10.8: an `UploadPart` on a cache-capacity bypass streams
+    /// verbatim to the upstream under S3's 5 GiB limit.
+    ///
+    /// `should_cache` returns `Bypass` whenever available cache capacity is
+    /// exhausted (`current_cache_usage == max_cache_capacity` here). The bypass arm
+    /// is forward-only and must use the same internal streamed cap as every other
+    /// PUT and UploadPart path.
+    #[tokio::test]
+    async fn test_upload_part_bypass_arm_streams_to_upstream() {
+        let temp_dir = TempDir::new().unwrap();
+        let compression_handler = CompressionHandler::new(1024, true);
+        // current_cache_usage == max_cache_capacity => available capacity is zero,
+        // so should_cache(Some(_ > 0)) always returns Bypass regardless of size.
+        let mut handler = SignedPutHandler::new(
+            temp_dir.path().to_path_buf(),
+            compression_handler,
+            10 * 1024 * 1024, // current_cache_usage
+            10 * 1024 * 1024, // max_cache_capacity (== current usage: forces Bypass)
+            None,
+            10 * 1024 * 1024,
+            5,
+        );
+
+        // 16 MiB crosses several network frames without the 150 MiB allocation that
+        // wedged the full suite under parallel load on 2026-08-17.
+        let part_size = 16 * 1024 * 1024;
+        // Mock upstream S3, sized to the part body so it can drain the request.
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream = tokio::spawn(accept_and_ok(upstream_listener, part_size));
+
+        // `_conn_keepalive` must outlive the `handle_upload_part` call below — see the
+        // helper's doc comment. Dropping it early closes the connection feeding the
+        // request body and starves the upstream stream.
+        let (req, _conn_keepalive) = incoming_upload_part_request(
+            "/test-object?uploadId=test-upload-bypass&partNumber=1",
+            vec![0xABu8; part_size],
+        )
+        .await;
+
+        let transport = Arc::new(UpstreamTransport {
+            ip: upstream_addr.ip(),
+            port: upstream_addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        });
+
+        // Bounded so a regression in the body-feeding path fails this test instead of
+        // parking the whole suite in the I/O driver with no output. 0.33s is typical.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            handler.handle_upload_part(
+                req,
+                "test-bucket/test-object".to_string(),
+                "test-bucket.s3.amazonaws.com".to_string(),
+                transport,
+                "test-upload-bypass".to_string(),
+                1,
+            ),
+        )
+        .await
+        .expect("handle_upload_part did not finish within 120s — the request body most likely stopped being fed (see incoming_upload_part_request's keep-alive guard)");
+
+        // If the cap is enforced too small, handle_upload_part rejects the body before
+        // ever connecting to the mock upstream, so the upstream task never completes.
+        // Bound the wait rather than hanging forever on that failure mode.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), upstream).await;
+
+        match &result {
+            Ok(response) => {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "UploadPart on a cache-capacity bypass must stream to the upstream \
+                     and succeed under S3's 5 GiB limit"
+                );
+            }
+            Err(ProxyError::RequestBodyTooLarge {
+                content_length,
+                max_bytes,
+            }) => {
+                panic!(
+                    "UploadPart incorrectly rejected with 413 on the cache-capacity bypass: \
+                     content_length={:?}, max_bytes={} (expected the streamed 5 GiB cap)",
+                    content_length, max_bytes
+                );
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+        }
     }
 
     #[test]
@@ -3781,7 +4084,6 @@ mod tests {
                     0,
                     10 * 1024 * 1024,
                     None,
-                    128 * 1024 * 1024,
                     10 * 1024 * 1024,
                     5,
                 );
@@ -3801,7 +4103,6 @@ mod tests {
                     0,
                     10 * 1024 * 1024,
                     None,
-                    128 * 1024 * 1024,
                     10 * 1024 * 1024,
                     5,
                 );

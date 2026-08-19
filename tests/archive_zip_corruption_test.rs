@@ -322,9 +322,11 @@ async fn test_non_aligned_range_requests_after_multipart_upload() {
         // Verify data matches original
         let expected_data = &full_data[start as usize..=end as usize];
         assert_eq!(
-            merge_result.data, expected_data,
+            merge_result.data.as_ref(),
+            expected_data,
             "Data mismatch for range {}-{}",
-            start, end
+            start,
+            end
         );
 
         println!(
@@ -484,7 +486,7 @@ async fn test_last_part_smaller_than_standard() {
         .unwrap();
 
     assert_eq!(merge_result.data.len(), total_size);
-    assert_eq!(merge_result.data, full_data);
+    assert_eq!(merge_result.data.as_ref(), &full_data);
 
     // Specifically test requesting just the last part
     let last_part_start = (standard_part_size * 3) as u64;
@@ -512,7 +514,8 @@ async fn test_last_part_smaller_than_standard() {
 
     let expected_last_part = &full_data[last_part_start as usize..];
     assert_eq!(
-        merge_result.data, expected_last_part,
+        merge_result.data.as_ref(),
+        expected_last_part,
         "Last part data mismatch"
     );
 
@@ -598,7 +601,8 @@ async fn test_aws_sdk_sync_simulation() {
             );
 
             assert_eq!(
-                merge_result.data, expected_data,
+                merge_result.data.as_ref(),
+                &expected_data,
                 "Chunk {} data mismatch",
                 chunk_num
             );

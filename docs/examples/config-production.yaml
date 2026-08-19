@@ -1,0 +1,54 @@
+# Production configuration — standard ports, TLS-terminating listener, shared
+# cache volume, OTLP export, loopback dashboard reached over an SSH tunnel.
+#
+# Ports 80 and 443 require either root or CAP_NET_BIND_SERVICE. See
+# docs/GETTING_STARTED.md for proxy-only mode if you cannot grant that.
+#
+# Verified to load with: s3-proxy --config docs/examples/config-production.yaml
+
+server:
+  http_port: 80
+  https_port: 443
+  max_concurrent_requests: 1000     # Size from measured permits_held_peak
+  tls:
+    enabled: true
+    tls_proxy_port: 3129
+    cert_path: "/mnt/nfs/config/tls/cert.pem"
+    key_path: "/mnt/nfs/config/tls/key.pem"
+
+cache:
+  cache_dir: "/var/cache/s3-proxy"
+  max_cache_size: 107374182400      # 100 GiB — keep at or below 90% of the volume
+  ram_cache_enabled: true
+  max_ram_cache_size: 1073741824    # 1 GiB
+  eviction_algorithm: "tinylfu"
+
+  shared_storage:
+    eviction_lock_timeout: "300s"
+
+logging:
+  access_log_dir: "/var/log/s3-proxy/access"
+  app_log_dir: "/var/log/s3-proxy/app"
+  log_level: "info"
+
+dashboard:
+  enabled: true
+  port: 8081
+  bind_address: "127.0.0.1"         # Unauthenticated; tunnel in rather than exposing
+
+# NOTE: metrics, metrics.otlp, health, and compression sections require ALL of
+# their fields once the section is present at all -- a partial section fails to
+# parse. Omit the whole section to accept every default, or write it in full as
+# below. See docs/CONFIGURATION.md -> Metrics Configuration.
+metrics:
+  enabled: true
+  endpoint: "/metrics"
+  port: 9090
+  collection_interval: "60s"
+  otlp:
+    enabled: true
+    endpoint: "http://localhost:4318"
+    export_interval: "60s"
+    timeout: "10s"
+    headers: {}
+    compression: "none"

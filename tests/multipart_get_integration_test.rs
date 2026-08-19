@@ -151,7 +151,8 @@ async fn test_multipart_upload_followed_by_get() {
         "Merged data should be 10MB"
     );
     assert_eq!(
-        merge_result.data, full_data,
+        merge_result.data.as_ref(),
+        &full_data,
         "Merged data should be byte-identical to original data"
     );
 
@@ -318,7 +319,7 @@ async fn test_multipart_upload_non_aligned_get() {
 
     // Verify byte-identical to original data
     let expected_data = &full_data[start as usize..=end as usize];
-    assert_eq!(merge_result.data, expected_data);
+    assert_eq!(merge_result.data.as_ref(), expected_data);
 
     assert_eq!(merge_result.bytes_from_cache, expected_size as u64);
     assert_eq!(merge_result.bytes_from_s3, 0);

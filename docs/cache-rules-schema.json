@@ -110,7 +110,7 @@
         },
         "hedging_enabled": {
           "type": "boolean",
-          "description": "Enables hedged upstream requests for keys matching this rule. When true and the original upstream fetch has not returned its first byte within hedge_trigger_after, the proxy issues a second identical fetch and serves whichever responds first. Off by default and never enabled globally - only via an explicit rule, because hedging trades bounded duplicate S3 cost for lower tail latency and the right trigger depends on the workload. See docs/CONNECTION_POOLING.md for the mechanism."
+          "description": "Enables hedged upstream requests for keys matching this rule. When true and the original upstream fetch has not returned its first byte within hedge_trigger_after, the proxy issues a second identical fetch and serves whichever responds first. Off by default and never enabled globally - only via an explicit rule, because hedging trades bounded duplicate S3 cost for lower tail latency and the right trigger depends on the workload. See docs/HEDGING.md for the mechanism, the cost governor, and when hedging helps."
         },
         "hedge_trigger_after": {
           "type": "string",

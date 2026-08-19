@@ -1,0 +1,43 @@
+# High-performance configuration — large disk and RAM tiers, long-lived
+# connections, slower dashboard polling to keep overhead off the hot path.
+#
+# Verified to load with: s3-proxy --config docs/examples/config-high-performance.yaml
+
+server:
+  http_port: 80
+  https_port: 443
+  max_concurrent_requests: 1000
+
+cache:
+  cache_dir: "/var/cache/s3-proxy"
+  max_cache_size: 1099511627776     # 1 TiB
+  ram_cache_enabled: true
+  max_ram_cache_size: 10737418240   # 10 GiB
+  eviction_algorithm: "tinylfu"
+  eviction_trigger_percent: 95
+  eviction_target_percent: 80
+
+connection_pool:
+  keepalive_enabled: true
+  max_idle_per_host: 100
+  max_lifetime: "600s"
+
+# NOTE: the compression section requires ALL of enabled, threshold, and
+# preferred_algorithm once present -- a partial section fails to parse. Omit the
+# whole section to accept every default.
+compression:
+  enabled: true
+  threshold: 1024
+  preferred_algorithm: "lz4"
+
+logging:
+  access_log_dir: "/var/log/s3-proxy/access"
+  app_log_dir: "/var/log/s3-proxy/app"
+  log_level: "info"
+
+dashboard:
+  enabled: true
+  port: 8081
+  bind_address: "127.0.0.1"
+  cache_stats_refresh_interval: "10s"
+  logs_refresh_interval: "15s"

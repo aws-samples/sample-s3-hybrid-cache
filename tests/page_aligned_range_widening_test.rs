@@ -182,6 +182,8 @@ async fn small_read_widens_to_page_and_slices_exact_bytes() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("handle_range_request should not error");
@@ -249,6 +251,8 @@ async fn second_small_read_into_cached_page_is_a_cache_hit() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("first request should not error");
@@ -279,6 +283,8 @@ async fn second_small_read_into_cached_page_is_a_cache_hit() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("second request should not error");
@@ -464,6 +470,8 @@ async fn straddling_read_fetches_both_pages_and_slices_correctly() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("straddling request should not error");
@@ -527,6 +535,8 @@ async fn signed_range_is_never_widened() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("signed request should not error");
@@ -600,6 +610,8 @@ async fn read_at_or_above_page_size_is_not_widened() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("request should not error");
@@ -739,6 +751,8 @@ async fn widened_fetch_failure_falls_back_to_original_range() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("request should not error even though the widened fetch failed");
@@ -818,6 +832,8 @@ async fn ram_cache_eligible_false_skips_page_promotion() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("request should not error");
@@ -873,6 +889,8 @@ async fn widening_disabled_leaves_small_read_unmodified() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("request should not error");
@@ -1034,6 +1052,8 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("first (disk-hit) request should not error");
@@ -1067,6 +1087,8 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("second (RAM-hit) request should not error");
@@ -1138,6 +1160,8 @@ async fn widened_miss_and_page_hit_increment_metrics() {
         Some(Arc::clone(&metrics_manager)),
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("first request should not error");
@@ -1176,6 +1200,8 @@ async fn widened_miss_and_page_hit_increment_metrics() {
         Some(Arc::clone(&metrics_manager)),
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("second request should not error");
@@ -1245,6 +1271,8 @@ async fn signed_range_increments_skipped_signed_range_metric() {
         Some(Arc::clone(&metrics_manager)),
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("signed request should not error");
@@ -1371,6 +1399,8 @@ async fn widened_fetch_failure_increments_fallback_metric() {
         Some(Arc::clone(&metrics_manager)),
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("request should not error even though the widened fetch failed");
@@ -1456,6 +1486,8 @@ async fn ram_page_promotion_increments_metric() {
         Some(Arc::clone(&metrics_manager)),
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("first request should not error");
@@ -1480,6 +1512,8 @@ async fn ram_page_promotion_increments_metric() {
         Some(Arc::clone(&metrics_manager)),
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("second request should not error");
@@ -1548,6 +1582,7 @@ async fn suffix_read_size_known_widens_to_page_and_slices_exact_suffix() {
         head_expires_at: None,
         head_last_accessed: None,
         head_access_count: 0,
+        head_cached_at: None,
     };
     cache_manager
         .get_metadata_cache()
@@ -1586,6 +1621,8 @@ async fn suffix_read_size_known_widens_to_page_and_slices_exact_suffix() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("suffix request should not error");
@@ -1668,6 +1705,8 @@ async fn suffix_read_size_unknown_widens_to_bytes_minus_p_and_slices_exact_suffi
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("size-unknown suffix request should not error");
@@ -1808,6 +1847,8 @@ async fn partial_page_only_fetches_missing_gap() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("partial-page request should not error");
@@ -1947,6 +1988,8 @@ async fn concurrent_sub_page_reads_coalesce_to_one_s3_fetch() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     );
     let fut2 = HttpProxy::handle_range_request(
         Method::GET,
@@ -1965,6 +2008,8 @@ async fn concurrent_sub_page_reads_coalesce_to_one_s3_fetch() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     );
 
     let (response1, response2) = tokio::join!(fut1, fut2);
@@ -2158,6 +2203,8 @@ async fn straddle_with_both_pages_in_ram_serves_with_no_s3_fetch() {
             None,
             &None,
             false,
+            // Test harness has no request-concurrency permit to thread.
+            None,
         )
         .await
         .expect("warming page 0 should not error");
@@ -2184,6 +2231,8 @@ async fn straddle_with_both_pages_in_ram_serves_with_no_s3_fetch() {
             None,
             &None,
             false,
+            // Test harness has no request-concurrency permit to thread.
+            None,
         )
         .await
         .expect("warming page 1 should not error");
@@ -2228,6 +2277,8 @@ async fn straddle_with_both_pages_in_ram_serves_with_no_s3_fetch() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("straddling read against warmed RAM pages should not error");
@@ -2300,6 +2351,8 @@ async fn conditional_if_range_fresh_slices_and_caches_widened_page() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("If-Range fresh request should not error");
@@ -2374,6 +2427,8 @@ async fn conditional_if_range_stale_passes_through_full_200() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("If-Range stale request should not error");
@@ -2430,6 +2485,8 @@ async fn conditional_if_match_fail_passes_through_412() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("If-Match fail request should not error");
@@ -2491,6 +2548,8 @@ async fn conditional_if_none_match_match_passes_through_304() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("If-None-Match match request should not error");
@@ -2559,6 +2618,8 @@ async fn conditional_if_none_match_mismatch_slices_206() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("If-None-Match mismatch request should not error");
@@ -2750,6 +2811,8 @@ async fn property_served_bytes_equal_origin_for_any_small_read() {
             None,
             &None,
             false,
+            // Test harness has no request-concurrency permit to thread.
+            None,
         )
         .await
         .unwrap_or_else(|_| {
@@ -2993,6 +3056,8 @@ async fn warm_page_stale_if_range_passes_through_full_200() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("warming read should not error");
@@ -3025,6 +3090,8 @@ async fn warm_page_stale_if_range_passes_through_full_200() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("stale If-Range request should not error");
@@ -3144,6 +3211,8 @@ async fn non_widened_warm_cache_stale_if_range_passes_through_full_200() {
         // a value: an `If-Range`-only request must be classified as a
         // conditional that only the origin can evaluate.
         forward_to_s3,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("stale If-Range request should not error");
@@ -3243,6 +3312,8 @@ async fn mode_b_matching_if_range_serves_range_from_cache_without_s3() {
         None,
         &None,
         forward_to_s3,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("matching If-Range request should not error");
@@ -3440,6 +3511,8 @@ async fn partial_cache_if_range_serve_sends_if_match_on_the_gap_fetch() {
         None,
         &None,
         false,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("partially cached If-Range serve should not error");

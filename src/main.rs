@@ -1,5 +1,6 @@
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use s3_proxy::{
     background_recovery::{BackgroundRecoveryConfig, BackgroundRecoverySystem},
@@ -24,9 +25,38 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+/// Return the HTTP response for a request that does not match a dedicated listener's route.
+///
+/// Health and metrics run on separate ports, but each port still accepts arbitrary HTTP
+/// requests. Restricting dispatch here makes the configured `endpoint` meaningful and
+/// prevents a scrape of an accidental path from being treated as valid service data.
+fn endpoint_rejection<B>(request: &Request<B>, endpoint: &str) -> Option<Response<String>> {
+    if request.uri().path() != endpoint {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(String::new())
+                .expect("static 404 response must be valid"),
+        );
+    }
+
+    if request.method() != Method::GET {
+        return Some(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("Allow", "GET")
+                .body(String::new())
+                .expect("static 405 response must be valid"),
+        );
+    }
+
+    None
+}
+
 /// Start health check HTTP server
 async fn start_health_server(
     addr: SocketAddr,
+    endpoint: String,
     health_manager: Arc<RwLock<HealthManager>>,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<()> {
@@ -45,11 +75,18 @@ async fn start_health_server(
 
                 let io = TokioIo::new(stream);
                 let health_manager_clone = health_manager.clone();
+                let endpoint = endpoint.clone();
 
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let health_manager = health_manager_clone.clone();
-                        async move { health_manager.read().await.handle_health_request(req).await }
+                        let endpoint = endpoint.clone();
+                        async move {
+                            if let Some(response) = endpoint_rejection(&req, &endpoint) {
+                                return Ok(response);
+                            }
+                            health_manager.read().await.handle_health_request(req).await
+                        }
                     });
 
                     if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
@@ -70,6 +107,7 @@ async fn start_health_server(
 /// Start metrics HTTP server
 async fn start_metrics_server(
     addr: SocketAddr,
+    endpoint: String,
     metrics_manager: Arc<RwLock<MetricsManager>>,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<()> {
@@ -88,11 +126,16 @@ async fn start_metrics_server(
 
                 let io = TokioIo::new(stream);
                 let metrics_manager_clone = metrics_manager.clone();
+                let endpoint = endpoint.clone();
 
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let metrics_manager = metrics_manager_clone.clone();
+                        let endpoint = endpoint.clone();
                         async move {
+                            if let Some(response) = endpoint_rejection(&req, &endpoint) {
+                                return Ok(response);
+                            }
                             metrics_manager
                                 .read()
                                 .await
@@ -358,6 +401,21 @@ async fn main() -> Result<()> {
         config.server.max_concurrent_requests,
     );
 
+    // Wire the request-concurrency semaphore into metrics for permit observability
+    // (permits_held, permits_available). Requirement: TCA 5.1, 5.2
+    metrics_manager
+        .write()
+        .await
+        .set_request_semaphore(http_proxy.get_request_semaphore());
+
+    // Wire the in-flight buffered-byte ledger and RAM cache ceiling into metrics
+    // for observability (inflight_memory.*). Requirement: IMA 8.1-8.7
+    {
+        let mut mm = metrics_manager.write().await;
+        mm.set_inflight_ledger(http_proxy.get_inflight_ledger());
+        mm.set_ram_cache_max_bytes(config.cache.max_ram_cache_size);
+    }
+
     // Start background cache hit update buffer flush task (for journal-based cache-hit updates)
     let cache_hit_update_buffer = cache_manager_ref.get_cache_hit_update_buffer().await;
     if let Some(buffer) = cache_hit_update_buffer {
@@ -476,6 +534,18 @@ async fn main() -> Result<()> {
                     _ = interval.tick() => {
                         if let Err(e) = dns_refresh_client.refresh_dns().await {
                             warn!("DNS refresh failed: {}", e);
+                        }
+                        // Recovery probing shares this tick deliberately, and runs
+                        // after the refresh: the refresh holds health-excluded IPs
+                        // out of the distributor, and the probe is the only thing
+                        // that puts them back. Eligibility is governed by
+                        // health_probe_initial_cooldown / health_probe_max_cooldown,
+                        // so this interval only bounds how promptly an elapsed
+                        // cooldown is noticed. Sharing the task also keeps the
+                        // shutdown subscriber count unchanged.
+                        let readmitted = dns_refresh_client.probe_unhealthy_ips().await;
+                        if readmitted > 0 {
+                            info!("Recovery probe re-admitted {} IP(s) to their distributors", readmitted);
                         }
                     }
                     _ = dns_refresh_shutdown.wait_for_shutdown() => {
@@ -598,12 +668,18 @@ async fn main() -> Result<()> {
             .parse()
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let health_addr = SocketAddr::from((health_bind, config.health.port));
+        let health_endpoint = config.health.endpoint.clone();
         let health_manager_clone = health_manager.clone();
         let health_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
 
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                start_health_server(health_addr, health_manager_clone, health_shutdown).await
+            if let Err(e) = start_health_server(
+                health_addr,
+                health_endpoint,
+                health_manager_clone,
+                health_shutdown,
+            )
+            .await
             {
                 error!("Health check server failed: {}", e);
             }
@@ -623,12 +699,18 @@ async fn main() -> Result<()> {
             .parse()
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let metrics_addr = SocketAddr::from((metrics_bind, config.metrics.port));
+        let metrics_endpoint = config.metrics.endpoint.clone();
         let metrics_manager_clone = metrics_manager.clone();
         let metrics_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
 
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                start_metrics_server(metrics_addr, metrics_manager_clone, metrics_shutdown).await
+            if let Err(e) = start_metrics_server(
+                metrics_addr,
+                metrics_endpoint,
+                metrics_manager_clone,
+                metrics_shutdown,
+            )
+            .await
             {
                 error!("Metrics server failed: {}", e);
             }
@@ -768,4 +850,41 @@ async fn main() -> Result<()> {
 
     info!("Hybrid Cache for Amazon S3 shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_rejection_allows_only_get_on_the_configured_path() {
+        let allowed = Request::builder()
+            .method(Method::GET)
+            .uri("/ready")
+            .body(())
+            .expect("test request must build");
+        assert!(endpoint_rejection(&allowed, "/ready").is_none());
+
+        let wrong_path = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(())
+            .expect("test request must build");
+        assert_eq!(
+            endpoint_rejection(&wrong_path, "/ready")
+                .expect("wrong path must be rejected")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let wrong_method = Request::builder()
+            .method(Method::POST)
+            .uri("/ready")
+            .body(())
+            .expect("test request must build");
+        let response =
+            endpoint_rejection(&wrong_method, "/ready").expect("wrong method must be rejected");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get("allow").unwrap(), "GET");
+    }
 }

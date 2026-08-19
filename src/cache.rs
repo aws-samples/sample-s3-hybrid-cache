@@ -22,6 +22,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Evaluate HEAD freshness from the most recent refresh anchor. Metadata written before
+/// `head_cached_at` existed falls back to `created_at`, preserving on-disk compatibility.
+fn is_head_fresh(
+    head_expires_at: Option<SystemTime>,
+    head_cached_at: Option<SystemTime>,
+    created_at: SystemTime,
+    current_head_ttl: Duration,
+    now: SystemTime,
+) -> bool {
+    let anchor = head_cached_at.unwrap_or(created_at);
+    head_expires_at.is_some()
+        && !current_head_ttl.is_zero()
+        && now.duration_since(anchor).unwrap_or(Duration::ZERO) <= current_head_ttl
+}
+
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
 const OBJECT_CONCURRENCY_LIMIT: usize = 8;
 
@@ -560,6 +575,8 @@ pub struct CacheStatistics {
     pub compression_ratio: f32,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// Range responses that refetched from S3 because cached extents were incomplete.
+    pub incomplete_range_fallbacks: u64,
     pub evicted_entries: u64,
     pub expired_entries: u64,
     pub last_updated: SystemTime,
@@ -617,6 +634,7 @@ impl Default for CacheStatistics {
             compression_ratio: 1.0,
             cache_hits: 0,
             cache_misses: 0,
+            incomplete_range_fallbacks: 0,
             head_hits: 0,
             head_misses: 0,
             get_hits: 0,
@@ -3241,13 +3259,22 @@ impl CacheManager {
             }
         }
 
-        // Update hit rate
-        let total_requests = inner.statistics.cache_hits + inner.statistics.cache_misses;
-        if total_requests > 0 {
-            inner.statistics.ram_cache_hit_rate =
-                inner.statistics.cache_hits as f32 / total_requests as f32;
-        }
+        // Note: `ram_cache_hit_rate` is deliberately NOT written here. It reports the
+        // RAM tier's own hit rate and is sourced from `ShardedRamCache::stats()` by
+        // `update_ram_cache_statistics`, `update_ram_cache_hit_statistics`, and
+        // `get_cache_size_stats`. This exit point has no RAM-tier view (reading it
+        // needs an async hop, and the `inner` mutex is held here), so it previously
+        // wrote the OVERALL hit rate into the RAM-tier field. The overall rate is
+        // derived by consumers from `cache_hits`/`cache_misses` and needs no field.
 
+        inner.statistics.last_updated = SystemTime::now();
+    }
+
+    /// Record a range response that refetched from S3 because the available
+    /// cached extents did not cover the requested interval.
+    pub fn record_incomplete_range_fallback(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.statistics.incomplete_range_fallbacks += 1;
         inner.statistics.last_updated = SystemTime::now();
     }
 
@@ -3319,7 +3346,7 @@ impl CacheManager {
         cache_key: &str,
         range: &Range,
         range_handler: &crate::range_handler::RangeHandler,
-    ) -> Result<(Vec<u8>, bool)> {
+    ) -> Result<(Bytes, bool)> {
         // Generate a unique cache key for this specific range
         let range_cache_key = Self::generate_ram_range_key(cache_key, range.start, range.end);
 
@@ -3343,18 +3370,23 @@ impl CacheManager {
                 // Spec: compression-followup-fixes Requirement 2.
                 let algorithm = ram_read.compression_algorithm.clone();
 
-                // RAM cache stores compressed data, decompress if needed
+                // RAM cache stores compressed data, decompress if needed.
+                // The uncompressed arm clones the `Bytes` out of the `Arc` (a refcount
+                // bump) instead of `.to_vec()`, which copied the whole range on every
+                // RAM hit. Requirement: IMA 5.2
                 let data = if compressed {
                     debug!(
                         "Decompressing RAM cache data for {}-{}",
                         range.start, range.end
                     );
                     let inner = self.inner.lock().unwrap();
-                    inner
-                        .compression_handler
-                        .decompress_with_algorithm(&entry_data, algorithm)?
+                    Bytes::from(
+                        inner
+                            .compression_handler
+                            .decompress_with_algorithm(&entry_data, algorithm)?,
+                    )
                 } else {
-                    entry_data.to_vec()
+                    entry_data.as_ref().clone()
                 };
 
                 debug!("Range cache hit (RAM) for {}-{}", range.start, range.end);
@@ -3363,12 +3395,14 @@ impl CacheManager {
             }
         }
 
-        // Second tier: Load from disk cache using range_handler
-        let range_data = match range_handler
+        // Second tier: Load from disk cache using range_handler.
+        // `Bytes::from(Vec<u8>)` takes ownership of the existing allocation, so this
+        // conversion is O(1) and does not copy the range. Requirement: IMA 5.2
+        let range_data: Bytes = match range_handler
             .load_range_data_from_new_storage(cache_key, range)
             .await
         {
-            Ok(data) => data,
+            Ok(data) => Bytes::from(data),
             Err(e) => {
                 // Record the disk cache miss before propagating the error
                 debug!(
@@ -7187,7 +7221,8 @@ impl CacheManager {
     /// the stored `head_expires_at`. The freshness comparison preserves the "not cached" gate:
     /// `head_expires_at == None` still reports a miss regardless of `current_head_ttl`.
     /// When HEAD metadata is present, the entry is fresh iff `current_head_ttl > 0` and
-    /// `now - created_at <= current_head_ttl`.
+    /// `now - head_cached_at <= current_head_ttl`, falling back to `created_at` for metadata
+    /// written before the anchor existed.
     ///
     /// Uses the new MetadataCache for RAM caching and NewCacheMetadata for unified storage.
     pub async fn get_head_cache_entry_unified(
@@ -7206,12 +7241,13 @@ impl CacheManager {
         if let Some(metadata) = self.metadata_cache.get(cache_key).await {
             // Check if HEAD is still valid using current head_ttl.
             // Preserve the "not cached" gate: head_expires_at must be Some.
-            let head_fresh = metadata.head_expires_at.is_some()
-                && !current_head_ttl.is_zero()
-                && now
-                    .duration_since(metadata.created_at)
-                    .unwrap_or(Duration::ZERO)
-                    <= current_head_ttl;
+            let head_fresh = is_head_fresh(
+                metadata.head_expires_at,
+                metadata.head_cached_at,
+                metadata.created_at,
+                current_head_ttl,
+                now,
+            );
             if head_fresh {
                 debug!("HEAD cache hit (MetadataCache RAM) for key: {}", cache_key);
                 self.metadata_cache.record_head_hit();
@@ -7234,12 +7270,13 @@ impl CacheManager {
                     self.metadata_cache.put(cache_key, metadata.clone()).await;
 
                     // Check if HEAD is still valid using current head_ttl
-                    let head_fresh = metadata.head_expires_at.is_some()
-                        && !current_head_ttl.is_zero()
-                        && now
-                            .duration_since(metadata.created_at)
-                            .unwrap_or(Duration::ZERO)
-                            <= current_head_ttl;
+                    let head_fresh = is_head_fresh(
+                        metadata.head_expires_at,
+                        metadata.head_cached_at,
+                        metadata.created_at,
+                        current_head_ttl,
+                        now,
+                    );
                     if head_fresh {
                         debug!("HEAD cache hit (disk .meta) for key: {}", cache_key);
                         self.metadata_cache.record_head_disk_hit();
@@ -7511,6 +7548,7 @@ impl CacheManager {
             head_expires_at: Some(now + effective_head_ttl),
             head_last_accessed: Some(now),
             head_access_count: 1,
+            head_cached_at: Some(now),
         };
 
         // Write to disk
@@ -7679,6 +7717,7 @@ impl CacheManager {
                 // Clear HEAD-specific fields to force re-fetch
                 metadata.head_expires_at = None;
                 metadata.head_last_accessed = None;
+                metadata.head_cached_at = None;
                 // Don't reset head_access_count - keep for statistics
 
                 // Write back atomically
@@ -7987,12 +8026,7 @@ impl CacheManager {
     }
     /// Load range data from RAM cache, returning the decompressed data if found.
     /// Records hit/miss statistics. Returns None on miss or if RAM cache is disabled.
-    pub fn get_range_from_ram_cache(
-        &self,
-        cache_key: &str,
-        start: u64,
-        end: u64,
-    ) -> Option<Vec<u8>> {
+    pub fn get_range_from_ram_cache(&self, cache_key: &str, start: u64, end: u64) -> Option<Bytes> {
         if !self.ram_cache_enabled {
             return None;
         }
@@ -8016,6 +8050,9 @@ impl CacheManager {
             // decoder. Spec: compression-followup-fixes Requirement 2.
             let algorithm = ram_read.compression_algorithm.clone();
 
+            // The uncompressed arm clones the `Bytes` out of the `Arc` (a refcount
+            // bump) rather than `.to_vec()`, which copied the whole Page on every RAM
+            // hit — the hottest path in page mode. Requirement: IMA 5.2
             let data = if compressed {
                 debug!("Decompressing RAM cache range data for {}-{}", start, end);
                 let inner = self.inner.lock().unwrap();
@@ -8023,7 +8060,7 @@ impl CacheManager {
                     .compression_handler
                     .decompress_with_algorithm(&entry_data, algorithm)
                 {
-                    Ok(decompressed) => decompressed,
+                    Ok(decompressed) => Bytes::from(decompressed),
                     Err(e) => {
                         error!(
                             "Failed to decompress RAM cache range data for {}-{}: {}",
@@ -8033,7 +8070,7 @@ impl CacheManager {
                     }
                 }
             } else {
-                entry_data.to_vec()
+                entry_data.as_ref().clone()
             };
 
             self.update_ram_cache_hit_statistics();
@@ -14797,17 +14834,14 @@ mod ram_promotion_frame_property_tests {
 mod head_freshness_current_ttl_tests {
     use std::time::{Duration, SystemTime};
 
-    /// Evaluate HEAD freshness against current head_ttl exactly as get_head_cache_entry_unified does.
-    /// Returns true (fresh) iff: head_expires_at is Some, head_ttl > 0, and age <= head_ttl.
+    /// Delegates to the production predicate with the legacy no-anchor state.
     fn is_head_fresh(
         head_expires_at: Option<SystemTime>,
         created_at: SystemTime,
         current_head_ttl: Duration,
         now: SystemTime,
     ) -> bool {
-        head_expires_at.is_some()
-            && !current_head_ttl.is_zero()
-            && now.duration_since(created_at).unwrap_or(Duration::ZERO) <= current_head_ttl
+        super::is_head_fresh(head_expires_at, None, created_at, current_head_ttl, now)
     }
 
     /// head_ttl=0 ⇒ always expired regardless of age or head_expires_at
@@ -15337,6 +15371,32 @@ mod global_cache_stats_unit_tests {
             "cache_misses must be unchanged after HEAD hit"
         );
     }
+
+    /// `ram_cache_hit_rate` reports the RAM tier's own hit rate and must not be
+    /// written by the overall hit/miss exit point. Before 2.5.0 this wrote
+    /// `cache_hits / (cache_hits + cache_misses)` into it, so a deployment with the
+    /// RAM tier disabled published a non-zero RAM hit rate, and one with it enabled
+    /// saw the value flip between the overall rate and the real RAM rate depending
+    /// on which writer ran last.
+    #[test]
+    fn update_statistics_does_not_write_the_ram_tier_hit_rate() {
+        let temp_dir = TempDir::new().unwrap();
+        let cm = CacheManager::new_with_defaults(temp_dir.path().to_path_buf(), false, 0);
+
+        // Three hits and one miss: an overall rate of 0.75, which must NOT appear.
+        cm.update_statistics(true, 1024, false);
+        cm.update_statistics(true, 1024, false);
+        cm.update_statistics(true, 1024, true);
+        cm.update_statistics(false, 0, false);
+
+        let stats = cm.get_statistics();
+        assert_eq!(stats.cache_hits, 3);
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(
+            stats.ram_cache_hit_rate, 0.0,
+            "with no RAM tier the RAM hit rate must stay 0.0, not the overall rate"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -15474,5 +15534,166 @@ mod range_tinylfu_sort_tests {
              ascending last_accessed order (oldest evicted first) — got {:?}",
             keys
         );
+    }
+}
+
+#[cfg(test)]
+mod head_freshness_anchor_tests {
+    use super::is_head_fresh;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn fresh_anchor_overrides_stale_creation_time() {
+        let now = SystemTime::now();
+        assert!(is_head_fresh(
+            Some(now + Duration::from_secs(60)),
+            Some(now - Duration::from_secs(1)),
+            now - Duration::from_secs(3600),
+            Duration::from_secs(60),
+            now,
+        ));
+    }
+
+    #[test]
+    fn stale_anchor_and_legacy_created_at_both_expire() {
+        let now = SystemTime::now();
+        let stale = now - Duration::from_secs(61);
+        assert!(!is_head_fresh(
+            Some(now + Duration::from_secs(60)),
+            Some(stale),
+            now,
+            Duration::from_secs(60),
+            now,
+        ));
+        assert!(!is_head_fresh(
+            Some(now + Duration::from_secs(60)),
+            None,
+            stale,
+            Duration::from_secs(60),
+            now,
+        ));
+    }
+
+    #[test]
+    fn current_ttl_and_legacy_gates_are_preserved() {
+        let now = SystemTime::now();
+        let anchor = now - Duration::from_secs(30);
+        assert!(!is_head_fresh(
+            Some(now + Duration::from_secs(3600)),
+            Some(anchor),
+            now,
+            Duration::ZERO,
+            now,
+        ));
+        assert!(!is_head_fresh(
+            None,
+            Some(anchor),
+            now,
+            Duration::from_secs(60),
+            now,
+        ));
+        assert!(!is_head_fresh(
+            Some(now + Duration::from_secs(3600)),
+            Some(anchor),
+            now,
+            Duration::from_secs(29),
+            now,
+        ));
+    }
+
+    #[test]
+    fn future_anchor_is_fresh_without_resetting_it_on_reads() {
+        let now = SystemTime::now();
+        assert!(is_head_fresh(
+            Some(now + Duration::from_secs(60)),
+            Some(now + Duration::from_secs(1)),
+            now - Duration::from_secs(3600),
+            Duration::from_secs(60),
+            now,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod head_anchor_integration_tests {
+    use super::*;
+    use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
+    use tempfile::TempDir;
+
+    fn head_response_metadata() -> CacheMetadata {
+        CacheMetadata {
+            etag: "\"head-anchor-etag\"".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 1024,
+            part_number: None,
+            cache_control: None,
+            access_count: 0,
+            last_accessed: SystemTime::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn head_refresh_reanchors_stale_metadata_and_preserves_ranges() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/head-anchor";
+        let now = SystemTime::now();
+        let range = RangeSpec::new(
+            0,
+            1023,
+            "head-anchor_0-1023.bin".to_string(),
+            CompressionAlgorithm::None,
+            1024,
+            1024,
+        );
+        let metadata = NewCacheMetadata {
+            cache_key: key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"head-anchor-etag\"".to_string(),
+                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                content_length: 1024,
+                ..Default::default()
+            },
+            ranges: vec![range.clone()],
+            created_at: now - Duration::from_secs(3600),
+            expires_at: now + Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: Some(now + Duration::from_secs(60)),
+            head_last_accessed: Some(now),
+            head_access_count: 1,
+            head_cached_at: Some(now),
+        };
+        manager.write_metadata_to_disk(&metadata).await.unwrap();
+
+        assert!(manager
+            .get_head_cache_entry_unified(key, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_some());
+
+        let headers = HashMap::from([(String::from("content-type"), String::from("text/plain"))]);
+        manager
+            .store_head_cache_entry_unified(key, headers, head_response_metadata())
+            .await
+            .unwrap();
+        let refreshed = manager.get_metadata_from_disk(key).await.unwrap().unwrap();
+        assert_eq!(refreshed.ranges, vec![range]);
+        assert!(refreshed.head_cached_at.is_some());
+
+        // Simulate the next TTL window without sleeping, then verify a second refresh
+        // reanchors the same old object again rather than falling back to created_at.
+        let mut next_window = refreshed;
+        next_window.head_cached_at = Some(SystemTime::now() - Duration::from_secs(61));
+        manager.write_metadata_to_disk(&next_window).await.unwrap();
+        manager.get_metadata_cache().invalidate(key).await;
+        manager
+            .store_head_cache_entry_unified(key, HashMap::new(), head_response_metadata())
+            .await
+            .unwrap();
+        assert!(manager
+            .get_head_cache_entry_unified(key, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_some());
     }
 }

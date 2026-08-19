@@ -425,6 +425,7 @@ fn prop_system_information_display(uptime_hours: u16, hostname_suffix: u8) -> Te
             logs_refresh_ms: 10000,
             active_requests: 0,
             max_concurrent_requests: 1000,
+            permits_held: 0,
         };
 
         let has_hostname = !system_info.hostname.is_empty();
@@ -574,6 +575,7 @@ mod unit_tests {
             logs_refresh_ms: 10000,
             active_requests: 0,
             max_concurrent_requests: 1000,
+            permits_held: 0,
         };
 
         let json_result = serde_json::to_string(&system_info);

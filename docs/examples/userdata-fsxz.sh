@@ -33,11 +33,16 @@ df -h /mnt/efs | grep -q efs || { echo "FATAL: EFS mount failed"; exit 1; }
 
 # --- Mount FSx for OpenZFS (cache) ---
 # lookupcache=pos is REQUIRED for multi-instance cache coordination.
+# nconnect=16 is REQUIRED for throughput: without it the mount uses a single TCP
+# connection, which hits the EC2 5 Gbps single-flow limit and caps disk-cache
+# reads near 625 MB/s per proxy regardless of the file system's provisioned
+# throughput. EFS has no equivalent option and needs none — its client provides
+# the same parallelism itself. See docs/SHARED_STORAGE.md.
 # Do NOT add noresvport — FSx rejects it (EFS requires it; FSx does not).
 # Security: FSx for OpenZFS encrypts data at rest (KMS) and in transit
 # automatically for supported EC2 instance types — no mount flag needed.
 mkdir -p /mnt/fsx
-echo "${FSX_DNS}:/fsx/ /mnt/fsx nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,lookupcache=pos,_netdev 0 0" >> /etc/fstab
+echo "${FSX_DNS}:/fsx/ /mnt/fsx nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,lookupcache=pos,nconnect=16,_netdev 0 0" >> /etc/fstab
 mount /mnt/fsx
 df -h /mnt/fsx | grep -q fsx || { echo "FATAL: FSx mount failed"; exit 1; }
 

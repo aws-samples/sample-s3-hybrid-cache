@@ -26,6 +26,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
+/// Serialises every test in this file, because `hedged_fetch`'s metrics are a
+/// **process-global** singleton (`hedged_fetch::get_global_metrics`) while libtest
+/// runs these tests as parallel threads in one process. Several tests here
+/// deliberately increment `issued`; others assert an exact before/after delta on it.
+/// Without this lock, a test asserting "no hedge issued" can observe a concurrent
+/// test's increment — `test_put_never_hedges` was seen failing exactly that way
+/// (`left: 1, right: 0`) during a full-suite run. Every test that reads or can
+/// increment the global counters holds this for its whole body.
+static HEDGE_METRICS_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 // ---------------------------------------------------------------------------
 // Configurable delayed stub
 // ---------------------------------------------------------------------------
@@ -219,6 +230,7 @@ fn resolved_with_hedging(
 /// Req 1.3: key not matched by an enabling rule → no hedge, byte-identical behaviour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_hedging_disabled_no_hedge_issued() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     // Ensure globals are initialized.
     hedged_fetch::init_global_hedging();
 
@@ -250,6 +262,8 @@ async fn test_hedging_disabled_no_hedge_issued() {
         &resolved,
         &None,
         None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -268,6 +282,7 @@ async fn test_hedging_disabled_no_hedge_issued() {
 /// Req 7.1, 3.2: rule-enabled key + slow original → hedge issued and serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_hedging_enabled_slow_original_hedge_wins() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     hedged_fetch::init_global_hedging();
 
     let stub = DelayedHedgeStub::new(
@@ -301,6 +316,8 @@ async fn test_hedging_enabled_slow_original_hedge_wins() {
         &resolved,
         &None,
         None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -326,6 +343,7 @@ async fn test_hedging_enabled_slow_original_hedge_wins() {
 /// Req 9.4: original first-byte timeout + hedge in flight → hedge wins, not a 504.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_original_timeout_hedge_in_flight_wins() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     hedged_fetch::init_global_hedging();
 
     // Original will exceed the 200ms first-byte timeout.
@@ -355,6 +373,8 @@ async fn test_original_timeout_hedge_in_flight_wins() {
         &resolved,
         &None,
         None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -371,6 +391,7 @@ async fn test_original_timeout_hedge_in_flight_wins() {
 /// and even if they reach here, hedging_eligible = false for non-GET/HEAD).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_put_never_hedges() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     hedged_fetch::init_global_hedging();
 
     let stub = DelayedHedgeStub::new(
@@ -404,6 +425,8 @@ async fn test_put_never_hedges() {
         &resolved,
         &None,
         None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -423,6 +446,7 @@ async fn test_put_never_hedges() {
 /// With a 50ms trigger and a 200ms original, a hedge should fire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_per_rule_trigger_override_honoured() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     hedged_fetch::init_global_hedging();
 
     // Original responds at 200ms. Trigger at 300ms → no hedge.
@@ -453,6 +477,8 @@ async fn test_per_rule_trigger_override_honoured() {
         config.clone(),
         &resolved,
         &None,
+        None,
+        // Test harness has no request-concurrency permit to thread.
         None,
     )
     .await
@@ -492,6 +518,8 @@ async fn test_per_rule_trigger_override_honoured() {
         config,
         &resolved2,
         &None,
+        None,
+        // Test harness has no request-concurrency permit to thread.
         None,
     )
     .await
@@ -620,6 +648,7 @@ impl S3ClientApi for SlowRangeStub {
 /// at most one hedge across the set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_range_hedge_budget_shared_across_subfetches() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     use s3_proxy::range_handler::RangeSpec;
     use std::sync::atomic::AtomicUsize as StdAtomicUsize;
 
@@ -680,6 +709,7 @@ async fn test_range_hedge_budget_shared_across_subfetches() {
 /// Req 6.5: budget `2` with 3 slow ranges → at most two hedges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_range_hedge_budget_2_allows_two_hedges() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     use s3_proxy::range_handler::RangeSpec;
     use std::sync::atomic::AtomicUsize as StdAtomicUsize;
 
@@ -736,6 +766,7 @@ async fn test_range_hedge_budget_2_allows_two_hedges() {
 /// Req 1.3: not rule-enabled (None budget) → byte-identical to previous behaviour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_range_no_hedging_when_budget_none() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     use s3_proxy::range_handler::RangeSpec;
 
     hedged_fetch::init_global_hedging();
@@ -804,6 +835,7 @@ async fn test_range_no_hedging_when_budget_none() {
 /// the unsigned full-object and range-miss paths already do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_signed_range_hedging_enabled_slow_original_hedge_wins() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     hedged_fetch::init_global_hedging();
 
     let stub = DelayedHedgeStub::new(
@@ -863,6 +895,8 @@ async fn test_signed_range_hedging_enabled_slow_original_hedge_wins() {
         None,
         &resolved,
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -890,6 +924,7 @@ async fn test_signed_range_hedging_enabled_slow_original_hedge_wins() {
 /// pre-fix behaviour, exactly one upstream call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_signed_range_hedging_disabled_no_hedge_issued() {
+    let _metrics_guard = HEDGE_METRICS_LOCK.lock().await;
     hedged_fetch::init_global_hedging();
 
     let stub = DelayedHedgeStub::new(
@@ -945,6 +980,8 @@ async fn test_signed_range_hedging_disabled_no_hedge_issued() {
         None,
         &resolved,
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();

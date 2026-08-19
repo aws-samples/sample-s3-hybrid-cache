@@ -13,29 +13,33 @@ server:
   http_port: 80
   https_port: 443
   https_mode: "passthrough"  # TCP passthrough to S3 (no caching on the HTTPS listener)
-  # Maximum concurrent requests (default: 200)
-  # Each concurrent request uses approximately 5 MiB of memory:
+  # Maximum concurrent requests (default: 1000). Bounds the whole request,
+  # including its response-body transfer, not just setup — a permit is held
+  # until the body has fully streamed to the client. Each concurrent request
+  # uses approximately 5 MiB of memory on the streaming paths:
   #   - Cache hit: ~1 MiB streaming decompression buffer + ~4 MiB channel backpressure
   #   - Cache miss: ~1 MiB TeeStream buffer + ~4 MiB incremental write buffer
   # Formula: total_proxy_memory ≈ base (~200 MiB) + max_concurrent_requests × 5 MiB
   # Examples: 200 requests ≈ 1.2 GB, 500 ≈ 2.7 GB, 1000 ≈ 5.2 GB, 2000 ≈ 10.2 GB
-  # Tuning guide:
+  # This formula covers the streaming paths only (signed writes, cache-miss GET).
+  # It does not cover the paths that still buffer a whole body or range in
+  # memory — size max_inflight_buffer_bytes below for those separately.
+  # Tuning guide (starting points — these bands predate 2.5.0, when a permit covered
+  # only request setup rather than the whole transfer, so the same number now admits
+  # fewer simultaneous requests). Confirm against /metrics permits_held_peak under
+  # your own load; a 100-client fleet test of 8 MiB ranged reads peaked at 71.
   #   Small deployments (< 50 users): 50-100
   #   Medium deployments (50-500 users): 100-300
   #   Large deployments (500+ users): 300-1000+
   #   High-throughput scenarios: 1000+
-  max_concurrent_requests: 200
+  max_concurrent_requests: 1000
   request_timeout: "30s"
   # Add Referer header for proxy identification in S3 Server Access Logs (default: true)
   # Format: Hybrid Cache for Amazon S3/{version} ({hostname})
   add_referer_header: true
-  # Maximum accepted/streamed request body size (applies to single-part PUT and UploadPart).
-  # The cap is still enforced (oversized bodies are rejected with HTTP 413 EntityTooLarge),
-  # but the body is now streamed to the upstream and tee'd to the cache incrementally rather
-  # than held whole in RAM — so this is the largest body the proxy will accept, not an amount
-  # of memory it reserves.
-  # Default 5 GiB matches the S3 protocol maximum so all valid S3 clients work transparently.
-  # Lower this on memory-constrained instances (e.g. 256m for 256 MiB).
+  # Deprecated compatibility setting. Existing configurations may keep this value,
+  # but it no longer controls upload size or memory use. S3's 5 GiB single-part PUT
+  # and UploadPart maximum applies instead. This field will be removed in a future release.
   # max_buffered_request_body_bytes: 5368709120
   # Cache-tee channel depth for the streaming signed-write path, in frames (default: 5).
   # On a streamed PUT/UploadPart the body is forwarded to the upstream verbatim while each
@@ -45,6 +49,22 @@ server:
   # default of 5 keeps it on par with the GET path — independent of object size.
   # Raising it can improve cache-write throughput at the cost of more per-connection memory.
   # write_cache_tee_channel_depth: 5
+
+  # Maximum total bytes held simultaneously across all buffered request and response
+  # bodies (default: 0, disabled). Bounds the paths that still buffer a whole body or
+  # range rather than streaming it — since 2.5.0 these are response-side almost
+  # exclusively (range merge, page widening, buffered range serving, recovery
+  # fallbacks), plus small non-GET/PUT request bodies such as a DeleteObjects POST.
+  # NOT the streaming paths covered by max_concurrent_requests above; every upload
+  # path streams. A request whose buffered body would exceed this ceiling gets
+  # HTTP 503 SlowDown with Retry-After (never 413), before any upstream connection
+  # is opened.
+  # Size alongside cache.max_ram_cache_size and instance memory: start at roughly
+  # instance_ram / 4 - cache.max_ram_cache_size, then confirm against /metrics ->
+  # inflight_memory.peak_reserved_bytes under real traffic and adjust. On a 4 GiB
+  # c6in.large with the default 512 MiB RAM cache that is 536870912 (512 MiB).
+  # A non-zero value below 1 MiB fails validation at startup; 0 is exempt.
+  # max_inflight_buffer_bytes: 0
 
   # TLS Proxy Listener Configuration
   # Terminates TLS using the proxy's own certificate, then processes decrypted HTTP
@@ -144,10 +164,10 @@ cache:
   # RAM-Disk Cache Coherency Settings
   # When RAM cache is enabled, these settings control how RAM cache accesses
   # are propagated to disk metadata for accurate eviction decisions
-  ram_cache_flush_interval: "60s"
-  ram_cache_flush_threshold: 100
-  ram_cache_flush_on_eviction: false
-  ram_cache_verification_interval: "1s"
+  ram_cache_flush_interval: "10s"        # Default: 10s
+  ram_cache_flush_threshold: 100         # Default: 100
+  ram_cache_flush_on_eviction: false     # Default: false
+  ram_cache_verification_interval: "1s"  # Default: 1s
   
   # ============================================================================
   # SHARED STORAGE CONFIGURATION
@@ -372,7 +392,7 @@ cache:
   read_cache_enabled: true
 
   # Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since,
-  # If-Unmodified-Since) against cached metadata instead of forwarding to S3 (default: false).
+  # If-Unmodified-Since) against cached metadata instead of forwarding to S3 (default: true).
   # When true (default): If-Match requests are served directly from cache when the cached ETag
   # matches and the data is fully cached — no S3 round trip. This is the optimal setting for
   # the AWS CLI CRT client, which stamps If-Match on every ranged GET of a multipart download.
@@ -556,8 +576,19 @@ connection_pool:
   # kernel auto-tuning; only do so if you have a specific reason to override the kernel.
   tcp_recv_buffer_size: null
   # Consecutive failures before excluding an IP from round-robin distribution (default: 3).
-  # Excluded IPs are restored on the next DNS refresh (every dns_refresh_interval).
+  # An excluded IP is NOT restored by a DNS refresh — it returns only when a recovery
+  # probe (TCP connect + TLS handshake) confirms it is reachable. See the two
+  # health_probe_* settings below.
   ip_failure_threshold: 3
+  # Recovery probing for excluded IPs. After health_probe_initial_cooldown an excluded
+  # IP becomes eligible to be probed; probes run once per pool_check_interval. A probe
+  # success returns the IP to rotation immediately. A probe failure doubles that IP's
+  # cooldown, up to health_probe_max_cooldown, so an unreachable IP is retried
+  # progressively less often instead of on every refresh. Each probe is bounded by
+  # connection_timeout. Lower the initial cooldown for faster recovery from transient
+  # failures; raise the maximum to back off harder on a persistently dead IP.
+  # health_probe_initial_cooldown: "5s"
+  # health_probe_max_cooldown: "300s"
   # Maximum registered endpoints for DNS-based IP distribution (default: 10000).
   # Prevents unbounded growth from excessive unique hostnames. Normal S3 usage is
   # well under this cap. Existing endpoints keep working when the cap is reached.
@@ -587,7 +618,9 @@ connection_pool:
   # hedge ratio to bound cost amplification.
   # hedged_requests:
   #   # Maximum fraction of in-flight fetches that may be hedges (default: 0.1).
-  #   # When the ratio exceeds this value, new hedges are suppressed.
+  #   # When the ratio exceeds this value, new hedges are suppressed. Note the first
+  #   # hedge is always admitted when none are in flight, so 0.0 does NOT disable
+  #   # hedging — remove hedging_enabled from the rules for that. See docs/HEDGING.md.
   #   # Valid range: [0.0, 1.0].
   #   max_inflight_fraction: 0.1
 
@@ -605,6 +638,7 @@ compression:
 
 health:
   enabled: true
+  # This listener serves only GET /health. Other paths return 404; other methods return 405.
   endpoint: "/health"
   port: 8080
   # bind_address: "0.0.0.0"  # Default: all interfaces. Use "127.0.0.1" to restrict to loopback.
@@ -612,6 +646,7 @@ health:
 
 metrics:
   enabled: true
+  # This listener serves only GET /metrics. Other paths return 404; other methods return 405.
   endpoint: "/metrics"
   port: 9090
   # bind_address: "0.0.0.0"  # Default: all interfaces. Use "127.0.0.1" to restrict to loopback.

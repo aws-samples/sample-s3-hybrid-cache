@@ -193,8 +193,10 @@ the project's [upgrade contract](UPGRADING.md) (config stays backward-compatible
 the field level, so no config edits are needed across versions) to the container
 boundary: the image is the binary, the config is data.
 
-**Or override specific fields via environment variables** — the real supported set,
-from `apply_env_overrides()` in `config.rs`:
+**Or override specific fields via environment variables.** The ones most useful in a
+container are below; for the complete 33-variable set, the units each one expects, and
+which fields have no override at all, see
+[Configuration — Environment Variable Reference](CONFIGURATION.md#environment-variable-reference).
 
 | Variable | Overrides |
 |---|---|
@@ -207,6 +209,9 @@ from `apply_env_overrides()` in `config.rs`:
 | `RAM_CACHE_ENABLED` / `WRITE_CACHE_ENABLED` / `COMPRESSION_ENABLED` | corresponding booleans |
 | `DASHBOARD_ENABLED` / `DASHBOARD_PORT` / `DASHBOARD_BIND_ADDRESS` | dashboard settings |
 | `OTLP_ENDPOINT` / `OTLP_EXPORT_INTERVAL` | OTLP metrics export (setting the endpoint also enables it) |
+
+Duration variables take a bare integer of seconds, not a duration string, and a value
+that fails to parse is silently ignored.
 
 There is no `S3_PROXY_`-prefixed family of variables — every name above is used
 as-is. `RUST_LOG` is also honored, but separately: it overrides `logging.log_level`
@@ -420,12 +425,12 @@ code default.
 Running more than one proxy container against a shared cache follows the same rules
 as bare-metal multi-instance deployments — see
 [High Availability: Shared NFS Cache Pattern](GETTING_STARTED.md#high-availability-shared-nfs-cache-pattern).
-The container adds one constraint worth getting right: the shared volume must be
-mounted with `lookupcache=pos`. That is a correctness requirement for cache
-coordination, not a performance tweak — see
-[Configuration Guide - Multi-Instance Coordination](CONFIGURATION.md#multi-instance-coordination).
+The container adds two constraints worth getting right: the shared volume must be
+mounted with `lookupcache=pos`, and it must enforce advisory file locks between hosts.
+Both are correctness requirements for cache coordination, not performance tweaks — see
+[NFS Mount Requirements](CONFIGURATION.md#nfs-mount-requirements).
 
-Two ways to satisfy it:
+Two ways to satisfy them:
 
 - **Mount on the host, bind-mount into the container.** The host owns the NFS mount
   (with `lookupcache=pos` in `/etc/fstab` or the `mount` command), and each container
@@ -440,9 +445,29 @@ Two ways to satisfy it:
     --opt device=:/export/s3-proxy-cache \
     s3-proxy-cache
   ```
-  Confirm the option actually landed (`docker volume inspect`, then check the mount
+  Confirm the options actually landed (`docker volume inspect`, then check the mount
   inside a running container) rather than assuming — a silently-dropped
-  `lookupcache=pos` degrades coordination correctness without any error.
+  `lookupcache=pos` degrades coordination correctness without any error. Never add
+  `nolock` or `local_lock` to the option string; either makes advisory locks
+  host-local, which lets every container hold the same coordination lock at once.
+
+Locking is the constraint containers are most likely to get wrong, because a
+container that shares the host's network and mount namespace still relies on the host
+having a working NFS lock path. Verify it across two containers on **different hosts**,
+not two on the same host — same-host containers can appear to lock correctly even when
+the mount is not enforcing locks between hosts:
+
+```bash
+# Container on host A - hold an exclusive lock for 30 seconds
+docker exec <container-a> flock -x /cache/.locktest -c 'sleep 30'
+
+# Container on host B, while A still holds it - must fail
+docker exec <container-b> flock -n -x /cache/.locktest -c true && echo BROKEN || echo OK
+```
+
+`BROKEN` means the volume is unsafe for multi-instance use. This also requires
+`flock(1)` in the image; if it is absent, run the same check from the hosts against
+the underlying mount path.
 
 ## TLS Proxy Listener in a Container
 
@@ -504,11 +529,13 @@ points:
   [Privilege Model](#privilege-model-ports-80443-vs-proxy_only)) to avoid needing
   `NET_BIND_SERVICE` at all.
 - **Cache volume**: use a `PersistentVolumeClaim` backed by a filesystem that
-  supports the `lookupcache=pos`-equivalent consistency guarantee for multi-replica
-  deployments sharing one cache — see
+  supports both the `lookupcache=pos`-equivalent consistency guarantee and cross-host
+  advisory locking, for multi-replica deployments sharing one cache — see
   [Multi-Instance / Shared Cache](#multi-instance--shared-cache). A `ReadWriteMany`
   PVC on EFS or an NFS-backed storage class both work; verify the mount options the
-  storage class actually applies.
+  storage class actually applies, since `mountOptions` on a `StorageClass` are the
+  only place `nolock` or `local_lock` would creep in, and run the two-host lock check
+  above between replicas scheduled on different nodes.
 - **ConfigMap for `config.yaml`**, mounted as a volume — equivalent to the bind
   mount shown in [docker compose Example](#docker-compose-example). Changing the
   ConfigMap and rolling the pods is the container-native version of "edit config,

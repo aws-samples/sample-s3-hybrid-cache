@@ -479,7 +479,7 @@ impl OtlpExporter {
 
         let m = provider.meter("s3-proxy");
 
-        // Build one ObservableCounter for each of the nine per-bucket metrics.
+        // Build one ObservableCounter for each of the four per-bucket metrics.
         // Each counter captures its own Arc clone so callbacks are independent.
         //
         // The macro syntax `traffic.$field` works because `$field` is an `ident` token;

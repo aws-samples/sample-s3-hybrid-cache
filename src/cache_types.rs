@@ -558,6 +558,10 @@ pub struct NewCacheMetadata {
     pub head_last_accessed: Option<SystemTime>,
     #[serde(default)]
     pub head_access_count: u64,
+    /// When the HEAD entry was last refreshed from an S3 response. Legacy
+    /// metadata has no anchor and falls back to `created_at` for freshness.
+    #[serde(default)]
+    pub head_cached_at: Option<SystemTime>,
 }
 
 impl NewCacheMetadata {
@@ -570,11 +574,12 @@ impl NewCacheMetadata {
         }
     }
 
-    /// Refresh HEAD TTL by setting head_expires_at to now + ttl
+    /// Refresh HEAD TTL and freshness anchor from the same instant.
     pub fn refresh_head_ttl(&mut self, ttl: std::time::Duration) {
         let now = SystemTime::now();
         self.head_expires_at = Some(now + ttl);
         self.head_last_accessed = Some(now);
+        self.head_cached_at = Some(now);
     }
 
     /// Record a HEAD access (increment count and update last_accessed)
@@ -608,6 +613,7 @@ impl Default for NewCacheMetadata {
             head_expires_at: None,
             head_last_accessed: None,
             head_access_count: 0,
+            head_cached_at: None,
         }
     }
 }
@@ -1743,9 +1749,8 @@ mod tests {
                 0,
                 10 * 1024 * 1024, // 10MB capacity
                 None,
-                128 * 1024 * 1024, // 128 MiB body cap
-                10 * 1024 * 1024,  // 10 MiB max complete body
-                5,                 // write_cache_tee_channel_depth
+                10 * 1024 * 1024, // 10 MiB max complete body
+                5,                // write_cache_tee_channel_depth
             );
 
             let cache_key = "test-bucket/test-object";
@@ -1962,5 +1967,56 @@ mod tests {
         }
 
         TestResult::passed()
+    }
+}
+
+#[cfg(test)]
+mod head_cached_at_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[test]
+    fn refresh_head_ttl_updates_the_expiry_access_time_and_anchor_together() {
+        let before = SystemTime::now();
+        let mut metadata = NewCacheMetadata::default();
+        metadata.refresh_head_ttl(Duration::from_secs(60));
+        let after = SystemTime::now();
+
+        let anchor = metadata.head_cached_at.expect("refresh must set an anchor");
+        let accessed = metadata
+            .head_last_accessed
+            .expect("refresh must record the access time");
+        let expiry = metadata
+            .head_expires_at
+            .expect("refresh must set an expiry");
+        assert!(anchor >= before && anchor <= after);
+        assert_eq!(anchor, accessed);
+        assert!(expiry.duration_since(anchor).unwrap() >= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn legacy_metadata_without_head_cached_at_deserializes_to_none() {
+        let mut value = serde_json::to_value(NewCacheMetadata::default()).unwrap();
+        value.as_object_mut().unwrap().remove("head_cached_at");
+        let metadata: NewCacheMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(metadata.head_cached_at, None);
+    }
+
+    #[test]
+    fn metadata_with_head_cached_at_is_readable_by_a_prior_schema() {
+        #[derive(Deserialize)]
+        struct PriorMetadata {
+            cache_key: String,
+        }
+
+        let metadata = NewCacheMetadata {
+            cache_key: "bucket/key".to_string(),
+            head_cached_at: Some(SystemTime::now()),
+            ..Default::default()
+        };
+        let parsed: PriorMetadata =
+            serde_json::from_str(&serde_json::to_string(&metadata).unwrap())
+                .expect("prior schemas must ignore the additive anchor field");
+        assert_eq!(parsed.cache_key, "bucket/key");
     }
 }

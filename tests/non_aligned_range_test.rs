@@ -178,7 +178,8 @@ async fn test_non_aligned_range_request() {
     // Requirement 2.2, 2.3: Verify response is byte-identical to original data
     let expected_data = &full_data[requested_start..=requested_end];
     assert_eq!(
-        merge_result.data, expected_data,
+        merge_result.data.as_ref(),
+        expected_data,
         "Merged data should be byte-identical to original data"
     );
 
@@ -314,7 +315,7 @@ async fn test_non_aligned_range_multiple_boundaries() {
     assert_eq!(merge_result.data.len(), expected_size);
 
     let expected_data = &full_data[requested_start..=requested_end];
-    assert_eq!(merge_result.data, expected_data);
+    assert_eq!(merge_result.data.as_ref(), expected_data);
 
     assert_eq!(merge_result.bytes_from_cache, expected_size as u64);
     assert_eq!(merge_result.bytes_from_s3, 0);
@@ -413,7 +414,7 @@ async fn test_non_aligned_range_at_start() {
     assert_eq!(merge_result.data.len(), expected_size);
 
     let expected_data = &full_data[requested_start..=requested_end];
-    assert_eq!(merge_result.data, expected_data);
+    assert_eq!(merge_result.data.as_ref(), expected_data);
 
     assert_eq!(merge_result.cache_efficiency, 100.0);
 
@@ -507,7 +508,7 @@ async fn test_non_aligned_range_at_end() {
     assert_eq!(merge_result.data.len(), expected_size);
 
     let expected_data = &full_data[requested_start..=requested_end];
-    assert_eq!(merge_result.data, expected_data);
+    assert_eq!(merge_result.data.as_ref(), expected_data);
 
     assert_eq!(merge_result.cache_efficiency, 100.0);
 

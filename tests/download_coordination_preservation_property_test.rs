@@ -265,6 +265,8 @@ async fn run_get_head(
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("Infallible");
@@ -312,6 +314,8 @@ async fn run_serve_from_cache_validated(
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("Infallible");
@@ -1214,6 +1218,8 @@ fn prop_different_flight_keys_are_independent(shape_tag: u8) -> TestResult {
                             None,
                             &ResolvedSettings::default(),
                             &None,
+                            // Test harness has no request-concurrency permit to thread.
+                            None,
                         )
                         .await
                         .expect("Infallible");

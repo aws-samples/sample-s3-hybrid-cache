@@ -220,13 +220,49 @@ pub struct ServerConfig {
     /// HTTP forward proxy port for proxy-only mode (default: 3128)
     #[serde(default = "default_proxy_port")]
     pub proxy_port: u16,
-    /// Maximum number of concurrent requests to handle
-    /// Default: 200 (suitable for most deployments)
+    /// Maximum number of concurrent requests, bounding the whole request
+    /// including its response-body transfer.
+    ///
+    /// Scope: the permit is acquired as an `OwnedSemaphorePermit`
+    /// (`try_acquire_owned`) at the top of `handle_request`, wrapped in `Arc`,
+    /// and attached to the response body itself (`PermitBody`) — it releases
+    /// only when the body has fully streamed to the client (or the connection
+    /// is dropped), and a share of it is held by any background cache-commit
+    /// task until that commit completes. This bounds concurrent transfers, not
+    /// just concurrent request setups. (Prior to the transfer-concurrency-
+    /// admission change, the permit was a borrowed `SemaphorePermit` released
+    /// when `handle_request` returned — before any response body byte reached
+    /// the client for a streaming response — so it bounded only the setup
+    /// phase; that behaviour no longer applies.)
+    ///
+    /// Exceeding this limit sheds the request with HTTP 503 `SlowDown` and
+    /// `Retry-After` rather than queueing it, on the basis that AWS SDKs retry 503
+    /// with backoff.
+    ///
+    /// Default: 1000, derived from a G3 fleet measurement of
+    /// Peak_Concurrent_Transfers = 71 (100-client fleet, 60s of concurrent
+    /// 8 MiB range reads) with ~14x headroom — see
+    /// `default_max_concurrent_requests` and
+    /// `.kiro/specs/combined-2.5.0/run-log.md`, G3. Because a permit now spans
+    /// the whole transfer, size this from measured `permits_held_peak`
+    /// (`/metrics` → `request_metrics.permits_held_peak`) under representative
+    /// load, not from request rate alone — see `docs/CONFIGURATION.md` →
+    /// "What this limit actually covers".
     /// Small deployments: 50-100
     /// Medium deployments: 100-300  
     /// Large deployments: 300-1000+
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// NOT ENFORCED. Accepted and validated for backward compatibility, but no code
+    /// path reads this value, so setting it has no effect on request handling.
+    ///
+    /// The 30s upstream request timeout that is actually applied is a separate
+    /// hard-coded value in `S3Client` (`src/s3_client.rs`), which coincidentally
+    /// matches this field's default. Changing this field does not change that timeout.
+    ///
+    /// Retained rather than removed so existing config files keep parsing (see
+    /// `.kiro/steering/config-compatibility.md`). Do not reference it as the
+    /// whole-request wall in new code or docs.
     #[serde(
         deserialize_with = "duration_serde::deserialize",
         default = "default_request_timeout"
@@ -235,12 +271,11 @@ pub struct ServerConfig {
     /// Enable adding Referer header for proxy identification in S3 Server Access Logs
     #[serde(default = "default_add_referer_header")]
     pub add_referer_header: bool,
-    /// Maximum size in bytes for request bodies that the proxy buffers into memory.
-    /// Applies to single-part PUT, UploadPart, and other requests with a body.
-    /// Default: 5 GiB (5_368_709_120) — matches the S3 single-part and UploadPart maximum,
-    /// ensuring the proxy is transparent to all valid S3 clients.
-    /// Operators on memory-constrained instances can lower this value.
-    /// Requirement: 11.1, 11.2, 11.3
+    /// Deprecated compatibility field. Existing configuration files continue to
+    /// parse unchanged, but the value does not control request handling.
+    ///
+    /// S3's own 5 GiB single-part PUT and UploadPart maximum now governs streamed
+    /// uploads. This field will be removed in a future release.
     #[serde(default = "default_max_buffered_request_body_bytes")]
     pub max_buffered_request_body_bytes: u64,
     /// Cache-tee channel depth for the streaming signed-write path (default: 5 frames).
@@ -254,14 +289,48 @@ pub struct ServerConfig {
     ///
     /// A frame is a single forwarded request-body frame, bounded by the HTTP read
     /// buffer, so a depth of 5 keeps per-connection streaming memory on par with the GET
-    /// path and independent of object size. Worst-case fleet streaming memory stays
-    /// bounded by `max_concurrent_requests × write_cache_tee_channel_depth × frame`.
+    /// path and independent of object size.
     ///
-    /// This is a new, additive knob; it does not change the meaning of
-    /// `max_buffered_request_body_bytes`.
+    /// Note on the fleet-wide bound: this depth bounds memory **per connection**,
+    /// and it now *does* multiply into a sound fleet-wide ceiling for the
+    /// streaming paths — `max_concurrent_requests × depth × frame` — because the
+    /// concurrency permit is an owned permit attached to the response body
+    /// (`PermitBody`) and held for the whole Transfer_Phase, not released at
+    /// head construction (see `max_concurrent_requests`'s own doc comment).
+    /// This does not cover the paths that still buffer a whole body or range in
+    /// memory. Request bodies on those paths use the internal
+    /// `BUFFERED_BODY_BOUND`; response bodies use their requested range size. The
+    /// opt-in `max_inflight_buffer_bytes` ledger accounts for both as a separate,
+    /// independent budget. Confirm the streaming-path formula against measured
+    /// peak memory rather than trusting it blindly.
     /// Requirement: 9.1, 9.2, 9.3
     #[serde(default = "default_write_cache_tee_channel_depth")]
     pub write_cache_tee_channel_depth: usize,
+    /// Maximum total bytes held simultaneously across all buffered request and
+    /// response bodies (the Inflight_Ceiling). `0` (default) disables the
+    /// accounting entirely (Ledger_Disabled) — an existing deployment gains no
+    /// new rejection behaviour on upgrade without an explicit configuration
+    /// change.
+    ///
+    /// This bounds the paths that must buffer a whole body or range (request
+    /// bodies read into memory, and response bodies buffered because streaming
+    /// isn't possible). It does NOT apply to the streaming paths (cache-miss
+    /// GET, signed PUT/UploadPart with caching), which are already bounded per-
+    /// connection independently of object size via
+    /// `write_cache_tee_channel_depth`.
+    ///
+    /// Size this alongside `cache.max_ram_cache_size` and instance memory: the
+    /// two budgets are independent and both count against RSS. A request
+    /// rejected by this ceiling receives HTTP 503 `SlowDown` with
+    /// `Retry-After`, which AWS SDKs retry automatically.
+    ///
+    /// Validated at startup: a non-zero value below the internal one-MiB
+    /// buffered-request bound is rejected, since such a config guarantees every
+    /// maximal buffered request body is rejected regardless of load — a
+    /// misconfiguration rather than a policy.
+    /// Requirement: IMA 7.1-7.5, 7.8
+    #[serde(default = "default_max_inflight_buffer_bytes")]
+    pub max_inflight_buffer_bytes: u64,
     /// Optional TLS proxy listener configuration
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -280,7 +349,14 @@ fn default_proxy_port() -> u16 {
 }
 
 fn default_max_concurrent_requests() -> usize {
-    200
+    // Raised from 200 to 1000 for TCA (transfer-concurrency-admission): the permit
+    // now spans the full response-body Transfer_Phase (and Commit_Phase), not just
+    // Setup_Phase, so a permit is held far longer than before. 1000 is derived from
+    // a G3 fleet measurement of Peak_Concurrent_Transfers = 71 (100-client fleet,
+    // 60s of concurrent 8 MiB range reads) with ~14x headroom — see
+    // .kiro/specs/combined-2.5.0/run-log.md, G3. Lands on this doc's own
+    // "large deployment: 300-1000+" figure rather than an arbitrary multiplier.
+    1000
 }
 
 fn default_request_timeout() -> Duration {
@@ -310,14 +386,12 @@ fn default_max_connections_per_ip() -> usize {
     10
 }
 
-/// Default maximum buffered request body size: 5 GiB (S3 single-part and UploadPart maximum).
+/// Default retained for the deprecated request-body compatibility field.
 ///
-/// This matches the S3 protocol limit so the proxy is transparent to all valid S3 clients.
-/// Operators on memory-constrained instances can lower this value; note that
-/// `max_concurrent_requests` bounds the worst-case concurrent memory usage.
-/// Requirement: 11.1, 11.3
+/// Existing configurations may keep `max_buffered_request_body_bytes` through
+/// this release. The value is not used to select the streamed request-body cap.
 fn default_max_buffered_request_body_bytes() -> u64 {
-    5 * 1024 * 1024 * 1024 // 5 GiB — S3 single-part / UploadPart maximum
+    5 * 1024 * 1024 * 1024
 }
 
 /// Default cache-tee channel depth: 5 frames.
@@ -330,14 +404,64 @@ fn default_max_buffered_request_body_bytes() -> u64 {
 ///
 /// A frame is a single forwarded request-body frame, bounded by the HTTP read buffer,
 /// so a depth of 5 keeps per-connection streaming memory on par with the GET path and
-/// independent of object size. Worst-case fleet streaming memory stays bounded by
-/// `max_concurrent_requests × write_cache_tee_channel_depth × frame`.
+/// independent of object size. This is a per-connection bound only — see the field
+/// doc on `write_cache_tee_channel_depth` for why `max_concurrent_requests` does not
+/// multiply it into a fleet-wide ceiling.
 fn default_write_cache_tee_channel_depth() -> usize {
     5
 }
 
 fn default_tls_proxy_port() -> u16 {
     3129
+}
+
+/// Default in-flight buffered-byte ceiling: `0`, meaning Ledger_Disabled.
+///
+/// Deferring to an operator-set value rather than deriving one from detected
+/// instance memory keeps the proxy's rejection behaviour independent of the
+/// host it lands on — reproducible across instance types and fleets — at the
+/// cost of protecting nobody until configured. See `docs/CONFIGURATION.md` for
+/// the worked sizing example.
+/// Requirement: IMA 7.4
+fn default_max_inflight_buffer_bytes() -> u64 {
+    0
+}
+
+impl ServerConfig {
+    fn max_buffered_request_body_bytes_deprecation_warning(&self) -> Option<&'static str> {
+        (self.max_buffered_request_body_bytes != default_max_buffered_request_body_bytes()).then_some(
+            "Configuration field 'server.max_buffered_request_body_bytes' is deprecated and has no effect. \
+             S3's own single-part PUT and UploadPart limits now apply. \
+             This field will be removed in a future release.",
+        )
+    }
+
+    /// Validate the configuration.
+    ///
+    /// Rejects a non-zero `max_inflight_buffer_bytes` below
+    /// `BUFFERED_BODY_BOUND`: such a config guarantees every single maximal
+    /// buffered request body is rejected by the Admission_Check regardless of
+    /// load. `0` (Ledger_Disabled) is exempt, since it performs no
+    /// Admission_Check.
+    ///
+    /// `max_buffered_request_body_bytes` is retained only for compatibility and
+    /// has no role in validation.
+    /// Requirement: 4.5
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let buffered_body_bound = crate::signed_request_proxy::BUFFERED_BODY_BOUND;
+        if self.max_inflight_buffer_bytes > 0
+            && self.max_inflight_buffer_bytes < buffered_body_bound
+        {
+            return Err(format!(
+                "server.max_inflight_buffer_bytes ({}) is non-zero but smaller than \
+                 BUFFERED_BODY_BOUND ({}); every maximal buffered request body would be \
+                 rejected regardless of load. Set max_inflight_buffer_bytes to 0 to disable \
+                 the ceiling, or to a value >= BUFFERED_BODY_BOUND.",
+                self.max_inflight_buffer_bytes, buffered_body_bound
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ServerConfig {
@@ -352,6 +476,7 @@ impl Default for ServerConfig {
             add_referer_header: default_add_referer_header(),
             max_buffered_request_body_bytes: default_max_buffered_request_body_bytes(),
             write_cache_tee_channel_depth: default_write_cache_tee_channel_depth(),
+            max_inflight_buffer_bytes: default_max_inflight_buffer_bytes(),
             tls: None,
         }
     }
@@ -1027,8 +1152,8 @@ pub struct MetadataCacheConfig {
         deserialize_with = "duration_serde::deserialize"
     )]
     pub refresh_interval: Duration,
-    /// Maximum number of entries in the cache (default: 10000)
-    /// Each entry is ~1-2KB, so 10000 entries uses ~15-25MB of RAM.
+    /// Maximum number of entries in the cache (default: 100000)
+    /// Each entry is ~1-2KB, so 100000 entries uses ~150-250MB of RAM.
     /// Valid range: 100-1000000
     #[serde(default = "default_metadata_cache_max_entries")]
     pub max_entries: usize,
@@ -2020,6 +2145,7 @@ pub struct UpstreamOverrideConfig {
 
 /// Compression configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CompressionConfig {
     pub enabled: bool,
     pub threshold: usize,
@@ -2071,6 +2197,7 @@ impl Default for CompressionConfig {
 
 /// Health check configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HealthConfig {
     pub enabled: bool,
     pub endpoint: String,
@@ -2122,6 +2249,7 @@ impl Default for PerBucketMetricsConfig {
 
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MetricsConfig {
     pub enabled: bool,
     pub endpoint: String,
@@ -2159,6 +2287,7 @@ pub struct MetricsConfig {
 
 /// OTLP (OpenTelemetry Protocol) configuration
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OtlpConfig {
     pub enabled: bool,
     pub endpoint: String,
@@ -2170,8 +2299,8 @@ pub struct OtlpConfig {
     pub compression: OtlpCompression,
     /// Enable per-bucket OTLP export (default: false). In-memory accounting and the
     /// /metrics + dashboard views are always active regardless of this flag.
-    /// Setting this to true causes the proxy to emit nine per-bucket cumulative counters
-    /// (bytes_downloaded, bytes_uploaded, get/put/head/delete/post/list/all_requests)
+    /// Setting this to true causes the proxy to emit four per-bucket cumulative counters
+    /// (bytes_downloaded, bytes_uploaded, get_requests, put_requests)
     /// via OTLP on every collection cycle, each with a `bucket` attribute.
     /// Design §6a.
     #[serde(default)]
@@ -2385,11 +2514,12 @@ impl Default for Config {
                 http_port: 80,
                 https_port: 443,
                 proxy_port: 3128,
-                max_concurrent_requests: 200,
+                max_concurrent_requests: default_max_concurrent_requests(),
                 request_timeout: Duration::from_secs(30),
                 add_referer_header: true,
                 max_buffered_request_body_bytes: default_max_buffered_request_body_bytes(),
                 write_cache_tee_channel_depth: default_write_cache_tee_channel_depth(),
+                max_inflight_buffer_bytes: default_max_inflight_buffer_bytes(),
                 tls: None,
             },
             cache: CacheConfig {
@@ -2602,6 +2732,15 @@ impl Config {
             )));
         }
 
+        // Validate server configuration against the internal buffered-body bound.
+        // Requirement: 4.5
+        if let Err(e) = config.server.validate() {
+            return Err(ProxyError::ConfigError(format!(
+                "Invalid server configuration: {}",
+                e
+            )));
+        }
+
         // Validate TLS configuration
         // Requirements: 6.2, 6.3, 6.5
         config.validate_tls_config()?;
@@ -2792,6 +2931,12 @@ impl Config {
                  Log entries displayed on the dashboard are managed internally. \
                  This field will be removed in a future release."
             );
+        }
+        if let Some(message) = self
+            .server
+            .max_buffered_request_body_bytes_deprecation_warning()
+        {
+            warn!("{}", message);
         }
     }
 
@@ -4556,6 +4701,63 @@ logging:
         assert_eq!(
             config.server.write_cache_tee_channel_depth, 5,
             "omitted write_cache_tee_channel_depth must default to 5 frames"
+        );
+    }
+
+    #[test]
+    fn test_deprecated_max_buffered_request_body_bytes_parses_and_warns() {
+        // Requirement 4.1: retain the old field for restart-free upgrades, but make
+        // its ignored status visible at startup.
+        let yaml = r#"
+server:
+  max_buffered_request_body_bytes: 1048576
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml)
+            .expect("config with deprecated max_buffered_request_body_bytes must parse");
+        assert!(
+            config.server.validate().is_ok(),
+            "a compatible config with the deprecated field must still start"
+        );
+        assert_eq!(
+            config.server.max_buffered_request_body_bytes_deprecation_warning(),
+            Some(
+                "Configuration field 'server.max_buffered_request_body_bytes' is deprecated and has no effect. \
+                 S3's own single-part PUT and UploadPart limits now apply. \
+                 This field will be removed in a future release."
+            ),
+            "a non-default deprecated value must produce the startup warning"
+        );
+    }
+
+    #[test]
+    fn test_deprecated_max_buffered_request_body_bytes_defaults_without_warning() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml)
+            .expect("config omitting deprecated max_buffered_request_body_bytes must parse");
+        assert_eq!(
+            config.server.max_buffered_request_body_bytes,
+            5 * 1024 * 1024 * 1024,
+            "omitting the field must preserve the 5 GiB compatibility default"
+        );
+        assert_eq!(
+            config
+                .server
+                .max_buffered_request_body_bytes_deprecation_warning(),
+            None,
+            "an omitted field must not produce a deprecation warning"
         );
     }
 
@@ -7489,7 +7691,7 @@ mod rolling_validation_config_property_tests {
         // --- server section ---
         assert_eq!(config.server.http_port, 80);
         assert_eq!(config.server.https_port, 443);
-        assert_eq!(config.server.max_concurrent_requests, 200);
+        assert_eq!(config.server.max_concurrent_requests, 1000);
         assert_eq!(config.server.request_timeout, Duration::from_secs(30));
         assert!(config.server.add_referer_header);
         assert_eq!(config.server.mode, ServerMode::Standard);
@@ -7521,9 +7723,15 @@ mod rolling_validation_config_property_tests {
         assert_eq!(config.cache.get_ttl, Duration::from_secs(315_360_000));
         assert_eq!(config.cache.head_ttl, Duration::from_secs(60));
         assert!(!config.cache.actively_remove_cached_data);
+        // The example carries the built-in default (10s), as does every other
+        // RAM-coherency field below it.
         assert_eq!(
             config.cache.ram_cache_flush_interval,
-            Duration::from_secs(60)
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.cache.ram_cache_flush_interval,
+            CacheConfig::default().ram_cache_flush_interval
         );
         assert_eq!(config.cache.ram_cache_flush_threshold, 100);
         assert!(!config.cache.ram_cache_flush_on_eviction);
@@ -7798,5 +8006,160 @@ upstream_idle_retries: 5
         assert_eq!(config.upstream_first_byte_timeout, Duration::from_secs(10));
         assert_eq!(config.upstream_idle_timeout, Duration::from_secs(3));
         assert_eq!(config.upstream_idle_retries, 5);
+    }
+
+    #[test]
+    fn server_inflight_ceiling_uses_the_buffered_body_bound() {
+        // Validates: Requirements 4.4, 4.5, 4.6, 6.4
+        let mut server = ServerConfig {
+            max_inflight_buffer_bytes: 256 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert!(
+            server.validate().is_ok(),
+            "a 256 MiB ceiling must be legal without changing the deprecated upload-size field"
+        );
+
+        server.max_inflight_buffer_bytes = crate::signed_request_proxy::BUFFERED_BODY_BOUND - 1;
+        let error = server
+            .validate()
+            .expect_err("a non-zero ceiling below the buffered-body bound must be rejected");
+        assert!(error.contains("max_inflight_buffer_bytes"));
+        assert!(error.contains(&crate::signed_request_proxy::BUFFERED_BODY_BOUND.to_string()));
+        assert!(error.contains("Set max_inflight_buffer_bytes to 0"));
+
+        server.max_inflight_buffer_bytes = 0;
+        assert!(
+            server.validate().is_ok(),
+            "the disabled ledger remains exempt from the validation floor"
+        );
+    }
+
+    #[test]
+    fn minimal_config_keeps_the_inflight_ledger_disabled() {
+        // Validates: Requirements 4.6, 6.4
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("minimal config must parse");
+
+        assert_eq!(config.server.max_inflight_buffer_bytes, 0);
+        assert!(
+            config.server.validate().is_ok(),
+            "an omitted ceiling must retain the disabled default and validate"
+        );
+    }
+
+    // Config-compat: a PARTIALLY specified section must parse, with the fields the
+    // operator did not write falling back to their documented defaults. `Config`
+    // carries field-level `#[serde(default)]` on each section, so omitting a whole
+    // section always worked; before `#[serde(default)]` was added to these four
+    // structs, writing the section with a single field failed startup naming a field
+    // the operator never wrote (e.g. "missing field `preferred_algorithm`").
+    // See .kiro/steering/config-compatibility.md.
+
+    #[test]
+    fn partial_compression_section_fills_remaining_defaults() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+compression:
+  enabled: true
+"#;
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("partial compression section must parse");
+
+        assert!(config.compression.enabled);
+        assert_eq!(config.compression.threshold, 1024);
+        assert_eq!(
+            config.compression.preferred_algorithm,
+            CompressionAlgorithm::Lz4
+        );
+        assert!(config.compression.content_aware_deprecated.is_none());
+    }
+
+    #[test]
+    fn partial_health_section_fills_remaining_defaults() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+health:
+  port: 18080
+"#;
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("partial health section must parse");
+
+        assert_eq!(config.health.port, 18080);
+        assert!(config.health.enabled);
+        assert_eq!(config.health.endpoint, "/health");
+        assert_eq!(config.health.bind_address, "0.0.0.0");
+        assert_eq!(config.health.check_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn partial_metrics_section_fills_remaining_defaults() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+metrics:
+  port: 19090
+"#;
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("partial metrics section must parse");
+
+        assert_eq!(config.metrics.port, 19090);
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.endpoint, "/metrics");
+        assert_eq!(config.metrics.bind_address, "0.0.0.0");
+        assert_eq!(config.metrics.collection_interval, Duration::from_secs(60));
+        assert_eq!(config.metrics.per_bucket.max_series, 100);
+        // Nested OTLP section must also fall back wholesale.
+        assert!(!config.metrics.otlp.enabled);
+        assert_eq!(config.metrics.otlp.endpoint, "http://localhost:4318");
+    }
+
+    #[test]
+    fn partial_otlp_section_fills_remaining_defaults() {
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+metrics:
+  otlp:
+    enabled: true
+"#;
+        let config: Config =
+            serde_yaml_ng::from_str(yaml).expect("partial otlp section must parse");
+
+        assert!(config.metrics.otlp.enabled);
+        assert_eq!(config.metrics.otlp.endpoint, "http://localhost:4318");
+        assert_eq!(config.metrics.otlp.export_interval, Duration::from_secs(60));
+        assert_eq!(config.metrics.otlp.timeout, Duration::from_secs(10));
+        assert!(config.metrics.otlp.headers.is_empty());
+        assert_eq!(config.metrics.otlp.compression, OtlpCompression::None);
+        assert!(!config.metrics.otlp.per_bucket_enabled);
+        // The enclosing metrics section keeps its own defaults.
+        assert_eq!(config.metrics.port, 9090);
+    }
+
+    #[test]
+    fn metadata_cache_max_entries_default_matches_documented_value() {
+        // The doc comment on MetadataCacheConfig::max_entries states 100000; pin it.
+        assert_eq!(MetadataCacheConfig::default().max_entries, 100_000);
     }
 }

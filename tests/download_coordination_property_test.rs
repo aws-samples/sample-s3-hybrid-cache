@@ -491,6 +491,8 @@ async fn launch_get_head_concurrent(
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");
@@ -532,6 +534,8 @@ async fn launch_get_head_concurrent(
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");
@@ -610,6 +614,8 @@ async fn launch_range_concurrent(
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("range coordination");
@@ -657,6 +663,8 @@ async fn launch_range_concurrent(
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("range coordination");
@@ -726,6 +734,8 @@ async fn launch_part_concurrent(
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("part coordination");
@@ -766,6 +776,8 @@ async fn launch_part_concurrent(
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("part coordination");
@@ -1174,6 +1186,8 @@ async fn run_preservation_fresh_cache_hit(seed: u64, method_tag: u8) -> TestResu
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("serve_from_cache_validated");
@@ -1279,6 +1293,8 @@ async fn run_preservation_single_missing(seed: u64) -> TestResult {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("coordination helper");
@@ -1374,6 +1390,8 @@ async fn run_preservation_single_expired(seed: u64) -> TestResult {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("coordination helper");
@@ -1488,6 +1506,8 @@ async fn run_preservation_coordination_disabled(seed: u64, n: usize) -> TestResu
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");
@@ -1612,6 +1632,8 @@ async fn run_preservation_fetcher_error(seed: u64) -> TestResult {
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");
@@ -1733,6 +1755,8 @@ async fn run_preservation_fetcher_timeout(seed: u64) -> TestResult {
             None,
             &ResolvedSettings::default(),
             &None,
+            // Test harness has no request-concurrency permit to thread.
+            None,
         )
         .await
         .expect("coordination helper");
@@ -1824,6 +1848,8 @@ async fn run_preservation_distinct_flight_keys(seed: u64, n: usize) -> TestResul
                 None,
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");
@@ -2016,6 +2042,8 @@ async fn run_waiter_conditional_headers_well_formed(seed: u64) -> TestResult {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("serve_from_cache_validated");

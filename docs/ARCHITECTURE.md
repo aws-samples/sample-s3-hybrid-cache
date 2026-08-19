@@ -164,18 +164,23 @@ src/
 ```rust
 pub struct TeeStream<S> {
     inner: S,
-    sender: mpsc::Sender<Result<Bytes>>,
+    sender: mpsc::Sender<Bytes>,
+    bytes_sent: usize,
+    // plus backpressure and idle-watchdog state — see src/tee_stream.rs
 }
 
-impl<S: Stream<Item = Result<Bytes>>> Stream for TeeStream<S> {
+impl<S> Stream for TeeStream<S>
+where
+    S: Stream<Item = Result<Frame<Bytes>, hyper::Error>> + Unpin,
+{
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                // Send to cache writer (non-blocking)
-                let _ = self.sender.try_send(Ok(chunk.clone()));
-                Poll::Ready(Some(Ok(chunk)))
+            Poll::Ready(Some(Ok(frame))) => {
+                // Send data frames to the cache writer, applying backpressure
+                // when the channel is full rather than dropping bytes
+                Poll::Ready(Some(Ok(frame)))
             }
-            // ... error handling
+            // ... backpressure, idle-watchdog, and error handling
         }
     }
 }
@@ -187,7 +192,7 @@ impl<S: Stream<Item = Result<Bytes>>> Stream for TeeStream<S> {
 - Sub-100ms first byte latency
 - No cache performance regression
 
-**RAM Cache Integration**: Both streaming and buffered paths check RAM cache before disk I/O. On a RAM hit, the streaming path serves data directly from memory as a buffered response. On a RAM miss, the streaming path collects chunks during disk streaming and promotes the range to RAM cache after completion (skipping promotion for ranges exceeding `max_ram_cache_size`).
+**RAM Cache Integration**: Both streaming and buffered paths check RAM cache before disk I/O. On a RAM hit, the streaming path serves data directly from memory as a buffered response. On a RAM miss, the streaming path collects chunks during disk streaming and promotes the range to RAM cache after completion. Promotion is bounded by **per-shard** capacity (`max_ram_cache_size / effective_shard_count`, 64 MiB at defaults), not by `max_ram_cache_size` as a whole — see [CONFIGURATION.md — RAM Sizing and the Admission Ceiling](CONFIGURATION.md#ram-sizing-and-the-admission-ceiling).
 
 ### 2. Bucket-First Hash-Based Sharding
 
@@ -237,7 +242,7 @@ fn get_sharded_path(base_dir: &Path, cache_key: &str, suffix: &str) -> Result<Pa
 - Sharded into `ram_cache_shard_count` independent `tokio::sync::RwLock` partitions (default 8), keyed by `blake3(cache_key) % shard_count`, so concurrent reads of different keys do not contend
 - Stores data as `Arc<Bytes>` for O(1) zero-copy reads; the shard lock is released before decompression and response construction
 - Access counters (`last_accessed`, `access_count`, hit/miss) are atomics updated under a shared read lock; LRU/TinyLFU reorder is deferred to the next `put()`
-- See [CACHING.md → RAM Cache Concurrency Model](CACHING.md#ram-cache-concurrency-model)
+- See [CACHING.md → RAM Cache Concurrency Model](CACHE_INTERNALS.md#ram-cache-concurrency-model)
 
 **Disk Cache (LZ4 Compressed)**:
 - All object data stored as ranges
@@ -259,15 +264,27 @@ access happens one level down, inside `CacheManager`, so searching a file for
 `ram_cache` understates its RAM participation. This map records, per entry
 point, what actually happens.
 
-| Entry point | Consults RAM? | Promotes to RAM? | RAM key |
-|---|---|---|---|
-| `serve_range_from_cache` (streaming, `http_proxy.rs`) | Only via the buffered/RAM pre-check before the streaming decision | On disk-hit collection during streaming, via the frame-verbatim path | `generate_ram_range_key` (colon grammar) |
-| `serve_range_from_cache_buffered` (`http_proxy.rs`) | Yes — `get_cached_range_data` → single-range branch checks RAM directly | Yes, on disk hit | `generate_ram_range_key` (colon grammar) |
-| `get_cached_range_data` → single-range branch | Yes | Yes, on disk hit | `generate_ram_range_key` (colon grammar) |
-| `get_cached_range_data` → merge branch → `RangeHandler::merge_range_segments` → `extract_bytes_from_cached_range` → `CacheManager::load_range_data_with_cache` | Yes, **per cached segment** | Yes, per segment on disk hit | `generate_ram_range_key` (colon grammar), keyed on each segment's stored-range bounds |
-| `fill_page` (page mode) → `load_page_from_cache` | Yes — page-keyed RAM lookup (`get_range_from_ram_cache` with page bounds) | Yes, on disk hit only — never on the cold S3-fetch fill | `generate_ram_range_key` (colon grammar), keyed on page bounds, not the client's sub-range |
+| Entry point | Consults RAM? | Promotes to RAM? | RAM key | Reserves against the in-flight ledger? |
+|---|---|---|---|---|
+| `serve_range_from_cache` → RAM pre-check hit (`http_proxy.rs`) | Yes — exact-key lookup before the streaming decision | n/a (already resident) | `generate_ram_range_key` (colon grammar) | **No** |
+| `serve_range_from_cache` (streaming, `http_proxy.rs`) | Only via the buffered/RAM pre-check before the streaming decision | On disk-hit collection during streaming, via the frame-verbatim path | `generate_ram_range_key` (colon grammar) | **No** — bounded by its 4-slot frame channel instead |
+| `serve_range_from_cache_buffered` (`http_proxy.rs`) | Yes — `get_cached_range_data` → single-range branch checks RAM directly | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | **Yes** — the requested range length, held by `PermitBody` until the client drains or disconnects |
+| `serve_full_object_from_cache` (`http_proxy.rs`) | Yes, via `get_cached_range_data` | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | **Yes** — the full object length, held by `PermitBody` |
+| `get_cached_range_data` → single-range branch | Yes | Yes, on disk hit | `generate_ram_range_key` (colon grammar) | Only its own recovery fetch, scoped to that fetch |
+| `get_cached_range_data` → merge branch → `RangeHandler::merge_range_segments` → `extract_bytes_from_cached_range` → `CacheManager::load_range_data_with_cache` | Yes, **per cached segment** | Yes, per segment on disk hit | `generate_ram_range_key` (colon grammar), keyed on each segment's stored-range bounds | Only its own fallback fetch, scoped to that fetch |
+| `fill_page` (page mode) → `load_page_from_cache` | Yes — page-keyed RAM lookup (`get_range_from_ram_cache` with page bounds) | Yes, on disk hit only — never on the cold S3-fetch fill | `generate_ram_range_key` (colon grammar), keyed on page bounds, not the client's sub-range | **No** |
 
 Notes:
+- **A request covering an object's entire byte range does not reach the buffered
+  path.** The RAM lookup is keyed on the exact `(cache_key, start, end)` triple,
+  and caching a full object registers it under the whole-object range key. So
+  `Range: bytes=0-<size-1>` is an exact-key RAM hit: served with `X-Cache: HIT`
+  and no ledger reservation. Only a partial range the RAM tier has not seen
+  reaches `serve_range_from_cache_buffered`.
+- The two reserving paths hold their claim on the response body, so it lasts until
+  the body is delivered or the client disconnects. Every other reservation in this
+  table is scoped to an upstream fetch. See `docs/METRICS.md` → `inflight_memory`
+  when sizing a ceiling.
 - All four paths share the **same RAM key grammar** (`generate_ram_range_key`,
   colon-separated) via the single-source-of-truth helper next to
   `generate_range_cache_key` in `cache.rs`. This is distinct from the
@@ -342,7 +359,7 @@ Each instance operates independently - the shared storage is the only integratio
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │  JournalConsolidator (background task, every 5s)            ││
-│  │    - Flushes accumulator to delta_{instance_id}.json        ││
+│  │    - Flushes accumulator to delta_{instance_id}_{seq}.json  ││
 │  │    - Acquires global lock                                   ││
 │  │    - Sums all delta files → updates size_state.json         ││
 │  │    - Resets delta files to zero                             ││
@@ -363,7 +380,7 @@ Each instance operates independently - the shared storage is the only integratio
 │                                                                 │
 │  cache/size_tracking/                                           │
 │    ├── size_state.json            ← Authoritative size state    │
-│    └── delta_{instance_id}.json   ← Per-instance delta files    │
+│    └── delta_{inst}_{seq}.json    ← One new file per flush      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -384,7 +401,7 @@ Each instance operates independently - the shared storage is the only integratio
 - If missing, starts at 0 and the periodic validation scan will correct
 - In-memory accumulator starts at zero; delta files are summed on next consolidation cycle
 
-**Periodic validation scan**: A background scan (default every 24h) walks cached metadata to reconcile tracked size with actual disk usage. The scan automatically switches between *full* mode (all L1 shard directories in parallel) and *rolling* mode (subset per cycle, resumed from a persistent cursor) based on observed duration vs. the `validation_max_duration` budget (default 4h). Large caches that exceed the budget run in rolling mode and achieve full coverage over multiple daily cycles. See [CONFIGURATION.md - Validation Scan](CONFIGURATION.md#validation-scan).
+**Periodic validation scan**: A background scan (once daily at midnight local time, plus up to an hour of jitter) walks cached metadata to reconcile tracked size with actual disk usage. The scan automatically switches between *full* mode (all L1 shard directories in parallel) and *rolling* mode (subset per cycle, resumed from a persistent cursor) based on observed duration vs. the `validation_max_duration` budget (default 4h). Large caches that exceed the budget run in rolling mode and achieve full coverage over multiple daily cycles. See [CONFIGURATION.md - Validation Scan](CONFIGURATION.md#validation-scan).
 
 ## Request Flow
 
@@ -440,7 +457,7 @@ For the full multipart upload state machine, correctness gates, concurrency sema
 
 ### Throughput
 - **Streaming**: No throughput degradation for large files
-- **Compression**: 2-10x space savings with minimal CPU overhead
+- **Compression**: LZ4 on every cache write, with minimal CPU overhead. Space savings depend entirely on content — highly compressible payloads see large reductions, while already-compressed formats are written store-mode at roughly 1:1 (see [COMPRESSION.md](COMPRESSION.md))
 - **Connection Pooling**: Reduced connection establishment overhead
 
 ### Scalability
@@ -522,7 +539,7 @@ cache:
   actively_remove_cached_data: false  # Required - must use lazy expiration
 ```
 
-**Behavior with TTL>0 (expired)**: When a cached object's TTL has elapsed, the next request triggers the same conditional revalidation flow described below. See [Cache Revalidation](CACHING.md#get-ttl-get_ttl) in the Caching documentation for full details including 304, 200, and 403 outcomes.
+**Behavior with TTL>0 (expired)**: When a cached object's TTL has elapsed, the next request triggers the same conditional revalidation flow described below. See [Cache Revalidation](CACHE_FRESHNESS.md#get-ttl-get_ttl) in the Caching documentation for full details including 304, 200, and 403 outcomes.
 
 **Behavior with TTL=0**:
 - Cache still stores data (useful for range merging, bandwidth savings)

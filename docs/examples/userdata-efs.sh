@@ -20,6 +20,9 @@ command -v mount.efs >/dev/null 2>&1 || dnf install -y amazon-efs-utils
 # Both Elastic Throughput AND the efs mount helper are required for the
 # 1,500 MiBps per-client cap. Without either, the cap is 500 MiBps.
 # lookupcache=pos is REQUIRED for multi-instance cache coordination.
+# There is deliberately no nconnect here: EFS neither supports nor needs it, since
+# the EFS client provides the connection parallelism itself. Do not copy it across
+# from userdata-fsxz.sh, where it IS required. See docs/SHARED_STORAGE.md.
 # Security: 'tls' enables encryption in transit. EFS also encrypts at rest
 # automatically when the file system is created with encryption enabled (default
 # in the console; specify --encrypted with the CLI).

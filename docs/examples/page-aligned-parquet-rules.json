@@ -1,0 +1,16 @@
+{
+  "$schema": "../cache-rules-schema.json",
+  "rules": [
+    {
+      "pattern": "analytics-lake/parquet/**",
+      "page_widening": true,
+      "page_size": 1048576,
+      "get_ttl": "7d",
+      "ram_cache_eligible": true
+    },
+    {
+      "pattern": "analytics-lake/**",
+      "get_ttl": "1h"
+    }
+  ]
+}

@@ -78,6 +78,21 @@ pub enum ProxyError {
         endpoint: String,
         source_err: String,
     },
+
+    /// The in-flight buffered-byte ledger (`server.max_inflight_buffer_bytes`)
+    /// could not admit a Reservation for a Buffering_Site allocation. Maps to
+    /// the shared Shed_Response (HTTP 503 `SlowDown` with `Retry-After`), never
+    /// to HTTP 413 — this is a transient admission condition, not a statement
+    /// that the request itself is invalid.
+    ///
+    /// Requirements: IMA 2.1, 2.2
+    #[error(
+        "In-flight memory ceiling exceeded: ceiling_bytes={ceiling_bytes}, requested_bytes={requested_bytes}"
+    )]
+    InflightCeilingExceeded {
+        ceiling_bytes: u64,
+        requested_bytes: u64,
+    },
 }
 
 impl From<std::io::Error> for ProxyError {

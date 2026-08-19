@@ -161,7 +161,7 @@ async fn test_cache_lookup_diagnostic_basic() {
     );
     assert_eq!(
         &loaded_data[..],
-        &test_data[..],
+        test_data,
         "Loaded data should match original data"
     );
     println!("✓ Range data loaded and verified");

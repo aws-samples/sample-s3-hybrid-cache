@@ -3,40 +3,28 @@
 Complete configuration guide for Hybrid Cache for Amazon S3 including cache behavior, TTL management, and performance tuning.
 
 ## Table of Contents
-
 - [Configuration Methods](#configuration-methods)
 - [Server Configuration](#server-configuration)
-  - [Request Body Size and Streaming Writes](#request-body-size-and-streaming-writes)
-  - [TLS Proxy Configuration](#tls-proxy-configuration)
 - [Cache Configuration](#cache-configuration)
 - [Time-To-Live (TTL) Configuration](#time-to-live-ttl-configuration)
 - [Write Cache Configuration](#write-cache-configuration)
 - [Cache Rules](#cache-rules)
-  - [Rules File Format](#rules-file-format)
-  - [Glob Syntax](#glob-syntax)
-  - [First-Match-Per-Field Precedence](#first-match-per-field-precedence)
-  - [Hot Reload and Error Resilience](#hot-reload-and-error-resilience)
-  - [Cache-Key Forms](#cache-key-forms)
-  - [Performance](#performance)
 - [Cache Expiration Scenarios](#cache-expiration-scenarios)
 - [RAM-Disk Cache Coherency](#ram-disk-cache-coherency)
+- [Cache Hit Performance Tuning](#cache-hit-performance-tuning)
 - [Range Request Optimization](#range-request-optimization)
 - [Eviction Configuration](#eviction-configuration)
 - [Multi-Instance Coordination](#multi-instance-coordination)
-  - [Validation Scan](#validation-scan)
-- [Cache Hit Performance Tuning](#cache-hit-performance-tuning)
 - [Download Coordination](#download-coordination)
 - [Cache Size Tracking](#cache-size-tracking)
 - [Compression Configuration](#compression-configuration)
 - [Connection Pooling](#connection-pooling)
 - [DNS Server Configuration](#dns-server-configuration)
 - [S3 PrivateLink (Interface VPC Endpoints)](#s3-privatelink-interface-vpc-endpoints)
+- [Upstream Transport Overrides](#upstream-transport-overrides)
 - [IP Distribution](#ip-distribution)
 - [Logging Configuration](#logging-configuration)
-  - [Buffered Access Logging](#buffered-access-logging)
-  - [Log Retention and Rotation](#log-retention-and-rotation)
 - [Metrics Configuration](#metrics-configuration)
-  - [Per-Bucket Traffic Metrics](#per-bucket-traffic-metrics)
 - [Dashboard Configuration](#dashboard-configuration)
 - [Health Check Configuration](#health-check-configuration)
 - [HTTPS Passthrough](#https-passthrough)
@@ -47,7 +35,6 @@ Complete configuration guide for Hybrid Cache for Amazon S3 including cache beha
 - [Troubleshooting](#troubleshooting)
 - [Download Bandwidth QoS Configuration](#download-bandwidth-qos-configuration)
 - [See Also](#see-also)
-
 ---
 
 ## Configuration Methods
@@ -79,8 +66,8 @@ HTTP_PORT=8081 ./s3-proxy -c config.yaml
 server:
   http_port: 80              # HTTP proxy port (caching enabled)
   https_port: 443            # HTTPS proxy port (TCP passthrough, no caching)
-  max_concurrent_requests: 200
-  request_timeout: "30s"
+  max_concurrent_requests: 1000   # default; raised from 200 in 2.5.0
+  request_timeout: "30s"          # NOT ENFORCED — see below
 ```
 
 **HTTP Port (80)**
@@ -92,28 +79,152 @@ server:
 **HTTPS Port (443)**
 - **Passthrough mode**: TCP tunneling, no caching (only mode)
 
-**Max Concurrent Requests**
+#### `request_timeout` is not enforced
+
+`request_timeout` (`Duration`, default `"30s"`) is accepted and validated, but **no code
+path reads it**. Setting it has no effect on request handling. It is retained so existing
+config files keep parsing.
+
+The 30s upstream timeout that does apply is a separate hardcoded value in `S3Client`,
+which coincidentally matches this field's default. Changing this field does not change
+that timeout. For timeouts you can actually control, see
+[Upstream Timeout](#upstream-timeout-stalled-response-fast-fail).
+
+#### Max Concurrent Requests
+
+Default `1000`.
+
 - Small deployments (< 50 users): 50-100
 - Medium deployments (50-500 users): 100-300
 - Large deployments (500+ users): 300-1000+
 - High-throughput scenarios: 1000+
 
-**Memory Impact**
+These bands predate 2.5.0, when a permit covered only request setup. A permit now
+covers the whole transfer, so the same number admits fewer simultaneous requests
+than it used to — treat the bands as a starting point and confirm against
+`/metrics` → `request_metrics.permits_held_peak` under your own load. For
+reference, a 100-client fleet test of 8 MiB ranged reads peaked at 71 permits held.
 
-Each concurrent request uses approximately 5 MiB of memory for streaming buffers:
+##### What this limit actually covers
+
+`max_concurrent_requests` bounds concurrency for the **whole request**, including
+its response-body transfer, not just the setup phase. The concurrency permit is
+acquired as an owned permit (`try_acquire_owned`) and attached to the response
+body itself; it releases only when the body has fully streamed to the client (or
+the connection is dropped), and a share of it is held by any background
+cache-commit task until that commit completes. This changed with the
+transfer-concurrency-admission work (2.5.0): earlier releases released the permit
+at response-head construction, before any body byte reached the client, so a
+slow transfer held its permit for only the milliseconds of its setup. That
+description is no longer accurate — this field now bounds concurrent *transfers*,
+not just concurrent request setups.
+
+Exceeding the limit sheds the request with HTTP 503 `SlowDown` and `Retry-After`
+rather than queueing it; AWS SDKs retry 503 with backoff automatically. Because a
+permit is now held for the duration of a transfer, a workload of many large,
+slow concurrent transfers reaches this limit sooner than the old setup-phase-only
+behaviour would have — size this value from measured `permits_held_peak`
+(`/metrics` → `request_metrics.permits_held_peak`) under representative load, not
+from request rate alone. The default was raised from 200 to 1000 for this reason
+(derived from a 100-client fleet measurement of peak concurrent transfers; see
+`CHANGELOG.md`'s 2.5.0 entry).
+
+#### Memory Impact
+
+Per-connection streaming memory is roughly 5 MiB and is independent of object size:
 - Cache hit path: 1 MiB decompression chunk buffer + up to 4 MiB channel backpressure (4 × 1 MiB chunks)
 - Cache miss path: 1 MiB TeeStream receive buffer + up to 4 MiB incremental cache write buffer
 
-Estimate total proxy memory: `base (~200 MiB) + max_concurrent_requests × 5 MiB`
+Because a permit now spans the full transfer, worst-case fleet streaming memory
+**is** bounded by `max_concurrent_requests × ~5 MiB`, for the streaming paths
+only (signed writes and cache-miss GET). This is the formula an earlier revision
+of this document removed as unsound when permits covered only the setup phase; it
+is sound again now that permits span the transfer. It does not, however, cover
+the paths that still buffer a whole body or range in memory (see below) — those
+are a second, independent budget.
 
-| max_concurrent_requests | Estimated Memory |
-|------------------------|-----------------|
-| 200 (default)          | ~1.2 GB         |
-| 500                    | ~2.7 GB         |
-| 1000                   | ~5.2 GB         |
-| 2000                   | ~10.2 GB        |
+Three budgets to size together, none of which the others cover:
 
-RAM cache (`max_ram_cache_size`) is additional. For example, a 1 GB RAM cache with 1000 concurrent requests uses ~6.2 GB total.
+1. **Streaming per-connection memory**: `max_concurrent_requests × ~5 MiB`, per
+   above.
+2. **In-flight buffered-byte ledger** (`server.max_inflight_buffer_bytes`,
+   default `0` = disabled): bounds the sum of concurrent buffered request and
+   response bodies. Since 2.5.0 this is almost entirely a response-side budget:
+   range merge, page widening, buffered range serving, and the
+   recovery/tee-accumulation fallbacks. On the request side, uploads stream —
+   signed and unsigned PUT and UploadPart, the signed-PUT bypass arms, and POST
+   object upload all forward frame by frame — leaving only small non-GET/PUT
+   bodies such as a `DeleteObjects` request, which an internal 1 MiB bound covers.
+   See [In-Flight Memory Ceiling](#in-flight-memory-ceiling) below for sizing
+   guidance. Left at its default (disabled), this budget is unbounded — the same
+   as every release before it existed.
+3. **RAM cache** (`cache.max_ram_cache_size`, default 512 MiB): accounted
+   separately from both of the above, and grows independently of in-flight
+   request traffic.
+
+Size instances from **measured** peak resident memory under representative load
+(the `/metrics` fields named above for budgets 1 and 2, plus `cache.max_ram_cache_size`
+for budget 3), not from a single combined formula — the three budgets are
+independent and additive, but nothing enforces a combined ceiling across all
+three at once.
+
+### In-Flight Memory Ceiling
+
+```yaml
+server:
+  # max_inflight_buffer_bytes: 0  # 0 = disabled (default)
+```
+
+**`max_inflight_buffer_bytes`** (`u64`, default `0` = Ledger_Disabled)
+
+Maximum total bytes held simultaneously across all buffered request and response
+bodies — the paths named in [Memory Impact](#memory-impact) above that still
+buffer a whole body or range rather than streaming it. `0` (the default)
+disables the accounting entirely: an existing deployment gains no new rejection
+behaviour on upgrade without an explicit configuration change.
+
+Since 2.5.0 this ceiling bounds **response-side** buffering almost exclusively:
+range merge, page widening, buffered range serving, and the recovery fallbacks.
+Every upload path streams, so a request body reaches the ledger only on the small
+non-GET/PUT verbs (a `DeleteObjects` POST and similar), which an internal 1 MiB
+bound covers.
+
+This does **not** apply to the streaming paths (signed and unsigned writes,
+cache-miss GET), which are already bounded per-connection independently of object
+size by budget 1 in [Memory Impact](#memory-impact) — configuring this field
+changes nothing about their behaviour.
+
+A request whose buffered body would push the running total over this ceiling is
+rejected with the same HTTP 503 `SlowDown` + `Retry-After` response used by
+`max_concurrent_requests`, before any upstream connection is opened — never HTTP
+413, since this is a transient capacity condition, not a statement that the
+request itself is too large. AWS SDKs retry 503 with backoff automatically.
+Startup validation rejects a non-zero `max_inflight_buffer_bytes` below **1 MiB**,
+the internal bound on a single buffered request body — below that floor every
+maximal buffered body would be rejected regardless of load. `0` is exempt. The
+floor was 5 GiB before 2.5.0, which no recommended instance could satisfy; any
+ceiling at or above 1 MiB is now legal with no other configuration change.
+
+A single request counts once against the ceiling for a given set of bytes, even when
+serving it involves an internal re-fetch of the same range (for example repairing a
+range whose cached data no longer covers the request). Those bytes are one allocation,
+so they are accounted as one claim, sized to the larger of the two.
+
+Sizing: on an instance with `M` bytes of RAM, start at roughly
+`M / 4 - cache.max_ram_cache_size`, then confirm against
+`/metrics` → `inflight_memory.peak_reserved_bytes` under real traffic and adjust.
+On the recommended `c6in.large` (4 GiB) with the default 512 MiB RAM cache that
+gives 1024 MiB − 512 MiB = **512 MiB**:
+
+```yaml
+server:
+  max_inflight_buffer_bytes: 536870912  # 512 MiB on a 4 GiB c6in.large
+```
+
+`/metrics` → `inflight_memory` also reports `reserved_bytes` (current total),
+`ceiling_bytes` (this field's value, reported even while disabled),
+`rejected_total` (Admission_Check rejections), and
+`aborted_accumulations_total` (unknown-length bodies aborted mid-accumulation).
 
 ### Proxy Identification
 
@@ -161,19 +272,36 @@ WHERE referer IS NULL OR referer NOT LIKE 'Hybrid Cache for Amazon S3/%';
 
 ```yaml
 server:
-  # max_buffered_request_body_bytes: 5368709120  # 5 GiB (default)
   # write_cache_tee_channel_depth: 5             # frames (default)
 ```
 
-**`max_buffered_request_body_bytes`** (`u64`, default `5368709120` = 5 GiB)
+Upload size is governed by S3's own limits, not by proxy configuration. A body above
+S3's 5 GiB single-part PUT and UploadPart maximum is rejected with HTTP 413
+`EntityTooLarge` before any upstream connection opens; anything S3 accepts, the proxy
+forwards. Every upload path streams the body to the upstream frame by frame, so proxy
+memory during an upload is independent of object size.
 
-The maximum accepted/streamed request body size for signed writes (single-part PUT and UploadPart). The cap is still enforced — a request whose body exceeds it is rejected with HTTP 413 `EntityTooLarge` — but the body is now streamed to the upstream and tee'd to the cache incrementally rather than held whole in RAM. The value therefore bounds the largest body the proxy will *accept*, not an amount of memory it reserves per request. The default matches the S3 single-part/UploadPart protocol maximum so the proxy is transparent to all valid S3 clients; operators can lower it on memory-constrained instances.
+> **Deprecated: `server.max_buffered_request_body_bytes`.** An existing config file
+> setting this field still parses and starts; the value has no effect from 2.5.0
+> onward. A value other than the old 5 GiB default logs a startup warning naming the
+> field. An operator who had lowered it to reject large uploads no longer gets that
+> rejection — S3's limits apply instead. The field will be removed in a future release.
 
 **`write_cache_tee_channel_depth`** (`usize`, default `5`)
 
 Bounded depth, in frames, of the streaming write-cache tee channel. On a streamed PUT or UploadPart the request body is forwarded to the upstream verbatim (preserving the SigV4 signature) while each frame is cloned onto a bounded channel feeding the write-through cache writer. At most this many frames are queued for the cache writer before backpressure stalls the next client read.
 
-Effect on per-connection memory: the per-connection streaming-cache budget is one in-flight frame plus this many queued frames. A frame is a single forwarded request-body frame, bounded by the HTTP read buffer, so the default of 5 keeps per-connection streaming memory on par with the GET path and independent of object size. Worst-case fleet streaming memory stays bounded by `max_concurrent_requests × write_cache_tee_channel_depth × frame` rather than by object size. Raising the depth can improve cache-write throughput under bursty writes at the cost of more per-connection memory; it does not duplicate `compression_batch_size`, which the cache writer reuses for LZ4 batching. Omitting the field applies the default, so existing config files keep working unchanged on upgrade.
+Effect on per-connection memory: the per-connection streaming-cache budget is one in-flight frame plus this many queued frames. A frame is a single forwarded request-body frame, bounded by the HTTP read buffer, so the default of 5 keeps per-connection streaming memory on par with the GET path and independent of object size.
+
+This is a **per-connection** bound, and it *does* combine with `max_concurrent_requests`
+into the streaming-path fleet-wide ceiling described in [Memory Impact](#memory-impact)
+above (`max_concurrent_requests × write_cache_tee_channel_depth × frame`), now that
+permits span the whole transfer rather than only the setup phase — see
+[What this limit actually covers](#what-this-limit-actually-covers). Raising the depth
+can improve cache-write throughput under bursty writes at the cost of more
+per-connection memory; it does not duplicate `compression_batch_size`, which the
+cache writer reuses for LZ4 batching. Omitting the field applies the default, so
+existing config files keep working unchanged on upgrade.
 
 ### Environment Variables
 
@@ -237,7 +365,7 @@ cache:
 
 Divides the RAM cache into this many independent shards, each with its own lock. Concurrent requests targeting different shards proceed in parallel without contention. Per-shard capacity is `max_ram_cache_size / effective_shard_count` (see the admission-ceiling clamp below) — for example, at the default 512 MB / 8 shards = 64 MB per shard.
 
-Objects larger than the per-shard capacity are silently dropped from the RAM cache. The proxy logs a warning at startup if per-shard capacity falls below 1 MB.
+Entries larger than the per-shard capacity are not admitted to the RAM cache; they are served from disk instead. The admission-ceiling clamp below keeps per-shard capacity at 64 MiB or above, and the proxy logs a warning at startup when that clamp reduces the effective shard count below the configured `ram_cache_shard_count`.
 
 Tuning:
 - Higher values (e.g. 32, 64) — lower contention under extreme concurrency (hundreds of parallel requests hitting distinct keys). Most deployments see no additional gain beyond 8–16 shards.
@@ -247,7 +375,7 @@ Skew caveat: each shard evicts independently. When a shard reaches capacity it e
 
 #### RAM Sizing and the Admission Ceiling
 
-The proxy unconditionally guarantees that any single RAM cache entry up to a hardcoded **64 MiB admission ceiling** (`RAM_CACHE_ADMISSION_CEILING = 67108864` bytes — a compile-time constant, not a config field) is admitted to the RAM cache rather than silently dropped. This applies regardless of whether [page-aligned range caching](CACHING.md#page-aligned-range-caching) is enabled for any key — it also covers plain large range reads.
+The proxy unconditionally guarantees that any single RAM cache entry up to a hardcoded **64 MiB admission ceiling** (`RAM_CACHE_ADMISSION_CEILING = 67108864` bytes — a compile-time constant, not a config field) is admitted to the RAM cache rather than silently dropped. This applies regardless of whether [page-aligned range caching](CACHE_READ_PATHS.md#page-aligned-range-caching) is enabled for any key — it also covers plain large range reads.
 
 It works by clamping the **effective** shard count so per-shard capacity never falls below the ceiling:
 
@@ -266,16 +394,58 @@ Admission is not the same as retention: a shard sized at the 64 MiB ceiling hold
 - **LRU** (Least Recently Used): Evicts oldest accessed entries
 - **TinyLFU**: Frequency-recency hybrid (simplified implementation, not full TinyLFU algorithm)
 
-### Environment Variables
+### Metadata Cache
+
+A RAM cache for `NewCacheMetadata` objects, separate from the RAM *data* cache above.
+It holds parsed `.meta` contents so HEAD requests and GET freshness checks avoid a disk
+read. See [CACHING.md — RAM Metadata Cache](CACHE_INTERNALS.md#ram-metadata-cache) for the
+mechanism and its interaction with shared storage.
+
+```yaml
+cache:
+  metadata_cache:
+    enabled: true                  # Default: true
+    refresh_interval: "5s"         # Default: 5s. Valid range: 1-300s
+    max_entries: 100000            # Default: 100000. Valid range: 100-1000000
+    stale_handle_max_retries: 3    # Default: 3. Valid range: 1-10
+```
+
+**`enabled`** (`bool`, default `true`) — turn the metadata cache off to force every
+metadata read to hit disk.
+
+**`refresh_interval`** (`Duration`, default `"5s"`, range 1-300s) — staleness threshold.
+An entry older than this is re-read from disk on next access. This governs **disk**
+re-reads, not S3 re-fetches; S3 freshness is governed by the TTLs.
+
+**`max_entries`** (`usize`, default `100000`, range 100-1000000) — entry cap. Each entry
+is roughly 1-2 KB, so the default is about 150-250 MB of RAM. Size this alongside
+`max_ram_cache_size`; the two are independent budgets.
+
+**`stale_handle_max_retries`** (`u32`, default `3`, range 1-10) — retries on an NFS/EFS
+stale file handle, which happens when another instance replaces a `.meta` file mid-read.
+
+### Cache Bypass Headers
+
+**`cache.cache_bypass_headers_enabled`** (`bool`, default `true`)
+
+When `true`, a client can bypass the cache for a single request by sending
+`Cache-Control: no-cache`, `Cache-Control: no-store`, or `Pragma: no-cache`. Set it to
+`false` to ignore those headers, so no client can force a cache bypass. See
+[CACHING.md — Cache Bypass](CACHING.md#cache-bypass-headers).
+
+### Cache Environment Variables
 
 - `CACHE_DIR` - Override cache directory
-- `MAX_CACHE_SIZE` - Override max cache size
 - `RAM_CACHE_ENABLED` - Enable/disable RAM cache
-- `MAX_RAM_CACHE_SIZE` - Override RAM cache size
+- `WRITE_CACHE_ENABLED` - Enable/disable write-through caching
+
+There is **no** environment override for `max_cache_size` or `max_ram_cache_size`; set
+those in the config file. See [Environment Variable Reference](#environment-variable-reference)
+for the complete list.
 
 ## Time-To-Live (TTL) Configuration
 
-TTL (Time-To-Live) controls how long cached data is served to clients without revalidating against S3. While a cached object's TTL has not expired, the proxy serves it directly from cache — S3 is not contacted, and the requesting client's IAM credentials are not checked by S3 for that request. When TTL expires, the next request triggers [revalidation](CACHING.md#time-to-live-ttl-configuration): the proxy sends a conditional request to S3 using the client's credentials, and S3 performs its normal authentication and authorization checks. Setting TTL to zero forces revalidation on every request, ensuring S3 checks every client's credentials while still saving bandwidth via 304 Not Modified responses. See [Security Considerations](ARCHITECTURE.md#security-considerations) for the access control implications of TTL settings.
+TTL (Time-To-Live) controls how long cached data is served to clients without revalidating against S3. While a cached object's TTL has not expired, the proxy serves it directly from cache — S3 is not contacted, and the requesting client's IAM credentials are not checked by S3 for that request. When TTL expires, the next request triggers [revalidation](CACHE_FRESHNESS.md#time-to-live-ttl-configuration): the proxy sends a conditional request to S3 using the client's credentials, and S3 performs its normal authentication and authorization checks. Setting TTL to zero forces revalidation on every request, ensuring S3 checks every client's credentials while still saving bandwidth via 304 Not Modified responses. See [Security Considerations](ARCHITECTURE.md#security-considerations) for the access control implications of TTL settings.
 
 ### TTL Types
 
@@ -406,10 +576,20 @@ cache:
 - Recommended for most use cases
 
 **Active Expiration (true)**:
-- Background process periodically removes expired entries
+- The daily validation scan removes expired entries as it goes
 - Frees disk space immediately when GET_TTL expires
 - Useful when disk capacity is elastic and not fixed
-- Adds background CPU/IO overhead
+- Adds CPU/IO overhead to the validation scan
+
+> **Not compatible with `get_ttl: "0s"`.** A zero TTL means an entry expires the moment it
+> is cached, so active expiration deletes it before anything can revalidate against it,
+> and the cache never serves a hit. Zero-TTL deployments must keep
+> `actively_remove_cached_data: false` — see
+> [CACHE_FRESHNESS.md — Minimum TTL Values](CACHE_FRESHNESS.md#minimum-ttl-values).
+
+On shared storage, active expiration checks whether an entry is in active use by another
+instance before deleting it, and skips it if so. HEAD entries need no such check because
+they are metadata-only.
 
 **HEAD Metadata**: Always actively removed regardless of this setting
 
@@ -417,7 +597,11 @@ cache:
 
 Write-through caching stores PUT operations and multipart uploads in the cache so subsequent GET requests can be served immediately without fetching from S3.
 
-### Basic Settings
+**Not covered: POST object upload** (the browser form upload, `POST /bucket` with a
+`multipart/form-data` body). It streams to S3 and succeeds, but is never write-through
+cached — see [Caching → POST object upload is not write-through cached](CACHE_READ_PATHS.md#post-object-upload-is-not-write-through-cached).
+
+### Write Cache Basic Settings
 
 ```yaml
 cache:
@@ -590,7 +774,7 @@ The file holds an optional `$schema` reference plus an ordered `rules` array. Ea
 
 **`page_widening` / `page_size` (page-aligned range caching / range read widening).** `page_widening` (bool, default `false`) enables widening a small ranged GET for matching keys into a fixed-size, page-aligned fetch; `page_size` (bytes, default `16777216` = 16 MiB when `page_widening` is enabled without specifying it) sets the page size `P`. `page_size` must be `> 0` and `<= 67108864` (64 MiB) for any rule enabling `page_widening` — validated at startup and on hot reload; an out-of-range value invalidates the rule set (see [Validation](#validation)). Off by default and never enabled globally — only via an explicit rule, since amplification is workload-dependent.
 
-**Check eligibility before enabling.** Widening applies only when `range` is absent from the request's SigV4 `SignedHeaders`. The AWS CLI and every official AWS SDK sign `Range`, so enabling this for a CLI/SDK workload has no effect and produces no error: requests fall through to the ordinary range path and increment `page_cache.skipped_signed_range`. Read [CACHING.md — Eligibility: which clients can use this](CACHING.md#eligibility-which-clients-can-use-this) first, then [Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching) for the mechanism.
+**Check eligibility before enabling.** Widening applies only when `range` is absent from the request's SigV4 `SignedHeaders`. The AWS CLI and every official AWS SDK sign `Range`, so enabling this for a CLI/SDK workload has no effect and produces no error: requests fall through to the ordinary range path and increment `page_cache.skipped_signed_range`. Read [CACHING.md — Eligibility: which clients can use this](CACHE_READ_PATHS.md#eligibility-which-clients-can-use-this) first, then [Page-Aligned Range Caching](CACHE_READ_PATHS.md#page-aligned-range-caching) for the mechanism.
 
 Field syntax, for a key pattern whose reads cluster within pages:
 
@@ -685,7 +869,7 @@ A bad edit never takes the cache down:
 
 ### Cache-Key Forms
 
-Patterns match the cache key as computed by [cache-key normalization](CACHING.md#cache-directory-structure), which differs by request kind. Match the leading segment accordingly (matching is case-sensitive):
+Patterns match the cache key as computed by [cache-key normalization](CACHE_INTERNALS.md#cache-directory-structure), which differs by request kind. Match the leading segment accordingly (matching is case-sensitive):
 
 | Request kind | Cache-key leading segment | Example pattern |
 |--------------|---------------------------|-----------------|
@@ -694,7 +878,7 @@ Patterns match the cache key as computed by [cache-key normalization](CACHING.md
 | Multi-Region Access Point (MRAP) | `{alias}.mrap` | `mfzwi23gnjvgw.mrap/data/**` |
 | Non-AWS S3-compatible / unrecognized host | `{host}:/{path}` (bare normalized path) | `minio.local:/bucket/**` |
 
-See [CACHING.md — Access Point and MRAP Cache Key Prefixing](CACHING.md#access-point-and-mrap-cache-key-prefixing) for how each form is derived.
+See [CACHING.md — Access Point and MRAP Cache Key Prefixing](CACHE_INTERNALS.md#access-point-and-mrap-cache-key-prefixing) for how each form is derived.
 
 ### Performance
 
@@ -725,49 +909,13 @@ See [CACHING.md](CACHING.md#cache-rules) for the runtime behavior of each settin
 
 ## Cache Expiration Scenarios
 
-### Scenario 1: Fresh Cache (GET_TTL Valid)
+Request-flow walkthroughs for each TTL state — fresh cache, expired GET TTL, a
+PUT-cached object read for the first time, HEAD revalidation, conditional requests,
+multipart, and incomplete-upload cleanup — live in
+[CACHING.md — Cache Validation Flow](CACHE_FRESHNESS.md#cache-validation-flow), which covers
+thirteen scenarios rather than the four this section used to duplicate.
 
-```
-Client GET → Proxy checks cache → GET_TTL valid → Serve from cache
-```
-
-No S3 request needed. HEAD_TTL status is irrelevant.
-
-### Scenario 2: GET_TTL Expired
-
-```
-Client GET → Proxy checks cache → GET_TTL expired
-          → Forward GET to S3
-          → S3 returns 200 OK with new data
-          → Update cache with new GET_TTL
-          → Serve fresh data
-```
-
-Full cache refresh. All ranges for this object expire together.
-
-### Scenario 3: PUT-Cached Object Accessed via GET
-
-**Note**: This scenario applies when write-through caching is enabled (enabled by default).
-
-```
-Client GET → Proxy checks cache → Found with PUT_TTL
-          → Serve from cache
-          → Transition TTL from PUT_TTL to GET_TTL (metadata-only)
-```
-
-Optimizes for "upload once, download many" pattern.
-
-### Scenario 4: HEAD Request
-
-```
-Client HEAD → Proxy checks HEAD cache → HEAD_TTL valid → Serve cached headers
-Client HEAD → Proxy checks HEAD cache → HEAD_TTL expired
-           → Forward HEAD to S3
-           → Cache headers with new HEAD_TTL
-           → Serve headers
-```
-
-HEAD metadata is actively removed when HEAD_TTL expires.
+For the fields that drive them, see [Time-To-Live (TTL) Configuration](#time-to-live-ttl-configuration).
 
 ## RAM-Disk Cache Coherency
 
@@ -776,9 +924,9 @@ When both RAM and disk caches are enabled, the proxy maintains coherency:
 ```yaml
 cache:
   # Batch flush settings
-  ram_cache_flush_interval: "60s"      # Time between flushes
-  ram_cache_flush_threshold: 100       # Pending updates before flush
-  ram_cache_flush_on_eviction: false   # Flush on RAM eviction
+  ram_cache_flush_interval: "10s"      # Time between flushes (default: 10s)
+  ram_cache_flush_threshold: 100       # Pending updates before flush (default: 100)
+  ram_cache_flush_on_eviction: false   # Flush on RAM eviction (default: false)
   
   # Verification settings
   ram_cache_verification_interval: "1s"  # Min time between verifications
@@ -980,38 +1128,36 @@ For scale-out deployments with shared cache storage:
 ```yaml
 cache:
   shared_storage:
-    lock_timeout: "60s"
-    lock_refresh_interval: "30s"
-    consolidation_interval: "5s"
-    validation_frequency: "24h"
-    validation_max_duration: "4h"
-    validation_threshold_warn: 5.0
-    validation_threshold_error: 20.0
-    eviction_lock_timeout: "60s"
-    lock_max_retries: 3
-    recovery_max_concurrent: 10
+    lock_timeout: "60s"                     # Default: 60s. Valid range: 10-300s
+    lock_refresh_interval: "30s"            # Default: 30s. Range 5-120s, must be < lock_timeout
+    consolidation_interval: "5s"            # Default: 5s. Valid range: 1-60s
+    consolidation_size_threshold: 1048576   # Default: 1 MiB. Valid range: 100 KB - 10 MB
+    validation_frequency: "23h"             # Default: 23h. Validated 1-168h, but INERT (see below)
+    validation_max_duration: "4h"           # Default: 4h. Valid range: 10m-23h
+    validation_threshold_warn: 5.0          # Default: 5.0 (percent drift → warn! log)
+    validation_threshold_error: 20.0        # Default: 20.0 (percent drift → error! log)
+    eviction_lock_timeout: "60s"            # Default: 60s. Valid range: 30-3600s
+    lock_max_retries: 5                     # Default: 5
+    recovery_max_concurrent: 10             # Default: 10
 ```
+
+`validation_threshold_warn` and `validation_threshold_error` select a **log level only**.
+Neither gates the size correction, which the validation scan applies unconditionally.
 
 **Note**: Journal-based metadata writes and distributed eviction locking are always enabled for consistency across all deployment modes. There is no `enabled` flag - these features are always active.
 
 ### NFS Mount Requirements
 
-**CRITICAL**: For reliable multi-instance cache coordination, NFS volumes MUST be mounted with `lookupcache=pos`.
+Two mount properties are **correctness requirements** for multi-instance coordination:
+`lookupcache=pos` so peers' new files are visible, and working cross-host `flock`
+(pin `nfsvers=4.1`, never `nolock` or `local_lock=*`). Neither produces an error when
+absent — the deployment looks healthy while losing most of its hit rate or corrupting
+cache state.
 
-**Why this is required**: NFS clients cache directory entry lookups by default. Without `lookupcache=pos`, instances cache "file not found" results and don't see files created by other instances. This causes 40%+ cache miss rate on repeat downloads because one instance caches data but other instances can't find it.
-
-**Example /etc/fstab entry**:
-```
-nfs-server.example.com:/export/cache /mnt/cache nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,lookupcache=pos,_netdev 0 0
-```
-
-**Mount options explained**:
-| Option | Purpose |
-|--------|---------|
-| `lookupcache=pos` | **Required** - Caches positive lookups (file exists) but not negative lookups (file not found), so new files from other instances are visible immediately |
-| `nfsvers=4.1` | Use NFSv4.1 for better locking support |
-| `hard` | Retry NFS requests indefinitely (recommended for data integrity) |
-| `_netdev` | Wait for network before mounting |
+Mount lines for generic NFS, FSx for OpenZFS, and EFS, the differences between the two
+managed file systems, why `nconnect` matters on FSx, and how to verify both properties
+end to end are in
+**[SHARED_STORAGE.md — Mount requirements](SHARED_STORAGE.md#mount-requirements)**.
 
 **Key features**:
 - **Atomic metadata writes**: Journal-based updates prevent corruption
@@ -1020,32 +1166,27 @@ nfs-server.example.com:/export/cache /mnt/cache nfs4 nfsvers=4.1,rsize=1048576,w
 - **Cache validation**: Cross-instance consistency checks
 - **Orphaned range recovery**: Cleanup of incomplete operations
 
+See [SHARED_STORAGE.md](SHARED_STORAGE.md) for how each works and its failure modes.
+
 **Configuration guidelines**:
 
 | Setting | Purpose | Recommendations |
 |---------|---------|-----------------|
-| `lock_timeout` | Max wait for file locks | Small cache: 60s, Large cache: 300-600s |
+| `lock_timeout` | Max wait for file locks | Small cache: 60s, Large cache: up to 300s (the validated maximum) |
 | `consolidation_interval` | Journal flush frequency | 5s (default), reduce for faster consistency |
-| `validation_frequency` | Consistency check interval | 24h (default), increase for large deployments |
+| `validation_frequency` | Accepted and validated, but **not read by the scheduler** | Leave at the default; see [Validation Scan](#validation-scan) |
 | `validation_max_duration` | Time budget for validation scan | 4h (default). Controls automatic full↔rolling mode switching |
 | `eviction_lock_timeout` | Distributed eviction timeout | Match lock_timeout for consistency |
 
 ### Validation Scan
 
-The proxy runs a periodic validation scan (every `validation_frequency`, default 24h) that walks cached metadata to reconcile tracked cache size with actual disk usage. The scan automatically selects between two modes based on observed duration:
+A daily scan reconciles tracked cache size against actual disk usage.
 
-**Full mode**: Scans all 256 L1 shard directories in parallel. Used on first scan and when the previous scan completed within the time budget.
-
-**Rolling mode**: Scans a subset of L1 directories per cycle, resuming from a persistent cursor on the next invocation. Full coverage is achieved over multiple daily cycles. Activated automatically when a full scan exceeds `validation_max_duration`.
-
-**Mode selection rules**:
-- No previous scan history → full scan
-- Previous full scan exceeded `validation_max_duration` → switch to rolling
-- Previous full scan within budget → stay in full
-- Previous rolling scan, extrapolated full time > budget → stay in rolling
-- Previous rolling scan, extrapolated full time ≤ budget → switch back to full
-
-**Configuration**:
+**Cadence is not configurable.** It fires once per day at midnight local time, plus up to
+one hour of random jitter to avoid a thundering herd across instances.
+`validation_frequency` (default `23h`, validated 1–168h) is parsed, range-checked, and
+logged at startup, but no code path reads it when scheduling the scan — treat it as inert,
+like `server.request_timeout`.
 
 ```yaml
 cache:
@@ -1053,15 +1194,18 @@ cache:
     validation_max_duration: "4h"  # Default: 4 hours. Valid range: 10m – 23h
 ```
 
-This is the single knob for self-tuning mode selection. The proxy adapts automatically — no manual mode switching is needed.
+**`validation_max_duration`** is the single knob. The scan self-tunes between a **full**
+mode (all 256 L1 shard directories in parallel) and a **rolling** mode (a subset per
+cycle, resuming from a persistent cursor) depending on whether the previous scan fit
+inside this budget. No manual mode switching is needed.
 
-**Rolling scan behavior**:
-- Adaptive batch sizing: uses the previous cycle's scan rate (seconds per L1 directory) to estimate how many directories fit within the time budget. First cycle defaults to 64 directories.
-- Proportional size correction: adjusts tracked cache size by the observed drift in the scanned subset rather than replacing the full total, avoiding large swings from partial scans.
-- Cursor persistence: the current position, scan rate, and rotation count are stored in `validation.json`. If the file is missing or corrupted, the cursor resets to 0.
-- Full rotation tracking: when the cursor wraps past all 256 directories, a rotation completion is logged with elapsed time.
+**`validation_threshold_warn`** (default `5.0`) and **`validation_threshold_error`**
+(default `20.0`) are drift percentages that select a **log level only**. Neither gates the
+size correction, which is applied unconditionally.
 
-**Monitoring**: Check `journalctl -u s3-proxy` for validation scan logs. The proxy logs the selected mode, reason, time budget, directories scanned, objects validated, scan rate, and cursor position at INFO level.
+The mode-selection rules, the rolling scan's adaptive batch sizing and cursor persistence,
+and what to monitor are in
+[SHARED_STORAGE.md — The validation scan](SHARED_STORAGE.md#the-validation-scan).
 
 ## Download Coordination
 
@@ -1080,28 +1224,25 @@ On waiter timeout the proxy does **not** launch an independent duplicate fetch �
 
 Disable for single-instance deployments with no concurrent duplicate requests, or when debugging cache behavior.
 
-See [CACHING.md - Download Coordination](CACHING.md#download-coordination) for details.
+See [CACHING.md - Download Coordination](CACHE_READ_PATHS.md#download-coordination) for details.
 
 ## Cache Size Tracking
 
-Cache size tracking uses an accumulator-based approach. Each proxy instance maintains an in-memory SizeAccumulator (AtomicI64) that tracks size changes at write and eviction time, then flushes to per-instance delta files.
+Each instance keeps an in-memory `AtomicI64` accumulator of size changes at write and
+eviction time, flushes it to a per-instance delta file, and a consolidator sums the deltas
+into `size_tracking/size_state.json`. Eviction triggers off that consolidated figure.
 
-**How It Works**:
-- Each instance tracks size changes in an in-memory AtomicI64 accumulator updated at write/eviction time
-- The accumulator periodically flushes to per-instance delta files in the shared cache directory
-- The consolidator collects per-instance delta files every 5 seconds (configurable via `shared_storage.consolidation_interval`) and sums them into `size_tracking/size_state.json`
-- Eviction is triggered automatically when cache exceeds capacity
+The mechanism, and the concurrent-write over-counting it is subject to on shared storage,
+are in [SHARED_STORAGE.md — Size tracking](SHARED_STORAGE.md#size-tracking).
 
 **Configuration**:
 ```yaml
 cache:
   shared_storage:
-    consolidation_interval: "5s"     # How often to consolidate and update size
+    consolidation_interval: "5s"     # Default: 5s. Valid range: 1-60s
 ```
 
 **Other `shared_storage` fields**
-
-These have defaults and rarely need changing, but were previously undocumented:
 
 **`metadata_lock_timeout_ms`** (`u64`, default `30000` = 30 seconds)
 
@@ -1123,6 +1264,10 @@ Interval between orphan recovery scans.
 **`orphan_scan_timeout`** (`Duration`, default `"30s"`, range 5-300s)
 
 Maximum time spent scanning per cycle, so a long scan cannot block other operations.
+
+**`orphan_max_per_cycle`** (`usize`, default `100`)
+
+Maximum orphaned range files handled per cycle, bounding the I/O one sweep can generate.
 
 **Deprecated Options** (removed):
 - `size_tracking_flush_interval` - replaced by `shared_storage.consolidation_interval`
@@ -1147,40 +1292,27 @@ compression:
 this always skip compression, regardless of extension or any `cache_rules.json`
 override.
 
-### Content-Aware Compression (Built-In Denylist)
+**`preferred_algorithm`** (`String`, default `"lz4"`) — parsed and stored per entry, but
+otherwise inert; LZ4 is the only implemented algorithm. Changing it does not invalidate
+existing cache entries, which continue to be read with the algorithm recorded in their
+own metadata.
 
-Content-aware filtering is always active: when no `cache_rules.json` rule
-explicitly sets `compression_enabled` for a key, these already-compressed
-formats automatically skip the LZ4 compressor (they are written as
-checksummed store-mode LZ4 frames instead — see `docs/COMPRESSION.md`):
+**Removed**: `compression.content_aware` never had any effect. It still parses via a
+deprecation alias and is ignored, with a startup warning when present.
 
-**Images**: jpg, jpeg, png, gif, webp, avif, heic, heif
-**Videos**: mp4, avi, mkv, mov, wmv, flv, webm, m4v
-**Audio**: mp3, aac, ogg, flac, m4a, wma, opus
-**Archives**: zip, rar, 7z, gz, bz2, xz, lz4, zst, tgz
-**Documents**: pdf, docx, xlsx, pptx, odt, ods, odp
-**Applications**: apk, ipa, jar, war, ear
-**Fonts**: woff, woff2
-**Database**: sqlite, db
-**Executables**: exe, msi, dmg, pkg
+### Content-Aware Compression
 
-**Text files** (json, html, css, js, txt, etc.) are still compressed.
+Content-aware filtering is always active. When no `cache_rules.json` rule sets
+`compression_enabled` for a key, already-compressed formats (images, video, audio,
+archives, office documents, app bundles, fonts, embedded databases, installers) skip the
+LZ4 block compressor and are written as checksummed store-mode frames instead. Text-like
+content is compressed.
 
-A `cache_rules.json` rule setting `compression_enabled` explicitly overrides
-this denylist in either direction for matching keys (see the Cache Rules
-section above).
-
-**Note**: the former `compression.content_aware` boolean has been removed —
-it never had any effect. It still parses via a deprecation alias but is
-ignored; a startup warning is logged if present.
-
-### Algorithm Metadata
-
-Each cache entry stores which algorithm was used:
-- Changing `preferred_algorithm` doesn't invalidate existing cache
-- Old entries continue working with their original algorithm
-- New entries use the preferred algorithm
-- Optional gradual migration on cache access
+**[COMPRESSION.md](COMPRESSION.md#built-in-denylist) owns the authoritative
+extension list**, the store-mode contract, and the extension-matching rules that make
+`archive.tar.gz` match through the `gz` arm. A `cache_rules.json` rule setting
+`compression_enabled` overrides the denylist in either direction for matching keys (see
+[Cache Rules](#cache-rules)).
 
 ## Connection Pooling
 
@@ -1195,10 +1327,28 @@ connection_pool:
   max_idle_per_host: 100
   max_lifetime: "300s"
   pool_check_interval: "10s"
-  
+
+  # TCP-level keepalive socket options
+  keepalive_idle_secs: 15     # TCP_KEEPIDLE
+  keepalive_interval_secs: 5  # TCP_KEEPINTVL
+  keepalive_retries: 3        # TCP_KEEPCNT
+
+  # TCP receive buffer (SO_RCVBUF). null = kernel auto-tuning. See warning below.
+  # tcp_recv_buffer_size: null
+
   # Endpoint registration cap
   # max_registered_endpoints: 10000
-  
+
+  # Per-IP health exclusion and recovery probing.
+  # An IP is dropped from round-robin after ip_failure_threshold consecutive
+  # failures and returns only when a recovery probe (TCP connect + TLS handshake)
+  # succeeds — a DNS refresh does not restore it. Probes run on the
+  # pool_check_interval tick once the cooldown has elapsed; each failed probe
+  # doubles that IP's cooldown up to the maximum.
+  # ip_failure_threshold: 3
+  # health_probe_initial_cooldown: "5s"
+  # health_probe_max_cooldown: "300s"
+
   # Upstream timeout (stalled-response fast-fail)
   # upstream_first_byte_timeout: "5s"
   # upstream_idle_timeout: "5s"
@@ -1211,6 +1361,31 @@ connection_pool:
 **`max_registered_endpoints`** (`usize`, default `10000`)
 
 Maximum number of DNS-resolved endpoints the connection pool will track. When the cap is reached, new endpoint registrations are rejected with a warning log; existing endpoints continue operating normally. This prevents unbounded memory growth from excessive unique hostnames in forward-proxy mode. Normal S3 usage (a small set of regional endpoints) is well under the default cap.
+
+### TCP Socket Options
+
+These map directly onto socket options on each upstream connection. They are distinct
+from `keepalive_enabled` and `max_idle_per_host`, which govern HTTP-level connection
+reuse. See [CONNECTION_POOLING.md](CONNECTION_POOLING.md) for how the two layers interact.
+
+**`keepalive_idle_secs`** (`u64`, default `15`) — `TCP_KEEPIDLE`. Idle seconds before the
+kernel starts sending keepalive probes.
+
+**`keepalive_interval_secs`** (`u64`, default `5`) — `TCP_KEEPINTVL`. Seconds between
+probes.
+
+**`keepalive_retries`** (`u32`, default `3`) — `TCP_KEEPCNT`. Unanswered probes before the
+connection is declared dead. At the defaults a dead peer is detected in roughly
+15 + (5 × 3) = 30 seconds.
+
+**`tcp_recv_buffer_size`** (`Option<usize>`, default `null`) — `SO_RCVBUF` hint in bytes.
+
+> **Leave this unset unless you have a specific reason.** `null` lets the kernel
+> auto-tune the receive window (DRS). Pinning an explicit value **disables**
+> auto-tuning, which caps single-stream throughput on high-bandwidth-delay-product
+> paths — the buffer becomes the ceiling on in-flight bytes, so throughput is bounded
+> by `buffer / RTT` no matter how much bandwidth is available. A value chosen for a
+> low-RTT path will throttle a high-RTT one.
 
 ### Upstream Timeout (Stalled-Response Fast-Fail)
 
@@ -1247,37 +1422,32 @@ connection_pool:
 
 **`max_inflight_fraction`** (`f64`, default `0.1`)
 
-Maximum fraction of in-flight upstream fetches that may be hedges. When `(in_flight_hedges + 1) / max(in_flight_fetches, 1)` exceeds this value, new hedges are suppressed and the original fetch is served alone (degrade to non-hedged behaviour). The first hedge attempt is always admitted when no other hedges are in flight ("first-is-free"), so single-request workloads benefit from hedging without needing a high fraction. Valid range: `[0.0, 1.0]`. Setting `0.0` effectively disables hedging on this instance without touching rule files (except for the first-is-free slot). This cap is per-instance (each proxy enforces it independently); there is no cross-instance coordination.
+Maximum fraction of in-flight upstream fetches that may be hedges. Valid range `[0.0, 1.0]`. When `(in_flight_hedges + 1) / max(in_flight_fetches, 1)` exceeds this value, new hedges are suppressed and the original fetch is served alone.
+
+**The first hedge is always admitted** when no other hedge is in flight ("first-is-free"), so a low-concurrency workload still hedges. Consequently **`0.0` does not disable hedging** — removing `hedging_enabled` from the rules is the only complete off switch.
+
+The cap is per-instance; each proxy enforces it independently with no cross-instance coordination.
+
+See [HEDGING.md](HEDGING.md) for the mechanism, the rule fields, and how to tell whether hedging is earning its cost.
 
 ### Connection Keepalive
 
-**Purpose**: Reuse TCP/TLS connections to eliminate handshake overhead
-
-**Benefits**:
-- 150-200ms latency reduction per request (based on internal testing with synthetic workloads)
-- 50-100% throughput increase (based on internal testing with synthetic workloads)
-- First request: Full handshake (~250-350ms)
-- Subsequent requests: Reuse connection (~100-150ms)
+Reuses TCP/TLS connections so repeat requests skip the handshake. The latency and
+throughput effect, and how the HTTP-level pool interacts with the TCP socket options
+above, are covered in [CONNECTION_POOLING.md](CONNECTION_POOLING.md).
 
 **Tuning guide**:
 
 | Setting | Low Value | High Value | Recommendation |
 |---------|-----------|------------|----------------|
 | max_idle_per_host | Less memory/FDs | More concurrent reuse | 100 (default), reduce for memory-constrained environments |
-| max_lifetime | More frequent rotation | Less overhead | 300s (5 min) for stable endpoints |
-| pool_check_interval | More responsive cleanup | Less CPU overhead | 10s for balanced performance |
+| max_lifetime | More frequent rotation | Less overhead | 300s (5 min) for stable endpoints. 60-120s if DNS changes often; up to 3600s for very stable endpoints |
+| pool_check_interval | More responsive cleanup, and excluded IPs probed sooner | Less CPU overhead | 10s for balanced performance |
+| health_probe_initial_cooldown | Faster recovery from a transient failure | Fewer probes against a genuinely dead IP | 5s (default); raise it if brief S3 blips cause probe churn |
+| health_probe_max_cooldown | An unreachable IP is retried more often | Less wasted work on a dead IP | 300s (default); the doubling backoff reaches it after ~6 failed probes from 5s |
 
-**Traffic-based tuning**:
-- Low traffic: 1-2 connections per IP
-- Medium traffic: 2-5 connections per IP
-- High traffic: 5-10 connections per IP
-
-**Endpoint stability tuning**:
-- Frequent DNS changes: 60-120s lifetime
-- Stable endpoints: 300-600s lifetime
-- Very stable endpoints: 600-3600s lifetime
-
-Set `keepalive_enabled: false` to disable connection reuse (useful for debugging connection issues).
+Set `keepalive_enabled: false` to disable connection reuse (useful for debugging
+connection issues).
 
 ## DNS Server Configuration
 
@@ -1301,34 +1471,20 @@ Whichever resolver you configure, it must not be one that resolves S3 hostnames 
 
 ## S3 PrivateLink (Interface VPC Endpoints)
 
-When using S3 interface VPC endpoints (PrivateLink), the proxy must resolve S3 endpoints to the PrivateLink ENI IPs instead of public S3 IPs. The default external DNS servers (Google, Cloudflare) return public IPs, bypassing PrivateLink entirely.
+With S3 interface VPC endpoints, the proxy must resolve S3 to the endpoint's ENI IPs
+rather than public S3 IPs. The default external resolvers (Google, Cloudflare) return
+public IPs and bypass PrivateLink entirely.
 
-Which mechanism to use depends on **where the proxy runs**, because the two cases need opposite settings for private DNS on the endpoint.
+**Which mechanism to use depends on where the proxy runs**, and the two cases need
+opposite settings for private DNS on the endpoint — one requires it disabled, the other
+requires it enabled. That decision, the DNS-collision and resolution-loop reasoning
+behind it, and the verification steps are in
+[GETTING_STARTED.md — S3 PrivateLink](GETTING_STARTED.md#s3-privatelink-interface-vpc-endpoints).
+Read that first; this section is the field reference.
 
-### Proxies in AWS, in the VPC holding the endpoint
+### `endpoint_overrides`
 
-Use `endpoint_overrides` to map the S3 hostnames to the endpoint's ENI IPs, taking DNS out of the path entirely, and **leave private DNS disabled on the endpoint**.
-
-Private DNS works by creating a private hosted zone for `s3.<region>.amazonaws.com` in that VPC — the same name a Route 53 private hosted zone must resolve to the proxy fleet for client routing. The two collide, and where a zone for the name already exists AWS rejects the endpoint with a conflicting-domain error. For the same reason, do not point `dns_servers` at the VPC resolver or at a Route 53 Resolver inbound endpoint in that VPC: both answer from the associated hosted zone and return the proxy's own address, forming a loop.
-
-An ENI IP excluded by health tracking is not restored until restart, because static overrides have no DNS refresh — see [PrivateLink (endpoint_overrides) Interaction](#privatelink-endpoint_overrides-interaction).
-
-### Proxies on-premises, reaching S3 over Direct Connect or VPN
-
-Point `dns_servers` at Route 53 Resolver inbound endpoints in the VPC, and **enable private DNS on the interface endpoint** so the VPC's internal resolver returns the ENI IPs. The inbound endpoint ENIs sit on your private subnets and are reachable from on-premises over the VPN or Direct Connect link.
-
-```yaml
-connection_pool:
-  dns_servers: ["10.0.1.50", "10.0.2.50"]  # Route 53 Resolver inbound endpoint IPs
-```
-
-The proxy cannot use your on-prem DNS server for this — that is where the override sending clients to the proxy lives, so it resolves S3 endpoints to the proxy's own IP and forms a loop. The inbound endpoint provides a separate resolution path. Nothing hijacks the name inside the VPC in this topology, so the VPC's view is clean and private DNS is what makes it return ENI IPs.
-
-`endpoint_overrides` also works here, and is the fallback when Resolver inbound endpoints are unavailable.
-
-### Static IP overrides
-
-Map S3 hostnames directly to PrivateLink ENI IPs, bypassing DNS:
+Maps S3 hostnames directly to PrivateLink ENI IPs, taking DNS out of the path.
 
 ```yaml
 connection_pool:
@@ -1346,15 +1502,32 @@ connection_pool:
     "*.s3-accesspoint.us-west-2.amazonaws.com": ["10.0.1.100", "10.0.2.100"]
 ```
 
-Keys starting with `*.` are suffix patterns — they match any hostname ending with that suffix. Exact matches take precedence; among suffix matches the longest (most specific) wins. The proxy load-balances across the listed IPs.
+**Matching precedence**: keys starting with `*.` are suffix patterns matching any hostname
+ending with that suffix. Exact matches take precedence; among suffix matches the longest
+wins. The proxy load-balances across the listed IPs.
 
-When any `endpoint_overrides` are configured, outbound TLS is locked to version 1.2 for VPC interface endpoint compatibility (interface endpoints do not support TLS 1.3). Regular S3 endpoints support TLS 1.2, so there is no functional regression.
+**TLS version**: when any `endpoint_overrides` are configured, outbound TLS is locked to
+1.2, because interface endpoints do not support 1.3. Regular S3 endpoints support 1.2, so
+there is no functional regression.
 
-Overrides apply to both the HTTP caching path and the HTTPS passthrough handler (port 443).
+**Scope**: overrides apply to both the HTTP caching path and the HTTPS passthrough handler
+on port 443. `dns_servers` does not cover the passthrough handler.
 
-**Note on virtual-hosted regional traffic**: `*.s3.<region>.amazonaws.com` wildcards have always carried virtual-hosted regional traffic (`<bucket>.s3.<region>.amazonaws.com`) to the proxy. Before 1.14.1 that traffic was forwarded correctly but the proxy produced a flat, un-prefixed cache key — requests succeeded but nothing was written to the cache. From 1.14.1 onwards the bucket is extracted from the Host and caching works for all virtual-hosted styles.
+**No DNS refresh**: an ENI IP excluded by health tracking is not restored until restart,
+because static overrides have no refresh cycle. See
+[PrivateLink (endpoint_overrides) Interaction](#privatelink-endpoint_overrides-interaction).
 
-See [Getting Started - S3 PrivateLink](GETTING_STARTED.md#s3-privatelink-interface-vpc-endpoints) for setup details and verification steps.
+### `dns_servers` with Route 53 Resolver
+
+```yaml
+connection_pool:
+  dns_servers: ["10.0.1.50", "10.0.2.50"]  # Route 53 Resolver inbound endpoint IPs
+```
+
+For the on-premises topology only, and it requires private DNS **enabled** on the
+endpoint. Do not point this at the VPC resolver when the proxy runs inside the endpoint's
+VPC, and never at your on-prem resolver: both return the proxy's own address and form a
+loop. See the GETTING_STARTED section linked above.
 
 ## Upstream Transport Overrides
 
@@ -1399,7 +1572,7 @@ Each key is `"host:port"`. The port is part of the key, so the same host on diff
 
 Hostnames resolve via the proxy's own configured `dns_servers`, not the host's default system resolver — the same resolver the rest of the egress uses. A publicly-resolvable name such as `s3.<region>.amazonaws.com` therefore resolves to its real address — you can override real S3 to plaintext on port 80 the same way you override a local store.
 
-**Blast radius when testing this feature**: because a DNS-name override matches every subdomain at that port, one override entry (e.g. `s3.us-west-2.amazonaws.com:80`) shadows both path-style and virtual-hosted requests to that entire region on that port. In the deployment-verification fleet suite, this is why the default (no-override) code path is not reachable through the suite's primary us-west-2 endpoint once T22's plaintext override is configured — see `nonpublic/shell/deployment-verification.sh`'s T22 and T39 banners. T39 deliberately targets hosts with no matching override entry (`eu-west-2`/`eu-central-1`) to exercise the default, verified-TLS-plus-distributed-IP arm.
+**Blast radius when testing this feature**: because a DNS-name override matches every subdomain at that port, one override entry (e.g. `s3.us-west-2.amazonaws.com:80`) shadows both path-style and virtual-hosted requests to that entire Region on that port. That is wider than it looks when testing: once such an entry exists, no request to that Region on that port can reach the default (no-override) transport path, because every one of them matches the override. So a test intended to exercise the default path — verified TLS on 443 with a distributed IP — has to target a host the override does not cover, for example a bucket in a different Region. Otherwise the test silently exercises the override arm and reports success for the wrong reason.
 
 ### Security implications
 
@@ -1447,7 +1620,7 @@ connection_pool:
 
 Enable for high-throughput, highly concurrent workloads. A single HTTP/1.1 connection to S3 tops out at ~90 MB/s, so aggregate throughput comes from running many connections in parallel. Distributing those connections across S3's frontend IPs spreads them over multiple frontend servers instead of concentrating them on one, which avoids per-IP connection limits and throttling. It does not change the ~90 MB/s per-connection cap — it lets more connections run at that speed at once.
 
-### How It Works
+### IP Distribution: How It Works
 
 1. The `ConnectionPoolManager` resolves S3 endpoint IPs via DNS (or uses `endpoint_overrides`)
 2. The `IpDistributor` selects a target IP using round-robin for each outgoing request
@@ -1653,158 +1826,49 @@ Optional per-bucket prefix lists for prefix-level attribution. When configured, 
 
 ## Dashboard Configuration
 
+A read-only web interface for cache statistics, a log viewer, and system info.
+**[DASHBOARD.md](DASHBOARD.md) is the guide** — features, API endpoints, deployment
+patterns, security posture, and troubleshooting. This section is the field reference only.
+
 ```yaml
 dashboard:
-  enabled: true                        # Enable dashboard server (default: true)
-  port: 8081                          # Dashboard server port (default: 8081)
-  bind_address: "127.0.0.1"           # Bind address (default: 127.0.0.1, loopback only)
-  cache_stats_refresh_interval: "5s"   # Auto-refresh interval for cache statistics (default: 5s)
-  logs_refresh_interval: "10s"         # Auto-refresh interval for application logs (default: 10s)
-  max_log_entries: 100                 # Maximum number of log entries to display (default: 100)
+  enabled: true                        # Default: true
+  port: 8081                           # Default: 8081
+  bind_address: "127.0.0.1"            # Default: 127.0.0.1 (loopback only)
+  cache_stats_refresh_interval: "5s"   # Default: 5s. Valid range: 1-300s
+  logs_refresh_interval: "10s"         # Default: 10s. Valid range: 1-300s
+  max_log_entries: 100                 # DEPRECATED: parsed and validated, but inert
 ```
 
-### Dashboard Features
+**`enabled`** (`bool`, default `true`) — set `false` to not start the dashboard server.
 
-The dashboard provides a web-based interface for monitoring proxy status:
+**`port`** (`u16`, default `8081`) — chosen to avoid the health server's 8080. Must differ
+from `health.port`, `metrics.port`, and `tls.tls_proxy_port`.
 
-**Real-time Cache Statistics**:
-- RAM and disk cache hit rates, miss rates, and current sizes
-- Cache eviction counts and effectiveness percentages
-- Human-readable size formatting (KB, MB, GB)
-- Auto-refresh every 5 seconds (configurable)
+**`bind_address`** (`String`, default `"127.0.0.1"`) — **loopback only by default**, unlike
+the health and metrics servers which default to `0.0.0.0`. The dashboard is
+unauthenticated, so binding it more widely makes cache statistics and recent application
+log lines readable by anyone who can reach the port. See
+[DASHBOARD.md — Security Considerations](DASHBOARD.md#security-considerations) for the
+SSH-tunnel pattern and what the interface exposes.
 
-**Application Log Viewer**:
-- Recent log entries with timestamp, level, and message content
-- Structured data formatting for key-value pairs
-- Log level filtering (ERROR, WARN, INFO, DEBUG)
-- Auto-refresh every 10 seconds (configurable)
-- Adjustable entry limit (default: 100 entries)
+**`cache_stats_refresh_interval`** (`Duration`, default `"5s"`, range 1-300s) — browser
+poll interval for the statistics cards.
 
-**System Information**:
-- Proxy instance hostname and version
-- Uptime and basic system status
-- Navigation between Cache Stats and Application Logs sections
+**`logs_refresh_interval`** (`Duration`, default `"10s"`, range 1-300s) — browser poll
+interval for the log viewer.
 
-### Configuration Options
+**`max_log_entries`** (`usize`, default `100`, range 10-10000) — **deprecated and inert**.
+Parsed, range-validated, and logged at startup, but the log viewer does not use it to cap
+output. It will be removed in a future release.
 
-**Basic Settings**:
-```yaml
-dashboard:
-  enabled: true          # Set to false to disable dashboard completely
-  port: 8081            # Change if port conflicts with other services
-  bind_address: "127.0.0.1"  # Default. Set to "0.0.0.0" to expose beyond loopback
-```
+Environment overrides exist for every field above except `max_log_entries`' effect; see
+[Environment Variable Reference](#environment-variable-reference) for the `DASHBOARD_*`
+entries.
 
-The dashboard defaults to loopback only, unlike the health and metrics servers which
-default to `0.0.0.0`. The dashboard is unauthenticated, so exposing it beyond
-loopback makes cache statistics and recent application log lines readable by anyone
-who can reach the port — restrict it at the firewall or security group if you change
-this.
-
-**Refresh Intervals**:
-```yaml
-dashboard:
-  cache_stats_refresh_interval: "5s"   # Valid range: 1-300 seconds
-  logs_refresh_interval: "10s"         # Valid range: 1-300 seconds
-```
-
-**Log Display**:
-```yaml
-dashboard:
-  max_log_entries: 100    # Valid range: 10-10000 entries
-```
-
-### Access and Security
-
-**No Authentication Required**: The dashboard is designed as an internal monitoring tool and does not require authentication.
-
-**Network Access Control**:
-- Default: Accessible on all network interfaces (`0.0.0.0`)
-- Localhost only: Set `bind_address: "127.0.0.1"`
-- Firewall rules recommended for production deployments
-
-**Access URL**: `http://your-proxy-host:8081`
-
-### Performance Impact
-
-**Resource Usage**:
-- Minimal overhead when no users are connected
-- Uses <10MB additional memory
-- Accepts up to 50 concurrent dashboard connections (see [DASHBOARD.md](DASHBOARD.md))
-- Does not impact main proxy performance
-
-**Optimization**:
-- API responses generated on-demand without caching
-- Static files embedded in binary (no external dependencies)
-- Efficient log reading with streaming to avoid loading entire files
-
-### Integration with Existing Components
-
-**Cache Statistics**: Integrates with existing `MetricsManager` to provide:
-- Real-time cache hit/miss statistics
-- Cache size and eviction metrics
-- Overall proxy effectiveness calculations
-
-**Application Logs**: Reads from the same log files as the main proxy:
-- Uses existing tracing framework configuration
-- Parses structured log entries with key-value pairs
-- Respects log level filtering and rotation
-
-**Graceful Shutdown**: Integrates with existing shutdown coordinator:
-- Closes dashboard connections gracefully during proxy shutdown
-- No hanging connections or resource leaks
-
-### Environment Variables
-
-Dashboard settings can be overridden via environment variables — see
-[Environment Variable Reference](#environment-variable-reference) for the
-`DASHBOARD_*` entries alongside every other supported variable.
-
-### Example Configurations
-
-**Development** (localhost only):
-```yaml
-dashboard:
-  enabled: true
-  port: 8081
-  bind_address: "127.0.0.1"
-  cache_stats_refresh_interval: "2s"
-  logs_refresh_interval: "5s"
-  max_log_entries: 200
-```
-
-**Production** (all interfaces):
-```yaml
-dashboard:
-  enabled: true
-  port: 8081
-  bind_address: "0.0.0.0"
-  cache_stats_refresh_interval: "10s"
-  logs_refresh_interval: "15s"
-  max_log_entries: 100
-```
-
-**Disabled**:
-```yaml
-dashboard:
-  enabled: false
-```
-
-### Troubleshooting
-
-**Port Conflicts**:
-- Change `port` if 8081 is already in use
-- Check for conflicts with health check or metrics ports
-
-**Access Issues**:
-- Verify `bind_address` allows connections from your network
-- Check firewall rules for the configured port
-- Ensure proxy is running and dashboard is enabled
-
-**Performance Issues**:
-- Increase refresh intervals to reduce update frequency
-- Reduce `max_log_entries` for faster log loading
-- Monitor dashboard connection count (50 concurrent connections accepted)
+**Resource cost**: under 10 MB of additional memory, 50 concurrent connections accepted,
+and no measurable impact on proxy request handling. Details in
+[DASHBOARD.md — Performance Impact](DASHBOARD.md#performance-impact).
 
 ## Health Check Configuration
 
@@ -1820,6 +1884,10 @@ health:
 **Endpoints**:
 - Health check: `http://localhost:8080/health`
 - Metrics: `http://localhost:9090/metrics`
+
+Each dedicated listener accepts only `GET` on its configured `endpoint`. A different path
+returns `404 Not Found`; another method on the configured path returns `405 Method Not
+Allowed` with `Allow: GET`. Change `endpoint` if another path is required.
 - Dashboard: `http://localhost:8081`
 - TLS proxy: `https://localhost:3129` (when enabled)
 
@@ -1892,124 +1960,97 @@ logging:
 
 ## Environment Variable Reference
 
-All configuration options can be overridden via environment variables:
+Environment variables override the YAML file for a **subset** of options. This table is
+the complete set — 33 variables. Anything not listed here has no environment override
+and must be set in the config file.
+
+Two things to know before using these:
+
+- **Durations take a bare integer, not a duration string.** `LOCK_TIMEOUT=60` is 60
+  seconds; `LOCK_TIMEOUT=60s` does not parse. Units are seconds everywhere except
+  `VALIDATION_FREQUENCY`, which is in hours.
+- **A value that fails to parse is silently ignored**, leaving the YAML or default value
+  in place. There is no warning. Check the startup config log line if an override does
+  not appear to take effect.
 
 | Variable | Configuration Path | Example |
 |----------|-------------------|---------|
-| `HTTP_PORT` | `server.http_port` | `HTTP_PORT=8081` |
-| `HTTPS_PORT` | `server.https_port` | `HTTPS_PORT=3129` |
+| `HTTP_PORT` | `server.http_port` | `HTTP_PORT=80` |
+| `HTTPS_PORT` | `server.https_port` | `HTTPS_PORT=443` |
+| `MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `MAX_CONCURRENT_REQUESTS=1000` |
 | `CACHE_DIR` | `cache.cache_dir` | `CACHE_DIR=/var/cache/s3-proxy` |
-| `MAX_CACHE_SIZE` | `cache.max_cache_size` | `MAX_CACHE_SIZE=10737418240` |
 | `RAM_CACHE_ENABLED` | `cache.ram_cache_enabled` | `RAM_CACHE_ENABLED=true` |
-| `CONSOLIDATION_INTERVAL` | `cache.shared_storage.consolidation_interval` | `CONSOLIDATION_INTERVAL=5s` |
-| `ACCESS_LOG_DIR` | `logging.access_log_dir` | `ACCESS_LOG_DIR=/var/log/s3-proxy` |
-| `APP_LOG_DIR` | `logging.app_log_dir` | `APP_LOG_DIR=/var/log/s3-proxy` |
-| `ACCESS_LOG_FLUSH_INTERVAL` | `logging.access_log_flush_interval` | `ACCESS_LOG_FLUSH_INTERVAL=5s` |
-| `ACCESS_LOG_BUFFER_SIZE` | `logging.access_log_buffer_size` | `ACCESS_LOG_BUFFER_SIZE=1000` |
-| `ACCESS_LOG_RETENTION_DAYS` | `logging.access_log_retention_days` | `ACCESS_LOG_RETENTION_DAYS=30` |
-| `APP_LOG_RETENTION_DAYS` | `logging.app_log_retention_days` | `APP_LOG_RETENTION_DAYS=30` |
-| `LOG_CLEANUP_INTERVAL` | `logging.log_cleanup_interval` | `LOG_CLEANUP_INTERVAL=24h` |
-| `ACCESS_LOG_FILE_ROTATION_INTERVAL` | `logging.access_log_file_rotation_interval` | `ACCESS_LOG_FILE_ROTATION_INTERVAL=5m` |
+| `WRITE_CACHE_ENABLED` | `cache.write_cache_enabled` | `WRITE_CACHE_ENABLED=true` |
+| `PARALLEL_SCAN` | `cache.initialization.parallel_scan` | `PARALLEL_SCAN=true` |
+| `PROGRESS_LOGGING` | `cache.initialization.progress_logging` | `PROGRESS_LOGGING=true` |
+| `SCAN_TIMEOUT` | `cache.initialization.scan_timeout` | `SCAN_TIMEOUT=300` (seconds) |
+| `LOCK_TIMEOUT` | `cache.shared_storage.lock_timeout` | `LOCK_TIMEOUT=60` (seconds) |
+| `LOCK_REFRESH_INTERVAL` | `cache.shared_storage.lock_refresh_interval` | `LOCK_REFRESH_INTERVAL=30` (seconds) |
+| `LOCK_MAX_RETRIES` | `cache.shared_storage.lock_max_retries` | `LOCK_MAX_RETRIES=5` |
+| `CONSOLIDATION_INTERVAL` | `cache.shared_storage.consolidation_interval` | `CONSOLIDATION_INTERVAL=5` (seconds) |
+| `CONSOLIDATION_SIZE_THRESHOLD` | `cache.shared_storage.consolidation_size_threshold` | `CONSOLIDATION_SIZE_THRESHOLD=1048576` (bytes) |
+| `EVICTION_LOCK_TIMEOUT` | `cache.shared_storage.eviction_lock_timeout` | `EVICTION_LOCK_TIMEOUT=60` (seconds) |
+| `RECOVERY_MAX_CONCURRENT` | `cache.shared_storage.recovery_max_concurrent` | `RECOVERY_MAX_CONCURRENT=10` |
+| `VALIDATION_FREQUENCY` | `cache.shared_storage.validation_frequency` | `VALIDATION_FREQUENCY=23` (**hours**; the field is inert, see [Validation Scan](#validation-scan)) |
+| `VALIDATION_THRESHOLD_WARN` | `cache.shared_storage.validation_threshold_warn` | `VALIDATION_THRESHOLD_WARN=5.0` |
+| `VALIDATION_THRESHOLD_ERROR` | `cache.shared_storage.validation_threshold_error` | `VALIDATION_THRESHOLD_ERROR=20.0` |
+| `COMPRESSION_ENABLED` | `compression.enabled` | `COMPRESSION_ENABLED=true` |
+| `ACCESS_LOG_DIR` | `logging.access_log_dir` | `ACCESS_LOG_DIR=/var/log/s3-proxy/access` |
+| `APP_LOG_DIR` | `logging.app_log_dir` | `APP_LOG_DIR=/var/log/s3-proxy/app` |
+| `LOG_LEVEL` | `logging.log_level` | `LOG_LEVEL=info` |
+| `HEALTH_ENABLED` | `health.enabled` | `HEALTH_ENABLED=true` |
+| `METRICS_ENABLED` | `metrics.enabled` | `METRICS_ENABLED=true` |
+| `OTLP_ENDPOINT` | `metrics.otlp.endpoint` (also sets `otlp.enabled=true`) | `OTLP_ENDPOINT=http://localhost:4318` |
+| `OTLP_EXPORT_INTERVAL` | `metrics.otlp.export_interval` | `OTLP_EXPORT_INTERVAL=60` (seconds) |
 | `DASHBOARD_ENABLED` | `dashboard.enabled` | `DASHBOARD_ENABLED=true` |
 | `DASHBOARD_PORT` | `dashboard.port` | `DASHBOARD_PORT=8081` |
 | `DASHBOARD_BIND_ADDRESS` | `dashboard.bind_address` | `DASHBOARD_BIND_ADDRESS=127.0.0.1` |
-| `OTLP_ENDPOINT` | `metrics.otlp.endpoint` | `OTLP_ENDPOINT=http://localhost:4318` |
-| `METRICS_ENABLED` | `metrics.enabled` | `METRICS_ENABLED=true` |
+| `DASHBOARD_CACHE_STATS_REFRESH_INTERVAL` | `dashboard.cache_stats_refresh_interval` | `DASHBOARD_CACHE_STATS_REFRESH_INTERVAL=10` (seconds) |
+| `DASHBOARD_LOGS_REFRESH_INTERVAL` | `dashboard.logs_refresh_interval` | `DASHBOARD_LOGS_REFRESH_INTERVAL=30` (seconds) |
+| `DASHBOARD_MAX_LOG_ENTRIES` | `dashboard.max_log_entries` | `DASHBOARD_MAX_LOG_ENTRIES=100` (field is deprecated and inert) |
+
+**No environment override exists** for `cache.max_cache_size`, any `logging.*` field
+other than the two directories and the level, any `cache.metadata_cache.*` field, any
+TTL, or any `connection_pool.*` field. Earlier revisions of this table listed
+`MAX_CACHE_SIZE`, `ACCESS_LOG_FLUSH_INTERVAL`, `ACCESS_LOG_BUFFER_SIZE`,
+`ACCESS_LOG_RETENTION_DAYS`, `APP_LOG_RETENTION_DAYS`, `LOG_CLEANUP_INTERVAL`, and
+`ACCESS_LOG_FILE_ROTATION_INTERVAL`; none of those are read by the proxy. Set those
+fields in the config file.
 
 ## Example Configurations
 
-### Development
+Three complete profiles live in [`docs/examples/`](examples/) as loadable YAML rather
+than as prose in this document, so they can be started directly and are load-tested
+against the binary:
 
-```yaml
-server:
-  http_port: 8081
-  https_port: 3129
+| File | Profile |
+|---|---|
+| [`config-development.yaml`](examples/config-development.yaml) | Local cache, debug logging, unprivileged ports, loopback dashboard |
+| [`config-production.yaml`](examples/config-production.yaml) | Standard ports, TLS-terminating listener, shared cache volume, OTLP export |
+| [`config-high-performance.yaml`](examples/config-high-performance.yaml) | 1 TiB disk / 10 GiB RAM tiers, long-lived connections, slower dashboard polling |
 
-cache:
-  cache_dir: "./tmp/cache"
-  max_cache_size: 1073741824        # 1GB
-  ram_cache_enabled: true
-  max_ram_cache_size: 134217728     # 128MB
-
-logging:
-  access_log_dir: "./tmp/logs/access"
-  app_log_dir: "./tmp/logs/app"
-  log_level: "debug"
-
-dashboard:
-  enabled: true
-  port: 8081
-  bind_address: "127.0.0.1"         # Localhost only for development
+```bash
+s3-proxy --config docs/examples/config-development.yaml
 ```
 
-### Production
+For an annotated walk through every available option, see
+[`config/config.example.yaml`](../config/config.example.yaml).
 
-```yaml
-server:
-  http_port: 80
-  https_port: 443
-  max_concurrent_requests: 500
-  tls:
-    enabled: true
-    tls_proxy_port: 3129
-    cert_path: "/mnt/nfs/config/tls/cert.pem"
-    key_path: "/mnt/nfs/config/tls/key.pem"
+### Partial sections fail to parse
 
-cache:
-  cache_dir: "/var/cache/s3-proxy"
-  max_cache_size: 107374182400      # 100GB
-  ram_cache_enabled: true
-  max_ram_cache_size: 1073741824    # 1GB
-  eviction_algorithm: "tinylfu"
-  
-  shared_storage:
-    eviction_lock_timeout: "300s"
+Four sections require **all** of their fields once the section is present at all:
+`compression`, `health`, `metrics`, and `metrics.otlp`. Omitting a section entirely is
+fine and accepts every default, but writing it partially fails startup with a
+`missing field` error naming a field you did not write:
 
-logging:
-  access_log_dir: "/var/log/s3-proxy/access"
-  app_log_dir: "/var/log/s3-proxy/app"
-  log_level: "info"
-
-dashboard:
-  enabled: true
-  port: 8081
-  bind_address: "0.0.0.0"           # All interfaces for production monitoring
-
-metrics:
-  otlp:
-    enabled: true
-    endpoint: "http://localhost:4318"
+```
+Error: ConfigError("Failed to parse config file config.yaml:
+compression: missing field `preferred_algorithm` at line 26 column 3")
 ```
 
-### High-Performance
-
-```yaml
-server:
-  max_concurrent_requests: 1000
-
-cache:
-  max_cache_size: 1099511627776     # 1TB
-  ram_cache_enabled: true
-  max_ram_cache_size: 10737418240   # 10GB
-  eviction_algorithm: "tinylfu"
-  eviction_trigger_percent: 95
-  eviction_target_percent: 80
-
-connection_pool:
-  keepalive_enabled: true
-  max_idle_per_host: 100
-  max_lifetime: "600s"
-
-compression:
-  enabled: true
-  threshold: 1024
-
-dashboard:
-  enabled: true
-  port: 8081
-  cache_stats_refresh_interval: "10s"  # Slower refresh for high-performance
-  logs_refresh_interval: "15s"
-```
+Either omit the section or write it in full. `config-production.yaml` and
+`config-high-performance.yaml` show the complete form for `metrics`/`metrics.otlp` and
+`compression` respectively.
 
 ## Troubleshooting
 
@@ -2029,7 +2070,7 @@ dashboard:
 ### Poor Cache Hit Rate
 
 - Increase `get_ttl`
-- Check bucket settings overrides are correct
+- Check that `cache_rules.json` rules match the keys you expect (see [Cache Rules](#cache-rules))
 - Monitor `cache_hit_rate` metric
 - Review access patterns
 
@@ -2050,20 +2091,8 @@ dashboard:
 
 ### Dashboard Issues
 
-**Dashboard Not Accessible**:
-- Verify `dashboard.enabled: true`
-- Check `dashboard.port` for conflicts
-- Verify `dashboard.bind_address` allows connections from your network
-- Check firewall rules for the configured port
-
-**Dashboard Performance Issues**:
-- Increase `cache_stats_refresh_interval` and `logs_refresh_interval`
-- Reduce `max_log_entries` for faster log loading
-- Limit concurrent dashboard connections (50 accepted before new ones are rejected)
-
-**Dashboard Port Conflicts**:
-- Change `dashboard.port` if 8081 conflicts with health check or other services
-- Ensure dashboard, health check, and metrics use different ports
+See [DASHBOARD.md — Troubleshooting](DASHBOARD.md#troubleshooting) for the dashboard not
+being reachable, port conflicts, and connection limits.
 
 ## Download Bandwidth QoS Configuration
 
@@ -2102,8 +2131,21 @@ See [BANDWIDTH_QOS.md](BANDWIDTH_QOS.md) for the full guide.
 
 ## See Also
 
-- [CACHING.md](CACHING.md) - Cache architecture details
-- [COMPRESSION.md](COMPRESSION.md) - Compression algorithms
-- [CONNECTION_POOLING.md](CONNECTION_POOLING.md) - Connection management
-- [OTLP_METRICS.md](OTLP_METRICS.md) - Metrics and observability
-- [config/config.example.yaml](../config/config.example.yaml) - Complete configuration with all options documented
+This document is the field reference. Each topic doc below owns the mechanism and the
+interpretation guidance for its own subject, and is authoritative there:
+
+- [CACHING.md](CACHING.md) - Cache architecture, TTL and revalidation flow, range merging, eviction, multi-instance coordination
+- [COMPRESSION.md](COMPRESSION.md) - The compression decision, the authoritative denylist, store-mode frames
+- [CONNECTION_POOLING.md](CONNECTION_POOLING.md) - Pooling, IP distribution, health tracking, TCP socket options
+- [METRICS_REFERENCE.md](METRICS_REFERENCE.md) - Every field in the `/metrics` payload
+- [METRICS.md](METRICS.md) - Per-bucket traffic, cache-savings inference, reading the permit and in-flight-memory counters
+- [OTLP_METRICS.md](OTLP_METRICS.md) - The OpenTelemetry export surface and backend integration
+- [DASHBOARD.md](DASHBOARD.md) - The web interface, its API endpoints, and its security posture
+- [BANDWIDTH_QOS.md](BANDWIDTH_QOS.md) - Download ceiling mechanics and fair-share scheduling
+- [HEDGING.md](HEDGING.md) - Hedged upstream requests and the cost governor
+- [SHARED_STORAGE.md](SHARED_STORAGE.md) - Multi-instance mount requirements, journals, eviction coordination, size tracking
+- [ACCESS_LOG_FORMAT.md](ACCESS_LOG_FORMAT.md) - The 25-field access log record
+- [ERROR_HANDLING.md](ERROR_HANDLING.md) - Failure classes, recovery paths, and the upstream idle watchdog
+- [GETTING_STARTED.md](GETTING_STARTED.md) - Deployment modes, client routing, TLS patterns, PrivateLink topology
+- [docs/examples/](examples/) - Three loadable config profiles and worked `cache_rules.json` files
+- [config/config.example.yaml](../config/config.example.yaml) - Annotated example covering every option

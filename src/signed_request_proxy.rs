@@ -23,6 +23,21 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
+/// Maximum body accepted by S3 for a single-part PUT or UploadPart.
+///
+/// This streamed-path cap prevents the proxy from relaying a body S3 will reject,
+/// avoiding unnecessary proxy-to-S3 egress. It is intentionally separate from the
+/// smaller buffered-body bound used only by the remaining buffering sites.
+pub(crate) const STREAMED_BODY_CAP: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Maximum request body retained whole in memory on the remaining buffered paths.
+///
+/// A DeleteObjects request for its maximum 1,000 keys is only a few hundred KiB.
+/// One MiB leaves headroom for that API without making an object-sized upload a
+/// buffered allocation. Do not use this for streamed PUT or UploadPart paths;
+/// [`STREAMED_BODY_CAP`] is their separate S3-derived limit.
+pub(crate) const BUFFERED_BODY_BOUND: u64 = 1024 * 1024;
+
 /// How the signed-write path (single-part PUT and the multipart operations)
 /// reaches the upstream for one request.
 ///
@@ -437,38 +452,48 @@ pub fn extract_metadata(
 /// 3. Forwards the raw bytes without modification
 /// 4. Returns the raw response
 ///
-/// This preserves AWS SigV4 signatures which would otherwise fail if headers are modified.
-pub async fn forward_signed_request(
-    req: Request<hyper::body::Incoming>,
-    target_host: &str,
-    transport: &UpstreamTransport,
-    proxy_referer: Option<&str>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
-    forward_signed_request_bounded(
-        req,
-        target_host,
-        transport,
-        proxy_referer,
-        default_max_buffered_request_body_bytes(),
-    )
-    .await
-}
-
-/// Default maximum buffered request body size: 128 MiB
-fn default_max_buffered_request_body_bytes() -> u64 {
-    128 * 1024 * 1024
-}
-
-/// Forward a signed request with a configurable body size cap.
+/// Forward a signed request without modification to preserve the client's AWS SigV4
+/// signature, with a caller-supplied body size cap.
 ///
-/// Same as `forward_signed_request` but accepts a `max_body_bytes` parameter
-/// for the bounded body read (Requirement 11.1, 11.4).
+/// This preserves AWS SigV4 signatures which would otherwise fail if headers are
+/// modified. There is deliberately no config-free convenience wrapper. One existed
+/// previously with a private 128 MiB default that every Bypass_Arm silently
+/// inherited, so a bypassed `UploadPart` above 128 MiB (and within S3's
+/// 5 GiB UploadPart maximum) was rejected with 413 purely because it took this path instead of the streaming/caching path.
+/// Requiring every caller to pass `max_body_bytes` explicitly makes that class of bug
+/// impossible to reintroduce by omission. Requirements: IMA 6.1, 6.2, 6.3, 6.4
 pub async fn forward_signed_request_bounded(
     req: Request<hyper::body::Incoming>,
     target_host: &str,
     transport: &UpstreamTransport,
     proxy_referer: Option<&str>,
     max_body_bytes: u64,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+    forward_signed_request_bounded_with_ledger(
+        req,
+        target_host,
+        transport,
+        proxy_referer,
+        max_body_bytes,
+        &Arc::new(crate::inflight_ledger::InflightLedger::disabled()),
+    )
+    .await
+}
+
+/// Buffer and forward a request whose caller must inspect or retain its full body.
+///
+/// This is the buffered counterpart to [`forward_signed_request_streaming_verbatim`].
+/// It reserves against the in-flight buffered-byte ledger before allocation and is
+/// correct only when the caller needs a complete `Bytes` body. Callers that only
+/// forward must use [`forward_signed_request_streaming_verbatim`] so they do not
+/// materialize the request body or participate in the buffered-byte ledger.
+pub async fn forward_signed_request_bounded_with_ledger(
+    req: Request<hyper::body::Incoming>,
+    target_host: &str,
+    transport: &UpstreamTransport,
+    proxy_referer: Option<&str>,
+    max_body_bytes: u64,
+    inflight_ledger: &Arc<crate::inflight_ledger::InflightLedger>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     debug!(
         "Forwarding signed request to {} ({}:{})",
@@ -481,9 +506,12 @@ pub async fn forward_signed_request_bounded(
     let headers = req.headers().clone();
     let version = req.version();
 
-    // Read request body with bounded size (Requirement 11.4). This enforces the cap
-    // up front and returns the fully-buffered body, exactly as before.
-    let body_bytes = read_request_body_bounded(req, max_body_bytes).await?;
+    // Read request body with bounded size (Requirement 11.4), reserving
+    // against the ledger before allocating (Requirement IMA 1.2). This
+    // enforces the cap up front and returns the fully-buffered body, exactly
+    // as before.
+    let body_bytes =
+        read_request_body_bounded_with_ledger(req, max_body_bytes, inflight_ledger).await?;
 
     // Delegate to the single streaming forward implementation, wrapping the
     // pre-buffered body in a single-frame `Full<Bytes>`. Header serialization and
@@ -505,6 +533,43 @@ pub async fn forward_signed_request_bounded(
     )
     .await
 }
+
+/// Stream a request that only needs verbatim forwarding to the upstream.
+///
+/// This is the non-buffering counterpart to
+/// [`forward_signed_request_bounded_with_ledger`]. It decomposes the inbound
+/// request and forwards its original body frame-by-frame with `tee = None`, so it
+/// neither materializes the body nor accepts a ledger parameter. Use it for
+/// forward-only callers; callers that need to inspect or retain the complete body
+/// must use the bounded forward instead.
+pub async fn forward_signed_request_streaming_verbatim(
+    req: Request<hyper::body::Incoming>,
+    target_host: &str,
+    transport: &UpstreamTransport,
+    proxy_referer: Option<&str>,
+    cap: u64,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+    debug!(
+        "Streaming verbatim request to {} ({}:{}) without caching",
+        target_host, transport.ip, transport.port
+    );
+
+    let (parts, body) = req.into_parts();
+    forward_signed_request_streaming(
+        &parts.method,
+        &parts.uri,
+        &parts.headers,
+        parts.version,
+        body,
+        target_host,
+        transport,
+        proxy_referer,
+        cap,
+        None,
+    )
+    .await
+}
+
 /// Forward a signed request with a pre-buffered body
 ///
 /// This function is similar to `forward_signed_request` but accepts a pre-buffered body
@@ -585,13 +650,13 @@ pub async fn forward_signed_request_with_body(
 /// calls exactly as the buffered path does.
 ///
 /// # Parameters
-/// * `cap` — the Body_Size_Cap (`server.max_buffered_request_body_bytes`),
-///   enforced without buffering the whole body (Requirements 8.1, 8.2, 8.3, 8.4):
-///   a declared `Content-Length` exceeding `cap` is rejected with HTTP 413
-///   `EntityTooLarge` before any body byte is read, and a body whose streamed
-///   bytes exceed `cap` mid-stream stops the upload and fails with the same 413.
-///   `cap == u64::MAX` means "no cap" (the `CompleteMultipartUpload`/buffered
-///   callers) and can never trip either check.
+/// * `cap` — an internal body-size cap enforced without buffering the whole
+///   body (Requirements 8.1, 8.2, 8.3, 8.4): a declared `Content-Length`
+///   exceeding `cap` is rejected with HTTP 413 `EntityTooLarge` before any
+///   body byte is read, and a body whose streamed bytes exceed `cap` mid-stream
+///   stops the upload and fails with the same 413. `cap == u64::MAX` means
+///   "no cap" for the already-buffered CompleteMultipartUpload caller and can
+///   never trip either check.
 /// * `tee` — optional cache tee (`None` means no caching). When `Some`, each
 ///   frame forwarded to the upstream is also sent to this bounded channel using
 ///   the `TeeStream` discipline (`try_send`; on `Full` an awaited `send`; on
@@ -646,7 +711,7 @@ where
             warn!(
                 content_length = cl,
                 max_bytes = cap,
-                "Streamed request body exceeds max_buffered_request_body_bytes (Content-Length)"
+                "Streamed request body exceeds S3 upload size limit (Content-Length)"
             );
             return Err(ProxyError::RequestBodyTooLarge {
                 content_length: Some(cl),
@@ -775,7 +840,7 @@ where
                     chunk_bytes = data.len(),
                     max_bytes = cap,
                     content_length = ?content_length_hint,
-                    "Streamed request body exceeds max_buffered_request_body_bytes"
+                    "Streamed request body exceeds S3 upload size limit"
                 );
                 return Err(ProxyError::RequestBodyTooLarge {
                     content_length: content_length_hint,
@@ -867,6 +932,17 @@ where
     parse_http_response(&response_bytes, method, path_and_query)
 }
 
+/// Compute the allocation capacity for a body the buffered path must retain.
+///
+/// A declared length has already passed the request-body cap before this is called.
+/// Reserving exactly that bounded length avoids `Vec` growth reallocations, whose
+/// simultaneous old and new allocations previously raised peak memory above the body
+/// size. Unknown-length requests retain the small initial allocation and grow only as
+/// frames arrive.
+fn buffered_body_initial_capacity(content_length_hint: Option<u64>, max_bytes: u64) -> usize {
+    content_length_hint.unwrap_or(8192).min(max_bytes) as usize
+}
+
 /// Read request body from incoming request with a configurable size cap.
 ///
 /// Reads the body frame-by-frame, accumulating bytes up to `max_bytes`.
@@ -880,9 +956,42 @@ where
 /// - Requirement 11.1: Configurable cap on request body buffering
 /// - Requirement 11.2: Return HTTP 413 on exceed
 /// - Requirement 11.4: Apply cap at every body.collect() callsite
+///
+/// This is a thin wrapper over [`read_request_body_bounded_with_ledger`] with a
+/// disabled ledger, preserving the exact pre-Phase-D signature and behaviour for
+/// callers (and tests) that don't need Admission_Check coverage.
 pub async fn read_request_body_bounded(
     req: Request<hyper::body::Incoming>,
     max_bytes: u64,
+) -> Result<Bytes> {
+    read_request_body_bounded_with_ledger(
+        req,
+        max_bytes,
+        &Arc::new(crate::inflight_ledger::InflightLedger::disabled()),
+    )
+    .await
+}
+
+/// Read the request body up to `max_bytes`, reserving against the in-flight
+/// buffered-byte ledger before allocating.
+///
+/// A declared `Content-Length` is reserved up front, before the
+/// `Vec::with_capacity` below — the Admission_Check happens before allocation
+/// (Requirement IMA 1.2). Absent a declared length, this is an Unknown_Size_Site:
+/// the reservation grows per chunk received via [`Reservation::try_grow`], and an
+/// over-ceiling growth aborts the accumulation (committing nothing — there is no
+/// cache write on this path to commit, so "abort" here means returning the
+/// rejection error) rather than continuing to allocate (Requirements 3.2, 3.3,
+/// 3.5). A disabled ledger (`Ledger_Disabled`) reserves nothing and this function
+/// is byte-for-byte the pre-feature `read_request_body_bounded` behaviour.
+///
+/// # Requirements
+/// - Requirement 11.1, 11.2, 11.4 (Body_Size_Cap, unchanged from the original)
+/// - Requirement IMA 1.2, 1.3, 2.1, 2.5, 3.2, 3.3, 3.5, 4.1
+pub async fn read_request_body_bounded_with_ledger(
+    req: Request<hyper::body::Incoming>,
+    max_bytes: u64,
+    ledger: &Arc<crate::inflight_ledger::InflightLedger>,
 ) -> Result<Bytes> {
     use http_body_util::BodyExt;
 
@@ -907,13 +1016,26 @@ pub async fn read_request_body_bounded(
         }
     }
 
+    // Admission_Check before allocation. A declared Content-Length is reserved
+    // up front in full; an absent one starts at zero and grows per chunk below
+    // (Unknown_Size_Site treatment).
+    let mut reservation = match ledger.try_reserve(content_length_hint.unwrap_or(0)) {
+        Some(r) => r,
+        None => {
+            return Err(ProxyError::InflightCeilingExceeded {
+                ceiling_bytes: ledger.ceiling_bytes(),
+                requested_bytes: content_length_hint.unwrap_or(0),
+            });
+        }
+    };
+
     let mut body = req.into_body();
-    let mut accumulated = Vec::with_capacity(
-        content_length_hint
-            .unwrap_or(8192)
-            .min(max_bytes)
-            .min(8 * 1024 * 1024) as usize,
-    );
+    // The up-front cap check above constrains a declared length before this
+    // allocation. Matching the capacity to that bounded length prevents
+    // `Vec` from doubling through progressively larger allocations while it
+    // accumulates a known-size body.
+    let initial_capacity = buffered_body_initial_capacity(content_length_hint, max_bytes);
+    let mut accumulated = Vec::with_capacity(initial_capacity);
 
     while let Some(frame) = body.frame().await {
         let frame = frame
@@ -931,6 +1053,24 @@ pub async fn read_request_body_bounded(
                     content_length: content_length_hint,
                     max_bytes,
                 });
+            }
+            // Grow the reservation only for bytes beyond what was already
+            // reserved from the declared Content-Length (avoids double-
+            // reserving the same bytes when a length was declared).
+            let already_reserved = reservation.held_bytes();
+            let new_total = accumulated.len() as u64 + data.len() as u64;
+            if new_total > already_reserved {
+                let growth = new_total - already_reserved;
+                if !reservation.try_grow(growth) {
+                    // `try_grow` already emitted the rate-limited rejection log
+                    // (Requirement 2.6, `InflightLedger::log_rejection_rate_limited`);
+                    // don't duplicate it here.
+                    ledger.record_aborted_accumulation();
+                    return Err(ProxyError::InflightCeilingExceeded {
+                        ceiling_bytes: ledger.ceiling_bytes(),
+                        requested_bytes: new_total,
+                    });
+                }
             }
             accumulated.extend_from_slice(&data);
         }
@@ -2171,16 +2311,14 @@ mod tests {
     // --- Body-size cap enforcement on the streaming forward (Req 8) ---
 
     #[tokio::test]
-    async fn test_streaming_cap_rejects_oversized_content_length() {
-        // Req 8.1: a declared `Content-Length` exceeding the cap is rejected with the
-        // same `RequestBodyTooLarge` error (mapped to HTTP 413 `EntityTooLarge`) that
-        // `read_request_body_bounded` returns — before any body byte is read and
-        // before an upstream connection is attempted. The transport points at a port
-        // nothing listens on; the test proves we never reach it.
+    async fn test_streaming_cap_rejects_declared_length_above_s3_limit_before_connecting() {
+        // Requirement 4.3 / 2.6: a declared length above S3's 5 GiB single-part
+        // PUT and UploadPart maximum is rejected before any upstream connection.
         let mut headers = hyper::HeaderMap::new();
+        let oversized_length = STREAMED_BODY_CAP + 1;
         headers.insert(
             "content-length",
-            hyper::header::HeaderValue::from_static("1000"),
+            oversized_length.to_string().parse().unwrap(),
         );
 
         let transport = UpstreamTransport {
@@ -2199,7 +2337,7 @@ mod tests {
             "example.com",
             &transport,
             None,
-            100, // cap < declared Content-Length
+            STREAMED_BODY_CAP,
             None,
         )
         .await;
@@ -2209,8 +2347,8 @@ mod tests {
                 content_length,
                 max_bytes,
             }) => {
-                assert_eq!(content_length, Some(1000));
-                assert_eq!(max_bytes, 100);
+                assert_eq!(content_length, Some(oversized_length));
+                assert_eq!(max_bytes, STREAMED_BODY_CAP);
             }
             Err(e) => panic!("expected RequestBodyTooLarge, got error: {}", e),
             Ok(_) => panic!("expected RequestBodyTooLarge, got Ok response"),
@@ -2276,12 +2414,189 @@ mod tests {
         }
     }
 
+    /// Drive `body` through a loopback HTTP/1 connection to obtain a real
+    /// `Request<Incoming>`. The returned sender keeps the server connection alive
+    /// until the consumer has drained the body; otherwise a multi-megabyte test body
+    /// can stop yielding when the service returns.
+    async fn incoming_request(
+        body: Vec<u8>,
+    ) -> (
+        Request<hyper::body::Incoming>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        incoming_request_with_details("PUT", "/bucket/key?part=1", None, body).await
+    }
+
+    /// Construct a real inbound request with a caller-selected method, target, and
+    /// Content-Type so streaming tests exercise the same `Incoming` body the proxy
+    /// receives from a client connection.
+    async fn incoming_request_with_details(
+        method: &str,
+        path_and_query: &str,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> (
+        Request<hyper::body::Incoming>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel::<Request<hyper::body::Incoming>>();
+        let request_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(request_tx)));
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let done_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(done_rx)));
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let request_tx = request_tx.clone();
+            let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                if let Some(sender) = request_tx.lock().unwrap().take() {
+                    let _ = sender.send(request);
+                }
+                let done = done_rx.lock().unwrap().take();
+                async move {
+                    if let Some(done) = done {
+                        let _ = done.await;
+                    }
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let content_length = body.len();
+        let method: hyper::Method = method.parse().expect("test HTTP method must be valid");
+        let path_and_query = path_and_query.to_owned();
+        let content_type = content_type.map(str::to_owned);
+        tokio::spawn(async move {
+            use hyper_util::client::legacy::Client;
+            use hyper_util::rt::TokioExecutor;
+
+            let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+            let mut request_builder = Request::builder()
+                .method(method)
+                .uri(format!("http://{address}{path_and_query}"))
+                .header("content-length", content_length.to_string());
+            if let Some(content_type) = content_type {
+                request_builder = request_builder.header("content-type", content_type);
+            }
+            let request = request_builder.body(Full::new(Bytes::from(body))).unwrap();
+            let _ = client.request(request).await;
+        });
+
+        (request_rx.await.unwrap(), done_tx)
+    }
+
+    #[tokio::test]
+    async fn streaming_verbatim_forward_handles_body_larger_than_buffering_thresholds() {
+        // Task 4: a forward-only caller must pass a body well beyond the historical
+        // 8 MiB allocation clamp without materializing it in the wrapper. Keep the
+        // Incoming connection alive until the stream has reached the mock upstream.
+        const BODY_SIZE: usize = 16 * 1024 * 1024;
+        let payload: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_body(listener, payload.len()));
+        let (request, _connection_keepalive) = incoming_request(payload.clone()).await;
+
+        let transport = UpstreamTransport {
+            ip: address.ip(),
+            port: address.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            forward_signed_request_streaming_verbatim(
+                request,
+                "example.com",
+                &transport,
+                None,
+                BODY_SIZE as u64,
+            ),
+        )
+        .await
+        .expect("forward-only streaming must not stall on a multi-megabyte body")
+        .expect("forward-only streaming must succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(upstream.await.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn streaming_verbatim_forward_posts_multipart_upload_without_a_cache_tee() {
+        // Task 5a / Validates: Requirements 2.5a. A POST object upload is a
+        // multipart/form-data envelope, so the forward-only helper must send it
+        // verbatim while `tee = None` ensures those envelope bytes cannot become a
+        // write-cache entry. The 204 is the mocked direct-S3 result; the proxied
+        // path must return that same upstream status.
+        let boundary = "----s3-proxy-test-boundary";
+        let payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\npost-object\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upload.txt\"\r\nContent-Type: text/plain\r\n\r\nobject bytes from browser form\r\n--{boundary}--\r\n"
+        )
+        .into_bytes();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_body_with_status(
+            listener,
+            payload.len(),
+            "204 No Content",
+        ));
+        let (request, _connection_keepalive) = incoming_request_with_details(
+            "POST",
+            "/bucket?uploads=browser-form",
+            Some(&format!("multipart/form-data; boundary={boundary}")),
+            payload.clone(),
+        )
+        .await;
+
+        let transport = UpstreamTransport {
+            ip: address.ip(),
+            port: address.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+        let response = forward_signed_request_streaming_verbatim(
+            request,
+            "example.com",
+            &transport,
+            None,
+            payload.len() as u64,
+        )
+        .await
+        .expect("POST object upload must stream to S3");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(upstream.await.unwrap(), payload);
+    }
+
     /// Mock upstream: accept one connection, read the request line + headers (up to
     /// the `\r\n\r\n` terminator), then read exactly `body_len` body bytes, capture
     /// them, send a minimal `200 OK`, and return the captured body so the test can
     /// assert verbatim forwarding. Reading the whole body before responding mirrors
     /// a real upstream draining the request.
     async fn capture_upstream_body(listener: tokio::net::TcpListener, body_len: usize) -> Vec<u8> {
+        capture_upstream_body_with_status(listener, body_len, "200 OK").await
+    }
+
+    async fn capture_upstream_body_with_status(
+        listener: tokio::net::TcpListener,
+        body_len: usize,
+        status: &str,
+    ) -> Vec<u8> {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
@@ -2309,11 +2624,233 @@ mod tests {
             body.extend_from_slice(&tmp[..n]);
         }
 
-        let _ = sock
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await;
+        let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+        let _ = sock.write_all(response.as_bytes()).await;
         let _ = sock.flush().await;
         body
+    }
+
+    #[tokio::test]
+    async fn streaming_verbatim_forward_preserves_presigned_put_query() {
+        // Task 5 regression: the former unsigned PUT reconstruction omitted this
+        // query string, dropping X-Amz-Signature and producing S3 AccessDenied.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let bytes_read = socket.read(&mut buffer).await.unwrap();
+                assert!(bytes_read > 0, "upstream received an incomplete request");
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        });
+
+        let transport = UpstreamTransport {
+            ip: address.ip(),
+            port: address.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+        let uri = "/bucket/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=signature";
+        let response = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &uri.parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            Full::new(Bytes::from_static(b"payload")),
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await
+        .expect("presigned PUT must forward successfully");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            upstream.await.unwrap(),
+            format!("PUT {} HTTP/1.1", uri),
+            "the upstream request line must retain every presigning parameter"
+        );
+    }
+
+    /// Capture the exact request bytes written to the mock upstream. The caller
+    /// supplies the expected body length so this handles the request-header/body
+    /// coalescing that is normal on a loopback TCP connection.
+    async fn capture_upstream_request(
+        listener: tokio::net::TcpListener,
+        body_len: usize,
+    ) -> Vec<u8> {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let header_end = loop {
+            let bytes_read = socket.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0, "upstream received an incomplete request");
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+
+        while request.len() - header_end < body_len {
+            let bytes_read = socket.read(&mut buffer).await.unwrap();
+            assert!(
+                bytes_read > 0,
+                "upstream received an incomplete request body"
+            );
+            request.extend_from_slice(&buffer[..bytes_read]);
+        }
+
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        request
+    }
+
+    #[tokio::test]
+    async fn converted_forward_only_request_shapes_are_byte_identical() {
+        // Task 8 / Validates: Requirements 2.2, 3.4.
+        //
+        // Every converted call site reaches the same streaming serializer. Cover the
+        // concrete request shapes rather than only PUT: unsigned PUT (with or
+        // without write caching), POST object upload, signed-PUT/UploadPart bypass,
+        // CreateMultipartUpload, unsafe uploadId forwards, and AbortMultipartUpload.
+        // The exact raw TCP request is the oracle: changing request-line query,
+        // header order/casing/value, or a body byte makes this test fail before S3 can
+        // report SignatureDoesNotMatch in production.
+        let cases = [
+            (
+                "unsigned PUT and signed PUT bypass",
+                "PUT",
+                "/bucket/object?X-Amz-Signature=put-signature",
+                b"put-body".as_slice(),
+            ),
+            (
+                "unsigned POST object upload",
+                "POST",
+                "/bucket?uploads=browser-form",
+                b"--form\r\nfile\r\n--form--\r\n".as_slice(),
+            ),
+            (
+                "CreateMultipartUpload",
+                "POST",
+                "/bucket/object?uploads",
+                b"".as_slice(),
+            ),
+            (
+                "unsafe UploadPart forward",
+                "PUT",
+                "/bucket/object?partNumber=1&uploadId=../unsafe",
+                b"part-body".as_slice(),
+            ),
+            (
+                "unsafe CompleteMultipartUpload forward",
+                "POST",
+                "/bucket/object?uploadId=../unsafe",
+                b"<CompleteMultipartUpload/>".as_slice(),
+            ),
+            (
+                "unsafe AbortMultipartUpload forward",
+                "DELETE",
+                "/bucket/object?uploadId=../unsafe",
+                b"".as_slice(),
+            ),
+            (
+                "AbortMultipartUpload",
+                "DELETE",
+                "/bucket/object?uploadId=safe-upload-id",
+                b"".as_slice(),
+            ),
+            (
+                "SSE-C or write-cache-disabled signed PUT",
+                "PUT",
+                "/bucket/object?x-id=PutObject",
+                b"sse-c-body".as_slice(),
+            ),
+        ];
+
+        for (site, method, path_and_query, payload) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(capture_upstream_request(listener, payload.len()));
+
+            let mut headers = hyper::HeaderMap::new();
+            headers.append("x-amz-meta-first", "first".parse().unwrap());
+            headers.append("content-type", "application/octet-stream".parse().unwrap());
+            headers.append("x-amz-meta-second", "second".parse().unwrap());
+            headers.append("content-length", payload.len().to_string().parse().unwrap());
+
+            let expected_headers: Vec<u8> = headers
+                .iter()
+                .flat_map(|(name, value)| {
+                    format!("{}: {}\r\n", name.as_str(), value.to_str().unwrap()).into_bytes()
+                })
+                .collect();
+            let expected = [
+                format!("{method} {path_and_query} HTTP/1.1\r\n").into_bytes(),
+                expected_headers,
+                b"\r\n".to_vec(),
+                payload.to_vec(),
+            ]
+            .concat();
+
+            let transport = UpstreamTransport {
+                ip: address.ip(),
+                port: address.port(),
+                tls: None,
+                validated_endpoint: None,
+            };
+            let response = forward_signed_request_streaming(
+                &method.parse().unwrap(),
+                &path_and_query.parse::<hyper::Uri>().unwrap(),
+                &headers,
+                hyper::Version::HTTP_11,
+                Full::new(Bytes::copy_from_slice(payload)),
+                "example.com",
+                &transport,
+                None,
+                u64::MAX,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{site} forwarding failed: {error}"));
+
+            assert_eq!(response.status(), StatusCode::OK, "{site} status");
+            assert_eq!(upstream.await.unwrap(), expected, "{site} raw request");
+        }
+    }
+
+    #[test]
+    fn known_length_buffered_body_preallocates_at_one_times_body_size() {
+        // Task 8 / Validates: Requirement 5.3. A known-length buffered body now
+        // allocates exactly its bounded length (1.0x). This fails against the former
+        // 8 MiB clamp: a 32 MiB body began at 8 MiB and had to grow through doubling
+        // reallocations, which measured at 1.67x peak RSS on the fleet.
+        const BODY_SIZE: u64 = 32 * 1024 * 1024;
+        let capacity = buffered_body_initial_capacity(Some(BODY_SIZE), BODY_SIZE);
+        assert_eq!(capacity as u64, BODY_SIZE);
+        assert!(
+            capacity as u64 <= BODY_SIZE,
+            "known-length allocation must stay at or below 1.0x the body size"
+        );
     }
 
     #[tokio::test]

@@ -47,6 +47,7 @@ fn test_system_metrics() -> SystemMetrics {
             range_load_duration_ms: 3.2,
             old_cache_key_encounters: 0,
             cache_write_failures_total: 0,
+            incomplete_range_fallbacks: 0,
             cache_bypasses_by_reason: HashMap::new(),
             cache_etag_validations_total: 100,
             cache_etag_mismatches_total: 2,
@@ -129,10 +130,19 @@ fn test_system_metrics() -> SystemMetrics {
             total_requests: 1000,
             successful_requests: 990,
             failed_requests: 10,
+            client_error_requests: 8,
+            server_error_requests: 2,
+            rejected_requests: 0,
+            cache_hit_requests: 700,
+            cache_miss_requests: 300,
             average_response_time_ms: 45,
             requests_per_second: 16.7,
             active_requests: 3,
             max_concurrent_requests: 50,
+            permits_total: 50,
+            permits_held: 3,
+            permits_available: 47,
+            permits_held_peak: 5,
         },
         bucket_traffic: HashMap::new(),
         download_bandwidth: s3_proxy::bandwidth_limiter::BandwidthLimiterSnapshot {
@@ -147,6 +157,7 @@ fn test_system_metrics() -> SystemMetrics {
             won: 0,
             suppressed: 0,
         },
+        inflight_memory: s3_proxy::metrics::InflightMemoryMetrics::default(),
     }
 }
 
@@ -281,10 +292,19 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
             total_requests: 0,
             successful_requests: 0,
             failed_requests: 0,
+            client_error_requests: 0,
+            server_error_requests: 0,
+            rejected_requests: 0,
+            cache_hit_requests: 0,
+            cache_miss_requests: 0,
             average_response_time_ms: 0,
             requests_per_second: 0.0,
             active_requests: 0,
             max_concurrent_requests: 0,
+            permits_total: 0,
+            permits_held: 0,
+            permits_available: 0,
+            permits_held_peak: 0,
         },
         bucket_traffic: HashMap::new(),
         download_bandwidth: s3_proxy::bandwidth_limiter::BandwidthLimiterSnapshot {
@@ -299,6 +319,7 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
             won: 0,
             suppressed: 0,
         },
+        inflight_memory: s3_proxy::metrics::InflightMemoryMetrics::default(),
     };
 
     let result = exporter.export_metrics(&metrics).await;

@@ -5,6 +5,156 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-08-19
+
+**Upgrade impact:** Review `server.max_concurrent_requests` if you set it explicitly —
+a permit now covers a request's whole transfer rather than just its setup, and the
+default changes from 200 to 1000. Remove `server.max_buffered_request_body_bytes` if you
+set it: it is deprecated and has no effect, so if you lowered it to reject large
+uploads, S3's own limits apply instead. Update any probe or scraper that uses an
+unconfigured path or a non-GET method on the health and metrics listeners, which now
+return 404 and 405. An upstream IP dropped after repeated failures now returns only
+when a recovery probe succeeds, rather than at the next DNS refresh. Presigned PUT
+uploads now succeed instead of returning 403, and every upload path streams, so proxy
+memory during an upload no longer scales with body size.  `cache.ram_cache_hit_rate_percent` on
+`/metrics` is now a 0–100 percentage rather than a 0.0–1.0 fraction, so a dashboard
+that multiplied it by 100 to correct the old scale now reads 100x high.
+
+### Added
+
+- **In-flight memory ceiling** (`server.max_inflight_buffer_bytes`, default `0` =
+  disabled). Some paths buffer a whole body or range in memory rather than
+  streaming it, and nothing previously bounded their combined size across
+  concurrent requests. When set, a request that would push the running total over
+  the ceiling is rejected with 503 `SlowDown` and `Retry-After` before any upstream
+  connection opens. A claim is held until its response body reaches the client or the
+  client disconnects, so a slow reader's memory is counted for as long as it is held.
+  With upload paths now streaming, the budget covers response-side buffering almost
+  exclusively. Any ceiling of 1 MiB or above is accepted, so the sizing guidance in
+  `docs/CONFIGURATION.md` is usable even on a small instance. `/metrics` gains an
+  `inflight_memory` section for sizing it. See `docs/CONFIGURATION.md`, which now
+  covers this budget, the streaming-path permits, and the RAM cache together.
+
+- **Permit utilisation metrics**: `permits_total`, `permits_held`,
+  `permits_available`, and `permits_held_peak`, distinct from the TCP connection
+  count. The dashboard's `Requests: N / M` tile now shows permits held against the
+  configured limit, with connections shown alongside.
+
+- **Request metrics expose bounded completion outcomes**: cumulative 4xx, 5xx,
+  rejection, cache-hit, and cache-miss counts, with no labels derived from object
+  keys, paths, buckets, hosts, or client addresses. The rejection counter covers
+  every shed, including sheds caused by the in-flight memory ceiling.
+
+### Changed
+
+- **`server.max_concurrent_requests` now bounds a request's full transfer, not
+  just its setup, and its default rises from 200 to 1000.** A permit is now held
+  until the response body completes — including the streamed transfer to the client
+  and the background cache write — and is released on normal completion, early
+  client disconnect, or error. Because each permit is held far longer, the old
+  default of 200 admits far fewer concurrent transfers than before; 1000 comes from
+  a fleet measurement of peak concurrent transfers plus headroom. If you set this
+  explicitly, review it against `permits_held_peak` under your own load.
+
+### Deprecated
+
+- **`server.max_buffered_request_body_bytes` has no effect and will be removed in a
+  future release.** Its stated purpose was memory protection, but every upload path now
+  streams, so lowering it saved no memory and only rejected valid uploads with 413.
+  An existing config file setting it still parses and starts; a value other than the old
+  5 GiB default logs a startup warning naming the field. Upload size is now governed by
+  S3's own limits: a body above S3's 5 GiB single-part `PUT` and `UploadPart` maximum is
+  rejected with 413 `EntityTooLarge` before any upstream connection opens. No replacement
+  field is added.
+
+### Fixed
+
+- **Uploads routed around the cache now stream, and presigned PUT works.** Every
+  upload path that does not write through the cache — objects too large to cache, SSE-C
+  uploads, keys with `write_cache_enabled: false`, uploads without an `Authorization`
+  header, browser form uploads, and the multipart create and abort calls — read the
+  entire body into memory before contacting S3, so a rejected 512 MiB upload still cost
+  512 MiB of proxy memory. All of them now stream the body to S3 frame by frame, so peak
+  memory is bounded by the per-connection buffer rather than the object size, and all of
+  them now share S3's own 5 GiB single-part limit instead of a private one — a large
+  `UploadPart` was previously rejected with 413 at an internal ~128 MiB cap.
+  Write-through caching is unchanged where it applied.
+
+  Presigned PUT was a casualty of the same path: a presigned URL returned 403
+  `AccessDenied` through the proxy while working direct to S3, because the forwarded
+  request dropped the query string and with it `X-Amz-Signature`. Uploads without an
+  `Authorization` header are now forwarded verbatim — request line, headers, and query
+  string unchanged — so the signature survives the hop. Presigned GET was never affected.
+  Browser form uploads (`POST` to the bucket) go the same way: forwarded verbatim and
+  streamed, but not cached, because a `multipart/form-data` body is an envelope rather
+  than the object bytes; the first read of that object through the proxy caches it as a
+  normal cache miss. See `docs/CACHING.md`.
+
+  The small bodies still read whole (DELETE and the other non-upload verbs) now size
+  their buffer from the declared `Content-Length` instead of growing it by repeated
+  reallocation, which previously peaked at roughly 1.67× the body size.
+
+- **Range reads spanning evicted cached extents now refetch missing bytes.** A
+  range request could return HTTP 500 after partial eviction left a hole between
+  cached ranges. The proxy now validates the unchanged object, fetches the
+  missing bytes, and returns the requested range.
+
+- **HEAD responses stay cacheable after their TTL window.** Freshness was compared
+  against the object's original cache time, so every HEAD past `head_ttl` was a miss
+  regardless of how recently the entry had been refreshed. HEAD now anchors
+  freshness to its most recent refresh, matching GET.
+
+- **Health and metrics listeners enforce their configured endpoints.** Each serves
+  only `GET` at its configured `endpoint`; other paths return 404 and other methods
+  405 with `Allow: GET`, so a health scrape can't be mistaken for metrics data.
+
+- **Unhealthy upstream IPs now recover by probe, with the cooldown backoff actually applied**:
+  An IP excluded after `connection_pool.ip_failure_threshold`
+  consecutive failures was returned to rotation by the next DNS refresh (every
+  `pool_check_interval`, default 10s), which also reset all recovery state. A
+  persistently unreachable IP was therefore re-admitted every 10s and spent more
+  requests failing, and `health_probe_initial_cooldown` /
+  `health_probe_max_cooldown` had no observable effect. A DNS refresh now keeps
+  health exclusions in place, and once an excluded IP's cooldown elapses the proxy
+  probes it directly — a full connect and TLS handshake to the same port and
+  transport live traffic would use. A successful probe returns the IP to rotation
+  immediately; a failed one doubles its cooldown up to
+  `health_probe_max_cooldown`, so a dead IP is retried progressively less often.
+  IPs that leave DNS while excluded are dropped from tracking.
+
+- **A partially specified `compression`, `health`, `metrics`, or `metrics.otlp`
+  section now parses.** Writing one of these sections with only some of its fields
+  set — for example `compression:` with just `enabled: true` — failed startup with a
+  message naming a field the config file never mentioned. Omitting a section
+  entirely always worked. Any field left out of these four sections now falls back
+  to its documented default, matching every other section.
+
+- **`cache.ram_cache_hit_rate_percent` on `/metrics` reports the RAM tier as a
+  percentage.** It was published as a 0.0–1.0 fraction under a `_percent` name, and
+  was separately overwritten with the *overall* cache hit rate by the request
+  accounting path, so it could report disk-and-RAM hits combined, or a non-zero rate
+  on a deployment with the RAM cache disabled. It is now sourced only from RAM-tier
+  hit and miss counts and scaled to 0–100. The dashboard's RAM hit-rate panel was
+  correct throughout and is unchanged.
+
+- **Documentation: Broad ranging updates**:
+  Load-balancer TLS patterns now agree across guides, NFS mount requirements now cover cross-host file locking and updated guidance for FSx for OpenZFS and EFS, general clarification  and deduplication.
+
+- **The FSx for OpenZFS userdata example now mounts with `nconnect=16`.**
+  `docs/examples/userdata-fsxz.sh` omitted it, so an instance bootstrapped from that
+  example verbatim used a single TCP connection to the file system and capped
+  disk-cache reads near 625 MB/s — the exact condition the rest of the documentation
+  tells you to avoid. The EFS example is unchanged and correctly has no `nconnect`;
+  it now says so explicitly, since the option is neither supported nor needed there.
+
+### Security
+
+- **RUSTSEC-2026-0258 resolved**: bumped the transitive `h2` dependency from
+  `0.4.12` to `0.4.16`. A peer could send an unbounded stream of empty HTTP/2 DATA
+  frames, consuming CPU without advancing the connection; availability-only impact
+  on the request-serving path. No API changes were required: `h2` is reached only
+  through `hyper`, and no proxy code needed to adapt.
+
 ## [2.4.3] - 2026-08-13
 
 ### Added
@@ -122,7 +272,7 @@ default `max_ram_cache_size`.
   S3; concurrent sub-page reads coalesce onto a single fetch; a failed
   widened fetch falls back to the client's original range so widening never
   turns a would-be-successful request into a failure. See
-  [`docs/CACHING.md` — Page-Aligned Range Caching](docs/CACHING.md#page-aligned-range-caching)
+  [`docs/CACHE_READ_PATHS.md` — Page-Aligned Range Caching](docs/CACHE_READ_PATHS.md#page-aligned-range-caching)
   and [`docs/examples/page-aligned-parquet-rules.json`](docs/examples/page-aligned-parquet-rules.json).
 - **New `page_cache.*` metrics**: `widened_requests`, `bytes_prefetched`
   (plus a derived amplification ratio), `page_hits`, `skipped_signed_range`,
@@ -798,7 +948,7 @@ Comprehensive security, correctness, and hardening release addressing 34 finding
 
 ### Fixed — concurrency correctness
 - **Write cache capacity accounting (Req 9)**: `src/write_cache_manager.rs` rewritten. New single atomic `try_reserve(size) -> Option<WriteReservation>` entry point replaces the racy `ensure_capacity` + `reserve_capacity` two-step. Uses `compare_exchange_weak` in a CAS loop; concurrent reservations can never together exceed the configured cap. Returns an RAII `WriteReservation` handle that releases capacity on `Drop` via saturating subtraction, so cancellation or panic mid-upload auto-releases. Rate-limited `warn!` (once per 60s via a global `AtomicU64`) on underflow detection. Removed `ensure_capacity`, `reserve_capacity`, `release_capacity` from the public API; all callers updated. `can_write_cache_accommodate()` retained as a deprecated legacy helper.
-- **IP health tracker recovery with exponential cooldown (Req 28)**: `IpHealthTracker` in `src/connection_pool.rs` now tracks unhealthy IPs with `unhealthy_at: Instant` + `cooldown: Duration`. Once cooldown elapses, an IP becomes a probe candidate; a successful probe clears the unhealthy state and failure count, while a failed probe doubles the cooldown (capped at `health_probe_max_cooldown`, default 300s). New config fields: `connection_pool.health_probe_initial_cooldown` (default 5s) and `health_probe_max_cooldown` (default 300s), both `#[serde(default)]`. Previously excluded IPs are now reintroduced automatically after they recover, instead of waiting for the next DNS refresh.
+- **IP health tracker recovery with exponential cooldown (Req 28)**: `IpHealthTracker` in `src/connection_pool.rs` now tracks unhealthy IPs with `unhealthy_at: Instant` + `cooldown: Duration`. Once cooldown elapses, an IP becomes a probe candidate; a successful probe clears the unhealthy state and failure count, while a failed probe doubles the cooldown (capped at `health_probe_max_cooldown`, default 300s). New config fields: `connection_pool.health_probe_initial_cooldown` (default 5s) and `health_probe_max_cooldown` (default 300s), both `#[serde(default)]`. (Correction: the probing described here was not reached in this release. Excluded IPs continued to be reintroduced by the next DNS refresh, and these two fields had no observable effect. Probe-based recovery became active in 2.5.0.)
 
 ### Fixed — operational correctness
 - **Background task shutdown integration (Req 10)**: `BackgroundRecoverySystem::start()` in `src/background_recovery.rs` now accepts a `broadcast::Receiver<()>` from the `ShutdownCoordinator` and uses `tokio::select!` to stop on shutdown. Background recovery no longer runs past `shutdown_timeout` and no longer gets force-killed mid-write. `ShutdownCoordinator::subscriber_count()` exposes the broadcast receiver count for test assertions.

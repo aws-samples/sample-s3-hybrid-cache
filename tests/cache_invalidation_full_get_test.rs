@@ -228,7 +228,8 @@ async fn test_put_then_full_get_uses_cache() {
     );
 
     assert_eq!(
-        merge_result.data, test_data,
+        merge_result.data.as_ref(),
+        test_data,
         "Merged data should be byte-identical to original PUT data"
     );
 
@@ -337,7 +338,7 @@ async fn test_put_then_full_get_large_object() {
         .unwrap();
 
     assert_eq!(merge_result.data.len(), data_size);
-    assert_eq!(merge_result.data, test_data);
+    assert_eq!(merge_result.data.as_ref(), test_data);
     assert_eq!(merge_result.bytes_from_s3, 0);
     assert_eq!(merge_result.cache_efficiency, 100.0);
 

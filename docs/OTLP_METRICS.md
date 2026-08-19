@@ -28,7 +28,7 @@ s3-proxy --otlp-endpoint http://localhost:4318 --otlp-export-interval 60
 
 Set `metrics.otlp.per_bucket_enabled: true` to emit four additional `ObservableCounter<u64>` instruments — `s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, `s3proxy.put_requests` — with a `bucket` attribute and an optional `prefix` attribute. These mirror S3's named CloudWatch request metrics for direct comparison.
 
-In-memory accounting is always active regardless of this flag; the flag only controls OTLP export. See [Metrics and Observability](METRICS.md) for the full per-bucket reference including `bytes_saved` (direct cache savings measurement) and cross-validation with S3 CloudWatch.
+In-memory accounting is always active regardless of this flag; the flag only controls OTLP export. See [Per-Bucket Traffic Metrics](METRICS.md) for the full per-bucket reference including `bytes_saved` (direct cache savings measurement, `/metrics` and dashboard only — not exported here) and cross-validation with S3 CloudWatch.
 
 ## Publishing Metrics to Observability Backends
 
@@ -81,7 +81,16 @@ service:
 
 ## Available Metrics
 
-All metrics are gauges with resource attributes `host.name`, `service.name`, and `service.version`. No per-metric dimensions.
+This is the OTLP-exported subset. For every field the `/metrics` endpoint returns,
+including the many that are not exported here, see
+[METRICS_REFERENCE.md](METRICS_REFERENCE.md).
+
+Every metric carries the resource attributes `host.name`, `service.name`, and `service.version`.
+
+Most metrics are **gauges with no per-metric dimensions**. Two groups are exceptions:
+
+- The four per-bucket counters (`s3proxy.bytes_downloaded`, `s3proxy.bytes_uploaded`, `s3proxy.get_requests`, `s3proxy.put_requests`) are cumulative `ObservableCounter`s carrying a `bucket` attribute and an optional `prefix` attribute. Cardinality is capped by `metrics.per_bucket.max_series`, with overflow folded into a synthetic `__other__` bucket.
+- `download_bandwidth.class_bytes` is a gauge carrying a `class` attribute. Classes over the tracking cap are reported under `class="residual"`.
 
 ### Cache — Sizes
 
@@ -178,7 +187,7 @@ All metrics are gauges with resource attributes `host.name`, `service.name`, and
 | `request_metrics.successful_requests` | Gauge | Successful requests |
 | `request_metrics.failed_requests` | Gauge | Failed requests |
 | `request_metrics.average_response_time_ms` | Gauge (ms) | Cumulative average response time |
-| `request_metrics.active_requests` | Gauge | Requests currently in flight |
+| `request_metrics.active_requests` | Gauge | Active **TCP connections**, not requests in flight — with HTTP/1 keep-alive one connection serves many sequential requests. See [METRICS.md](METRICS.md#request-completion-metrics) |
 
 ### Process
 
@@ -193,7 +202,7 @@ All metrics are gauges with resource attributes `host.name`, `service.name`, and
 |--------|------|-------------|
 | `download_bandwidth.instance_ceiling_bps` | Gauge (bytes/s) | This instance's share of the configured origin download ceiling |
 | `download_bandwidth.failopen_total` | Gauge (count) | Times the scheduler failed open, admitting traffic without shaping |
-| `download_bandwidth.class_bytes` | Gauge (bytes) | Bytes attributed to the scheduling class |
+| `download_bandwidth.class_bytes` | Gauge (bytes), `class` attribute | Bytes attributed to the scheduling class. Classes beyond `max_tracked_classes` are folded into `class="residual"` |
 
 See [Bandwidth QoS](BANDWIDTH_QOS.md) for what these mean and how the ceiling is
 shared across a fleet.
@@ -203,7 +212,7 @@ shared across a fleet.
 The `page_cache.*` metrics for page-aligned range caching are **not** OTLP-exported.
 They are available from the `/metrics` JSON endpoint and in the dashboard's
 `/api/cache-stats` payload. If you need them in a metrics backend, scrape `/metrics`.
-See [CACHING.md — Page-Aligned Range Caching](CACHING.md#page-aligned-range-caching).
+See [CACHING.md — Page-Aligned Range Caching](CACHE_READ_PATHS.md#page-aligned-range-caching).
 
 ## Configuration Options
 

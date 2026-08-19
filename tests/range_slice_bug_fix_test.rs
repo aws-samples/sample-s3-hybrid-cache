@@ -617,7 +617,8 @@ async fn test_range_slice_multiple_cached_ranges() {
     expected_data.extend_from_slice(&range3_data[0..1000]); // First 1000 bytes from range3 (which is bytes 2000-2999 of the object)
 
     assert_eq!(
-        merge_result.data, expected_data,
+        merge_result.data.as_ref(),
+        &expected_data,
         "Merged data should match expected sliced and concatenated data"
     );
 

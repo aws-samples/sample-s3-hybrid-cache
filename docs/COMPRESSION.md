@@ -172,17 +172,14 @@ compression:
   preferred_algorithm: "lz4"  # only "lz4" is implemented; parsed but otherwise inert
 ```
 
-Per-key overrides live in `cache_rules.json` (see `docs/CONFIGURATION.md`),
-via the `compression_enabled` field on a matching glob rule. There is no
-separate extension-list configuration field — the built-in denylist above
-is the default, and `cache_rules.json` rules are the override mechanism.
+Field types, defaults, and the removed `content_aware` alias are documented in
+[CONFIGURATION.md — Compression Configuration](CONFIGURATION.md#compression-configuration).
 
-**Note**: `compression.content_aware` (a boolean that used to exist in this
-section) has been removed. It never had any effect in any version of the
-proxy — content-aware filtering (the denylist described above) was always
-applied unconditionally regardless of this field's value. It is still
-accepted in YAML via a deprecation alias so existing config files keep
-parsing, but is ignored; a startup warning is logged if present.
+There is no extension-list configuration field. The built-in denylist above is the
+default, and per-key overrides go through the `compression_enabled` field on a
+`cache_rules.json` glob rule (see
+[CONFIGURATION.md — Cache Rules](CONFIGURATION.md#cache-rules)), which overrides the
+denylist in either direction.
 
 ## Benefits
 

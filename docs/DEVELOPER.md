@@ -17,26 +17,14 @@ Implementation details, architectural decisions, and technical notes for Hybrid 
 
 ## Architecture Overview
 
-### Core Principles
+[ARCHITECTURE.md](ARCHITECTURE.md) is the maintained reference for the core principles
+(transparent forwarder, streaming architecture, unified range storage), the module
+inventory, and the system diagram. This guide does not repeat them — an earlier revision
+did, and the two copies drifted in opposite directions, each carrying an error the other
+had right.
 
-**Transparent Forwarder**
-- Proxy only responds to client requests
-- Cannot initiate requests to S3 (no AWS credentials)
-- Cannot sign requests (relies on client-signed requests)
-- Acts as intelligent cache between client and S3
-
-**Streaming Architecture**
-- Large responses (> 1MB) stream directly to client
-- Simultaneous caching in background
-- Eliminates buffering and memory pressure
-- Constant memory usage regardless of file size
-
-**Unified Range Storage**
-- All cached data stored as ranges
-- PUT operations: Stored as range 0-N
-- GET operations: Full objects or partial ranges
-- Multipart uploads: Parts assembled into ranges
-- No data copying on TTL transitions
+What this guide adds is the *why*: the trade-offs behind each design decision, the
+implementation detail a maintainer needs, and the known limitations.
 
 ### Module Organization
 
@@ -63,7 +51,7 @@ changing any of them.
 **Problem**: Large files (500MB+) caused AWS SDK throughput timeouts when buffering entire response.
 
 **Solution**: TeeStream architecture
-- Responses > 1MB stream directly to client
+- All S3 responses stream directly to client, regardless of size
 - Data simultaneously sent to background task for caching
 - No buffering of entire response in memory
 
@@ -494,7 +482,7 @@ where
 - **Reliability**: Stale file handle recovery for NFS
 
 **Trade-offs**:
-- Additional memory for metadata cache (~15-25MB for 10,000 entries)
+- Additional memory for metadata cache (~15-25MB for 10,000 entries; ~150-250MB at the default `max_entries` of 100,000)
 - Refresh interval adds slight staleness (default 5s)
 - Per-key locks add coordination overhead
 
@@ -1362,6 +1350,64 @@ ahead of live data.
 **Future**: Parallel eviction scanning with rayon
 
 ## Testing Strategy
+
+### Running the suite
+
+```bash
+cargo test --release                          # everything; always use --release
+cargo test --release --lib                    # in-crate unit tests only (what CI runs)
+cargo test --release --test integration_test  # one integration binary
+cargo test --release -- --nocapture           # with test stdout
+```
+
+`--release` is not optional in practice: debug builds of this crate are slow and
+memory-hungry enough that the full suite becomes impractical.
+
+Two constraints worth knowing before you rely on a green run:
+
+- **CI does not run the integration suite.** The runner cannot link 130+ `--release`
+  test binaries within its memory budget, so the pipeline runs `cargo test --release --lib`
+  only. Integration and property tests are gated locally and by the fleet verification
+  suite. A green pipeline does not mean they passed.
+- **Never run two `cargo` invocations against the same `target/` concurrently.** Parallel
+  `--release` links sum their peak memory and OOM the linker, which presents as a hang
+  during linking rather than as an error.
+
+### Test Scenarios
+
+The integration suite covers:
+
+| Area | Scenarios |
+|---|---|
+| Basic operations | GET (small/medium/large), HEAD metadata, PUT through the proxy |
+| Conditional requests | `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, each with matching and non-matching validators |
+| Range requests | Single ranges, mid-file ranges, byte-exactness of returned content |
+| Cache behaviour | Repeat requests for hit/miss timing, invalidation on object change |
+| AWS CLI integration | Standard CLI operations end to end |
+| Error handling | 404s, invalid conditional headers, network-error resilience |
+
+### Asserting on conditional requests
+
+Which side answers a conditional request depends on `evaluate_conditions_from_cache`,
+which has defaulted to `true` since 2.2.0. **A test must assert against the mode it
+configures**, not against a single fixed expectation:
+
+- **Local evaluation (default `true`)**: an `If-Match` request is answered from cached
+  metadata when the cached ETag matches and the data is fully cached. No S3 round trip,
+  so no S3-side credential revalidation for those requests.
+- **Forward to S3** (`evaluate_conditions_from_cache: false`, or any request the local
+  path declines): S3 decides the condition.
+
+When the request does reach S3, the cache action follows S3's response:
+
+| S3 response | Cache action |
+|---|---|
+| `200 OK` | Invalidate old cache, cache new data |
+| `304 Not Modified` | Refresh TTL, keep cache |
+| `412 Precondition Failed` | No cache change |
+
+See [CACHE_FRESHNESS.md](CACHE_FRESHNESS.md#conditional-headers-handling) for the full
+dispatch matrix.
 
 ### Unit Tests
 

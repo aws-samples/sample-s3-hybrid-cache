@@ -40,6 +40,19 @@ pub struct S3Client {
     /// and shared (via `Arc`) with the `CustomHttpsConnector`. Held here so the
     /// IP-distribution rewrite can be skipped for matched targets (task 4.2).
     upstream_overrides: Arc<UpstreamOverrides>,
+    /// In-flight buffered-byte ledger, consulted before buffering a response
+    /// body when `allow_streaming == false` (Requirement: IMA 4.5). Defaults
+    /// to a disabled ledger when constructed via `S3Client::new` without an
+    /// explicit ledger (see `with_inflight_ledger`), matching pre-feature
+    /// behaviour.
+    inflight_ledger: Arc<crate::inflight_ledger::InflightLedger>,
+    /// Connector clone used only by `probe_unhealthy_ips` to dial an excluded IP
+    /// directly. The connector handed to hyper is moved into the `Client`, and
+    /// probing needs the same root store, override matcher, and pool manager to
+    /// reproduce the live egress transport, so a clone is retained here.
+    probe_connector: CustomHttpsConnector,
+    /// Timeout applied to a single recovery probe (connect + TLS handshake).
+    probe_timeout: Duration,
 }
 
 /// S3 request context for forwarding
@@ -181,6 +194,14 @@ pub trait S3ClientApi: Send + Sync {
         ))
     }
 
+    /// The in-flight buffered-byte ledger consulted before buffering a
+    /// response body when `allow_streaming == false` (Requirement IMA 4.5).
+    /// Defaults to a disabled ledger, which is the correct behaviour for test
+    /// stubs that don't configure a ceiling.
+    fn get_inflight_ledger(&self) -> Arc<crate::inflight_ledger::InflightLedger> {
+        Arc::new(crate::inflight_ledger::InflightLedger::disabled())
+    }
+
     /// True when the client was built with endpoint overrides (PrivateLink
     /// destinations). Consumers use this to decide whether to lock outbound
     /// TLS to 1.2.
@@ -197,9 +218,18 @@ pub trait S3ClientApi: Send + Sync {
     /// distribution and perform an immediate resolve.
     async fn register_endpoint(&self, endpoint: &str);
 
-    /// Refresh DNS for all registered endpoints and reset per-IP failure
-    /// tracking so restored IPs aren't immediately re-excluded.
+    /// Refresh DNS for all registered endpoints, preserving per-IP health
+    /// exclusions so a refresh cannot short-circuit a recovery cooldown.
     async fn refresh_dns(&self) -> Result<()>;
+
+    /// Probe excluded IPs whose cooldown has elapsed and re-admit those that
+    /// respond, returning how many were re-admitted.
+    ///
+    /// Defaults to a no-op returning 0, which is correct for test stubs that have
+    /// no connection pool or health tracker of their own.
+    async fn probe_unhealthy_ips(&self) -> usize {
+        0
+    }
 }
 
 #[async_trait]
@@ -237,6 +267,10 @@ impl S3ClientApi for S3Client {
         Arc::clone(&self.upstream_overrides)
     }
 
+    fn get_inflight_ledger(&self) -> Arc<crate::inflight_ledger::InflightLedger> {
+        Arc::clone(&self.inflight_ledger)
+    }
+
     fn has_endpoint_overrides(&self) -> bool {
         S3Client::has_endpoint_overrides(self)
     }
@@ -254,6 +288,10 @@ impl S3ClientApi for S3Client {
 
     async fn refresh_dns(&self) -> Result<()> {
         S3Client::refresh_dns(self).await
+    }
+
+    async fn probe_unhealthy_ips(&self) -> usize {
+        S3Client::probe_unhealthy_ips(self).await
     }
 }
 
@@ -307,6 +345,11 @@ impl S3Client {
         // Set the shared metrics manager reference on connector
         https_connector.set_metrics_manager_ref(Arc::clone(&metrics_ref));
 
+        // Retain a probe-only clone before the connector is moved into the hyper
+        // Client below. Probing reuses the connector's root store, override
+        // matcher and pool manager so a probe dials exactly like live egress.
+        let probe_connector = https_connector.clone();
+
         // Build Hyper client with connection pooling
         let pool_max_idle = if config.ip_distribution_enabled {
             config.max_idle_per_ip
@@ -345,7 +388,22 @@ impl S3Client {
             health_tracker,
             has_endpoint_overrides: !config.endpoint_overrides.is_empty(),
             upstream_overrides,
+            inflight_ledger: Arc::new(crate::inflight_ledger::InflightLedger::disabled()),
+            probe_connector,
+            probe_timeout: config.connection_timeout,
         })
+    }
+
+    /// Attach an in-flight buffered-byte ledger, replacing the disabled
+    /// default `S3Client::new` constructs. Builder-style so callers can chain
+    /// it before wrapping the client in `Arc<dyn S3ClientApi>`.
+    /// Requirement: IMA 4.5
+    pub fn with_inflight_ledger(
+        mut self,
+        ledger: Arc<crate::inflight_ledger::InflightLedger>,
+    ) -> Self {
+        self.inflight_ledger = ledger;
+        self
     }
 
     /// Set metrics manager for tracking connection metrics
@@ -608,6 +666,24 @@ impl S3Client {
         let response_body = if should_stream {
             Some(S3ResponseBody::Streaming(body))
         } else {
+            // Buffering_Site (allow_streaming == false): reserve against the
+            // in-flight ledger before collecting. A declared content_length is
+            // used as the reservation size; a body with no declared length (or
+            // a lying one) is still bounded because `collect()` cannot exceed
+            // the actual bytes on the wire, but we reserve what we know up
+            // front so the Admission_Check happens before allocation.
+            // Requirements: IMA 1.2, 1.3, 2.1, 2.5, 4.5
+            let reserve_bytes = content_length.unwrap_or(0);
+            let _reservation = match self.inflight_ledger.try_reserve(reserve_bytes) {
+                Some(r) => r,
+                None => {
+                    return Err(ProxyError::InflightCeilingExceeded {
+                        ceiling_bytes: self.inflight_ledger.ceiling_bytes(),
+                        requested_bytes: reserve_bytes,
+                    });
+                }
+            };
+
             let body_bytes = body
                 .collect()
                 .await
@@ -954,16 +1030,80 @@ impl S3Client {
         pool_manager.register_endpoint(endpoint).await;
     }
 
-    /// Refresh DNS for all registered endpoints and clear health tracker failure counts.
+    /// Refresh DNS for all registered endpoints, preserving health exclusions.
     ///
-    /// Clearing the tracker on each refresh gives previously-excluded IPs a clean slate
-    /// when they are restored by the DNS refresh.
+    /// The health tracker is passed through so IPs still under a health exclusion
+    /// are held out of the rebuilt distributor. This previously reset the whole
+    /// tracker on each refresh, wiping every failure count and cooldown (default
+    /// every 10s), so an unreachable IP was re-admitted every cycle and the
+    /// exponential backoff never accumulated. Recovery is now the recovery probe's
+    /// job — see [`probe_unhealthy_ips`](Self::probe_unhealthy_ips).
     pub async fn refresh_dns(&self) -> Result<()> {
         let mut pool_manager = self.pool_manager.write().await;
-        pool_manager.refresh_dns().await?;
-        // Clear failure counts so restored IPs aren't immediately re-excluded
-        self.health_tracker.clear();
+        pool_manager.refresh_dns(Some(&self.health_tracker)).await?;
         Ok(())
+    }
+
+    /// Probe every excluded IP whose cooldown has elapsed and re-admit the ones
+    /// that respond.
+    ///
+    /// For each candidate: resolve its owning endpoint, connect and complete a TLS
+    /// handshake, then on success clear the unhealthy state and add the IP straight
+    /// back into that endpoint's distributor. On failure the cooldown doubles (to a
+    /// `health_probe_max_cooldown` ceiling), so a persistently dead IP is retried
+    /// ever less often instead of every refresh interval.
+    ///
+    /// A candidate whose endpoint can no longer be resolved has left DNS entirely;
+    /// its tracked state is dropped rather than probed.
+    ///
+    /// Returns the number of IPs re-admitted, for logging by the caller.
+    pub async fn probe_unhealthy_ips(&self) -> usize {
+        let candidates = self.health_tracker.get_probe_candidates();
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Resolve endpoints under a read lock, then release it for the probes —
+        // a probe performs network I/O and must not hold the pool manager lock.
+        let resolved: Vec<(IpAddr, Option<String>)> = {
+            let pm = self.pool_manager.read().await;
+            candidates
+                .into_iter()
+                .map(|ip| (ip, pm.get_endpoint_for_ip(&ip)))
+                .collect()
+        };
+
+        let mut readmitted = 0usize;
+        for (ip, endpoint) in resolved {
+            let Some(endpoint) = endpoint else {
+                debug!(ip = %ip, "Recovery probe skipped: IP no longer present in DNS, dropping health state");
+                self.health_tracker.forget(&ip);
+                continue;
+            };
+
+            match self
+                .probe_connector
+                .probe_ip(ip, &endpoint, self.probe_timeout)
+                .await
+            {
+                Ok(()) => {
+                    self.health_tracker.record_probe_success(&ip);
+                    let mut pm = self.pool_manager.write().await;
+                    if let Some(dist) = pm.get_distributor_mut(&endpoint) {
+                        if dist.add_ip(ip, "recovery probe succeeded") {
+                            readmitted += 1;
+                            info!(ip = %ip, endpoint = %endpoint, "Recovery probe succeeded, IP re-admitted to distributor");
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.health_tracker.record_probe_failure(&ip);
+                    warn!(ip = %ip, endpoint = %endpoint, error = %e, "Recovery probe failed, cooldown extended");
+                }
+            }
+        }
+
+        readmitted
     }
 
     /// Extract metadata from S3 response headers

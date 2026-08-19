@@ -1,0 +1,31 @@
+# Development configuration — local cache, verbose logging, loopback dashboard.
+#
+# Ports avoid the defaults used by the health (8080), dashboard (8081),
+# metrics (9090), and TLS proxy (3129) listeners, so nothing collides.
+#
+# Verified to load with: s3-proxy --config docs/examples/config-development.yaml
+
+server:
+  http_port: 8000
+  https_port: 8443
+
+cache:
+  cache_dir: "./tmp/cache"
+  max_cache_size: 1073741824        # 1 GiB
+  ram_cache_enabled: true
+  # 128 MiB with the default ram_cache_shard_count: 8 clamps to 2 effective
+  # shards to honour the 64 MiB admission ceiling, and logs a warning at
+  # startup. That is expected here; raise to 512 MiB to get all 8 shards.
+  max_ram_cache_size: 134217728     # 128 MiB
+
+logging:
+  access_log_dir: "./tmp/logs/access"
+  app_log_dir: "./tmp/logs/app"
+  log_level: "debug"
+
+dashboard:
+  enabled: true
+  port: 8081
+  bind_address: "127.0.0.1"
+  cache_stats_refresh_interval: "2s"
+  logs_refresh_interval: "5s"

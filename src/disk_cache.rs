@@ -14777,6 +14777,7 @@ mod tests {
             head_expires_at: None,
             head_last_accessed: None,
             head_access_count: 0,
+            head_cached_at: None,
         };
 
         // Write the metadata file so delete_cache_entry can read it

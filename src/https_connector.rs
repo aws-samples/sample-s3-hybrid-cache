@@ -252,6 +252,76 @@ impl CustomHttpsConnector {
     ) {
         self.metrics_manager = metrics_manager;
     }
+
+    /// Probe a single excluded IP for reachability, then close the connection.
+    ///
+    /// Performs the same TCP connect **and** TLS handshake the live egress path
+    /// performs, honouring the resolved `upstream_overrides` transport mode and
+    /// port, and using `endpoint` for SNI. Covering the handshake matters because
+    /// `record_failure` fires on TLS-handshake failure as well as TCP-connect
+    /// failure, so a TCP-only probe would re-admit a host that accepts TCP and
+    /// then fails to negotiate TLS, causing it to flap straight back out.
+    ///
+    /// Deliberately does **not** apply keepalive or `SO_RCVBUF` socket options,
+    /// record connection metrics, or feed `record_failure`: the socket is dropped
+    /// immediately and the caller owns the probe-result bookkeeping, so a probe
+    /// must not perturb the live pool's counters or advance the failure count that
+    /// excluded the IP in the first place.
+    pub(crate) async fn probe_ip(
+        &self,
+        ip: IpAddr,
+        endpoint: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        // Resolve the transport exactly as the egress path does. The caching
+        // egress is HTTP-origin, so a portless endpoint defaults to 80, not 443.
+        let target_port = 80;
+        let transport_mode = self.upstream_overrides.resolve(endpoint, target_port);
+        let port = connect_port(transport_mode, target_port);
+
+        tokio::time::timeout(timeout, async {
+            let tcp = TcpStream::connect((ip, port)).await.map_err(|e| {
+                ProxyError::ConnectionError(format!(
+                    "Probe TCP connect failed to {}:{}: {}",
+                    ip, port, e
+                ))
+            })?;
+
+            let tls_config = match transport_mode {
+                // Plaintext upstreams have no handshake to verify; a completed
+                // TCP connect is the whole reachability signal available.
+                Some(TransportMode::Plaintext) => return Ok(()),
+                Some(TransportMode::TlsUnvalidated) => build_tls_accept_any_config(),
+                Some(TransportMode::TlsValidated) | None => {
+                    let pm = self.pool_manager.read().await;
+                    build_tls_config_for_host(endpoint, self.root_store.clone(), &pm)
+                }
+            };
+
+            let server_name = ServerName::try_from(endpoint.to_string()).map_err(|e| {
+                ProxyError::TlsError(format!("Probe invalid server name '{}': {}", endpoint, e))
+            })?;
+
+            TlsConnector::from(Arc::new(tls_config))
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| {
+                    ProxyError::TlsError(format!(
+                        "Probe TLS handshake failed to {} ({}): {}",
+                        endpoint, ip, e
+                    ))
+                })?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            ProxyError::TimeoutError(format!(
+                "Probe timed out after {:?} connecting to {}:{}",
+                timeout, ip, port
+            ))
+        })?
+    }
 }
 
 /// Select the TCP connect port for the caching egress.
@@ -541,7 +611,83 @@ impl Clone for CustomHttpsConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ConnectionPoolConfig;
+    use crate::config::{ConnectionPoolConfig, UpstreamOverrideConfig, UpstreamScheme};
+
+    /// Build a connector whose overrides map `host:port` to the given transport.
+    fn probe_connector_with_override(
+        entries: Vec<(&str, UpstreamOverrideConfig)>,
+    ) -> CustomHttpsConnector {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = ConnectionPoolConfig::default();
+        let pool_manager = Arc::new(tokio::sync::RwLock::new(
+            ConnectionPoolManager::new_with_config(config.clone()).unwrap(),
+        ));
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let overrides: std::collections::HashMap<String, UpstreamOverrideConfig> = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        CustomHttpsConnector::new(
+            pool_manager,
+            root_store,
+            config,
+            Arc::new(IpHealthTracker::new(3)),
+            Arc::new(UpstreamOverrides::from_config(&overrides)),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_probe_ip_targets_443_with_no_override() {
+        // Secure_Default_Behaviour: an unmatched endpoint is probed on 443, the
+        // same port live egress uses, so the probe tests the real path.
+        let connector = probe_connector_with_override(vec![]);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let err = connector
+            .probe_ip(ip, "probe-test.invalid", Duration::from_secs(3))
+            .await
+            .expect_err("nothing is listening on loopback:443 in CI");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("127.0.0.1:443"),
+            "probe should target the default 443, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_ip_plaintext_override_targets_override_port_and_skips_tls() {
+        // Mirrors a plaintext upstream override on an `s3.<region>:80` key: the
+        // probe must follow the override to port 80 and must not attempt a
+        // handshake, since a plaintext upstream has none to verify.
+        let connector = probe_connector_with_override(vec![(
+            "probe-plain.invalid:80",
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: true,
+            },
+        )]);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let err = connector
+            .probe_ip(ip, "probe-plain.invalid", Duration::from_secs(3))
+            .await
+            .expect_err("nothing is listening on loopback:80 in CI");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("127.0.0.1:80"),
+            "plaintext override should target port 80, got: {msg}"
+        );
+        assert!(
+            matches!(err, ProxyError::ConnectionError(_)),
+            "a plaintext probe must fail at connect, never at TLS: {err:?}"
+        );
+    }
+
+    // NOTE: the plaintext success arm (TCP connect Ok -> probe Ok, no handshake)
+    // is not unit-tested. `probe_ip` derives its target port from override
+    // resolution at port 80, matching live egress, so reaching it would require
+    // binding privileged port 80 or 443. Distorting the production port logic to
+    // make it reachable would test the distortion, not the behaviour, so this arm
+    // is left to end-to-end coverage against a real plaintext upstream.
 
     #[tokio::test]
     async fn test_connector_creation() {

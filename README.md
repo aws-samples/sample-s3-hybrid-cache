@@ -79,18 +79,27 @@ The same proxy accelerates access to a cross-region Amazon S3 bucket or an S3-co
 - **[Architecture](docs/ARCHITECTURE.md)** - Technical architecture and design principles
 - **[AWS Deployment](docs/AWS_DEPLOYMENT.md)** - Deploying on EC2 with FSx/EFS for cross-region or external origins
 - **[Security Considerations](docs/ARCHITECTURE.md#security-considerations)** - Network security and shared cache access model
-- **[Testing](docs/TESTING.md)** - Test suite and validation procedures
-- **[Developer Guide](docs/DEVELOPER.md)** - Implementation details and development notes
+- **[Developer Guide](docs/DEVELOPER.md)** - Design decisions, implementation notes, build and test workflow
+
+### The Cache
+- **[Caching](docs/CACHING.md)** - What gets cached, what bypasses, and per-key rules. Start here
+- **[Cache Internals](docs/CACHE_INTERNALS.md)** - On-disk and in-memory layout, sharding, cache keys, access tracking
+- **[Cache Freshness](docs/CACHE_FRESHNESS.md)** - TTL, revalidation, conditional requests
+- **[Cache Read Paths](docs/CACHE_READ_PATHS.md)** - Range merging, page widening, write-through, multipart, coherency
+- **[Eviction](docs/EVICTION.md)** - Reclaiming space
+- **[Shared Storage](docs/SHARED_STORAGE.md)** - Running several proxies against one cache volume
 
 ### Feature Documentation
-- **[Caching](docs/CACHING.md)** - Cache behavior and TTL management
 - **[Compression](docs/COMPRESSION.md)** - LZ4 compression and content detection
 - **[Connection Pooling](docs/CONNECTION_POOLING.md)** - Connection management and load balancing
+- **[Hedged Requests](docs/HEDGING.md)** - Racing a duplicate upstream fetch to cut tail latency
+- **[Bandwidth QoS](docs/BANDWIDTH_QOS.md)** - Origin download ceiling and fair sharing
 - **[Dashboard](docs/DASHBOARD.md)** - Web-based monitoring interface
 - **[Error Handling](docs/ERROR_HANDLING.md)** - Error handling patterns
+- **[Metrics Reference](docs/METRICS_REFERENCE.md)** - Every field in the `/metrics` payload
 - **[Metrics](docs/METRICS.md)** - Per-bucket traffic metrics and cache savings inference
 - **[OTLP Metrics](docs/OTLP_METRICS.md)** - OpenTelemetry metrics export
-- **[Bandwidth QoS](docs/BANDWIDTH_QOS.md)** - Download bandwidth fairness and rate limiting
+- **[Access Log Format](docs/ACCESS_LOG_FORMAT.md)** - The 25-field S3-style record
 
 ## Quick Start
 
@@ -203,7 +212,7 @@ Endpoints:
 
 **Traffic in transit**: SigV4 authenticates every request but provides no confidentiality, so any hop carrying plain HTTP across a network exposes the object key, the caller's access key ID, and the object payload to anything that can observe it — and a captured request can be replayed against S3. The affected hops are the HTTP listener (`:80`) and forward proxy (`:3128`) when reached across a network, a load balancer that terminates TLS and forwards cleartext to the proxy, and a `scheme: http` [upstream override](docs/CONFIGURATION.md#upstream-transport-overrides). Each has an encrypted alternative that keeps full caching. See [What a Cleartext Hop Exposes](docs/ARCHITECTURE.md#what-a-cleartext-hop-exposes) for what is captured, what is not, and the replay windows.
 
-**Network access**: With [TTL](docs/CACHING.md#time-to-live-ttl-configuration) > 0, cache hits bypass S3 entirely — any client that can reach the proxy over the network can read any cached object without IAM authorization checks. Restrict proxy access using security groups, firewalls, or network segmentation. The proxy listens on ports 80 (HTTP with caching), 443 (HTTPS passthrough), 3128 (HTTP forward proxy, proxy_only mode), 3129 (TLS proxy), 8080 (health), 8081 (dashboard), and 9090 (metrics). The admin endpoints (8080, 8081, 9090) are unauthenticated and bind to `127.0.0.1` by default; they require the same network restriction as the data endpoints if exposed beyond localhost. When an operator overrides the dashboard bind address to `0.0.0.0`, the operator is responsible for restricting access via firewall, security group, or reverse proxy.
+**Network access**: With [TTL](docs/CACHE_FRESHNESS.md#time-to-live-ttl-configuration) > 0, cache hits bypass S3 entirely — any client that can reach the proxy over the network can read any cached object without IAM authorization checks. Restrict proxy access using security groups, firewalls, or network segmentation. The proxy listens on ports 80 (HTTP with caching), 443 (HTTPS passthrough), 3128 (HTTP forward proxy, proxy_only mode), 3129 (TLS proxy), 8080 (health), 8081 (dashboard), and 9090 (metrics). The admin endpoints (8080, 8081, 9090) are unauthenticated and bind to `127.0.0.1` by default; they require the same network restriction as the data endpoints if exposed beyond localhost. When an operator overrides the dashboard bind address to `0.0.0.0`, the operator is responsible for restricting access via firewall, security group, or reverse proxy.
 
 **Outbound destination restrictions**: The proxy restricts CONNECT tunnels (TLS proxy listener) and SNI passthrough (HTTPS listener) to port 443 only. Destinations resolving to link-local (`169.254.0.0/16`), loopback (`127.0.0.0/8`), or private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) IP ranges are rejected. IPv6 equivalents (`::1`, `fe80::/10`, `fc00::/7`) are also rejected. This prevents clients from using the proxy as a relay to IMDS, internal services, or arbitrary network destinations. IPs listed in `endpoint_overrides` are exempt from the IP-range restriction, allowing PrivateLink ENIs, on-premises object stores, and other explicitly configured endpoints to function normally. An optional `server.tls.connect_allowlist` can further restrict allowed hostnames via glob patterns (e.g., `*.amazonaws.com`); when configured, only hostnames matching a pattern are permitted.
 

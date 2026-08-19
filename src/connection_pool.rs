@@ -171,6 +171,25 @@ impl IpDistributor {
         }
     }
 
+    /// Re-admit a single IP into the selection set.
+    ///
+    /// Returns `true` if the IP was added, `false` if it was already present
+    /// (making the call idempotent, so a repeated recovery probe cannot produce
+    /// a duplicate entry that would skew round-robin weighting toward that IP).
+    ///
+    /// Used by the recovery-probe path to restore an IP that was excluded by
+    /// [`remove_ip`](Self::remove_ip) once a probe confirms it is reachable
+    /// again, without waiting for the next DNS refresh.
+    pub fn add_ip(&mut self, ip: IpAddr, reason: &str) -> bool {
+        if self.ips.contains(&ip) {
+            return false;
+        }
+        self.ips.push(ip);
+        info!(ip = %ip, reason = %reason, "IP added to distributor");
+        self.counter.store(0, Ordering::Relaxed);
+        true
+    }
+
     /// Return the number of IPs currently in the selection set.
     pub fn ip_count(&self) -> usize {
         self.ips.len()
@@ -274,13 +293,24 @@ impl IpHealthTracker {
     /// When the threshold is reached, the IP is also recorded as unhealthy
     /// with the initial cooldown for recovery probing.
     pub fn record_failure(&self, ip: &IpAddr) -> bool {
+        self.record_failure_at(ip, Instant::now())
+    }
+
+    /// [`record_failure`](Self::record_failure) with an explicit clock reading.
+    ///
+    /// The public wrapper passes `Instant::now()`. Tests pass a synthetic `now`
+    /// so cooldown behaviour is asserted deterministically instead of by sleeping
+    /// (a `thread::sleep`-based assertion with a millisecond budget flakes on a
+    /// loaded CI runner, where a single scheduler preemption between two adjacent
+    /// statements can exceed the budget).
+    pub(crate) fn record_failure_at(&self, ip: &IpAddr, now: Instant) -> bool {
         let mut count = self.failures.entry(*ip).or_insert(0);
         *count += 1;
         let threshold_reached = *count >= self.threshold;
         if threshold_reached {
             // Mark as unhealthy with initial cooldown if not already tracked
             self.unhealthy.entry(*ip).or_insert(IpHealthEntry {
-                unhealthy_at: Instant::now(),
+                unhealthy_at: now,
                 cooldown: self.initial_cooldown,
             });
         }
@@ -290,6 +320,11 @@ impl IpHealthTracker {
     /// Record a failed probe attempt on an unhealthy IP.
     /// Doubles the cooldown (capped at max_cooldown) and resets the unhealthy_at timestamp.
     pub fn record_probe_failure(&self, ip: &IpAddr) {
+        self.record_probe_failure_at(ip, Instant::now())
+    }
+
+    /// [`record_probe_failure`](Self::record_probe_failure) with an explicit clock reading.
+    pub(crate) fn record_probe_failure_at(&self, ip: &IpAddr, now: Instant) {
         if let Some(mut entry) = self.unhealthy.get_mut(ip) {
             let new_cooldown = entry.cooldown.saturating_mul(2);
             entry.cooldown = if new_cooldown > self.max_cooldown {
@@ -297,7 +332,7 @@ impl IpHealthTracker {
             } else {
                 new_cooldown
             };
-            entry.unhealthy_at = Instant::now();
+            entry.unhealthy_at = now;
         }
     }
 
@@ -311,7 +346,11 @@ impl IpHealthTracker {
     /// Returns IPs whose cooldown has elapsed and are eligible for probing.
     /// These IPs are still considered unhealthy until a probe succeeds.
     pub fn get_probe_candidates(&self) -> Vec<IpAddr> {
-        let now = Instant::now();
+        self.get_probe_candidates_at(Instant::now())
+    }
+
+    /// [`get_probe_candidates`](Self::get_probe_candidates) with an explicit clock reading.
+    pub(crate) fn get_probe_candidates_at(&self, now: Instant) -> Vec<IpAddr> {
         self.unhealthy
             .iter()
             .filter_map(|entry| {
@@ -327,8 +366,13 @@ impl IpHealthTracker {
 
     /// Check if a specific IP is a probe candidate (cooldown elapsed).
     pub fn is_probe_candidate(&self, ip: &IpAddr) -> bool {
+        self.is_probe_candidate_at(ip, Instant::now())
+    }
+
+    /// [`is_probe_candidate`](Self::is_probe_candidate) with an explicit clock reading.
+    pub(crate) fn is_probe_candidate_at(&self, ip: &IpAddr, now: Instant) -> bool {
         if let Some(entry) = self.unhealthy.get(ip) {
-            let elapsed = Instant::now().duration_since(entry.unhealthy_at);
+            let elapsed = now.duration_since(entry.unhealthy_at);
             elapsed >= entry.cooldown
         } else {
             false
@@ -340,11 +384,31 @@ impl IpHealthTracker {
         self.unhealthy.contains_key(ip)
     }
 
-    /// Clear all failure counts and unhealthy state (e.g., on DNS refresh when IPs are restored).
-    pub fn clear(&self) {
-        self.failures.clear();
-        self.unhealthy.clear();
+    /// Drop all tracked state for a single IP.
+    ///
+    /// Used when an IP has left DNS entirely: there is nothing left to re-admit,
+    /// so retaining its failure count and cooldown would leak map entries and
+    /// could mis-attribute a future reappearance of the same address.
+    pub fn forget(&self, ip: &IpAddr) {
+        self.failures.remove(ip);
+        self.unhealthy.remove(ip);
     }
+
+    /// Snapshot of every IP currently marked unhealthy.
+    ///
+    /// Unlike [`get_probe_candidates`](Self::get_probe_candidates) this ignores
+    /// cooldown state, so callers can reconcile the tracked set against DNS.
+    pub fn tracked_unhealthy_ips(&self) -> Vec<IpAddr> {
+        self.unhealthy.iter().map(|e| *e.key()).collect()
+    }
+
+    // NOTE: a blanket `clear()` used to exist and was called on every DNS refresh,
+    // which wiped every failure count and cooldown each `pool_check_interval`
+    // (default 10s) — so the backoff in `record_probe_failure` could never
+    // accumulate and an unreachable IP was re-admitted every 10s. Recovery is now
+    // driven by probing, and per-IP state is dropped through `forget`, so nothing
+    // needs to reset the whole tracker. Reintroduce a blanket reset only with a
+    // caller that genuinely needs one.
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +608,10 @@ impl ConnectionPoolManager {
             return;
         }
         info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
-        if let Err(e) = self.refresh_endpoint_dns(endpoint).await {
+        // `None`: this is a first-time registration (the early return above skips
+        // endpoints already known), so no IP of this endpoint can be under a
+        // health exclusion yet and there is nothing to hold back.
+        if let Err(e) = self.refresh_endpoint_dns(endpoint, None).await {
             warn!(
                 "Initial DNS resolution failed for endpoint {}: {}",
                 endpoint, e
@@ -553,7 +620,12 @@ impl ConnectionPoolManager {
     }
 
     /// Refresh DNS for all registered endpoints whose refresh interval has elapsed.
-    pub async fn refresh_dns(&mut self) -> Result<()> {
+    ///
+    /// When `health_tracker` is `Some`, IPs the tracker still considers unhealthy
+    /// are held out of the rebuilt distributor so a refresh cannot silently undo a
+    /// health exclusion. Pass `None` to rebuild from the raw DNS result (the
+    /// pre-recovery behaviour, retained for tests that exercise DNS alone).
+    pub async fn refresh_dns(&mut self, health_tracker: Option<&IpHealthTracker>) -> Result<()> {
         let now = std::time::SystemTime::now();
         let endpoints_to_refresh: Vec<String> = self
             .resolved_ips
@@ -571,7 +643,7 @@ impl ConnectionPoolManager {
             .collect();
 
         for endpoint in endpoints_to_refresh {
-            if let Err(e) = self.refresh_endpoint_dns(&endpoint).await {
+            if let Err(e) = self.refresh_endpoint_dns(&endpoint, health_tracker).await {
                 warn!("Failed to refresh DNS for endpoint {}: {}", endpoint, e);
             }
         }
@@ -581,9 +653,20 @@ impl ConnectionPoolManager {
 
     /// Refresh DNS for a specific endpoint and update the IP distributor.
     ///
-    /// Also clears health tracker failure counts for any IPs that are restored
-    /// by the refresh, so previously-excluded IPs get a clean slate.
-    pub async fn refresh_endpoint_dns(&mut self, endpoint: &str) -> Result<()> {
+    /// `resolved_ips` always records the complete DNS result, but the distributor
+    /// is rebuilt from the result minus any IP `health_tracker` still considers
+    /// unhealthy. Recovery from an exclusion is the recovery probe's job (a probe
+    /// success clears the unhealthy state, after which the IP is re-admitted
+    /// immediately and by every later refresh); a DNS refresh must not short-circuit
+    /// the cooldown, or the exponential backoff can never accumulate.
+    ///
+    /// Tracker entries for IPs that have vanished from DNS entirely are dropped,
+    /// so the unhealthy map cannot grow without bound as S3 rotates addresses.
+    pub async fn refresh_endpoint_dns(
+        &mut self,
+        endpoint: &str,
+        health_tracker: Option<&IpHealthTracker>,
+    ) -> Result<()> {
         debug!("Refreshing DNS for endpoint: {}", endpoint);
 
         let new_ip_addresses = self.resolve_endpoint(endpoint).await?;
@@ -596,22 +679,51 @@ impl ConnectionPoolManager {
         self.dns_refresh_count += 1;
         debug!("DNS refresh count: {}", self.dns_refresh_count);
 
-        // Rebuild the distributor with all resolved IPs (restores previously excluded IPs)
+        // Forget tracked IPs that no endpoint resolves to any more, then hold back
+        // the ones still under a health exclusion. Pruning is computed against the
+        // union of every endpoint's resolved set, not just this endpoint's, so a
+        // refresh of one endpoint cannot discard another endpoint's exclusions.
+        let distributor_ips = match health_tracker {
+            Some(tracker) => {
+                let all_resolved: std::collections::HashSet<IpAddr> =
+                    self.resolved_ips.values().flatten().copied().collect();
+                for ip in tracker.tracked_unhealthy_ips() {
+                    if !all_resolved.contains(&ip) {
+                        debug!(ip = %ip, "Forgetting health state for IP no longer present in DNS");
+                        tracker.forget(&ip);
+                    }
+                }
+                let (healthy, excluded): (Vec<IpAddr>, Vec<IpAddr>) = new_ip_addresses
+                    .iter()
+                    .partition(|ip| !tracker.is_unhealthy(ip));
+                if !excluded.is_empty() {
+                    info!(
+                        endpoint = %endpoint,
+                        excluded = ?excluded,
+                        "Holding unhealthy IPs out of distributor on DNS refresh (awaiting recovery probe)"
+                    );
+                }
+                healthy
+            }
+            None => new_ip_addresses.clone(),
+        };
+
+        // Rebuild the distributor with the healthy subset of resolved IPs
         if let Some(distributor) = self.ip_distributors.get_mut(endpoint) {
             info!(
                 endpoint = %endpoint,
-                ip_count = new_ip_addresses.len(),
+                ip_count = distributor_ips.len(),
                 "Updating IP distributor on DNS refresh"
             );
-            distributor.update_ips(new_ip_addresses, "DNS refresh");
+            distributor.update_ips(distributor_ips, "DNS refresh");
         } else {
             info!(
                 endpoint = %endpoint,
-                ip_count = new_ip_addresses.len(),
+                ip_count = distributor_ips.len(),
                 "Creating IP distributor on DNS refresh"
             );
             self.ip_distributors
-                .insert(endpoint.to_string(), IpDistributor::new(new_ip_addresses));
+                .insert(endpoint.to_string(), IpDistributor::new(distributor_ips));
         }
 
         Ok(())
@@ -677,6 +789,29 @@ impl ConnectionPoolManager {
         }
         // Also check exact endpoint_overrides for IPs not yet in a distributor
         for (endpoint, ips) in self.overrides.exact_iter() {
+            if ips.contains(ip) {
+                return Some(endpoint.clone());
+            }
+        }
+        None
+    }
+
+    /// Look up the endpoint that owns an IP, including IPs currently excluded
+    /// from their distributor for health reasons.
+    ///
+    /// [`get_hostname_for_ip`](Self::get_hostname_for_ip) searches only the live
+    /// distributor sets, so it returns `None` for an IP that `remove_ip` has
+    /// already excluded — precisely the IP a recovery probe needs to resolve.
+    /// This lookup additionally consults `resolved_ips`, which retains the full
+    /// DNS result per endpoint and is not touched by `remove_ip`.
+    ///
+    /// Returns `None` when the IP has disappeared from DNS entirely, which the
+    /// probe path treats as "stop tracking this IP" rather than "probe it".
+    pub fn get_endpoint_for_ip(&self, ip: &IpAddr) -> Option<String> {
+        if let Some(endpoint) = self.get_hostname_for_ip(ip) {
+            return Some(endpoint);
+        }
+        for (endpoint, ips) in &self.resolved_ips {
             if ips.contains(ip) {
                 return Some(endpoint.clone());
             }
@@ -879,18 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn test_health_tracker_clear_resets_all() {
-        let tracker = IpHealthTracker::new(3);
-        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-
-        tracker.record_failure(&ip);
-        tracker.record_failure(&ip);
-        tracker.clear();
-        // After clear, count starts from 0
-        assert!(!tracker.record_failure(&ip)); // 1
-    }
-
-    #[test]
     fn test_health_tracker_marks_unhealthy_at_threshold() {
         let tracker = IpHealthTracker::new(3);
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -905,24 +1028,23 @@ mod tests {
 
     #[test]
     fn test_health_tracker_probe_candidate_after_cooldown() {
-        // Use a very short cooldown so it elapses immediately
-        let tracker = IpHealthTracker::new_with_cooldown(
-            3,
-            Duration::from_millis(1),
-            Duration::from_secs(300),
-        );
+        // Synthetic clock: production-realistic 5s cooldown, advanced explicitly
+        // rather than slept through, so the assertion cannot flake under load.
+        let tracker =
+            IpHealthTracker::new_with_cooldown(3, Duration::from_secs(5), Duration::from_secs(300));
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let t0 = Instant::now();
 
         // Hit threshold
-        tracker.record_failure(&ip);
-        tracker.record_failure(&ip);
-        tracker.record_failure(&ip);
+        tracker.record_failure_at(&ip, t0);
+        tracker.record_failure_at(&ip, t0);
+        tracker.record_failure_at(&ip, t0);
         assert!(tracker.is_unhealthy(&ip));
 
-        // Wait for cooldown to elapse
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(tracker.is_probe_candidate(&ip));
-        let candidates = tracker.get_probe_candidates();
+        // Cooldown has elapsed
+        let after_cooldown = t0 + Duration::from_secs(5);
+        assert!(tracker.is_probe_candidate_at(&ip, after_cooldown));
+        let candidates = tracker.get_probe_candidates_at(after_cooldown);
         assert!(candidates.contains(&ip));
     }
 
@@ -967,33 +1089,321 @@ mod tests {
 
     #[test]
     fn test_health_tracker_probe_failure_doubles_cooldown() {
+        // Synthetic clock throughout. The previous sleep-based version budgeted
+        // 10ms/20ms windows and asserted `!is_probe_candidate` on the statement
+        // immediately after `record_probe_failure`, so a >=20ms scheduler stall
+        // between two adjacent statements failed it on the shared CI runner.
+        let tracker =
+            IpHealthTracker::new_with_cooldown(3, Duration::from_secs(5), Duration::from_secs(300));
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let t0 = Instant::now();
+
+        // Hit threshold — initial cooldown is 5s
+        tracker.record_failure_at(&ip, t0);
+        tracker.record_failure_at(&ip, t0);
+        tracker.record_failure_at(&ip, t0);
+
+        // Initial cooldown elapsed — eligible for probing
+        let t_probe = t0 + Duration::from_secs(5);
+        assert!(tracker.is_probe_candidate_at(&ip, t_probe));
+
+        // Probe fails — cooldown doubles to 10s and unhealthy_at re-anchors to t_probe
+        tracker.record_probe_failure_at(&ip, t_probe);
+        assert_eq!(
+            tracker.unhealthy.get(&ip).unwrap().cooldown,
+            Duration::from_secs(10),
+            "probe failure should double the 5s cooldown"
+        );
+
+        // Immediately after the failed probe: not a candidate, cooldown re-anchored
+        assert!(!tracker.is_probe_candidate_at(&ip, t_probe));
+
+        // Partway through the doubled cooldown: still not a candidate
+        assert!(!tracker.is_probe_candidate_at(&ip, t_probe + Duration::from_secs(9)));
+
+        // Full doubled cooldown elapsed: candidate again
+        assert!(tracker.is_probe_candidate_at(&ip, t_probe + Duration::from_secs(10)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery probe: re-admission, endpoint resolution, and DNS-refresh
+    // interaction. Before these, the probe API had no production callers and a
+    // DNS refresh (every pool_check_interval, default 10s) both re-admitted
+    // excluded IPs and cleared all cooldown state, so backoff never accumulated.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_ip_readmits_and_is_idempotent() {
+        let ip_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let mut dist = IpDistributor::new(vec![ip_a, ip_b]);
+
+        dist.remove_ip(ip_b, "test exclusion");
+        assert_eq!(dist.ip_count(), 1);
+
+        assert!(dist.add_ip(ip_b, "recovery probe succeeded"));
+        assert_eq!(dist.ip_count(), 2);
+        assert!(dist.get_ips().contains(&ip_b));
+
+        // Idempotent: a repeat probe must not duplicate the entry, which would
+        // skew round-robin weighting toward the re-admitted IP.
+        assert!(!dist.add_ip(ip_b, "recovery probe succeeded"));
+        assert_eq!(dist.ip_count(), 2);
+    }
+
+    #[test]
+    fn test_get_endpoint_for_ip_resolves_health_removed_dns_ip() {
+        // The capability the probe path depends on. `get_hostname_for_ip` searches
+        // the live distributor sets plus the *exact endpoint_overrides* map, so for
+        // a DNS-derived IP it goes blind the moment `remove_ip` excludes it —
+        // exactly the IP a probe needs to resolve. Seed the DNS-derived state
+        // directly (no network) rather than via endpoint_overrides, because an
+        // override-seeded IP stays findable through `exact_iter` and would make
+        // this assertion pass for the wrong reason.
+        let endpoint = "s3.us-west-2.amazonaws.com";
+        let kept = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100));
+        let excluded = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 100));
+
+        let mut manager =
+            ConnectionPoolManager::new_with_config(crate::config::ConnectionPoolConfig::default())
+                .unwrap();
+        manager
+            .resolved_ips
+            .insert(endpoint.to_string(), vec![kept, excluded]);
+        manager.ip_distributors.insert(
+            endpoint.to_string(),
+            IpDistributor::new(vec![kept, excluded]),
+        );
+
+        // While in rotation, both lookups agree
+        assert_eq!(
+            manager.get_hostname_for_ip(&excluded).as_deref(),
+            Some(endpoint)
+        );
+        assert_eq!(
+            manager.get_endpoint_for_ip(&excluded).as_deref(),
+            Some(endpoint)
+        );
+
+        manager
+            .get_distributor_mut(endpoint)
+            .unwrap()
+            .remove_ip(excluded, "test exclusion");
+
+        // Once excluded, they diverge — which is the whole reason the new lookup exists
+        assert_eq!(
+            manager.get_hostname_for_ip(&excluded),
+            None,
+            "live-distributor lookup cannot see a health-excluded DNS IP"
+        );
+        assert_eq!(
+            manager.get_endpoint_for_ip(&excluded).as_deref(),
+            Some(endpoint),
+            "probe lookup must still resolve an excluded IP via resolved_ips"
+        );
+    }
+
+    #[test]
+    fn test_get_endpoint_for_ip_returns_none_for_unknown_ip() {
+        // Drives the probe path's "IP left DNS entirely" branch, which drops the
+        // tracked health state instead of probing an address nothing resolves to.
+        let manager =
+            ConnectionPoolManager::new_with_config(crate::config::ConnectionPoolConfig::default())
+                .unwrap();
+        assert_eq!(
+            manager.get_endpoint_for_ip(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_dns_refresh_holds_back_unhealthy_ip() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.1.100".to_string(), "10.0.2.100".to_string()],
+        );
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+        let tracker = IpHealthTracker::new(3);
+        let unhealthy = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 100));
+        let healthy = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100));
+
+        tracker.record_failure(&unhealthy);
+        tracker.record_failure(&unhealthy);
+        assert!(tracker.record_failure(&unhealthy));
+
+        futures::executor::block_on(
+            manager.refresh_endpoint_dns("s3.us-west-2.amazonaws.com", Some(&tracker)),
+        )
+        .unwrap();
+
+        let ips = manager
+            .get_distributor_mut("s3.us-west-2.amazonaws.com")
+            .unwrap()
+            .get_ips();
+        assert!(ips.contains(&healthy), "healthy IP stays in rotation");
+        assert!(
+            !ips.contains(&unhealthy),
+            "a DNS refresh must not undo a health exclusion — that is what let the \
+             cooldown reset every 10s and prevented backoff from accumulating"
+        );
+        // The exclusion state itself survives the refresh
+        assert!(tracker.is_unhealthy(&unhealthy));
+        // And the IP is still resolvable for probing
+        assert_eq!(
+            manager.get_endpoint_for_ip(&unhealthy).as_deref(),
+            Some("s3.us-west-2.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn test_dns_refresh_readmits_after_probe_success_clears_state() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.1.100".to_string(), "10.0.2.100".to_string()],
+        );
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+        let tracker = IpHealthTracker::new(3);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 100));
+
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        futures::executor::block_on(
+            manager.refresh_endpoint_dns("s3.us-west-2.amazonaws.com", Some(&tracker)),
+        )
+        .unwrap();
+        assert!(!manager
+            .get_distributor_mut("s3.us-west-2.amazonaws.com")
+            .unwrap()
+            .get_ips()
+            .contains(&ip));
+
+        // A successful probe clears the exclusion; the next refresh is then free
+        // to restore the IP (the probe path also re-admits it immediately).
+        tracker.record_probe_success(&ip);
+        futures::executor::block_on(
+            manager.refresh_endpoint_dns("s3.us-west-2.amazonaws.com", Some(&tracker)),
+        )
+        .unwrap();
+        assert!(manager
+            .get_distributor_mut("s3.us-west-2.amazonaws.com")
+            .unwrap()
+            .get_ips()
+            .contains(&ip));
+    }
+
+    #[test]
+    fn test_dns_refresh_forgets_ip_absent_from_dns() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "s3.us-west-2.amazonaws.com".to_string(),
+            vec!["10.0.1.100".to_string()],
+        );
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+        let tracker = IpHealthTracker::new(3);
+        // An IP that no endpoint resolves to — e.g. S3 rotated it away while it
+        // was excluded. Left tracked, it would leak a map entry forever.
+        let departed = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+
+        tracker.record_failure(&departed);
+        tracker.record_failure(&departed);
+        tracker.record_failure(&departed);
+        assert!(tracker.is_unhealthy(&departed));
+
+        futures::executor::block_on(
+            manager.refresh_endpoint_dns("s3.us-west-2.amazonaws.com", Some(&tracker)),
+        )
+        .unwrap();
+
+        assert!(
+            !tracker.is_unhealthy(&departed),
+            "health state for an IP no longer in DNS should be dropped"
+        );
+        assert!(tracker.tracked_unhealthy_ips().is_empty());
+    }
+
+    #[test]
+    fn test_dns_refresh_of_one_endpoint_preserves_another_endpoints_exclusion() {
+        // Pruning is computed against the union of all resolved sets, so
+        // refreshing endpoint A must not discard endpoint B's exclusions.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("a.example.com".to_string(), vec!["10.0.1.1".to_string()]);
+        overrides.insert("b.example.com".to_string(), vec!["10.0.2.1".to_string()]);
+        let config = crate::config::ConnectionPoolConfig {
+            endpoint_overrides: overrides,
+            ..Default::default()
+        };
+        let mut manager = ConnectionPoolManager::new_with_config(config).unwrap();
+        let tracker = IpHealthTracker::new(3);
+        let b_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+
+        // Register both endpoints so resolved_ips knows about b.example.com
+        futures::executor::block_on(manager.refresh_endpoint_dns("a.example.com", None)).unwrap();
+        futures::executor::block_on(manager.refresh_endpoint_dns("b.example.com", None)).unwrap();
+
+        tracker.record_failure(&b_ip);
+        tracker.record_failure(&b_ip);
+        tracker.record_failure(&b_ip);
+
+        futures::executor::block_on(manager.refresh_endpoint_dns("a.example.com", Some(&tracker)))
+            .unwrap();
+
+        assert!(
+            tracker.is_unhealthy(&b_ip),
+            "refreshing a.example.com must not prune b.example.com's exclusion"
+        );
+    }
+
+    #[test]
+    fn test_health_tracker_forget_drops_all_state() {
+        let tracker = IpHealthTracker::new(3);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        tracker.record_failure(&ip);
+        assert!(tracker.is_unhealthy(&ip));
+        assert_eq!(tracker.tracked_unhealthy_ips(), vec![ip]);
+
+        tracker.forget(&ip);
+        assert!(!tracker.is_unhealthy(&ip));
+        assert!(tracker.tracked_unhealthy_ips().is_empty());
+        // Failure count dropped too, so the IP starts from zero if it returns
+        assert!(!tracker.record_failure(&ip));
+    }
+
+    #[test]
+    fn test_tracked_unhealthy_ips_ignores_cooldown_unlike_probe_candidates() {
         let tracker = IpHealthTracker::new_with_cooldown(
             3,
-            Duration::from_millis(10),
+            Duration::from_secs(300),
             Duration::from_secs(300),
         );
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
-        // Hit threshold — initial cooldown is 10ms
         tracker.record_failure(&ip);
         tracker.record_failure(&ip);
         tracker.record_failure(&ip);
 
-        // Wait for initial cooldown
-        std::thread::sleep(Duration::from_millis(15));
-        assert!(tracker.is_probe_candidate(&ip));
-
-        // Probe fails — cooldown doubles to 20ms, unhealthy_at resets
-        tracker.record_probe_failure(&ip);
-        assert!(!tracker.is_probe_candidate(&ip)); // not yet, cooldown reset
-
-        // Wait less than doubled cooldown (20ms)
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(!tracker.is_probe_candidate(&ip));
-
-        // Wait for the full doubled cooldown
-        std::thread::sleep(Duration::from_millis(15));
-        assert!(tracker.is_probe_candidate(&ip));
+        assert_eq!(tracker.tracked_unhealthy_ips(), vec![ip]);
+        assert!(
+            tracker.get_probe_candidates().is_empty(),
+            "cooldown has not elapsed, so it is tracked but not yet probeable"
+        );
     }
 
     #[test]
@@ -1031,20 +1441,6 @@ mod tests {
 
         // Regular success also clears unhealthy state
         tracker.record_success(&ip);
-        assert!(!tracker.is_unhealthy(&ip));
-    }
-
-    #[test]
-    fn test_health_tracker_clear_resets_unhealthy() {
-        let tracker = IpHealthTracker::new(3);
-        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-
-        tracker.record_failure(&ip);
-        tracker.record_failure(&ip);
-        tracker.record_failure(&ip);
-        assert!(tracker.is_unhealthy(&ip));
-
-        tracker.clear();
         assert!(!tracker.is_unhealthy(&ip));
     }
 

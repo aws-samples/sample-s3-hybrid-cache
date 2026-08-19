@@ -1,6 +1,12 @@
 # Error Handling and Recovery
 
-This document describes the comprehensive error handling and recovery mechanisms implemented in the S3 proxy cache system, specifically for the new range storage architecture.
+This document describes the error handling and recovery mechanisms in the S3 proxy cache
+system, for the range storage architecture.
+
+> **The Rust snippets here illustrate internal `DiskCache` methods**, not a public or
+> stable API. They exist to show what the proxy does on each failure class and what it
+> logs. Operators do not call these — every recovery path described here runs
+> automatically. Method names and signatures may change between releases.
 
 ## Table of Contents
 - [Overview](#overview)
@@ -58,7 +64,7 @@ The S3 proxy cache system handles several categories of errors, each with specif
 **Example**:
 ```rust
 // When metadata file is corrupted
-let result = cache_manager.get_metadata(cache_key).await?;
+let result = disk_cache.get_metadata(cache_key).await?;
 // Returns Ok(None) and deletes corrupted file
 ```
 
@@ -132,7 +138,7 @@ the destructive overwrite.
 **Example**:
 ```rust
 // When range file is missing
-let result = cache_manager.load_range_data(&range_spec).await;
+let result = disk_cache.load_range_data(&range_spec).await;
 // Returns Err(ProxyError::CacheError("Range file not found..."))
 // Caller handles by fetching from S3
 ```
@@ -170,7 +176,7 @@ let result = cache_manager.load_range_data(&range_spec).await;
 **Example**:
 ```rust
 // When disk is full
-let result = cache_manager.store_range(cache_key, start, end, data, metadata).await;
+let result = disk_cache.store_range(cache_key, start, end, data, metadata).await;
 // Returns Err(ProxyError::CacheError("Disk space exhausted..."))
 ```
 
@@ -209,7 +215,7 @@ let result = cache_manager.store_range(cache_key, start, end, data, metadata).aw
 **Example**:
 ```rust
 // Verify and fix inconsistent metadata
-let fixed_count = cache_manager.verify_and_fix_metadata(cache_key).await?;
+let fixed_count = disk_cache.verify_and_fix_metadata(cache_key).await?;
 // Returns number of inconsistencies fixed
 ```
 
@@ -253,7 +259,7 @@ let fixed_count = cache_manager.verify_and_fix_metadata(cache_key).await?;
 **Example**:
 ```rust
 // Clean up temporary files
-cache_manager.cleanup_temp_files(cache_key).await?;
+disk_cache.cleanup_temp_files(cache_key).await?;
 // Removes all .tmp files for the cache key
 ```
 
@@ -294,7 +300,7 @@ cache_manager.cleanup_temp_files(cache_key).await?;
 **Example**:
 ```rust
 // Perform comprehensive cleanup
-let stats = cache_manager.perform_cache_cleanup().await?;
+let stats = disk_cache.perform_cache_cleanup().await?;
 // Returns CacheCleanupStats with counts
 ```
 
@@ -364,6 +370,9 @@ pub struct CacheMetrics {
     pub partial_write_cleanup_total: u64,
     pub disk_full_events_total: u64,
     pub orphaned_files_cleaned_total: u64,
+    pub metadata_heal_overwrite_total: u64,
+    /// Corruption counts broken down by detected reason
+    pub corruption_metadata_by_reason: HashMap<String, u64>,
 }
 ```
 
@@ -424,7 +433,7 @@ The system provides a comprehensive cleanup operation that:
 4. Returns statistics about cleanup operations
 
 ```rust
-let stats = cache_manager.perform_cache_cleanup().await?;
+let stats = disk_cache.perform_cache_cleanup().await?;
 println!("Cleaned up {} temp files", stats.temp_files_cleaned);
 println!("Cleaned up {} orphaned files", stats.orphaned_files_cleaned);
 println!("Fixed {} inconsistencies", stats.inconsistencies_fixed);
@@ -432,20 +441,16 @@ println!("Fixed {} inconsistencies", stats.inconsistencies_fixed);
 
 ### Scheduled Cleanup
 
-It's recommended to run comprehensive cleanup periodically:
+**The proxy already runs this on a schedule; operators do not need to arrange it.** The
+orphan recovery sweep (`background_recovery.rs`, `orphaned_range_recovery.rs`) fires
+every `cache.shared_storage.orphan_recovery_interval` (default `300s`) while
+`orphan_recovery_enabled` is `true`, which is the default. Each cycle is bounded by
+`orphan_scan_timeout` (default `30s`) and `orphan_max_per_cycle` (default `100`) so a
+large cache cannot let one scan block other operations.
 
-```rust
-// Run cleanup every hour
-tokio::spawn(async move {
-    let mut interval = tokio::time::interval(Duration::from_secs(3600));
-    loop {
-        interval.tick().await;
-        if let Err(e) = cache_manager.perform_cache_cleanup().await {
-            error!("Cache cleanup failed: {}", e);
-        }
-    }
-});
-```
+To make cleanup less or more aggressive, tune those fields rather than driving cleanup
+externally. See [Configuration — Cache Size Tracking](CONFIGURATION.md#cache-size-tracking)
+and [SHARED_STORAGE.md — Orphan recovery](SHARED_STORAGE.md#orphan-recovery).
 
 ## Error Handling Best Practices
 
@@ -455,7 +460,7 @@ All internal helpers that can fail return `Result` rather than panicking. For ex
 
 ```rust
 // Good
-match cache_manager.get_metadata(cache_key).await {
+match disk_cache.get_metadata(cache_key).await {
     Ok(Some(metadata)) => {
         // Use metadata
     }
@@ -469,14 +474,14 @@ match cache_manager.get_metadata(cache_key).await {
 }
 
 // Bad
-let metadata = cache_manager.get_metadata(cache_key).await.unwrap();
+let metadata = disk_cache.get_metadata(cache_key).await.unwrap();
 ```
 
 ### 2. Handle Cache Misses Gracefully
 
 ```rust
 // Try to load from cache
-let data = match cache_manager.load_range_data(&range_spec).await {
+let data = match disk_cache.load_range_data(&range_spec).await {
     Ok(data) => data,
     Err(e) => {
         // Cache miss - fetch from S3
@@ -503,7 +508,7 @@ error!("Store failed: {}", e);
 
 ```rust
 // Always record metrics for error events
-if let Err(e) = cache_manager.get_metadata(cache_key).await {
+if let Err(e) = disk_cache.get_metadata(cache_key).await {
     metrics_manager.record_corrupted_metadata().await;
     error!("Corrupted metadata for key {}: {}", cache_key, e);
 }
@@ -513,9 +518,9 @@ if let Err(e) = cache_manager.get_metadata(cache_key).await {
 
 ```rust
 // Always clean up temporary files on failure
-if let Err(e) = cache_manager.store_range(cache_key, start, end, data, metadata).await {
+if let Err(e) = disk_cache.store_range(cache_key, start, end, data, metadata).await {
     // Cleanup is automatic in store_range, but for custom operations:
-    let _ = cache_manager.cleanup_temp_files(cache_key).await;
+    let _ = disk_cache.cleanup_temp_files(cache_key).await;
     return Err(e);
 }
 ```
@@ -642,7 +647,7 @@ cargo test --release --test error_handling_test test_corrupted_metadata_handling
 
 **Solutions**:
 1. Increase cleanup frequency
-2. Run manual cleanup: `cache_manager.perform_cache_cleanup().await`
+2. Run manual cleanup: `disk_cache.perform_cache_cleanup().await`
 3. Review deletion logic
 4. Check for crashes during cache operations
 
@@ -693,20 +698,9 @@ df -h
 
 ### 4. Regular Cache Maintenance
 
-Schedule regular cache cleanup operations:
-
-```rust
-// Run comprehensive cleanup weekly
-tokio::spawn(async move {
-    let mut interval = tokio::time::interval(Duration::from_secs(7 * 24 * 3600)); // 7 days
-    loop {
-        interval.tick().await;
-        if let Err(e) = cache_manager.perform_cache_cleanup().await {
-            error!("Weekly cache cleanup failed: {}", e);
-        }
-    }
-});
-```
+Nothing to schedule. Cleanup runs inside the proxy on `orphan_recovery_interval`
+(default `300s`), and the daily validation scan reconciles tracked size against disk.
+See [Scheduled Cleanup](#scheduled-cleanup) for the fields that tune both.
 
 ### 5. Backup and Recovery Planning
 

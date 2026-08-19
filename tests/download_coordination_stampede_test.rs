@@ -431,6 +431,8 @@ async fn pre_warm_cache(
         Some(Arc::clone(mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("pre-warm GET");
@@ -642,6 +644,8 @@ async fn run_scenario(
                 Some(mm),
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");

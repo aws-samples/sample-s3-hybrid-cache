@@ -558,6 +558,7 @@ mod tests {
             head_expires_at: Some(now + Duration::from_secs(60)),
             head_last_accessed: Some(now),
             head_access_count: 0,
+            head_cached_at: None,
         }
     }
 

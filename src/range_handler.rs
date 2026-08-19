@@ -11,6 +11,7 @@ use crate::cache::{CacheManager, Range};
 use crate::cache_types::ObjectMetadata;
 use crate::disk_cache::DiskCacheManager;
 use crate::{ProxyError, Result};
+use bytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -344,8 +345,11 @@ pub enum RangeMergeSource {
     },
     /// Data fetched from S3
     Fetched {
-        /// The actual data bytes
-        data: Vec<u8>,
+        /// The actual data bytes.
+        ///
+        /// `Bytes` so carrying a fetched segment into a merge segment is a refcount
+        /// bump rather than a copy of the segment. Requirement: IMA 5.2
+        data: Bytes,
         /// Range specification for this data
         range_spec: RangeSpec,
     },
@@ -354,8 +358,13 @@ pub enum RangeMergeSource {
 /// Result of range merging operation with metrics
 #[derive(Debug)]
 pub struct RangeMergeResult {
-    /// Merged data ready to send to client
-    pub data: Vec<u8>,
+    /// Merged data ready to send to client.
+    ///
+    /// `Bytes` rather than `Vec<u8>` so the fetch and fallback paths can hand over
+    /// the body they already hold instead of memcpy'ing it, and so slicing a
+    /// sub-range out of it is a refcount bump rather than a copy.
+    /// Requirement: IMA 5.2
+    pub data: Bytes,
     /// Number of bytes served from cache
     pub bytes_from_cache: u64,
     /// Number of bytes fetched from S3
@@ -821,7 +830,7 @@ impl RangeHandler {
     }
 
     /// Calculate missing ranges that are not covered by cached ranges
-    fn calculate_missing_ranges(
+    pub(crate) fn calculate_missing_ranges(
         &self,
         requested: &RangeSpec,
         covered: &[RangeSpec],
@@ -1324,7 +1333,7 @@ impl RangeHandler {
         &self,
         requested_range: &RangeSpec,
         cached_ranges: &[Range],
-        fetched_ranges: &[(RangeSpec, Vec<u8>, HashMap<String, String>)],
+        fetched_ranges: &[(RangeSpec, Bytes, HashMap<String, String>)],
     ) -> bool {
         // If we have both cached and fetched ranges, merge is needed
         if !cached_ranges.is_empty() && !fetched_ranges.is_empty() {
@@ -1508,7 +1517,7 @@ impl RangeHandler {
         cache_key: &str,
         requested_range: &RangeSpec,
         cached_ranges: &[Range],
-        fetched_ranges: &[(RangeSpec, Vec<u8>, HashMap<String, String>)],
+        fetched_ranges: &[(RangeSpec, Bytes, HashMap<String, String>)],
     ) -> Result<RangeMergeResult> {
         let merge_start = std::time::Instant::now();
 
@@ -1892,7 +1901,9 @@ impl RangeHandler {
         }
 
         Ok(RangeMergeResult {
-            data: output,
+            // The merge assembles into a Vec because it extends incrementally;
+            // `Bytes::from` then takes that allocation without copying.
+            data: Bytes::from(output),
             bytes_from_cache,
             bytes_from_s3,
             segments_merged: segments.len(),
@@ -1913,7 +1924,7 @@ impl RangeHandler {
     /// * `headers` - Request headers (including Authorization)
     ///
     /// # Returns
-    /// Vector of (RangeSpec, Vec<u8>, HashMap<String, String>) tuples for successfully fetched ranges
+    /// Vector of (RangeSpec, Bytes, HashMap<String, String>) tuples for successfully fetched ranges
     /// The HashMap contains S3 response headers including ETag
     ///
     /// Requirements: 1.1, 1.4
@@ -1929,7 +1940,7 @@ impl RangeHandler {
         hedge_budget: Option<&Arc<AtomicUsize>>,
         hedge_trigger_after: Duration,
         max_inflight_fraction: f64,
-    ) -> Result<Vec<(RangeSpec, Vec<u8>, HashMap<String, String>)>> {
+    ) -> Result<Vec<(RangeSpec, Bytes, HashMap<String, String>)>> {
         if missing_ranges.is_empty() {
             debug!("No missing ranges to fetch");
             return Ok(Vec::new());
@@ -2006,18 +2017,21 @@ impl RangeHandler {
                             if s3_response.status == hyper::StatusCode::PARTIAL_CONTENT {
                                 if let Some(body) = s3_response.body {
                                     let fetch_duration = fetch_start.elapsed();
+                                    // Hand the collected Bytes straight through. This
+                                    // previously did `body_bytes.to_vec()`, holding the
+                                    // fetched range twice for the rest of the scope.
+                                    // Requirement: IMA 5.2
                                     let body_bytes = body.into_bytes().await?;
-                                    let body_vec = body_bytes.to_vec(); // Convert Bytes to Vec<u8>
                                     let response_headers = s3_response.headers.clone();
                                     debug!(
                                         "Successfully fetched range from S3: cache_key={}, range={}-{}, size={} bytes, duration={:.2}ms",
                                         cache_key,
                                         range_spec.start,
                                         range_spec.end,
-                                        body_vec.len(),
+                                        body_bytes.len(),
                                         fetch_duration.as_secs_f64() * 1000.0
                                     );
-                                    Ok((range_spec, body_vec, response_headers))
+                                    Ok((range_spec, body_bytes, response_headers))
                                 } else {
                                     warn!(
                                         "S3 response has no body: cache_key={}, range={}-{}",
@@ -2119,6 +2133,12 @@ impl RangeHandler {
     /// * `host` - S3 host for fallback fetch
     /// * `uri` - Request URI for fallback fetch
     /// * `headers` - Request headers for fallback fetch
+    /// * `caller_reservation` - An in-flight ledger reservation the caller
+    ///   already holds covering the requested range's bytes, if any. Pass it
+    ///   when the caller reserved before calling (both cached-serve paths do),
+    ///   so a fallback fetch of those same bytes reuses that claim instead of
+    ///   taking a second one for the same memory. Pass `None` when the caller
+    ///   holds nothing, and the fallback will reserve for itself.
     ///
     /// # Returns
     /// RangeMergeResult containing merged data and efficiency metrics
@@ -2136,11 +2156,12 @@ impl RangeHandler {
         cache_key: &str,
         requested_range: &RangeSpec,
         cached_ranges: &[Range],
-        fetched_ranges: &[(RangeSpec, Vec<u8>, HashMap<String, String>)],
+        fetched_ranges: &[(RangeSpec, Bytes, HashMap<String, String>)],
         s3_client: &Arc<dyn crate::s3_client::S3ClientApi + Send + Sync>,
         host: &str,
         uri: &hyper::Uri,
         headers: &HashMap<String, String>,
+        mut caller_reservation: Option<&mut crate::inflight_ledger::Reservation>,
     ) -> Result<RangeMergeResult> {
         // Attempt to merge ranges
         match self
@@ -2166,6 +2187,7 @@ impl RangeHandler {
                             uri,
                             headers,
                             "size validation failed",
+                            caller_reservation.as_deref_mut(),
                         )
                         .await;
                 }
@@ -2215,7 +2237,12 @@ impl RangeHandler {
                     cache_key, error_context, e
                 );
 
-                // Fall back to complete S3 fetch
+                // Fall back to complete S3 fetch. A gap means the cached
+                // extents did not cover the request, so expose it separately
+                // from ordinary misses in cache statistics.
+                if error_context == "byte alignment mismatch" {
+                    self.cache_manager.record_incomplete_range_fallback();
+                }
                 self.fallback_to_complete_s3_fetch(
                     cache_key,
                     requested_range,
@@ -2224,6 +2251,7 @@ impl RangeHandler {
                     uri,
                     headers,
                     error_context,
+                    caller_reservation,
                 )
                 .await
             }
@@ -2244,6 +2272,8 @@ impl RangeHandler {
     /// * `uri` - Request URI
     /// * `headers` - Request headers
     /// * `reason` - Reason for fallback (for logging)
+    /// * `caller_reservation` - An in-flight ledger reservation the caller
+    ///   already holds for the same bytes this fetch will buffer, if any
     ///
     /// # Returns
     /// RangeMergeResult with data from S3 and 0% cache efficiency
@@ -2257,6 +2287,7 @@ impl RangeHandler {
         uri: &hyper::Uri,
         headers: &HashMap<String, String>,
         reason: &str,
+        caller_reservation: Option<&mut crate::inflight_ledger::Reservation>,
     ) -> Result<RangeMergeResult> {
         info!(
             "Falling back to complete S3 fetch: range={}-{} reason={} cache_key={}",
@@ -2284,20 +2315,63 @@ impl RangeHandler {
         );
         context.allow_streaming = true; // Enable streaming for fallback fetches
 
+        // Admission_Check before buffering: `allow_streaming = true` above means
+        // `S3Client` itself does not reserve (it only reserves on its
+        // `allow_streaming == false` buffering path), but this call site
+        // immediately calls `into_bytes()` on the "streaming" body below,
+        // buffering it here instead — one of the design's explicitly-named
+        // exceptions ("range_handler.rs:2285 sets allow_streaming = true but
+        // then calls into_bytes() anyway, so it needs its own reservation").
+        // The requested range's byte length is known up front.
+        //
+        // `claim_overlapping`, not `try_reserve`, because this repair fetch is
+        // frequently nested inside a caller that has ALREADY reserved for the
+        // very same bytes — `serve_range_from_cache_buffered` and
+        // `serve_full_object_from_cache` both reserve `range_spec`'s length and
+        // then hand the merged result straight to the response body, which is
+        // this fetch's buffer (refcounted `Bytes`, so the two are one
+        // allocation). Reserving again there counted the same memory twice, so a
+        // ceiling that comfortably fits the range refused the repair and kept
+        // refusing it on every retry — the request's own claim was the thing in
+        // the way, so waiting never helped.
+        //
+        // Neither under- nor double-counts: with a caller claim the bytes are
+        // counted once (grown only if this buffer is genuinely larger, so the
+        // ledger holds the real peak rather than a sum); with no caller claim —
+        // the partial-cache merge path in `forward_range_request_to_s3`, which
+        // holds no reservation of its own — this is an ordinary reservation for
+        // bytes nothing else accounts for.
+        // Requirements: IMA 1.2, 1.3, 2.1, 2.5, 4.1.
+        let fallback_fetch_bytes = requested_range.end - requested_range.start + 1;
+        let ledger = s3_client.get_inflight_ledger();
+        let _fallback_claim =
+            match ledger.claim_overlapping(fallback_fetch_bytes, caller_reservation) {
+                Some(claim) => claim,
+                None => {
+                    return Err(ProxyError::InflightCeilingExceeded {
+                        ceiling_bytes: ledger.ceiling_bytes(),
+                        requested_bytes: fallback_fetch_bytes,
+                    });
+                }
+            };
+
         match s3_client.forward_request(context).await {
             Ok(s3_response) => {
                 if s3_response.status == hyper::StatusCode::PARTIAL_CONTENT {
                     if let Some(body) = s3_response.body {
+                        // Keep the collected Bytes and move it into the result. This
+                        // previously did `.to_vec()` and then `body_vec.clone()` into
+                        // `data`, so a fallback fetch held the range three times at
+                        // peak. Requirement: IMA 5.2
                         let body_bytes = body.into_bytes().await?;
-                        let body_vec = body_bytes.to_vec();
+                        let body_len = body_bytes.len() as u64;
                         let expected_size = requested_range.end - requested_range.start + 1;
 
                         // Validate response size
-                        if body_vec.len() as u64 != expected_size {
+                        if body_len != expected_size {
                             return Err(ProxyError::S3Error(format!(
                                 "S3 fallback fetch size mismatch: expected {} bytes, got {} bytes",
-                                expected_size,
-                                body_vec.len()
+                                expected_size, body_len
                             )));
                         }
 
@@ -2307,16 +2381,16 @@ impl RangeHandler {
                             "Fallback S3 fetch succeeded: range={}-{} size={} bytes duration={:.2}ms cache_key={}",
                             requested_range.start,
                             requested_range.end,
-                            body_vec.len(),
+                            body_len,
                             fallback_duration.as_secs_f64() * 1000.0,
                             cache_key
                         );
 
                         // Return result with 0% cache efficiency (all from S3)
                         Ok(RangeMergeResult {
-                            data: body_vec.clone(),
+                            data: body_bytes,
                             bytes_from_cache: 0,
-                            bytes_from_s3: body_vec.len() as u64,
+                            bytes_from_s3: body_len,
                             segments_merged: 1,
                             cache_efficiency: 0.0,
                             ram_hit: false, // Data came from S3, not cache

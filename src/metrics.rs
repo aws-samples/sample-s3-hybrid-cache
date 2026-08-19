@@ -18,6 +18,13 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Convert the RAM cache hit rate held in `CacheStatistics::ram_cache_hit_rate`
+/// (a 0.0-1.0 fraction, sourced from `ShardedRamCache::stats()`) into the
+/// percentage published as `cache.ram_cache_hit_rate_percent` on `/metrics`.
+fn ram_hit_rate_percent(fraction: f32) -> f32 {
+    fraction * 100.0
+}
+
 /// Cache metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetrics {
@@ -30,6 +37,8 @@ pub struct CacheMetrics {
     pub total_requests: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// Range responses refetched from S3 because cached extents were incomplete.
+    pub incomplete_range_fallbacks: u64,
     pub evictions: u64,
     pub corruption_metadata_total: u64,
     pub corruption_missing_range_total: u64,
@@ -302,6 +311,56 @@ pub struct SystemMetrics {
     /// Hedged upstream request metrics.
     /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
     pub hedged_requests: HedgingStats,
+    /// In-flight buffered-byte ledger metrics. Present regardless of whether the
+    /// ceiling is configured (`ceiling_bytes: 0` reports Ledger_Disabled) so an
+    /// operator can confirm the feature is off from `/metrics` alone.
+    /// Spec: inflight-memory-accounting. Requirements: 8.1-8.7
+    pub inflight_memory: InflightMemoryMetrics,
+}
+
+/// In-flight buffered-byte ledger statistics.
+///
+/// Exposed as `inflight_memory.{reserved_bytes,ceiling_bytes,peak_reserved_bytes,
+/// rejected_total,aborted_accumulations_total,ram_cache_max_bytes}` in the
+/// `/metrics` JSON.
+///
+/// **Relationship to `request_metrics.rejected_requests`**: `rejected_requests`
+/// is the top-level counter incremented for *every* Shed_Response, regardless of
+/// cause — it currently counts both `max_concurrent_requests` exhaustion and
+/// in-flight ceiling exhaustion. `rejected_total` here is the subset of those
+/// sheds specifically caused by the in-flight ceiling. An operator comparing the
+/// two should expect `rejected_total <= request_metrics.rejected_requests`, with
+/// the difference attributable to concurrency-limit sheds; the same relationship
+/// the Phase C permit-metrics work already had to make explicit for
+/// `permits_held`/`permits_held_peak` vs `rejected_requests`.
+///
+/// `ram_cache_max_bytes` is included alongside so an operator can compare the two
+/// independent memory budgets side by side (Requirement 8.7) without a second
+/// `/metrics` field lookup or a separate config read.
+///
+/// Spec: inflight-memory-accounting. Requirements: 8.1-8.7
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InflightMemoryMetrics {
+    /// Current total bytes reserved across all live Buffering_Site reservations.
+    /// Requirement: 8.1
+    pub reserved_bytes: u64,
+    /// Configured Inflight_Ceiling in bytes. `0` means Ledger_Disabled. Reported
+    /// even while disabled so an operator can confirm the feature is off.
+    /// Requirements: 8.2, 8.6
+    pub ceiling_bytes: u64,
+    /// High-water mark of `reserved_bytes` observed since process start.
+    /// Requirement: 8.3
+    pub peak_reserved_bytes: u64,
+    /// Cumulative count of Admission_Check rejections. Requirement: 8.4
+    pub rejected_total: u64,
+    /// Cumulative count of Unknown_Size_Site accumulations aborted mid-stream
+    /// because growing the reservation would have exceeded the ceiling.
+    /// Requirement: 8.5
+    pub aborted_accumulations_total: u64,
+    /// Configured `cache.max_ram_cache_size`, reported alongside the ledger so
+    /// the two independent memory budgets are directly comparable.
+    /// Requirement: 8.7
+    pub ram_cache_max_bytes: u64,
 }
 
 /// Hedged upstream request statistics.
@@ -322,13 +381,40 @@ pub struct HedgingStats {
 /// Request processing metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestMetrics {
+    /// Cumulative request completions since process start, including semaphore rejections.
     pub total_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
+    /// Completed 4xx responses. Semaphore overload rejections are also counted separately.
+    pub client_error_requests: u64,
+    /// Completed 5xx responses.
+    pub server_error_requests: u64,
+    /// Requests rejected before processing because `max_concurrent_requests` was reached.
+    pub rejected_requests: u64,
+    /// GET/HEAD responses served from cache, identified by `X-Cache: HIT`.
+    pub cache_hit_requests: u64,
+    /// GET/HEAD responses not served from cache.
+    pub cache_miss_requests: u64,
     pub average_response_time_ms: u64,
+    /// Lifetime-average request rate since the process started, not a rolling window.
     pub requests_per_second: f32,
+    /// Active TCP connections. HTTP/1 keep-alive means this is not in-flight request count.
     pub active_requests: u64,
     pub max_concurrent_requests: u64,
+    /// Configured total request-concurrency permits (`server.max_concurrent_requests`).
+    /// Same underlying config value as `max_concurrent_requests` above, exposed under
+    /// the `permits_*` name so it can be paired with `permits_held`/`permits_available`
+    /// without mixing naming schemes. Requirement: TCA 5.3
+    pub permits_total: u64,
+    /// Request-concurrency permits currently held. Distinct from `active_requests`,
+    /// which counts TCP connections (a connection can outlive the permit held for any
+    /// single request on it, via HTTP/1 keep-alive). Requirement: TCA 5.1, 5.5
+    pub permits_held: u64,
+    /// Request-concurrency permits currently available (`total - held`).
+    /// Requirement: TCA 5.2
+    pub permits_available: u64,
+    /// High-water mark of `permits_held` since process start. Requirement: TCA 5.4
+    pub permits_held_peak: u64,
 }
 
 /// Internal atomic metadata writes statistics tracking
@@ -524,9 +610,20 @@ pub struct MetricsManager {
     active_connections: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Maximum concurrent requests from config
     max_concurrent_requests: usize,
+    /// Shared request-concurrency semaphore (shared with HttpProxy and the TLS
+    /// listener). `available_permits()` gives permits_available directly;
+    /// permits_held is `permits_total - permits_available`. Spec:
+    /// transfer-concurrency-admission. Requirements: TCA 5.1, 5.2, 5.3
+    request_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// Shared hedging metrics counters (owned by the HedgeGovernor/startup, read here).
     /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
     hedge_metrics: Option<Arc<HedgeMetrics>>,
+    /// Shared in-flight buffered-byte ledger (shared with HttpProxy and every
+    /// Buffering_Site). Spec: inflight-memory-accounting. Requirements: 8.1-8.6
+    inflight_ledger: Option<Arc<crate::inflight_ledger::InflightLedger>>,
+    /// Configured `cache.max_ram_cache_size`, reported alongside the ledger.
+    /// Requirement: 8.7
+    ram_cache_max_bytes: u64,
 }
 
 /// Internal request statistics tracking
@@ -535,6 +632,11 @@ struct RequestStats {
     total_requests: u64,
     successful_requests: u64,
     failed_requests: u64,
+    client_error_requests: u64,
+    server_error_requests: u64,
+    rejected_requests: u64,
+    cache_hit_requests: u64,
+    cache_miss_requests: u64,
     total_response_time_ms: u64,
     last_reset: SystemTime,
 }
@@ -545,6 +647,11 @@ impl Default for RequestStats {
             total_requests: 0,
             successful_requests: 0,
             failed_requests: 0,
+            client_error_requests: 0,
+            server_error_requests: 0,
+            rejected_requests: 0,
+            cache_hit_requests: 0,
+            cache_miss_requests: 0,
             total_response_time_ms: 0,
             last_reset: SystemTime::now(),
         }
@@ -764,7 +871,10 @@ impl MetricsManager {
             otlp_exporter: None,
             active_connections: None,
             max_concurrent_requests: 200,
+            request_semaphore: None,
             hedge_metrics: None,
+            inflight_ledger: None,
+            ram_cache_max_bytes: 0,
         }
     }
 
@@ -829,6 +939,14 @@ impl MetricsManager {
         self.max_concurrent_requests = max_concurrent_requests;
     }
 
+    /// Set the shared request-concurrency semaphore for permit observability
+    /// (`permits_held`, `permits_available`). `HttpProxy::get_request_semaphore()`
+    /// already exists (used by the TLS listener), so this holds it the same way
+    /// `set_active_connections` holds the connection counter. Requirement: TCA 5.1, 5.2
+    pub fn set_request_semaphore(&mut self, request_semaphore: Arc<tokio::sync::Semaphore>) {
+        self.request_semaphore = Some(request_semaphore);
+    }
+
     /// Set the shared hedge metrics reference.
     ///
     /// The `HedgeMetrics` instance is created at startup alongside the
@@ -838,6 +956,21 @@ impl MetricsManager {
     /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
     pub fn set_hedge_metrics(&mut self, hedge_metrics: Arc<HedgeMetrics>) {
         self.hedge_metrics = Some(hedge_metrics);
+    }
+
+    /// Set the shared in-flight buffered-byte ledger for `/metrics` observability
+    /// (`inflight_memory.*`). `HttpProxy::get_inflight_ledger()` holds the same
+    /// `Arc`, mirroring how `set_request_semaphore` holds the permit semaphore.
+    /// Requirement: 8.1-8.6
+    pub fn set_inflight_ledger(&mut self, ledger: Arc<crate::inflight_ledger::InflightLedger>) {
+        self.inflight_ledger = Some(ledger);
+    }
+
+    /// Set the configured `cache.max_ram_cache_size`, reported alongside the
+    /// ledger so the two independent memory budgets are directly comparable.
+    /// Requirement: 8.7
+    pub fn set_ram_cache_max_bytes(&mut self, bytes: u64) {
+        self.ram_cache_max_bytes = bytes;
     }
 
     /// Record a hedge issued (convenience — delegates to the shared `HedgeMetrics`).
@@ -864,6 +997,26 @@ impl MetricsManager {
         }
     }
 
+    /// Collect in-flight buffered-byte ledger stats.
+    /// Returns a disabled snapshot (`ceiling_bytes: 0`) when the ledger has not
+    /// been wired in, so `/metrics` always carries the section (Requirement 8.6).
+    fn collect_inflight_memory_metrics(&self) -> InflightMemoryMetrics {
+        match &self.inflight_ledger {
+            Some(ledger) => InflightMemoryMetrics {
+                reserved_bytes: ledger.reserved_bytes(),
+                ceiling_bytes: ledger.ceiling_bytes(),
+                peak_reserved_bytes: ledger.peak_reserved_bytes(),
+                rejected_total: ledger.rejected_total(),
+                aborted_accumulations_total: ledger.aborted_total(),
+                ram_cache_max_bytes: self.ram_cache_max_bytes,
+            },
+            None => InflightMemoryMetrics {
+                ram_cache_max_bytes: self.ram_cache_max_bytes,
+                ..Default::default()
+            },
+        }
+    }
+
     /// Collect hedging stats from the shared `HedgeMetrics` counters.
     /// Returns zeroes when hedge metrics have not been wired in.
     fn collect_hedging_metrics(&self) -> HedgingStats {
@@ -877,17 +1030,58 @@ impl MetricsManager {
         }
     }
 
-    /// Record a request completion
-    pub async fn record_request(&self, success: bool, response_time: Duration) {
+    /// Record a request completion with fixed-cardinality response and cache outcomes.
+    ///
+    /// `cache_hit` is supplied only for GET/HEAD requests. The method stores scalars
+    /// rather than request paths, hosts, buckets, or object keys, so its memory use is
+    /// fixed even when the proxy serves an unbounded object namespace.
+    pub async fn record_response(
+        &self,
+        status: StatusCode,
+        response_time: Duration,
+        cache_hit: Option<bool>,
+        rejected: bool,
+    ) {
         let mut stats = self.request_stats.write().await;
-        stats.total_requests += 1;
-        stats.total_response_time_ms += response_time.as_millis() as u64;
+        stats.total_requests = stats.total_requests.saturating_add(1);
+        stats.total_response_time_ms = stats
+            .total_response_time_ms
+            .saturating_add(response_time.as_millis() as u64);
 
-        if success {
-            stats.successful_requests += 1;
+        if status.is_success() {
+            stats.successful_requests = stats.successful_requests.saturating_add(1);
         } else {
-            stats.failed_requests += 1;
+            stats.failed_requests = stats.failed_requests.saturating_add(1);
         }
+        if status.is_client_error() {
+            stats.client_error_requests = stats.client_error_requests.saturating_add(1);
+        }
+        if status.is_server_error() {
+            stats.server_error_requests = stats.server_error_requests.saturating_add(1);
+        }
+        if rejected {
+            stats.rejected_requests = stats.rejected_requests.saturating_add(1);
+        }
+        match cache_hit {
+            Some(true) => {
+                stats.cache_hit_requests = stats.cache_hit_requests.saturating_add(1);
+            }
+            Some(false) => {
+                stats.cache_miss_requests = stats.cache_miss_requests.saturating_add(1);
+            }
+            None => {}
+        }
+    }
+
+    /// Record a request completion for callers that only know success and elapsed time.
+    pub async fn record_request(&self, success: bool, response_time: Duration) {
+        let status = if success {
+            StatusCode::OK
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        self.record_response(status, response_time, None, false)
+            .await;
     }
 
     /// Collect comprehensive system metrics
@@ -982,6 +1176,7 @@ impl MetricsManager {
             bucket_traffic,
             download_bandwidth: crate::bandwidth_limiter::global_limiter().snapshot(),
             hedged_requests: self.collect_hedging_metrics(),
+            inflight_memory: self.collect_inflight_memory_metrics(),
         };
 
         // Cache the result
@@ -1054,10 +1249,11 @@ impl MetricsManager {
             write_cache_size: stats.write_cache_size,
             ram_cache_size: stats.ram_cache_size,
             cache_hit_rate_percent: hit_rate,
-            ram_cache_hit_rate_percent: stats.ram_cache_hit_rate,
+            ram_cache_hit_rate_percent: ram_hit_rate_percent(stats.ram_cache_hit_rate),
             total_requests,
             cache_hits: stats.cache_hits,
             cache_misses: stats.cache_misses,
+            incomplete_range_fallbacks: stats.incomplete_range_fallbacks,
             evictions: stats.evicted_entries,
             corruption_metadata_total: error_stats.corruption_metadata_total,
             corruption_missing_range_total: error_stats.corruption_missing_range_total,
@@ -1203,10 +1399,25 @@ impl MetricsManager {
             0.0
         };
 
+        // permits_held = total - available_permits(); available_permits() is a gauge,
+        // so held is derived rather than tracked. Requirement: TCA 5.1, 5.2
+        let permits_available = self
+            .request_semaphore
+            .as_ref()
+            .map(|s| s.available_permits() as u64)
+            .unwrap_or(0);
+        let permits_total = self.max_concurrent_requests as u64;
+        let permits_held = permits_total.saturating_sub(permits_available);
+
         RequestMetrics {
             total_requests: stats.total_requests,
             successful_requests: stats.successful_requests,
             failed_requests: stats.failed_requests,
+            client_error_requests: stats.client_error_requests,
+            server_error_requests: stats.server_error_requests,
+            rejected_requests: stats.rejected_requests,
+            cache_hit_requests: stats.cache_hit_requests,
+            cache_miss_requests: stats.cache_miss_requests,
             average_response_time_ms,
             requests_per_second,
             active_requests: self
@@ -1215,6 +1426,10 @@ impl MetricsManager {
                 .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64)
                 .unwrap_or(0),
             max_concurrent_requests: self.max_concurrent_requests as u64,
+            permits_total,
+            permits_held,
+            permits_available,
+            permits_held_peak: crate::http_proxy::permits_held_peak(),
         }
     }
 
@@ -4506,6 +4721,85 @@ mod tests {
         // Only one bucket series exists (no overflow, no spurious keys).
         assert_eq!(snapshot.len(), 1);
     }
+    #[tokio::test]
+    async fn test_request_metrics_classify_response_and_cache_outcomes() {
+        let metrics = MetricsManager::new();
+        metrics
+            .record_response(StatusCode::OK, Duration::from_millis(10), Some(true), false)
+            .await;
+        metrics
+            .record_response(
+                StatusCode::NOT_FOUND,
+                Duration::from_millis(20),
+                Some(false),
+                false,
+            )
+            .await;
+        metrics
+            .record_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Duration::from_millis(30),
+                None,
+                true,
+            )
+            .await;
+
+        let request_metrics = metrics.collect_metrics().await.request_metrics;
+        assert_eq!(request_metrics.total_requests, 3);
+        assert_eq!(request_metrics.successful_requests, 1);
+        assert_eq!(request_metrics.failed_requests, 2);
+        assert_eq!(request_metrics.client_error_requests, 1);
+        assert_eq!(request_metrics.server_error_requests, 1);
+        assert_eq!(request_metrics.rejected_requests, 1);
+        assert_eq!(request_metrics.cache_hit_requests, 1);
+        assert_eq!(request_metrics.cache_miss_requests, 1);
+        assert_eq!(request_metrics.average_response_time_ms, 20);
+    }
+
+    /// Permit observability (Requirement TCA 5.1-5.5): `permits_held` and
+    /// `permits_available` are derived from the live semaphore, `permits_total`
+    /// from the configured value, and `permits_held` is distinct from
+    /// `active_requests` (a separate, unrelated connection counter).
+    #[tokio::test]
+    async fn test_permit_metrics_derive_from_semaphore() {
+        let mut metrics = MetricsManager::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+        metrics.set_request_semaphore(Arc::clone(&semaphore));
+        metrics.set_active_connections(
+            Arc::new(std::sync::atomic::AtomicUsize::new(999)), // deliberately different from permits held
+            10,
+        );
+
+        // Nothing held yet.
+        let request_metrics = metrics.collect_metrics().await.request_metrics;
+        assert_eq!(request_metrics.permits_total, 10);
+        assert_eq!(request_metrics.permits_held, 0);
+        assert_eq!(request_metrics.permits_available, 10);
+        // active_requests (connections) must not be conflated with permits_held.
+        assert_eq!(request_metrics.active_requests, 999);
+
+        // Hold 3 permits.
+        let permits = semaphore.clone().try_acquire_many_owned(3).unwrap();
+        let request_metrics = metrics.collect_metrics().await.request_metrics;
+        assert_eq!(request_metrics.permits_held, 3);
+        assert_eq!(request_metrics.permits_available, 7);
+        assert_eq!(request_metrics.permits_total, 10);
+
+        drop(permits);
+        let request_metrics = metrics.collect_metrics().await.request_metrics;
+        assert_eq!(request_metrics.permits_held, 0);
+        assert_eq!(request_metrics.permits_available, 10);
+    }
+
+    /// With no semaphore wired (e.g. before `set_request_semaphore` is called),
+    /// permit fields degrade to a held-count of zero rather than panicking.
+    #[tokio::test]
+    async fn test_permit_metrics_default_without_semaphore() {
+        let metrics = MetricsManager::new();
+        let request_metrics = metrics.collect_metrics().await.request_metrics;
+        assert_eq!(request_metrics.permits_available, 0);
+        assert_eq!(request_metrics.permits_held, request_metrics.permits_total);
+    }
 }
 
 #[cfg(test)]
@@ -4636,5 +4930,20 @@ mod bandwidth_metrics_tests {
         assert_eq!(system_metrics.hedged_requests.issued, 0);
         assert_eq!(system_metrics.hedged_requests.won, 0);
         assert_eq!(system_metrics.hedged_requests.suppressed, 0);
+    }
+
+    /// Pin the scale of `cache.ram_cache_hit_rate_percent`. The source field
+    /// (`CacheStatistics::ram_cache_hit_rate`) is a 0.0-1.0 fraction, and this
+    /// metric name promises a percentage, so the conversion must be x100. It was
+    /// published unscaled before 2.5.0.
+    #[test]
+    fn ram_cache_hit_rate_is_published_as_a_percentage() {
+        assert_eq!(ram_hit_rate_percent(0.0), 0.0);
+        assert_eq!(ram_hit_rate_percent(1.0), 100.0);
+        assert_eq!(ram_hit_rate_percent(0.4), 40.0);
+        assert!(
+            (ram_hit_rate_percent(0.855) - 85.5).abs() < 0.01,
+            "a 0.855 fraction must publish as ~85.5 percent"
+        );
     }
 }

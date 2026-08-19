@@ -224,6 +224,7 @@ impl TlsProxyListener {
                                         // blocking) is applied by the connection pool's
                                         // own checks, and the CONNECT handler above
                                         // already gates tunnel destinations.
+                                        let inflight_ledger = s3_client.get_inflight_ledger();
                                         HttpProxy::handle_request(
                                             req,
                                             addr,
@@ -238,6 +239,7 @@ impl TlsProxyListener {
                                             proxy_referer,
                                             None,
                                             None,
+                                            inflight_ledger,
                                         )
                                         .await
                                     }

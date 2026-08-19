@@ -184,6 +184,8 @@ async fn test_stalled_upstream_aborts_at_timeout_and_retries() {
         &resolved,
         &None,
         None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -242,6 +244,8 @@ async fn test_stalled_upstream_zero_retries() {
         config.clone(),
         &resolved,
         &None,
+        None,
+        // Test harness has no request-concurrency permit to thread.
         None,
     )
     .await

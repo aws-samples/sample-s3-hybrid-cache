@@ -284,6 +284,8 @@ async fn multi_range_request_resolves_settings_exactly_once() {
         None, // metrics_manager
         &resolved,
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("range coordination");

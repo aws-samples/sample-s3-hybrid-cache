@@ -257,6 +257,8 @@ async fn conditional_range_206_forwards_headers_and_surfaces_206() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("range coordination");
@@ -340,6 +342,8 @@ async fn conditional_range_304_does_not_cache() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("range coordination");
@@ -417,6 +421,8 @@ async fn conditional_range_412_does_not_cache() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("range coordination");

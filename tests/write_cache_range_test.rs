@@ -355,7 +355,11 @@ async fn test_full_object_range_from_write_cache() {
         .await
         .unwrap();
 
-    assert_eq!(range_data, test_data, "Full object data should match");
+    assert_eq!(
+        range_data.as_ref(),
+        test_data,
+        "Full object data should match"
+    );
 
     println!("✅ Full object range request test passed!");
 }

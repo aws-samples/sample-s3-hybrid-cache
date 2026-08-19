@@ -1,6 +1,28 @@
-# Cache Rules Examples
+# Examples
 
-Example `cache_rules.json` files. Each overrides global cache settings for keys matching a glob pattern, without editing the YAML config or restarting the proxy.
+Two kinds of example file live here.
+
+**`config-*.yaml`** — complete proxy configurations, ready to start:
+
+| File | Profile |
+|---|---|
+| `config-development.yaml` | Local cache, debug logging, unprivileged ports, loopback dashboard |
+| `config-production.yaml` | Standard ports, TLS-terminating listener, shared cache volume, OTLP export |
+| `config-high-performance.yaml` | 1 TiB disk / 10 GiB RAM tiers, long-lived connections, slower dashboard polling |
+
+```bash
+s3-proxy --config docs/examples/config-development.yaml
+```
+
+The production and high-performance profiles use absolute paths under `/var`, and
+standard ports 80/443 which need root or `CAP_NET_BIND_SERVICE`. Adjust both for a local
+trial, or start from the development profile.
+
+**`*-rules.json`** — `cache_rules.json` files, documented below. Each overrides global
+cache settings for keys matching a glob pattern, without editing the YAML config or
+restarting the proxy.
+
+## Cache Rules Examples
 
 To use one, copy it to `cache_dir/cache_rules.json`:
 
@@ -26,7 +48,7 @@ Each file is a `{ "rules": [...] }` document with an optional `$schema` referenc
 }
 ```
 
-Optional per-rule fields: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`.
+Optional per-rule fields: `get_ttl`, `head_ttl`, `put_ttl`, `read_cache_enabled`, `write_cache_enabled`, `compression_enabled`, `ram_cache_eligible`, `evaluate_conditions_from_cache`, `page_widening`, `page_size`, `hedging_enabled`, `hedge_trigger_after`, `hedge_max_per_request`.
 
 ## Glob Syntax
 
@@ -63,6 +85,7 @@ Rules are an ordered list. For each field independently, the value comes from th
 | `no-cache-prefix-rules.json` | Bucket with a `volatile/` prefix that bypasses read caching, everything else cached 1h |
 | `allowlist-pattern-rules.json` | Rule enabling caching for one bucket when global `read_cache_enabled` is `false` |
 | `path-prefix-rules.json` | Matching several path prefixes within a bucket with distinct settings each |
+| `page-aligned-parquet-rules.json` | Page-aligned range caching for a Parquet prefix, so footer and column-chunk reads that cluster within a page hit cache |
 
 ## Allowlist Pattern
 

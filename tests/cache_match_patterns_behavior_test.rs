@@ -204,6 +204,7 @@ async fn spawn_proxy_server(
                             let s3_client = Arc::clone(&s3_client);
                             let inflight_tracker = Arc::clone(&inflight_tracker);
                             let request_semaphore = Arc::clone(&request_semaphore);
+                            let inflight_ledger = s3_client.get_inflight_ledger();
                             async move {
                                 HttpProxy::handle_request(
                                     req,
@@ -219,6 +220,7 @@ async fn spawn_proxy_server(
                                     None, // proxy_referer
                                     None, // destination_policy
                                     None, // policy_resolver
+                                    inflight_ledger,
                                 )
                                 .await
                             }

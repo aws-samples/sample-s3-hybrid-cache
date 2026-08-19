@@ -6,6 +6,7 @@
 //! - Verify ranges with large gaps are NOT consolidated
 //! - Verify all missing bytes are fetched correctly
 
+use bytes::Bytes;
 use s3_proxy::cache::CacheManager;
 use s3_proxy::cache_types::{ObjectMetadata, UploadState};
 use s3_proxy::disk_cache::DiskCacheManager;
@@ -531,11 +532,13 @@ async fn test_range_consolidation_with_fetch_and_merge() {
         range_handler.consolidate_missing_ranges(overlap.missing_ranges.clone(), gap_threshold);
 
     // Simulate fetching the missing ranges (not consolidated in this case)
-    let fetched_ranges: Vec<(RangeSpec, Vec<u8>, HashMap<String, String>)> = overlap
+    let fetched_ranges: Vec<(RangeSpec, Bytes, HashMap<String, String>)> = overlap
         .missing_ranges
         .iter()
         .map(|range_spec| {
-            let data = full_data[range_spec.start as usize..=range_spec.end as usize].to_vec();
+            let data = Bytes::copy_from_slice(
+                &full_data[range_spec.start as usize..=range_spec.end as usize],
+            );
             (range_spec.clone(), data, HashMap::new())
         })
         .collect();
@@ -559,7 +562,8 @@ async fn test_range_consolidation_with_fetch_and_merge() {
         "Merged data should be complete"
     );
     assert_eq!(
-        merge_result.data, full_data,
+        merge_result.data.as_ref(),
+        &full_data,
         "Merged data should be byte-identical to original"
     );
 

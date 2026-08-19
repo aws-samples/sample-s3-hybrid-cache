@@ -8,6 +8,7 @@
 //! - Verify missing ranges are now cached
 //! - Verify cache efficiency is approximately 60%
 
+use bytes::Bytes;
 use s3_proxy::cache::CacheManager;
 use s3_proxy::cache_types::{ObjectMetadata, UploadState};
 use s3_proxy::disk_cache::DiskCacheManager;
@@ -179,11 +180,13 @@ async fn test_partial_cache_hit_scenario() {
     // Step 4: Simulate fetching missing ranges from S3
     // In a real scenario, these would be fetched from S3
     // For this test, we extract them from our full_data
-    let fetched_ranges: Vec<(RangeSpec, Vec<u8>, HashMap<String, String>)> = overlap
+    let fetched_ranges: Vec<(RangeSpec, Bytes, HashMap<String, String>)> = overlap
         .missing_ranges
         .iter()
         .map(|range_spec| {
-            let data = full_data[range_spec.start as usize..=range_spec.end as usize].to_vec();
+            let data = Bytes::copy_from_slice(
+                &full_data[range_spec.start as usize..=range_spec.end as usize],
+            );
             (range_spec.clone(), data, HashMap::new())
         })
         .collect();
@@ -223,7 +226,8 @@ async fn test_partial_cache_hit_scenario() {
         "Merged data should be 40MB"
     );
     assert_eq!(
-        merge_result.data, full_data,
+        merge_result.data.as_ref(),
+        &full_data,
         "Merged data should be byte-identical to original data"
     );
 

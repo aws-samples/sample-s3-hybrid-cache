@@ -223,6 +223,8 @@ async fn full_get_validated_serve_304_serves_cached_body() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -282,6 +284,8 @@ async fn full_get_validated_serve_200_serves_s3_body() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -333,6 +337,8 @@ async fn full_get_validated_serve_403_returns_s3_response_cache_preserved() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -386,6 +392,8 @@ async fn full_get_validated_serve_500_falls_back_to_cache() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -435,6 +443,8 @@ async fn full_get_validated_serve_metadata_missing_delegates_to_forward() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -484,6 +494,8 @@ async fn conditional_request_headers_well_formed() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -546,6 +558,8 @@ async fn head_validated_serve_304_returns_empty_body_with_metadata() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -599,6 +613,8 @@ async fn range_validated_serve_304_serves_cached_range() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -666,6 +682,8 @@ async fn range_validated_serve_200_serves_s3_body() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -721,6 +739,8 @@ async fn range_validated_serve_403_returns_s3_response() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -774,6 +794,8 @@ async fn range_validated_serve_500_falls_back_to_cache() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -825,6 +847,8 @@ async fn range_validated_serve_metadata_missing_delegates_to_forward() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -898,6 +922,8 @@ async fn part_validated_serve_304_serves_cached_part() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -968,6 +994,8 @@ async fn part_validated_serve_200_serves_s3_body() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1036,6 +1064,8 @@ async fn part_validated_serve_403_returns_s3_response() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1102,6 +1132,8 @@ async fn part_validated_serve_500_falls_back_to_cache() {
         Some(Arc::clone(&mm)),
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1152,6 +1184,8 @@ async fn part_validated_serve_metadata_missing_delegates_to_forward() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1203,6 +1237,8 @@ async fn fetcher_branch_completes_success_on_2xx() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1248,6 +1284,8 @@ async fn fetcher_branch_completes_error_on_non_2xx() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1310,6 +1348,8 @@ async fn range_fetcher_branch_completes_success_on_2xx() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1365,6 +1405,8 @@ async fn range_fetcher_branch_completes_error_on_non_2xx() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1419,6 +1461,8 @@ async fn part_fetcher_branch_completes_success_on_2xx() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1467,6 +1511,8 @@ async fn part_fetcher_branch_completes_error_on_non_2xx() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1518,6 +1564,8 @@ async fn coordination_disabled_bypasses_inflight_tracker_full_object() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -1589,6 +1637,8 @@ async fn coordination_disabled_bypasses_inflight_tracker_range() {
         None,
         &ResolvedSettings::default(),
         &None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();

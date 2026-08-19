@@ -187,9 +187,9 @@ impl StubResponse {
 /// Builder-style [`S3ClientApi`] stub for in-process tests.
 ///
 /// Matching order: first by exact `If-None-Match` value, then by exact
-/// `authorization` header value, then the global default. If no match and no
-/// default is configured, a 500 Internal Server Error is returned so the test
-/// fails loudly.
+/// `Range` value, then by exact `authorization` header value, then the global
+/// default. If no match and no default is configured, a 500 Internal Server
+/// Error is returned so the test fails loudly.
 #[derive(Clone)]
 pub struct StubS3Client {
     inner: Arc<StubInner>,
@@ -197,9 +197,15 @@ pub struct StubS3Client {
 
 struct StubInner {
     captured: Mutex<Vec<CapturedRequest>>,
+    range_responses: Mutex<HashMap<String, StubResponse>>,
     etag_responses: Mutex<HashMap<String, StubResponse>>,
     auth_responses: Mutex<HashMap<String, StubResponse>>,
     default_response: Mutex<Option<StubResponse>>,
+    /// Defaults to a disabled ledger (matching the trait's default impl), but
+    /// can be overridden via [`StubS3Client::with_inflight_ledger`] so
+    /// inflight-memory-accounting integration tests can drive real Admission_Check
+    /// behaviour against the stub's `allow_streaming == false` responses.
+    inflight_ledger: Mutex<Arc<s3_proxy::inflight_ledger::InflightLedger>>,
 }
 
 impl Default for StubS3Client {
@@ -216,11 +222,42 @@ impl StubS3Client {
         Self {
             inner: Arc::new(StubInner {
                 captured: Mutex::new(Vec::new()),
+                range_responses: Mutex::new(HashMap::new()),
                 etag_responses: Mutex::new(HashMap::new()),
                 auth_responses: Mutex::new(HashMap::new()),
                 default_response: Mutex::new(None),
+                inflight_ledger: Mutex::new(Arc::new(
+                    s3_proxy::inflight_ledger::InflightLedger::disabled(),
+                )),
             }),
         }
+    }
+
+    /// Attach an in-flight buffered-byte ledger, replacing the disabled
+    /// default. Builder-style so tests can chain it alongside `with_default`.
+    pub fn with_inflight_ledger(
+        self,
+        ledger: Arc<s3_proxy::inflight_ledger::InflightLedger>,
+    ) -> Self {
+        *self
+            .inner
+            .inflight_ledger
+            .lock()
+            .expect("stub inflight_ledger poisoned") = ledger;
+        self
+    }
+
+    /// Route requests that carry a matching `Range` header to `response`.
+    ///
+    /// This is useful for tests where a partial-cache response requires more
+    /// than one upstream byte interval.
+    pub fn with_response_for_range(self, range: impl Into<String>, response: StubResponse) -> Self {
+        self.inner
+            .range_responses
+            .lock()
+            .expect("stub range map poisoned")
+            .insert(range.into(), response);
+        self
     }
 
     /// Route requests that carry a matching `If-None-Match` header to `response`.
@@ -274,7 +311,8 @@ impl StubS3Client {
     }
 
     fn resolve_response(&self, context: &S3RequestContext) -> StubResponse {
-        // Prefer an ETag-targeted rule.
+        // A conditional response models the revalidation request that precedes
+        // any hole fetch.
         if let Some(etag) = context
             .headers
             .get("if-none-match")
@@ -286,6 +324,24 @@ impl StubS3Client {
                 .lock()
                 .expect("stub etag map poisoned")
                 .get(etag)
+            {
+                return resp.clone();
+            }
+        }
+
+        // Hole fetches retain their Range header but not the revalidation
+        // headers, so an exact range response models S3's partial-content body.
+        if let Some(range) = context
+            .headers
+            .get("range")
+            .or_else(|| context.headers.get("Range"))
+        {
+            if let Some(resp) = self
+                .inner
+                .range_responses
+                .lock()
+                .expect("stub range map poisoned")
+                .get(range)
             {
                 return resp.clone();
             }
@@ -440,6 +496,16 @@ impl S3ClientApi for StubS3Client {
 
     async fn refresh_dns(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn get_inflight_ledger(&self) -> Arc<s3_proxy::inflight_ledger::InflightLedger> {
+        Arc::clone(
+            &self
+                .inner
+                .inflight_ledger
+                .lock()
+                .expect("stub inflight_ledger poisoned"),
+        )
     }
 }
 

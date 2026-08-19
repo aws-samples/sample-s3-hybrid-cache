@@ -13,6 +13,7 @@ The dashboard provides a lightweight, browser-based interface for monitoring pro
 - **Auto-refresh**: Updates every 5 seconds (configurable)
 - **Human-readable formatting**: Displays sizes in KB, MB, GB units
 - **Eviction tracking**: Shows eviction counts and recently evicted items
+- **Requests tile**: `Requests: N / M` shows concurrency permits held against the configured `server.max_concurrent_requests`, with the TCP connection count displayed alongside. Before 2.5.0 the numerator was the connection count, which does not track what the limit bounds — with HTTP/1 keep-alive one connection serves many sequential requests. See [Metrics](METRICS.md) for the underlying `permits_held` and `permits_held_peak` fields.
 - **Effectiveness metrics**: Overall Statistics card shows total requests served (GET + HEAD + PUT), GET hits, GET misses, and cache hit rate. The hit-rate denominator counts every GET/HEAD that flows through the proxy — including list-object GETs, conditional requests, and non-cacheable or error responses (e.g. 404/403) — so the displayed rate is the fraction of all GET/HEAD traffic served from cache, not of cacheable object reads alone. Per-bucket traffic table shows GET/PUT request counts, bytes downloaded to clients, bytes saved (S3 transfers avoided via cache), and bytes uploaded.
 
 ### Cache Rules
@@ -20,7 +21,7 @@ The dashboard provides a lightweight, browser-based interface for monitoring pro
 - **Rule rows**: One row per rule, shown in first-match-per-field order. The "Rule / Pattern" column holds the glob pattern; HEAD and GET columns show per-rule hit summaries (e.g. `72.3% of 4 102`)
 - **Pattern filter**: Client-side text filter that matches rule patterns
 - **Top 20 display**: Shows the top 20 rows by default with a "Show all" toggle
-- **Expandable settings**: Click "Settings" on a rule row to view the fields that rule sets (GET/HEAD/PUT TTL, read/write/compression/RAM, "Local conditions" for `evaluate_conditions_from_cache`, and page widening + page size for [page-aligned range caching](CACHING.md#page-aligned-range-caching)). Only fields the rule actually sets are shown; unset fields fall through to the global defaults and are omitted. "Local conditions: On" means the proxy answers conditional requests for matching keys from cached metadata rather than forwarding them to S3 — worth noting when auditing which prefixes skip S3-side credential revalidation.
+- **Expandable settings**: Click "Settings" on a rule row to view the fields that rule sets (GET/HEAD/PUT TTL, read/write/compression/RAM, "Local conditions" for `evaluate_conditions_from_cache`, and page widening + page size for [page-aligned range caching](CACHE_READ_PATHS.md#page-aligned-range-caching)). Only fields the rule actually sets are shown; unset fields fall through to the global defaults and are omitted. "Local conditions: On" means the proxy answers conditional requests for matching keys from cached metadata rather than forwarding them to S3 — worth noting when auditing which prefixes skip S3-side credential revalidation.
 
 ### Page-Aligned Range Caching Statistics
 
@@ -31,11 +32,11 @@ endpoint or from `/metrics`. Per-rule page settings *are* visible in the Cache R
 table via the Settings expander, described above.
 
 ### Application Log Viewer
-- **Recent entries**: Shows most recent 100 log entries by default (configurable)
-- **Auto-refresh**: Updates every 10 seconds (configurable)
+- **Recent entries**: Shows the most recent 100 log entries by default
+- **Auto-refresh**: Updates every 10 seconds (`logs_refresh_interval`)
 - **Structured display**: Timestamp, log level, and message content
 - **Log level filtering**: Filter by ERROR, WARN, INFO, DEBUG levels
-- **Adjustable limits**: Configure display count (50, 100, 200, 500 entries)
+- **Adjustable limit**: An in-page dropdown selects 50, 100, 200, or 500 entries and is passed to `/api/logs?limit=`. This is a **browser-side control**, which is why the `dashboard.max_log_entries` config field is inert — the viewer's cap comes from the dropdown, not from configuration.
 - **Structured data formatting**: Key-value pairs displayed in readable format
 
 ### System Information
@@ -55,7 +56,7 @@ dashboard:
   bind_address: "127.0.0.1"           # Default: loopback only
   cache_stats_refresh_interval: "5s"   # Cache stats refresh rate
   logs_refresh_interval: "10s"         # Log refresh rate
-  max_log_entries: 100                 # Maximum log entries to display
+  max_log_entries: 100                 # DEPRECATED: parsed but has no effect
 ```
 
 ### Access Control
@@ -76,8 +77,7 @@ dashboard:
 - Lower values = more frequent updates, higher CPU usage
 
 **Log Display**:
-- `max_log_entries`: 10-10000 entries (default: 100)
-- Higher values = more memory usage, slower loading
+- `max_log_entries` is **deprecated**. It is parsed and range-validated (10-10000) and logged at startup, but the log viewer does not use it to cap output. It will be removed in a future release.
 
 ## Architecture
 
@@ -100,13 +100,13 @@ dashboard:
 - `GET /style.css` - Stylesheet
 - `GET /script.js` - JavaScript
 
-**JSON APIs**:
-- `GET /api/cache-stats` - Current cache statistics
+**JSON APIs** (six endpoints):
+- `GET /api/cache-stats` - Cache statistics, including the global hit/miss counters and the `page_cache` counters. Returns `overall` with `total_requests` (GET + HEAD + PUT), `get_hits`, `get_misses`, `get_total`, `head_hits`, `head_misses`, `head_total`, `put_total`, `cache_hit_rate`, `s3_requests_saved`, and `bytes_served_from_cache`, plus the per-tier size and eviction figures the statistics cards render.
 - `GET /api/bucket-stats` - Cache rules and per-rule hit/miss stats. Returns `rules` (the ordered rule list, each with the fields it sets plus HEAD/GET hit and miss counts). Only populated when `cache_rules.json` has at least one rule.
-- `GET /api/bucket-traffic` - Per-bucket traffic counters. Returns `bucket_traffic` map keyed by `bucket` or `bucket/prefix`, each entry with `get_requests`, `put_requests`, `bytes_served` (all GET bytes to clients), `bytes_saved` (GET bytes served from cache, i.e. S3 transfers avoided), and `bytes_uploaded` (PUT/UploadPart bytes from clients).
-- `GET /api/cache-stats` - Global cache hit/miss counters. Returns `overall` with `total_requests` (GET + HEAD + PUT), `get_hits`, `get_misses`, `get_total`, `head_hits`, `head_misses`, `head_total`, `put_total`, `cache_hit_rate`, `s3_requests_saved`, and `bytes_served_from_cache`.
-- `GET /api/logs` - Recent application log entries
-- `GET /api/system-info` - System information
+- `GET /api/bucket-traffic` - Per-bucket traffic counters. Returns `bucket_traffic` map keyed by `bucket` or `bucket/prefix`, each entry with `get_requests`, `put_requests`, `bytes_served` (all GET bytes to clients), `bytes_saved` (GET bytes served from cache, i.e. S3 transfers avoided), and `bytes_uploaded` (PUT/UploadPart bytes from clients). See [METRICS.md](METRICS.md).
+- `GET /api/bandwidth` - Download bandwidth QoS state. Returns `instance_ceiling_bps`, `class_bytes`, `residual_bytes`, and `failopen_total`. See [BANDWIDTH_QOS.md](BANDWIDTH_QOS.md).
+- `GET /api/logs` - Recent application log entries. Accepts `?limit=` (50/100/200/500) and `?level=` (ERROR/WARN/INFO/DEBUG).
+- `GET /api/system-info` - Hostname, version, and uptime
 
 ## Performance Impact
 
@@ -139,11 +139,16 @@ dashboard:
 dashboard:
   enabled: true
   port: 8081
-  bind_address: "0.0.0.0"    # All interfaces
+  bind_address: "127.0.0.1"  # Loopback; reach it over an SSH tunnel
   cache_stats_refresh_interval: "10s"  # Reduced frequency
   logs_refresh_interval: "30s"
-  max_log_entries: 50        # Reduced memory usage
 ```
+
+The dashboard is unauthenticated and exposes cache statistics and application log
+content, so the recommended production posture is to leave it on loopback and reach
+it through an SSH tunnel (see [Security Considerations](#security-considerations)).
+Binding `0.0.0.0` is supported, but then the port needs a firewall or a reverse proxy
+in front of it.
 
 ## Troubleshooting
 
@@ -156,14 +161,13 @@ dashboard:
 
 ### Performance Issues
 1. Increase refresh intervals to reduce update frequency
-2. Reduce `max_log_entries` for faster log loading
 3. Monitor concurrent connection count (50 concurrent connections are accepted; beyond
    that, new connections are rejected and the rejection is logged)
 4. Check proxy logs for dashboard-related errors
 
 ### Connection Limits
 - Dashboard supports maximum 50 concurrent connections
-- Additional connections are silently dropped when the limit is reached
+- Additional connections are rejected once the limit is reached, and each rejection is logged at WARN with the peer address
 - Use browser refresh if connection limit reached
 - Consider increasing refresh intervals to reduce connection frequency
 

@@ -1128,9 +1128,12 @@ async function loadSystemInfo() {
             document.getElementById('uptime').textContent = 'Uptime: ' + uptime;
         }
 
-        // Update active requests display
+        // Update requests display. Paired with permits_held (request-concurrency
+        // permits), not active_requests (a TCP connection count) — the numerator
+        // and denominator must share units. active_requests is shown separately
+        // as a connections figure so the connection count is still visible.
         if (data.max_concurrent_requests > 0) {
-            document.getElementById('active-requests').textContent = 'Requests: ' + data.active_requests + ' / ' + data.max_concurrent_requests;
+            document.getElementById('active-requests').textContent = 'Requests: ' + data.permits_held + ' / ' + data.max_concurrent_requests + ' (connections: ' + data.active_requests + ')';
         }
 
         // Apply server-configured refresh intervals (only on first load)
@@ -1795,7 +1798,8 @@ impl ApiHandler {
                         ram_stats.max_size,
                     )
                 } else {
-                    // Fallback to the simplified rate from cache_stats (already in percentage)
+                    // Fallback to the aggregate rate mirrored into cache_stats, which is
+                    // a 0.0-1.0 fraction and so needs scaling to a percentage here.
                     (cache_stats.ram_cache_hit_rate * 100.0, 0, 0, 0, 0)
                 };
 
@@ -2059,6 +2063,20 @@ impl ApiHandler {
             .unwrap_or(0);
         let max_concurrent_val = *self.max_concurrent_requests.read().await as u64;
 
+        // permits_held: request-concurrency permits held, distinct from the TCP
+        // connection count above. Sourced from the metrics manager's cached snapshot
+        // rather than re-deriving from the semaphore directly, since ApiHandler does
+        // not hold it independently. Requirement: TCA 5.1, 5.5, 5.6
+        let permits_held_val =
+            if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
+                match metrics_manager.read().await.get_cached_metrics().await {
+                    Some(cached_metrics) => cached_metrics.request_metrics.permits_held,
+                    None => 0,
+                }
+            } else {
+                0
+            };
+
         let system_info = SystemInfoResponse {
             timestamp: SystemTime::now(),
             hostname: gethostname::gethostname().to_string_lossy().to_string(),
@@ -2069,6 +2087,7 @@ impl ApiHandler {
             logs_refresh_ms: self.config.logs_refresh_interval.as_millis() as u64,
             active_requests: active_requests_val,
             max_concurrent_requests: max_concurrent_val,
+            permits_held: permits_held_val,
         };
 
         let body = serde_json::to_string(&system_info).map_err(|e| {
@@ -2706,10 +2725,17 @@ pub struct SystemInfoResponse {
     pub cache_stats_refresh_ms: u64,
     /// Logs refresh interval in milliseconds (from config)
     pub logs_refresh_ms: u64,
-    /// Current active HTTP requests
+    /// Active TCP connections. Kept for backward compatibility with existing
+    /// dashboard/API consumers; HTTP/1 keep-alive means this is not in-flight
+    /// request count. Prefer `permits_held` for a request-concurrency figure.
     pub active_requests: u64,
     /// Maximum concurrent requests allowed
     pub max_concurrent_requests: u64,
+    /// Request-concurrency permits currently held. This is what the dashboard's
+    /// `Requests: N / M` tile now pairs with `max_concurrent_requests`, replacing
+    /// `active_requests` (a connection count) as that tile's numerator.
+    /// Requirement: TCA 5.6
+    pub permits_held: u64,
 }
 
 /// Log entry structure

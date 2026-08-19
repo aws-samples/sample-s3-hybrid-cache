@@ -529,7 +529,7 @@ The MRAP zone (`dns-mrap.json`) follows the same pattern — apex A records plus
 
 This approach mirrors how S3 itself uses multi-value answer (MVA) routing for DNS queries ([launch announcement](https://aws.amazon.com/about-aws/whats-new/2023/08/amazon-s3-multivalue-answer-response-dns-queries/); see also [Multivalue answer DNS routing](https://docs.aws.amazon.com/general/latest/gr/s3.html#multivalue-answer-dns-routing) in the AWS General Reference). The AWS Common Runtime (CRT), available as a transfer client in AWS CLI v2 and modern SDKs, resolves all IPs from DNS, distributes requests across them, and retries against alternate IPs on connection failure — providing load balancing and failover without an external load balancer. Clients without MVA support fall back to using the first IP in the response.
 
-**Multi-Instance Shared Storage**: When running multiple proxy instances with shared NFS storage, the volume MUST be mounted with `lookupcache=pos` for reliable cache coordination. See [Configuration Guide - Multi-Instance Coordination](CONFIGURATION.md#multi-instance-coordination) for details.
+**Multi-Instance Shared Storage**: When running multiple proxy instances with shared NFS storage, the volume MUST be mounted with `lookupcache=pos`, and MUST enforce advisory file locks between hosts (so never `nolock` or `local_lock`). Both are required for reliable cache coordination and neither reports an error when missing. See [NFS Mount Requirements](CONFIGURATION.md#nfs-mount-requirements) for the full option list and how to verify a live mount.
 
 #### Option C: Hosts File (Testing/Development)
 
@@ -1139,7 +1139,7 @@ How it works:
 - Each client talks to `127.0.0.1` — no load balancer or DNS infrastructure needed
 - Objects cached by any node are available to all nodes via the shared volume
 - If a node's proxy crashes, its process supervisor (systemd, etc.) restarts it — other nodes are unaffected
-- NFS mount requirement: `lookupcache=pos` for reliable cache coordination
+- NFS mount requirements: `lookupcache=pos`, and cross-host advisory locking (never `nolock` or `local_lock`) — see [NFS Mount Requirements](CONFIGURATION.md#nfs-mount-requirements)
 
 **Comparison with DNS multi-value routing:**
 
@@ -1164,7 +1164,7 @@ This works because the upstream `host:port` is carried in the request the proxy 
 
 ### Local-Dev Recipe: Plaintext MinIO on :9000
 
-This recipe fronts a plaintext S3-compatible store (MinIO shown; RustFS or any S3-compatible server works the same) listening on `127.0.0.1:9000`, with the proxy in [Proxy-Only Mode](#proxy-only-mode). The same mechanism (a plaintext `scheme: http` override fronting a real MinIO origin, PUT then GET round-trip) is exercised on every deploy by the fleet deployment-verification suite (group T24), so the path below is known-good — adjust only the host/port for your store.
+This recipe fronts a plaintext S3-compatible store (MinIO shown; RustFS or any S3-compatible server works the same) listening on `127.0.0.1:9000`, with the proxy in [Proxy-Only Mode](#proxy-only-mode). This exact mechanism — a plaintext `scheme: http` override fronting a real MinIO origin, with a PUT then GET round-trip — is covered by automated end-to-end tests on every release, so the recipe below is known-good; adjust only the host and port for your store.
 
 **1. Start the store.** MinIO listens on `:9000` in plaintext by default:
 
@@ -1328,7 +1328,7 @@ RUST_LOG=debug sudo cargo run --release -- -c config/config.example.yaml
 
 - **Dashboard**: See [Dashboard Guide](DASHBOARD.md) for real-time monitoring
 - **Configuration**: See [Configuration Guide](CONFIGURATION.md) for detailed settings
-- **Testing**: See [Testing Guide](TESTING.md) for validation procedures
+- **Testing**: See [Developer Guide — Testing Strategy](DEVELOPER.md#testing-strategy) for validation procedures
 - **Features**: Explore feature documentation in `docs/`
 - **Development**: See [Developer Guide](DEVELOPER.md) for implementation details
 
@@ -1339,7 +1339,6 @@ RUST_LOG=debug sudo cargo run --release -- -c config/config.example.yaml
 3. **Adjust cache sizes** based on your workload
 4. **Use range requests** for large files when possible
 5. **Configure TTL values** appropriate for your data freshness requirements
-
 
 ## System Requirements and Sizing
 

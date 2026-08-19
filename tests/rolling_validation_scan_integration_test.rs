@@ -76,6 +76,7 @@ fn create_meta_file(path: &std::path::Path, compressed_size: u64) {
         head_expires_at: None,
         head_last_accessed: None,
         head_access_count: 0,
+        head_cached_at: None,
     };
     let json = serde_json::to_string_pretty(&meta).unwrap();
     std::fs::write(path, json).unwrap();

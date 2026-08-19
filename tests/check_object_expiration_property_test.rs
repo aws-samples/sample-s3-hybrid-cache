@@ -310,10 +310,17 @@ fn test_property_head_freshness_vs_current_head_ttl() {
             None
         };
 
-        // The formula from get_head_cache_entry_unified:
+        let head_cached_at = if input.head_expires_at_present {
+            Some(created_at)
+        } else {
+            None
+        };
         let actual_head_fresh = head_expires_at.is_some()
             && !head_ttl.is_zero()
-            && now.duration_since(created_at).unwrap_or(Duration::ZERO) <= head_ttl;
+            && now
+                .duration_since(head_cached_at.unwrap_or(created_at))
+                .unwrap_or(Duration::ZERO)
+                <= head_ttl;
 
         // Expected: fresh iff head_expires_at = Some AND head_ttl > 0 AND age ≤ head_ttl
         let expected_head_fresh =

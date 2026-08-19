@@ -490,6 +490,8 @@ async fn integration_coalesce_full_flow() {
                 Some(mm),
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");
@@ -643,6 +645,8 @@ async fn integration_coalesce_head_flow() {
                 Some(mm),
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");
@@ -793,6 +797,8 @@ async fn integration_coalesce_range_flow() {
                 Some(mm),
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("range coordination");
@@ -924,6 +930,8 @@ async fn integration_coalesce_expired_cache() {
             Some(Arc::clone(&mm)),
             &ResolvedSettings::default(),
             &None,
+            // Test harness has no request-concurrency permit to thread.
+            None,
         )
         .await
         .expect("pre-warm GET");
@@ -977,6 +985,8 @@ async fn integration_coalesce_expired_cache() {
                 Some(mm),
                 &ResolvedSettings::default(),
                 &None,
+                // Test harness has no request-concurrency permit to thread.
+                None,
             )
             .await
             .expect("coordination helper");

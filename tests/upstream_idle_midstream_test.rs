@@ -190,6 +190,8 @@ async fn test_response_with_matching_length_cached() {
         &resolved,
         &None,
         None,
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .unwrap();
@@ -238,6 +240,8 @@ async fn test_complete_response_cached() {
         config.clone(),
         &resolved,
         &None,
+        None,
+        // Test harness has no request-concurrency permit to thread.
         None,
     )
     .await

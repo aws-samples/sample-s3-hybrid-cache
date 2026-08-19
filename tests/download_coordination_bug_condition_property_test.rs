@@ -328,6 +328,8 @@ async fn run_one_coordinated_get(
         None, // metrics_manager: not needed for this property
         &ResolvedSettings::default(),
         &None, // proxy_referer
+        // Test harness has no request-concurrency permit to thread.
+        None,
     )
     .await
     .expect("Infallible — coordination helper never returns Err");

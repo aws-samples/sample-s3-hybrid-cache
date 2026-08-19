@@ -13,7 +13,7 @@ Deployment recommendations for two cases with a high-latency origin: a **cross-r
   - [Credentials and network access](#credentials-and-network-access)
 - [Client routing](#client-routing)
   - [DNS: Route 53 private hosted zones](#dns-route-53-private-hosted-zones)
-  - [Load balancer: end-to-end encryption](#load-balancer-end-to-end-encryption)
+  - [Load balancer: encrypting the client hop](#load-balancer-encrypting-the-client-hop)
   - [Choosing between DNS and NLB](#choosing-between-dns-and-nlb)
 - [Origin configuration](#origin-configuration)
   - [Cross-region S3](#cross-region-s3)
@@ -92,7 +92,7 @@ EFS is viable but not performance-equivalent. FSx has lower per-operation latenc
 
 Latency matters more here than headline throughput: each cache hit reads `.meta`, may take a lock, then reads range data, so per-operation cost lands on the critical path before any bytes flow. The gap is widest for small objects and amortizes away on large sequential reads.
 
-On EFS, **use Elastic Throughput and mount with the EFS client**. Both are required for the 1,500 MiBps per-client cap; any other combination is limited to 500 MiBps, and each proxy counts as one client.
+On EFS, **use Elastic Throughput and mount with the EFS client** (`amazon-efs-utils` 2.0 or later, or the EFS CSI driver). Both are required for the [1,500 MiBps per-client cap](https://docs.aws.amazon.com/efs/latest/ug/performance.html); any other combination is limited to 500 MiBps, and each proxy counts as one client. This is also why EFS has no use for `nconnect` — the client provides that connection parallelism itself, so the mount option that FSx needs has no equivalent here. Note that 2.0 replaced `stunnel` with `efs-proxy`, and existing mounts must be re-mounted to pick up its behaviour.
 
 FSx charges a flat rate for provisioned capacity; EFS charges per GB transferred ([$0.03/GB read, $0.06/GB written](https://aws.amazon.com/efs/pricing/) in us-east-1 Elastic Throughput), and because a miss writes to the volume, the effective EFS rate depends on hit rate. Compare like for like — 500 GB cache, 1,280 MB/s throughput:
 
@@ -126,11 +126,11 @@ EFS is least competitive when the cache is cold or churning. Metering minimums (
 
 Scale out, not up: adding proxies raises aggregate throughput, while enlarging a single one mainly buys more concurrent connections, because the bottleneck is per-connection processing rather than total CPU.
 
-**Recommended starting point**: 3× `c6in.large` (2 vCPU, 4 GiB, up to 25 Gbps) — the network-optimized family, sized for the proxy's actual resource use. Peak process memory is independent of object size, because both the read and write paths stream rather than buffer whole objects.
+**Recommended starting point**: 3× `c6in.large` (2 vCPU, 4 GiB, up to 25 Gbps) — the network-optimized family, sized for the proxy's actual resource use. Every upload path and cache-miss GET streams rather than buffering whole objects, so memory on them is independent of object size. What still buffers is read-side: range merge, page widening, buffered range serving, and the recovery fallbacks. Those are bounded in aggregate by `server.max_inflight_buffer_bytes` (opt-in, disabled by default — see [Configuration → In-Flight Memory Ceiling](CONFIGURATION.md#in-flight-memory-ceiling)).
 
 For what a fleet delivers, see the measured figures in [Performance](../README.md#performance). Against a cross-region bucket, 8 proxies reached **2.0 GiB/s** on cache misses and **5.5 GiB/s** on cache hits — roughly double the same test on 3 proxies. A separate same-Region test isolating one large proxy peaked at **3.6 GiB/s** on misses and **7.1 GiB/s** on RAM cache hits. Scale to 8 or more proxies when throughput requires it; scale up to `c6in.xlarge` or `m6in.2xlarge` only if you need more connections per instance.
 
-Memory formula: `~200 MiB + (max_concurrent_requests × ~5 MiB)`, plus `max_ram_cache_size` on top.
+Sizing memory: `server.max_concurrent_requests` now bounds the whole request including its transfer, not just setup, so the streaming-path memory formula `~200 MiB + max_concurrent_requests × ~5 MiB` (see [Configuration → Memory Impact](CONFIGURATION.md#server-configuration)) is a sound fleet-wide ceiling for the streaming paths. It does not cover the read paths that still buffer a whole range — those are bounded in aggregate across concurrent requests by the opt-in `max_inflight_buffer_bytes` ceiling. On a 4 GiB `c6in.large` with the default 512 MiB RAM cache, 512 MiB (`536870912`) is a reasonable starting ceiling. `cache.max_ram_cache_size` (default 512 MiB) is a third, independent budget on top of both. Confirm all three against measured peak resident memory and the corresponding `/metrics` fields (`request_metrics.permits_held_peak`, `inflight_memory.peak_reserved_bytes`) under representative load.
 
 Place each proxy in the same AZ as the clients it serves, subject to the file-system constraints in [Shared cache volume](#shared-cache-volume).
 
@@ -162,7 +162,7 @@ Keep `config.yaml` on the shared volume and point every instance at it with `-c`
 
 The proxy holds no AWS credentials — it forwards requests the client has already signed and cannot call S3 on its own behalf — so the instance profile grants nothing for the data path. It needs `AmazonSSMManagedInstanceCore` for management, `CloudWatchAgentServerPolicy` if you publish metrics to CloudWatch, and read on the artifact prefix if userdata fetches the binary from S3. Manage instances over SSM so no inbound SSH is required.
 
-Open only the ports the chosen client-routing mechanism actually uses. Behind a load balancer that reaches the TLS listener (either encrypted configuration under [Load balancer: end-to-end encryption](#load-balancer-end-to-end-encryption)), only 3129 needs to be reachable — leaving 80 open there is an unnecessary cleartext path into the fleet.
+Open only the ports the chosen client-routing mechanism actually uses. Behind a load balancer that reaches the TLS listener (either encrypted configuration under [Load balancer: encrypting the client hop](#load-balancer-encrypting-the-client-hop)), only 3129 needs to be reachable — leaving 80 open there is an unnecessary cleartext path into the fleet.
 
 | Port | Source |
 |---|---|
@@ -188,9 +188,15 @@ For a single-proxy static fleet, `/etc/hosts` on each compute host is the minima
 
 **Static fleet**: update every zone on every fleet change manually. Do not mix proxy IPs across AZs in a single zone if you want AZ affinity.
 
-### Load balancer: end-to-end encryption
+### Load balancer: encrypting the client hop
 
-A `TLS` listener with a `TCP` target group decrypts at the NLB and forwards cleartext to the proxy — see [what that exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes). Use a **TLS target group** instead, so the NLB re-encrypts the hop to the proxy:
+[GETTING_STARTED](GETTING_STARTED.md#which-pattern-to-choose) names three TLS termination patterns and compares them. Two of the three encrypt the NLB→proxy hop, and this section gives the AWS configuration for both.
+
+**Pattern 1 (`TLS` listener with a `TCP` target group) is not covered here.** It decrypts at the NLB and forwards cleartext to the proxy — see [what that exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes). Choose it only where you have consciously accepted the NLB→proxy segment as trusted; Pattern 3 below encrypts that segment for one extra target-group setting.
+
+#### Pattern 3: NLB re-encrypts to the proxy (recommended)
+
+Change the target group protocol from `TCP` to **`TLS`**:
 
 ```
 Client (HTTPS) → NLB (TLS :443, ACM cert) → Proxy (TLS :3129) → S3 (HTTPS)
@@ -214,6 +220,38 @@ Enable the [TLS proxy listener](GETTING_STARTED.md#tls-proxy-listener-configurat
 
 Store a self-signed cert and key on the shared volume so every instance presents the same one (`chmod 600` the key) — the NLB does not validate it, so any CN/SAN and any expiry works. Allow health-check traffic to port 8080 in the instance security group. If you raise the TCP idle timeout above 350 s, raise the targets' ENI `TcpEstablishedTimeout` to match.
 
+#### Pattern 2: NLB passes TCP through, proxy terminates the client's TLS
+
+Choose this over Pattern 3 when the **client** must validate the proxy's certificate itself, or when you cannot attach a certificate to the NLB. Pattern 3 protects the internal hop against passive observation but not against an active attacker impersonating a proxy instance on it, because the NLB does not validate the target certificate. Pattern 2 closes that gap — at the cost of real certificate management.
+
+```
+Client (HTTPS) → NLB (TCP :443, passthrough) → Proxy (TLS :3129, terminates) → S3 (HTTPS)
+```
+
+The differences from the Pattern 3 configuration above:
+
+| Setting | Value |
+|---|---|
+| Listener | `TCP` on 443, **no** certificate on the NLB |
+| Target group | Protocol `TCP`, port 3129 (`tls_proxy_port`) |
+
+Everything else — health check, cross-zone off, AZ DNS affinity, idle and deregistration timeouts — is unchanged.
+
+The certificate requirements are the real cost, and they are the reason Pattern 3 is the default. The client validates the certificate the proxy presents, so its SANs must match the **NLB's** hostname (that is what clients connect to), every instance must present a cert covering those SANs, and rotation is now tied to the client-facing name rather than being a one-off self-signed file. Put the cert and key on the shared volume so all instances serve the same one, `chmod 600` the key, and plan the rotation.
+
+Clients must trust that certificate and address the NLB on the TLS port:
+
+```bash
+export AWS_CA_BUNDLE=/path/to/proxy-cert.pem
+aws s3 cp s3://your-bucket/key ./local \
+  --endpoint-url https://<nlb-hostname>:3129 \
+  --region us-east-1
+```
+
+To let clients use the default port instead, point the NLB's TCP listener on 443 at target port 3129 and drop `:3129` from the endpoint URL.
+
+#### Both encrypted patterns
+
 **Auto Scaling with NLB**: attach the ASG directly to the target group. Registration and deregistration are automatic — no lifecycle hook or Lambda needed. The deregistration delay drains in-flight connections before the instance is terminated.
 
 Use an NLB, not an ALB — see [Why Layer 4, Not Layer 7](GETTING_STARTED.md#why-layer-4-not-layer-7).
@@ -226,7 +264,7 @@ Use an NLB, not an ALB — see [Why Layer 4, Not Layer 7](GETTING_STARTED.md#why
 | Auto Scaling | EventBridge rule + Lambda | Attach ASG to target group; automatic |
 | Client requirement | CRT or multi-value-aware resolver | Any client |
 | Failover speed | DNS TTL | Health check interval |
-| Client → proxy encryption | Cleartext (HTTP on port 80 for caching); HTTPS on 443 passes through uncached | TLS re-encrypt at NLB (port 3129, encrypted + cached) |
+| Client → proxy encryption | Cleartext (HTTP on port 80 for caching); HTTPS on 443 passes through uncached | Encrypted and cached via the TLS listener on 3129 — Pattern 3 (re-encrypt at NLB) or Pattern 2 (TCP passthrough) |
 | Cost | < $1/month (query charges) | ~$450/month at 100 GB/hr; ~$2,200/month at 500 GB/hr ([pricing](https://aws.amazon.com/elasticloadbalancing/pricing/)) |
 
 NLB is the simpler path for multi-AZ fleets with Auto Scaling: AZ affinity, health checking, and scaling are all managed for you, and it is the only client-routing mechanism that encrypts the client→proxy hop while still caching. DNS is cheaper at any throughput and simpler for static fleets and CRT clients, but the caching path is cleartext — see [What a Cleartext Hop Exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes). [VPC Encryption Controls](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-encryption-controls.html) can mitigate this: in monitor or enforce mode, Nitro hardware encrypts traffic between instances even when the application layer is cleartext, so the HTTP hop is protected from network-level observers without changing the proxy configuration. Choose DNS when cost matters more than managed health checking and automatic registration, and either VPC Encryption Controls is active or the cleartext exposure is acceptable for your network.
@@ -270,10 +308,21 @@ Nothing in the proxy is specific to Amazon S3. Because the Direct Connect or VPN
 
 ## Mount and configuration
 
-Mount with `lookupcache=pos`. Without it instances cache negative lookups and cannot see files written by their peers, producing a 40%+ miss rate on repeat downloads. See [NFS Mount Requirements](CONFIGURATION.md#nfs-mount-requirements) for the full option list.
+Two mount properties are correctness requirements, and neither reports an error when
+absent: `lookupcache=pos`, without which instances cache negative lookups and cannot see
+files written by their peers (a 40%+ miss rate on repeat downloads), and working
+cross-host file locking, without which instances hold the same coordination lock
+simultaneously and evict or consolidate against each other.
 
-- **Omit `noresvport` for FSx** — it is rejected with `mount(2): Operation not permitted`, so an EFS mount line reused for FSx will fail. A silently-failed mount falls through to the root filesystem and cache writes go to local disk; verify with `df -h`.
-- **Leave `nconnect` alone** — the bottleneck is proxy CPU and network, not NFS connection parallelism.
+Neither appears in AWS's recommended options for EFS or for FSx, so add both. The rest of
+the option list differs by file system — `noresvport` is required on EFS and rejected by
+FSx, `nconnect` is recommended on FSx and neither supported nor needed on EFS — so take
+the line for the file system you actually run. Both lines, the per-option comparison, and
+the verification steps are in
+[NFS Mount Requirements](CONFIGURATION.md#nfs-mount-requirements).
+
+A silently-failed mount falls through to the root filesystem and cache writes go to local
+disk; verify with `df -h`.
 
 Settings that differ from defaults:
 
@@ -288,17 +337,26 @@ logging:
   app_log_dir: "/mnt/efs/logs/app"
 ```
 
-Shared-storage coordination is always active and needs no enabling. For analytics-style small reads inside large objects, consider [page-aligned range caching](CACHING.md#page-aligned-range-caching).
+Shared-storage coordination is always active and needs no enabling. For analytics-style small reads inside large objects, consider [page-aligned range caching](CACHE_READ_PATHS.md#page-aligned-range-caching).
 
 ## Verification
 
 ```bash
 curl -s http://<proxy-ip>:8080/health                          # each proxy healthy
-mount | grep -E 'fsx|efs'                                      # confirm lookupcache=pos
+mount | grep -E 'fsx|efs'                                      # confirm lookupcache=pos and nfsvers=4.1, and that nolock/local_lock are absent
 curl -s http://<proxy-ip>:9090/metrics | grep cache_hit_rate_percent   # hit rate rising
 ```
 
 Confirm the cache is genuinely shared, which a health check cannot tell you: request an object through one proxy, then the same object pinned to a different proxy, and expect a hit. A miss points at a mount missing `lookupcache=pos`.
+
+Confirm locking separately, since a mount can pass the shared-cache check above and still not enforce locks between hosts:
+
+```bash
+flock -x /mnt/fsx/.locktest -c 'sleep 30'                              # on one instance, hold the lock
+flock -n -x /mnt/fsx/.locktest -c true && echo BROKEN || echo OK       # on a second instance, must print OK
+```
+
+`BROKEN` means locks are host-local and multi-instance coordination is unsafe; fix the mount options before running more than one instance against the volume.
 
 ## Monitoring
 
