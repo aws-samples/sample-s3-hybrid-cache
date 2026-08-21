@@ -2095,10 +2095,24 @@ impl DiskCacheManager {
         // Drop the file handle first to release the fd
         drop(writer);
         if let Err(e) = std::fs::remove_file(&tmp_path) {
-            warn!(
-                "Failed to clean up aborted incremental tmp file {:?}: {}",
-                tmp_path, e
-            );
+            // NotFound is success, not a failure. Aborting a write whose tmp file
+            // is already gone is the normal outcome, not an anomaly: another
+            // instance's TTL sweep may have reaped the staging directory, or a
+            // concurrent abort may have won the race. Reporting it as a warning
+            // produced a flood of lines that read like disk faults during the
+            // multipart lifecycle race, which is the opposite of useful — the
+            // signal drowned in its own consequence.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                debug!(
+                    "Aborted incremental tmp file was already gone, nothing to clean up: {:?}",
+                    tmp_path
+                );
+            } else {
+                warn!(
+                    "Failed to clean up aborted incremental tmp file {:?}: {}",
+                    tmp_path, e
+                );
+            }
         }
     }
 

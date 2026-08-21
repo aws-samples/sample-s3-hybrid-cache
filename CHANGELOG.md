@@ -5,6 +5,49 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-08-21
+
+### Fixed
+
+- **Upgrade impact:** The first log cleanup pass after upgrading deletes log files
+  older than the configured retention that were previously being kept indefinitely:
+  files left behind by instances no longer running, access log files from a period
+  when access logging was enabled and has since been turned off, and — on a
+  deployment currently running with `access_log_enabled: false` — app log files,
+  because the same gate skipped both sweeps. Retention defaults to 30 days, so this
+  applies whether or not you set it. To keep anything older, copy it off or raise
+  `access_log_retention_days` / `app_log_retention_days` (maximum 365) **before**
+  upgrading.
+
+  Retention now applies to the whole of `access_log_dir` and `app_log_dir` rather
+  than only to files this instance is currently writing, and no longer depends on
+  `access_log_enabled`. Only files matching the documented naming convention are
+  removed; anything else in those directories is left alone regardless of age. A file
+  written by another instance gets one extra day of grace, so configure `N - 1` for a
+  hard cap at N days. See
+  [`docs/ACCESS_LOG_FORMAT.md`](docs/ACCESS_LOG_FORMAT.md).
+
+- Multipart uploads through the proxy are now cached. Previously the upload
+  succeeded and reads were correct, but nothing was cached, so multipart objects
+  were served from S3 on every read. Recording parts is also faster and no longer
+  scales with an upload's part count.
+
+  Uploads with very large part counts take longer to finalise than small ones, so a
+  larger part size is worth preferring for very large objects.
+
+- A `HEAD` request for a single part of a multipart object (`?partNumber=N`) could
+  cause later reads of that object to return only that part's bytes with HTTP 200,
+  until the cache entry expired. Part-scoped requests are now forwarded without
+  consulting or populating the whole-object cache entry, and response-specific
+  headers are no longer stored as object metadata. A part-scoped `HEAD` now returns
+  that part's length and the object's part count.
+
+  **No action is required on upgrade.** Affected entries are detected and repaired
+  against S3 on the first read, so no cache flush or configuration change is needed.
+
+### Changed
+
+- Documentation updates.
 ## [2.5.0] - 2026-08-19
 
 **Upgrade impact:** Review `server.max_concurrent_requests` if you set it explicitly —

@@ -132,7 +132,6 @@ cache_dir/
 ```
 
 **Why BLAKE3**:
-- 10x faster than SHA-256
 - Cryptographically secure (prevents collision attacks)
 - Excellent distribution properties
 - Native Rust implementation

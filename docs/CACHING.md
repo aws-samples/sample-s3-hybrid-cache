@@ -163,8 +163,15 @@ The proxy intelligently bypasses cache for S3 operations that return dynamic or 
 
   The proxy has no way to decrypt SSE-C data, and the cache key is path-only — caching plaintext obtained under one key and serving it under a different (or missing) key would leak data. SSE-C requests are forwarded to S3 verbatim, and S3 enforces key matching end-to-end. Existing non-SSE-C cache entries for a path remain; an SSE-C request to that same path goes straight to S3 and S3's response determines what the client sees.
 
+**Part-Scoped HEAD** (always bypasses):
+- **HeadObject with `partNumber`** — a `HEAD` naming a single part is forwarded to S3 with no cache lookup and no cache write, under the bypass reason `part-scoped-head`.
+
+  S3 answers such a request with that PART's `Content-Length` plus a `Content-Range`, but the cache key is path-only and does not carry the query string. Treating it as an ordinary `HeadObject` therefore filed a partial response under the whole-object key, after which the object's cached length was one part's length — so a client that sizes an object from `HEAD` before reading (as the AWS CLI's CRT transfer client does) read only that many bytes and treated the transfer as complete, with HTTP 200 and no error. Fixed in 2.6.0; present from v0.5.0 to 2.5.0 inclusive.
+
+  Caching it under a part-scoped key was considered and rejected: a part-scoped `HEAD` is rare and cheap to serve from S3, and a part-key HEAD grammar would add TTL and invalidation surface for the same class of bug. Bypassing also fixes the converse case, where a part-scoped `HEAD` issued after a plain one was answered from the whole-object entry and returned the object's length with no part count.
+
 **Part Operations** (cached):
-- **GetObjectPart** (query parameter: `partNumber`) - Cached as ranges using existing range storage architecture
+- **GetObjectPart** (query parameter: `partNumber`) - Cached as ranges using existing range storage architecture. Unaffected by the above: a part `GET` writes a real range and takes the object's length from `Content-Range`'s total, so it neither truncates a later read nor mis-reports the object's size.
 
 ### Cached Operations
 
@@ -200,6 +207,7 @@ GET /bucket/object.txt?tagging            → Bypassed (GetObjectTagging)
 GET /bucket/object.txt?partNumber=1       → Cached (GetObjectPart)
 HEAD /                                    → Bypassed (HeadBucket/ListBuckets)
 HEAD /bucket/object.txt                   → Cached (HeadObject)
+HEAD /bucket/object.txt?partNumber=1      → Bypassed (part-scoped-head)
 ```
 
 ### Logging

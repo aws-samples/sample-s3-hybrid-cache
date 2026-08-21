@@ -21,13 +21,20 @@
 //! state machine, correctness gates, concurrency semantics, and threat model.
 //! Short version:
 //!
-//! - In-flight state lives under `{cache_dir}/mpus_in_progress/{uploadId}/`.
+//! - In-flight state lives under `{cache_dir}/mpus_in_progress/{uploadId}/`. A
+//!   part owns its own `part{N}.bin`, `part{N}.json` and `part{N}.lock`; there is
+//!   no shared tracker document that each part appends to.
 //! - The streaming part path (`open_multipart_part_sink` + its `finalize`) must
-//!   hold `upload.lock` across both the part-file rename and the tracker update
-//!   — same-part-number concurrent writes rely on this.
-//! - `finalize_multipart_upload` only retains the cache if S3 succeeded, the
-//!   request body parses, every requested part is cached locally, and every
-//!   requested ETag matches the tracker. Any miss → cleanup, no cache entry.
+//!   hold `part{N}.lock` across both the part-file rename and the part-record
+//!   write — same-part-number concurrent writes rely on this. Per part, not per
+//!   upload: see [`SignedPutHandler::record_part_blocking`].
+//! - `finalize_multipart_upload` first waits (bounded by
+//!   [`MULTIPART_COMPLETE_CACHE_WAIT`]) for the records of the parts its own
+//!   request body names, then only retains the cache if S3 succeeded, the request
+//!   body parses, every requested part is cached locally, every requested ETag
+//!   matches its record, and the assembled part count agrees with S3's ETag. Any
+//!   miss → no cache entry; whether staging is also deleted depends on the path
+//!   (see [`SignedPutHandler::cleanup_incomplete_multipart_cache`]).
 //! - `aws_chunked_decoder` is the one true chunk parser for both this handler
 //!   and the non-multipart PUT path.
 
@@ -42,6 +49,69 @@ use crate::signed_request_proxy::{
     forward_signed_request_with_body, UpstreamTransport, STREAMED_BODY_CAP,
 };
 use crate::{ProxyError, Result};
+
+/// How long `CompleteMultipartUpload` will wait for the part records it needs to
+/// appear in the upload tracker before giving up and not caching the object.
+///
+/// The per-part cache task is fire-and-forget and lags the client's response by
+/// design, so on a working cache this wait is the normal path rather than an
+/// exception — measured stragglers landed within about three seconds of Complete.
+/// Ten seconds leaves room for a slow shared volume without letting a genuinely
+/// lost part hold a client-visible request open indefinitely.
+///
+/// It is worth being explicit that this trades Complete latency for a working
+/// cache. Complete previously returned as soon as S3 did; it now may wait for
+/// local work. The cost is bounded, only paid on multipart uploads, and the
+/// alternative measured outcome was multipart objects never being cached at all.
+///
+/// Deliberately a fixed internal constant rather than a config field: no operator
+/// has needed to tune it, and the shape of the fix does not depend on the value.
+/// If a need appears, a field with this as its default is a compatible change.
+const MULTIPART_COMPLETE_CACHE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Gap between tracker polls while waiting for part records (see
+/// [`MULTIPART_COMPLETE_CACHE_WAIT`]). Short enough that the common case adds
+/// little latency, long enough not to hammer a network filesystem.
+const TRACKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How many part-cache finalizations may hold a `spawn_blocking` thread at
+/// once, per process.
+///
+/// # Why this bound exists, and why the rationale changed
+///
+/// This started as a fix for a real, measured failure: before per-part records
+/// (see [`Self::record_part_blocking`]), every part's finalize took an exclusive
+/// cross-instance `flock` on a single shared `upload.lock` and rewrote the WHOLE
+/// `upload.meta` tracker, so per-part cost grew with the number of parts already
+/// recorded and every in-flight part queued on that one lock. Each waiter occupied
+/// a `spawn_blocking` thread for up to its 30-second timeout; the forward path
+/// needs that same pool, so the pool was exhausted and the client's upload failed.
+/// Measured on a three-proxy fleet at 2,000 parts (2026-08-21, release 2.6.0,
+/// against the shared-`upload.lock` design): **1,214 `upload.lock` timeouts and
+/// 1,220 part-record failures across the three instances, and the client's upload
+/// failed** with `Connection reset by peer` on an `UploadPart`.
+///
+/// **That mechanism no longer exists.** Finalization now takes a *per-part*
+/// `part{N}.lock` (see [`Self::finalize_and_record_cached_part`]), so two writers
+/// on different part numbers never contend at all — only same-part-number retries
+/// do, which is the correctness gate this was always meant to preserve, not the
+/// throughput problem. Re-run at 2,000 parts against the per-part-lock design
+/// showed zero lock contention from this cause.
+///
+/// This semaphore is kept anyway, as a **plain backstop** rather than a fix for a
+/// live defect: it caps how many finalizations can occupy a `spawn_blocking`
+/// thread simultaneously, independent of why any one of them might be slow (a
+/// degraded shared volume, an unusually large part, etc.). It is not load-bearing
+/// for the 2,000-part case any more: re-measured against the per-part-lock
+/// design, that case succeeds without this semaphore needing to intervene.
+///
+/// Four is deliberately below the AWS CLI's default upload concurrency of 10, so
+/// the queue is bounded for the common client, while leaving enough parallelism
+/// that a single slow shared-volume operation does not serialise everything behind
+/// it. It does **not** reduce the total serialised time for one upload — see the
+/// note on `MULTIPART_COMPLETE_CACHE_WAIT` and the deferred O(n²) work.
+static PART_FINALIZE_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{HeaderMap, Request, Response, StatusCode};
@@ -1384,8 +1454,8 @@ impl SignedPutHandler {
     /// consults per-bucket cache rules and streams rather than buffering. This
     /// buffered one-shot writer is retained solely as the part-population helper
     /// for the multipart test suite (cleanup, finalize, GET-from-cache, and the
-    /// same-part-race concurrency regression); it holds `upload.lock` across the
-    /// part-file rename and the tracker update, the same correctness gate the
+    /// same-part-race concurrency regression); it holds `part{N}.lock` across the
+    /// part-file rename and the part-record write, the same correctness gate the
     /// sink enforces. It is compiled only under `cfg(test)` and never ships in
     /// the production binary. Spec: compression-followup-fixes Requirement 4.
     #[cfg(test)]
@@ -1397,7 +1467,7 @@ impl SignedPutHandler {
         data: &[u8],
         etag: &str,
     ) -> Result<()> {
-        use crate::cache_types::{CachedPartInfo, MultipartUploadTracker};
+        use crate::cache_types::CachedPartInfo;
         use fs2::FileExt;
 
         // Ensure multipart tracking directory exists
@@ -1417,11 +1487,12 @@ impl SignedPutHandler {
             self.compression_handler
                 .compress_with_metadata(data, cache_key, should_compress);
 
-        // Acquire lock BEFORE writing part file and updating tracker, so a racing
-        // same-part-number write cannot leave the on-disk bytes out of sync with
-        // the tracker ETag (the invariant exercised by the concurrency test).
-        let upload_meta_file = multipart_dir.join("upload.meta");
-        let lock_file_path = multipart_dir.join("upload.lock");
+        // Acquire the PER-PART lock before writing the part file and its record, so
+        // a racing same-part-number write cannot leave the on-disk bytes out of sync
+        // with the recorded ETag (the invariant exercised by the concurrency test).
+        // Per part rather than per upload: the invariant is per part, and a
+        // per-upload lock serialised every part of every concurrent upload.
+        let lock_file_path = Self::part_lock_path(&multipart_dir, part_number);
 
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -1431,7 +1502,7 @@ impl SignedPutHandler {
             .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
 
         lock_file.lock_exclusive().map_err(|e| {
-            ProxyError::CacheError(format!("Failed to acquire lock for upload.meta: {}", e))
+            ProxyError::CacheError(format!("Failed to acquire per-part lock: {}", e))
         })?;
 
         // Write part file atomically using temp file + rename (inside the lock)
@@ -1455,35 +1526,204 @@ impl SignedPutHandler {
         );
 
         // Read existing tracker or create new one
-        let mut tracker = if upload_meta_file.exists() {
-            let meta_content = tokio::fs::read_to_string(&upload_meta_file)
-                .await
-                .map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to read upload metadata: {}", e))
-                })?;
-
-            MultipartUploadTracker::from_json(&meta_content).unwrap_or_else(|_| {
-                warn!("Failed to parse existing upload.meta, creating new tracker");
-                MultipartUploadTracker::new(upload_id.to_string(), cache_key.to_string())
-            })
-        } else {
-            MultipartUploadTracker::new(upload_id.to_string(), cache_key.to_string())
-        };
-
-        tracker.add_part(part_info);
-
-        let tracker_json = tracker.to_json().map_err(|e| {
-            ProxyError::CacheError(format!("Failed to serialize upload tracker: {}", e))
-        })?;
-
-        tokio::fs::write(&upload_meta_file, tracker_json)
-            .await
-            .map_err(|e| {
-                ProxyError::CacheError(format!("Failed to write upload metadata: {}", e))
-            })?;
+        // One small file per part. Nothing shared is read or rewritten, so this
+        // costs the same at ten parts and at ten thousand.
+        let multipart_dir_owned = multipart_dir.clone();
+        let part_info_owned = part_info.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::record_part_blocking(&multipart_dir_owned, part_number, &part_info_owned)
+        })
+        .await
+        .map_err(|e| ProxyError::CacheError(format!("Part record task panicked: {}", e)))??;
 
         drop(lock_file);
         Ok(())
+    }
+
+    /// Path of the per-part record for `part_number`.
+    ///
+    /// Sits beside the part's data file (`part{N}.bin`) and holds that part's
+    /// [`CachedPartInfo`] — size, ETag and compression algorithm — as its own small
+    /// JSON document.
+    fn part_record_path(multipart_dir: &std::path::Path, part_number: u32) -> std::path::PathBuf {
+        multipart_dir.join(format!("part{}.json", part_number))
+    }
+
+    /// Path of the per-part lock for `part_number`.
+    fn part_lock_path(multipart_dir: &std::path::Path, part_number: u32) -> std::path::PathBuf {
+        multipart_dir.join(format!("part{}.lock", part_number))
+    }
+
+    /// Record one part, without rewriting anything shared.
+    ///
+    /// # Why per-part files rather than one tracker
+    ///
+    /// Every `UploadPart` used to take an exclusive cross-instance `flock` on
+    /// `upload.lock`, read the WHOLE `upload.meta`, append one entry, and write the
+    /// whole file back. That is O(n²) bytes over an upload and, worse, it serialises
+    /// every part of every concurrent upload on one lock on a network filesystem.
+    ///
+    /// Measured at 2,000 parts on a three-proxy fleet: **1,214 `upload.lock`
+    /// timeouts, 1,220 part-record failures, and the client's upload FAILED** with
+    /// `Connection reset by peer`, because each timed-out finalize held a
+    /// `spawn_blocking` thread for its full 30-second timeout and the forward path
+    /// needs that same pool. At ten concurrent parts the same queueing left three
+    /// records unlanded after ten seconds, so the object was not cached at all.
+    ///
+    /// A part now owns its own filenames — `part{N}.bin`, `part{N}.json`,
+    /// `part{N}.lock` — so per-part cost is O(1) and no part contends with any
+    /// other. Finalisation reads the directory instead of one growing document
+    /// ([`Self::load_tracker`]).
+    ///
+    /// # The correctness gate is preserved, at per-part scope
+    ///
+    /// The § 2 invariant is that a retried part with different bytes must never
+    /// leave the on-disk file and the recorded ETag disagreeing. That still holds:
+    /// the caller publishes `part{N}.bin` and writes `part{N}.json` inside one
+    /// critical section, now guarded by `part{N}.lock`. Two writers racing the SAME
+    /// part number still serialise; two writers on DIFFERENT part numbers no longer
+    /// serialise at all, which is the whole point. The lock is per part rather than
+    /// per upload because the invariant is per part — nothing about it ever needed
+    /// to exclude a different part number.
+    fn record_part_blocking(
+        multipart_dir: &std::path::Path,
+        part_number: u32,
+        part_info: &crate::cache_types::CachedPartInfo,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let record_path = Self::part_record_path(multipart_dir, part_number);
+        let json = serde_json::to_string(part_info).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to serialize part record: {}", e))
+        })?;
+
+        // Atomic: tmp + fsync + rename (Req 6.2). The tmp name carries the part
+        // number so two parts cannot collide on it.
+        let tmp_path = multipart_dir.join(format!("part{}.json.tmp", part_number));
+        let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to create temp part record: {}", e))
+        })?;
+        f.write_all(json.as_bytes()).map_err(|e| {
+            ProxyError::CacheError(format!("Failed to write temp part record: {}", e))
+        })?;
+        f.sync_all()
+            .map_err(|e| ProxyError::CacheError(format!("Failed to fsync part record: {}", e)))?;
+        drop(f);
+
+        std::fs::rename(&tmp_path, &record_path)
+            .map_err(|e| ProxyError::CacheError(format!("Failed to rename part record: {}", e)))
+    }
+
+    /// Which of `wanted` have a record on disk.
+    ///
+    /// Stats the specific files rather than listing the directory. A staging directory
+    /// holds up to three files per part (`.bin`, `.json`, `.lock`), so at 2,000 parts a
+    /// full listing walks 6,000 entries on a network filesystem — and the poll loop
+    /// that needs this answer runs every 100 ms. Statting `wanted` is bounded by what
+    /// the caller asked about, and short-circuits as soon as one is missing, which is
+    /// the common case early in the wait.
+    fn present_parts_blocking(
+        multipart_dir: &std::path::Path,
+        wanted: &std::collections::HashSet<u32>,
+    ) -> std::collections::HashSet<u32> {
+        wanted
+            .iter()
+            .copied()
+            .filter(|n| Self::part_record_path(multipart_dir, *n).exists())
+            .collect()
+    }
+
+    /// Which part numbers have a record on disk.
+    ///
+    /// Existence only — no JSON parsing — because the one hot caller
+    /// ([`Self::await_tracker_parts`]) asks nothing else, and it asks repeatedly.
+    fn recorded_part_numbers(multipart_dir: &std::path::Path) -> std::collections::HashSet<u32> {
+        let mut present = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(multipart_dir) {
+            for entry in entries.flatten() {
+                if let Some(n) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("part"))
+                    .and_then(|rest| rest.strip_suffix(".json"))
+                    .and_then(|digits| digits.parse::<u32>().ok())
+                {
+                    present.insert(n);
+                }
+            }
+        }
+        present
+    }
+
+    /// Assemble a [`MultipartUploadTracker`] from the upload-level `upload.meta`
+    /// plus the per-part records on disk.
+    ///
+    /// `upload.meta` is written once, at `CreateMultipartUpload`, and carries only
+    /// upload-level facts (upload id, cache key, start time, content type). The
+    /// parts come from the directory. So the returned value is the same shape every
+    /// existing caller expects, assembled rather than parsed from one document.
+    ///
+    /// A record that fails to parse is skipped with a `warn!` rather than failing
+    /// the whole load: one unreadable part should cost that part, not the object.
+    /// The missing-parts guard in `finalize_multipart_upload` then declines to
+    /// finalise, which is the correct outcome and the same one as if the part had
+    /// never landed.
+    fn load_tracker_blocking(
+        multipart_dir: &std::path::Path,
+        upload_id: &str,
+        cache_key: &str,
+    ) -> Result<crate::cache_types::MultipartUploadTracker> {
+        use crate::cache_types::{CachedPartInfo, MultipartUploadTracker};
+
+        // A missing or unparseable `upload.meta` is NOT fatal, and that is deliberate.
+        // The per-part path used to create the tracker on demand when it was absent, so
+        // an upload whose `CreateMultipartUpload` this fleet never saw — one started
+        // before a deploy, or on a volume that lost the file — still cached. Requiring
+        // the file here would silently remove that self-healing. The only thing lost by
+        // synthesising is upload-level `content_type`, which is cosmetic; the parts
+        // come from disk either way.
+        let upload_meta_file = multipart_dir.join("upload.meta");
+        let mut tracker = match std::fs::read_to_string(&upload_meta_file) {
+            Ok(content) => match MultipartUploadTracker::from_json(&content) {
+                Ok(tracker) => tracker,
+                Err(e) => {
+                    warn!(
+                        "Unparseable upload.meta at {:?}: {} — rebuilding upload-level fields from the request (parts are unaffected; they come from disk)",
+                        upload_meta_file, e
+                    );
+                    MultipartUploadTracker::new(upload_id.to_string(), cache_key.to_string())
+                }
+            },
+            Err(_) => {
+                debug!(
+                    "No upload.meta at {:?}; rebuilding upload-level fields from the request",
+                    upload_meta_file
+                );
+                MultipartUploadTracker::new(upload_id.to_string(), cache_key.to_string())
+            }
+        };
+
+        // Upload-level file is authoritative for everything except the parts, which
+        // are rebuilt from disk so a stale `parts` array in an old-format file
+        // cannot contribute.
+        tracker.parts.clear();
+        tracker.total_size = 0;
+
+        for part_number in Self::recorded_part_numbers(multipart_dir) {
+            let record_path = Self::part_record_path(multipart_dir, part_number);
+            match std::fs::read_to_string(&record_path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| serde_json::from_str::<CachedPartInfo>(&s).map_err(|e| e.to_string()))
+            {
+                Ok(info) => tracker.add_part(info),
+                Err(e) => warn!(
+                    "Skipping unreadable part record {:?}: {} (this part will count as not cached)",
+                    record_path, e
+                ),
+            }
+        }
+
+        Ok(tracker)
     }
 
     /// Handle CompleteMultipartUpload by creating metadata linking all parts
@@ -1694,20 +1934,39 @@ impl SignedPutHandler {
 
             // Create metadata linking all parts as ranges (Requirement 5.4, 8.1, 9.3)
             // Pass the requested_parts to finalize_multipart_upload for filtering (Requirement 4.4, 5.1)
-            if let Err(e) = self
-                .finalize_multipart_upload(
-                    &cache_key,
-                    &upload_id,
-                    &etag,
-                    &response_headers,
-                    requested_parts.as_deref(),
-                )
-                .await
-            {
-                error!(
-                    "CompleteMultipartUpload cache failed: bucket={}, key={}, error={}",
-                    bucket, key, e
-                );
+            //
+            // A parse failure now genuinely skips finalization, which is what the
+            // warning above has always claimed. Previously `None` was passed
+            // through to `finalize_multipart_upload`, where it meant "use all
+            // cached parts" — disabling the missing-part and ETag guards and
+            // letting a tracker holding a SUBSET of parts produce
+            // self-consistent metadata for a shorter object. There is no safe
+            // way to finalize without the requested part list: it is the only
+            // statement of what the completed object actually contains.
+            match requested_parts.as_deref() {
+                Some(parts) => {
+                    if let Err(e) = self
+                        .finalize_multipart_upload(
+                            &cache_key,
+                            &upload_id,
+                            &etag,
+                            &response_headers,
+                            parts,
+                        )
+                        .await
+                    {
+                        error!(
+                            "CompleteMultipartUpload cache failed: bucket={}, key={}, error={}",
+                            bucket, key, e
+                        );
+                    }
+                }
+                None => {
+                    warn!(
+                        "Skipping multipart cache finalization because the CompleteMultipartUpload body did not parse: cache_key={}, upload_id={} (upload unaffected — S3 already accepted it)",
+                        cache_key, upload_id
+                    );
+                }
             }
             // Success log is in finalize_multipart_upload with full details
 
@@ -1880,11 +2139,9 @@ impl SignedPutHandler {
         upload_id: &str,
         etag: &str,
         response_headers: &std::collections::HashMap<String, String>,
-        requested_parts: Option<&[RequestedPart]>,
+        requested_parts: &[RequestedPart],
     ) -> Result<()> {
-        use crate::cache_types::{
-            MultipartUploadTracker, NewCacheMetadata, ObjectMetadata, RangeSpec, UploadState,
-        };
+        use crate::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec, UploadState};
         use crate::compression::CompressionAlgorithm;
         use fs2::FileExt;
 
@@ -1899,6 +2156,34 @@ impl SignedPutHandler {
             return Ok(());
         }
 
+        // Wait for the parts this Complete names to appear in the tracker before
+        // evaluating it (the lifecycle race).
+        //
+        // The per-part cache task is fire-and-forget and deliberately lags the
+        // client's response: the forward path answers the client, and only then
+        // does the cache task drain the tee, await the S3 result and finalize.
+        // Clients send Complete as soon as the last part is acknowledged — 147 ms
+        // after the first part was recorded, in the measured case — so Complete
+        // used to read a tracker holding 2 of 10 parts, declare the other 8
+        // "not cached locally", and `remove_dir_all` the staging directory out
+        // from under the 8 tasks still writing into it. Those tasks then failed
+        // ENOENT on rename or ESTALE on `upload.lock`, which is where the error
+        // flood came from. The loser was predetermined.
+        //
+        // WHY POLL THE TRACKER RATHER THAN TRACK IN-FLIGHT TASKS. Parts of one
+        // upload can be served by several proxies and Complete by a fourth, so
+        // an in-process registry of spawned tasks fixes only the case where they
+        // happen to share an instance — which on a three-proxy fleet is the
+        // uncommon one. The tracker already lives on the shared volume and is
+        // already updated under `upload.lock` by whichever instance ran the part
+        // task, and this Complete already knows exactly which parts it needs from
+        // its own request body. So waiting for the tracker to contain them is
+        // fleet-correct with no new shared state, no marker files, and no
+        // dependence on process memory. It is also why the parse-failure path
+        // above must skip outright: without the requested part list there is no
+        // well-defined set to wait for.
+        Self::await_tracker_parts(&multipart_dir, cache_key, upload_id, requested_parts).await;
+
         // Acquire lock on upload.meta
         let lock_file_path = multipart_dir.join("upload.lock");
         let lock_file = std::fs::OpenOptions::new()
@@ -1912,29 +2197,31 @@ impl SignedPutHandler {
             ProxyError::CacheError(format!("Failed to acquire lock for upload.meta: {}", e))
         })?;
 
-        // Read the upload tracker
-        let upload_meta_file = multipart_dir.join("upload.meta");
-        let tracker_result = tokio::fs::read_to_string(&upload_meta_file).await;
-
-        let tracker_content = match tracker_result {
-            Ok(content) => content,
-            Err(e) => {
-                warn!(
-                    "CompleteMultipartUpload succeeded on S3 but failed to read upload tracker: cache_key={}, upload_id={}, error={}, cleaning up and skipping cache finalization",
-                    cache_key, upload_id, e
-                );
-                drop(lock_file);
-                self.cleanup_incomplete_multipart_cache(&multipart_dir, upload_id)
-                    .await;
-                return Ok(());
-            }
+        // Assemble the tracker: upload-level facts from `upload.meta`, parts from
+        // the per-part records on disk. This is the only place that pays O(n) for
+        // the part set, once per upload, instead of every part paying it.
+        // Off the runtime: this reads one small file per part, so at high part counts
+        // it is thousands of synchronous round trips to a shared volume.
+        let tracker_load = {
+            let dir = multipart_dir.clone();
+            let upload_id_owned = upload_id.to_string();
+            let cache_key_owned = cache_key.to_string();
+            tokio::task::spawn_blocking(move || {
+                Self::load_tracker_blocking(&dir, &upload_id_owned, &cache_key_owned)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(ProxyError::CacheError(format!(
+                    "Tracker load task panicked: {}",
+                    e
+                )))
+            })
         };
-
-        let tracker = match MultipartUploadTracker::from_json(&tracker_content) {
+        let tracker = match tracker_load {
             Ok(tracker) => tracker,
             Err(e) => {
                 warn!(
-                    "CompleteMultipartUpload succeeded on S3 but failed to parse upload tracker: cache_key={}, upload_id={}, error={}, cleaning up and skipping cache finalization",
+                    "CompleteMultipartUpload succeeded on S3 but failed to load the upload tracker: cache_key={}, upload_id={}, error={}, cleaning up and skipping cache finalization",
                     cache_key, upload_id, e
                 );
                 drop(lock_file);
@@ -1956,11 +2243,13 @@ impl SignedPutHandler {
         }
 
         // Build HashSet of requested part numbers for efficient lookup (Requirements 5.1, 5.2, 5.3)
-        // If requested_parts is None, use all cached parts (backward compatibility)
-        let requested_part_numbers: std::collections::HashSet<u32> = match requested_parts {
-            Some(parts) => parts.iter().map(|p| p.part_number).collect(),
-            None => tracker.parts.iter().map(|p| p.part_number).collect(),
-        };
+        //
+        // Always the set S3 was asked to assemble, never "whatever the tracker
+        // happens to hold". The old `None` fallback to the tracker's own contents
+        // made the filter below a no-op and the guards that follow vacuous, so a
+        // partially-recorded upload finalized as a short object.
+        let requested_part_numbers: std::collections::HashSet<u32> =
+            requested_parts.iter().map(|p| p.part_number).collect();
 
         // Filter cached parts to only those in the request and sort by part number
         let all_cached_parts = tracker.get_sorted_parts();
@@ -1971,23 +2260,31 @@ impl SignedPutHandler {
 
         // Check if any requested parts are not cached locally (Requirement 5.4)
         // If a requested part is not in our cache, skip cache finalization
-        if let Some(parts) = requested_parts {
+        {
             let cached_part_numbers: std::collections::HashSet<u32> =
                 tracker.parts.iter().map(|p| p.part_number).collect();
-            let missing_requested: Vec<u32> = parts
+            let missing_requested: Vec<u32> = requested_parts
                 .iter()
                 .filter(|p| !cached_part_numbers.contains(&p.part_number))
                 .map(|p| p.part_number)
                 .collect();
 
             if !missing_requested.is_empty() {
+                // A genuine straggler after the bounded wait above. Degrade to
+                // "not cached" quietly and leave the staging directory to the TTL
+                // sweep.
+                //
+                // Deleting it here is what produced the error flood: the parts
+                // this instance is declaring missing may still be mid-write, on
+                // this instance or another, and `remove_dir_all` pulls the
+                // directory (including `upload.lock` and any `.tmp`) out from
+                // under them, so they fail ENOENT on rename or ESTALE on the
+                // lock. Those errors read like disk faults and are not.
                 warn!(
-                    "CompleteMultipartUpload succeeded on S3 but requested parts {:?} not cached locally: cache_key={}, upload_id={}, cleaning up and skipping cache finalization",
-                    missing_requested, cache_key, upload_id
+                    "CompleteMultipartUpload succeeded on S3 but parts {:?} were still not recorded after waiting {:?}: cache_key={}, upload_id={}, skipping cache finalization (upload unaffected; staging left for the TTL sweep)",
+                    missing_requested, MULTIPART_COMPLETE_CACHE_WAIT, cache_key, upload_id
                 );
                 drop(lock_file);
-                self.cleanup_incomplete_multipart_cache(&multipart_dir, upload_id)
-                    .await;
                 return Ok(());
             }
         }
@@ -2020,8 +2317,8 @@ impl SignedPutHandler {
 
         // Validate ETags match between request and cached parts (Requirements 9.1, 9.2, 9.3, 9.4)
         // If any ETag mismatches, skip cache finalization but still forward to S3 (already done)
-        if let Some(parts) = requested_parts {
-            for requested_part in parts {
+        {
+            for requested_part in requested_parts {
                 // Find the corresponding cached part
                 if let Some(cached_part) = sorted_parts
                     .iter()
@@ -2218,6 +2515,37 @@ impl SignedPutHandler {
             );
         }
 
+        // Cross-check the assembled part count against what S3 itself reports
+        // (Requirement 5.3).
+        //
+        // Offsets and `content_length` below are derived purely by summing the
+        // tracker's part sizes and are otherwise never compared with S3, so a
+        // tracker holding a subset yields self-consistent metadata describing a
+        // SHORTER object — and a later GET then serves the wrong length and the
+        // wrong bytes. The guards above make that unreachable, but they are
+        // guards on our own bookkeeping; this is the one check anchored to S3.
+        //
+        // A multipart ETag has the form `"<md5-of-md5s>-<part-count>"`, and that
+        // suffix is the only size-related fact S3 returns here — the
+        // CompleteMultipartUpload response carries no object length, so a byte
+        // comparison would need an extra HEAD on a client-visible path. The count
+        // is enough to catch the truncation signature, which is a missing part.
+        if let Some((_, s3_part_count)) = etag.trim_matches('"').rsplit_once('-') {
+            if let Ok(s3_part_count) = s3_part_count.parse::<usize>() {
+                if s3_part_count != sorted_parts.len() {
+                    warn!(
+                        "CompleteMultipartUpload part-count disagrees with S3: S3 reports {} part(s) via the ETag, we assembled {}: cache_key={}, upload_id={}, skipping cache finalization to avoid caching a truncated object",
+                        s3_part_count,
+                        sorted_parts.len(),
+                        cache_key,
+                        upload_id
+                    );
+                    drop(lock_file);
+                    return Ok(());
+                }
+            }
+        }
+
         // Calculate total size from filtered parts (Requirements 5.3)
         // This ensures the object size matches what S3 returns (only requested parts)
         let total_size: u64 = sorted_parts.iter().map(|p| p.size).sum();
@@ -2393,11 +2721,105 @@ impl SignedPutHandler {
         Ok(())
     }
 
+    /// Wait, up to [`MULTIPART_COMPLETE_CACHE_WAIT`], for every part named by this
+    /// `CompleteMultipartUpload` to appear in the on-disk tracker.
+    ///
+    /// Returns once the tracker holds them all, or once the bound elapses —
+    /// never an error. Exceeding the bound is not a failure of the upload (S3
+    /// has already accepted it) and not a failure of this request; it degrades to
+    /// "not cached", which the caller's existing missing-parts guard then reports.
+    ///
+    /// The tracker is read WITHOUT taking `upload.lock`. That is deliberate: the
+    /// read is a monotonic "have the parts I need landed yet" poll, and taking the
+    /// exclusive lock on every attempt would contend with the very part tasks
+    /// being waited for and serialise them behind the waiter. A torn or
+    /// half-written tracker simply fails to parse and is treated as "not yet",
+    /// which is the correct answer for a poll. The authoritative read still
+    /// happens under the lock in the caller.
+    async fn await_tracker_parts(
+        multipart_dir: &std::path::Path,
+        cache_key: &str,
+        upload_id: &str,
+        requested_parts: &[RequestedPart],
+    ) {
+        let wanted: std::collections::HashSet<u32> =
+            requested_parts.iter().map(|p| p.part_number).collect();
+
+        let deadline = std::time::Instant::now() + MULTIPART_COMPLETE_CACHE_WAIT;
+        let mut waited_ms: u64 = 0;
+
+        loop {
+            // Existence of `part{N}.json` is the whole question, so this checks for
+            // files rather than parsing anything. It used to parse the entire
+            // `upload.meta` on every poll, which grew with the part count — so the
+            // poll itself got more expensive the more parts there were to wait for,
+            // while holding up the very Complete that was waiting.
+            //
+            // ON A BLOCKING THREAD, and that is not incidental. These are synchronous
+            // filesystem calls against a shared network volume, in a loop that ticks
+            // every 100 ms. Called directly from this async fn they pin a runtime
+            // worker for the duration of every poll, and at high part counts a
+            // 2,000-entry staging directory on EFS made that long enough to starve
+            // the forward path and fail the client's upload — trading the lock
+            // contention this design removed for a different way to lose the same way.
+            let dir = multipart_dir.to_path_buf();
+            let wanted_now = wanted.clone();
+            let present = match tokio::task::spawn_blocking(move || {
+                Self::present_parts_blocking(&dir, &wanted_now)
+            })
+            .await
+            {
+                Ok(present) => present,
+                Err(e) => {
+                    warn!(
+                        "Part-record poll task failed: {} — treating as not yet landed",
+                        e
+                    );
+                    std::collections::HashSet::new()
+                }
+            };
+
+            if wanted.is_subset(&present) {
+                if waited_ms > 0 {
+                    debug!(
+                        "Multipart Complete waited {}ms for {} part record(s) to land: cache_key={}, upload_id={}",
+                        waited_ms,
+                        wanted.len(),
+                        cache_key,
+                        upload_id
+                    );
+                }
+                return;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                let missing = wanted.len() - wanted.intersection(&present).count();
+                warn!(
+                    "Multipart Complete waited {:?} and {} of {} part record(s) still had not landed: cache_key={}, upload_id={} — this object will not be cached (upload unaffected)",
+                    MULTIPART_COMPLETE_CACHE_WAIT,
+                    missing,
+                    wanted.len(),
+                    cache_key,
+                    upload_id
+                );
+                return;
+            }
+
+            tokio::time::sleep(TRACKER_POLL_INTERVAL).await;
+            waited_ms += TRACKER_POLL_INTERVAL.as_millis() as u64;
+        }
+    }
+
     /// Clean up incomplete multipart cache data
     ///
     /// This method removes partial cache data when CompleteMultipartUpload succeeds on S3
     /// but the proxy doesn't have complete local state. This prevents serving corrupted
     /// data from incomplete cache entries.
+    ///
+    /// Note the missing-parts path no longer calls this: deleting the staging
+    /// directory while part-cache tasks may still be writing into it is what
+    /// produced the ENOENT/ESTALE error cascade. Remaining callers are the ones
+    /// where the tracker itself is unusable.
     ///
     /// # Arguments
     ///
@@ -2692,7 +3114,9 @@ impl SignedPutHandler {
                 }
                 Err(e) => {
                     // Channel closed unexpectedly - don't cache
-                    warn!(
+                    // Expected on a client disconnect; counted by the metric
+                    // below rather than shouted about in the log (Req 6.7).
+                    debug!(
                         "S3 result channel closed unexpectedly: cache_key={}, error={:?}",
                         cache_key, e
                     );
@@ -2938,7 +3362,8 @@ impl SignedPutHandler {
             Err(e) => {
                 // The forward loop dropped the result sender without sending — treat
                 // as a cache failure but never touch the upload.
-                warn!(
+                // Expected on a client disconnect; counted by the metric below.
+                debug!(
                     "Streaming cache: S3 result channel closed unexpectedly: cache_key={}, error={:?}",
                     cache_key, e
                 );
@@ -2994,7 +3419,7 @@ impl SignedPutHandler {
 
         // ---- Phase 4: finalize the range bytes, then write `.meta` immediately ----
         //
-        // Read-after-write parity (deployment-verification T9/T10): the buffered
+        // Read-after-write parity — an immediate GET after a PUT must hit: the buffered
         // write-cache path (`store_put_as_write_cached_range_with_ttl`) finalizes the
         // `.bin` and then writes the `.meta` synchronously via `store_new_metadata`,
         // so an immediate post-PUT GET is a cache hit. `WriteCacheRangeSink::commit`
@@ -3436,7 +3861,8 @@ impl SignedPutHandler {
                 return StreamingCacheOutcome::Skipped("s3_error");
             }
             Err(e) => {
-                warn!(
+                // Expected on a client disconnect; counted by the metric below.
+                debug!(
                     "Streaming part cache: S3 result channel closed unexpectedly: cache_key={}, upload_id={}, part_number={}, error={:?}",
                     cache_key, upload_id, part_number, e
                 );
@@ -3520,7 +3946,14 @@ impl SignedPutHandler {
                 StreamingCacheOutcome::Committed
             }
             Err(e) => {
-                error!(
+                // WARN, not ERROR, matching every sibling cache-skip in this
+                // function. The client's upload is unaffected — S3 has already
+                // accepted the part — so this is a missed caching opportunity, not
+                // a failure. It was ERROR, and during the multipart lifecycle race
+                // it produced a per-part flood that read like a disk fault on the
+                // shared volume; the level implied an operator action that does not
+                // exist.
+                warn!(
                     "Streaming part cache: failed to record cached part (upload unaffected): cache_key={}, upload_id={}, part_number={}, error={}",
                     cache_key, upload_id, part_number, e
                 );
@@ -3532,10 +3965,10 @@ impl SignedPutHandler {
         }
     }
 
-    /// Finalize a streamed part and record it in the `upload.meta` tracker, holding
-    /// `upload.lock` across **both** the part-file publish (atomic `.tmp` →
+    /// Finalize a streamed part and write its `part{N}.json` record, holding
+    /// `part{N}.lock` across **both** the part-file publish (atomic `.tmp` →
     /// `part{N}.bin` rename, inside [`crate::cache::MultipartPartSink::finalize`])
-    /// AND the tracker update. This is the same correctness gate as
+    /// AND the record write. This is the same correctness gate as
     /// [`Self::cache_upload_part`]: a racing same-part-number write cannot leave the
     /// on-disk bytes and the tracker ETag out of sync. Returns the part's
     /// uncompressed size for logging.
@@ -3547,8 +3980,26 @@ impl SignedPutHandler {
         etag: &str,
         sink: crate::cache::MultipartPartSink,
     ) -> Result<u64> {
-        use crate::cache_types::{CachedPartInfo, MultipartUploadTracker};
+        use crate::cache_types::CachedPartInfo;
         use fs2::FileExt;
+
+        // Bound how many finalizations contend for `upload.lock` at once, so the
+        // cache path cannot exhaust the blocking pool and fail the client's upload
+        // (see `PART_FINALIZE_SLOTS`). Held for the whole critical section below,
+        // including the blocking task, and released on every exit path by `Drop`.
+        //
+        // `acquire()` only fails if the semaphore is closed, which never happens
+        // for a process-lifetime static; treat it as a non-fatal cache skip rather
+        // than unwrapping.
+        let _slot = match PART_FINALIZE_SLOTS.acquire().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                return Err(ProxyError::CacheError(format!(
+                    "part finalize slot unavailable: {}",
+                    e
+                )))
+            }
+        };
 
         let multipart_dir = cache_dir.join("mpus_in_progress").join(upload_id);
         // The sink open already created this directory; ensure it regardless.
@@ -3558,20 +4009,24 @@ impl SignedPutHandler {
                 ProxyError::CacheError(format!("Failed to create multipart directory: {}", e))
             })?;
 
-        let upload_meta_file = multipart_dir.join("upload.meta");
-        let lock_file_path = multipart_dir.join("upload.lock");
+        // PER-PART lock, not per-upload. The invariant being protected is per part
+        // (this part's bytes must agree with this part's recorded ETag), so nothing
+        // here ever needed to exclude a different part number — and excluding them
+        // is what serialised every part of every concurrent upload on one lock and
+        // failed client uploads at high part counts. See `record_part_blocking`.
+        let lock_file_path = Self::part_lock_path(&multipart_dir, part_number);
+        let etag_owned = etag.to_string();
         let cache_key_owned = cache_key.to_string();
         let upload_id_owned = upload_id.to_string();
-        let etag_owned = etag.to_string();
 
-        // The whole critical section — blocking `flock`, the blocking `sink.finalize()`
-        // (.tmp flush + rename), and the tracker read/modify/write — runs on a blocking
-        // thread under a timeout. The advisory lock is on the shared EFS `upload.lock`;
+        // The whole critical section — the blocking `flock`, the blocking
+        // `sink.finalize()` (.tmp flush + rename), and the part-record write — runs on
+        // a blocking thread under a timeout. The advisory lock is on the shared volume;
         // acquiring it (and holding it across the blocking finalize) on an async worker
         // would pin that worker and, across instances, could wedge a 2-worker runtime.
         // This mirrors the timeout+spawn_blocking lock pattern used elsewhere
-        // (`disk_cache.rs`). The flock is still held across the entire publish+tracker
-        // update, preserving the per-part correctness gate.
+        // (`disk_cache.rs`). The flock is held across the part publish AND its record
+        // write, preserving the per-part correctness gate.
         let join = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             tokio::task::spawn_blocking(move || -> Result<u64> {
@@ -3584,11 +4039,11 @@ impl SignedPutHandler {
                         ProxyError::CacheError(format!("Failed to open lock file: {}", e))
                     })?;
                 lock_file.lock_exclusive().map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to acquire lock for upload.meta: {}", e))
+                    ProxyError::CacheError(format!("Failed to acquire per-part lock: {}", e))
                 })?;
 
                 // Publish the staged part bytes (flush residual batch + atomic rename)
-                // UNDER the lock, so the on-disk part file and the tracker ETag are
+                // UNDER the lock, so the on-disk part file and its recorded ETag are
                 // updated as one critical section — identical correctness gate to
                 // `cache_upload_part`.
                 let info = sink.finalize()?;
@@ -3601,29 +4056,17 @@ impl SignedPutHandler {
                     info.compression_algorithm,
                 );
 
-                let mut tracker = if upload_meta_file.exists() {
-                    let meta_content = std::fs::read_to_string(&upload_meta_file).map_err(|e| {
-                        ProxyError::CacheError(format!("Failed to read upload metadata: {}", e))
-                    })?;
-                    MultipartUploadTracker::from_json(&meta_content).unwrap_or_else(|_| {
-                        warn!("Failed to parse existing upload.meta, creating new tracker");
-                        MultipartUploadTracker::new(
-                            upload_id_owned.clone(),
-                            cache_key_owned.clone(),
-                        )
-                    })
-                } else {
-                    MultipartUploadTracker::new(upload_id_owned.clone(), cache_key_owned.clone())
-                };
-
-                tracker.add_part(part_info);
-
-                let tracker_json = tracker.to_json().map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to serialize upload tracker: {}", e))
-                })?;
-                std::fs::write(&upload_meta_file, tracker_json).map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to write upload metadata: {}", e))
-                })?;
+                // One small file, written once. Nothing shared is read or rewritten,
+                // so this costs the same whether the upload has ten parts or ten
+                // thousand.
+                Self::record_part_blocking(&multipart_dir, part_number, &part_info).map_err(
+                    |e| {
+                        ProxyError::CacheError(format!(
+                            "{} (cache_key={}, upload_id={}, part={})",
+                            e, cache_key_owned, upload_id_owned, part_number
+                        ))
+                    },
+                )?;
 
                 // Release lock (also released on drop / early `?` return).
                 drop(lock_file);
@@ -3639,9 +4082,10 @@ impl SignedPutHandler {
                 "Part finalize task panicked: {}",
                 join_err
             ))),
-            Err(_elapsed) => Err(ProxyError::CacheError(
-                "Timed out (30s) acquiring upload.lock / finalizing streamed part".to_string(),
-            )),
+            Err(_elapsed) => Err(ProxyError::CacheError(format!(
+                "Timed out (30s) acquiring part{}.lock / finalizing streamed part",
+                part_number
+            ))),
         }
     }
 }
@@ -3650,6 +4094,32 @@ impl SignedPutHandler {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Assemble the tracker from disk the way production does — upload-level fields
+    /// from `upload.meta` (synthesised if absent) plus the per-part `part{N}.json`
+    /// records.
+    ///
+    /// Tests used to read `upload.meta` directly and trust its `parts` array. They
+    /// cannot any more: parts are no longer written into that file, because rewriting
+    /// it once per part was O(n²) and serialised every part of every concurrent upload
+    /// on one cross-instance lock. This helper is the supported way to ask "what parts
+    /// are recorded", and it goes through the same loader the product does so a test
+    /// cannot pass against a layout the product does not read.
+    fn tracker_from_disk(
+        multipart_dir: &std::path::Path,
+        cache_key: &str,
+    ) -> crate::cache_types::MultipartUploadTracker {
+        // The directory name IS the upload id, so derive it rather than hardcoding
+        // one: several tests assert on `tracker.upload_id`, and these staging dirs are
+        // often created by staging a part directly, without a
+        // `CreateMultipartUpload` to write `upload.meta`.
+        let upload_id = multipart_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown-upload");
+        SignedPutHandler::load_tracker_blocking(multipart_dir, upload_id, cache_key)
+            .expect("tracker should load from per-part records")
+    }
 
     fn create_test_handler(temp_dir: &TempDir) -> SignedPutHandler {
         let compression_handler = CompressionHandler::new(1024, true);
@@ -4013,13 +4483,7 @@ mod tests {
 
         // Verify upload.meta exists with tracker info
         let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
-        let upload_meta_file = multipart_dir.join("upload.meta");
-        assert!(upload_meta_file.exists());
-
-        // Read and verify tracker
-        let meta_content = std::fs::read_to_string(&upload_meta_file).unwrap();
-        let tracker: crate::cache_types::MultipartUploadTracker =
-            serde_json::from_str(&meta_content).unwrap();
+        let tracker = tracker_from_disk(&multipart_dir, cache_key);
 
         assert_eq!(tracker.upload_id, upload_id);
         assert_eq!(tracker.cache_key, cache_key);
@@ -4120,11 +4584,7 @@ mod tests {
                 .path()
                 .join("mpus_in_progress")
                 .join(&iter_upload_id);
-            let upload_meta_file = multipart_dir.join("upload.meta");
-            let meta_content = std::fs::read_to_string(&upload_meta_file)
-                .expect("upload.meta should exist after both writes");
-            let tracker: crate::cache_types::MultipartUploadTracker =
-                serde_json::from_str(&meta_content).expect("upload.meta parses");
+            let tracker = tracker_from_disk(&multipart_dir, cache_key);
 
             assert_eq!(
                 tracker.parts.len(),
@@ -4200,13 +4660,7 @@ mod tests {
 
         // Verify upload.meta exists with all parts
         let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
-        let upload_meta_file = multipart_dir.join("upload.meta");
-        assert!(upload_meta_file.exists());
-
-        // Read and verify tracker
-        let meta_content = std::fs::read_to_string(&upload_meta_file).unwrap();
-        let tracker: crate::cache_types::MultipartUploadTracker =
-            serde_json::from_str(&meta_content).unwrap();
+        let tracker = tracker_from_disk(&multipart_dir, cache_key);
 
         assert_eq!(tracker.upload_id, upload_id);
         assert_eq!(tracker.cache_key, cache_key);
@@ -4238,13 +4692,7 @@ mod tests {
 
         // Verify parts exist before cleanup
         let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
-        let upload_meta_file = multipart_dir.join("upload.meta");
-        assert!(upload_meta_file.exists());
-
-        // Verify part files exist in the upload directory
-        let meta_content = std::fs::read_to_string(&upload_meta_file).unwrap();
-        let tracker: crate::cache_types::MultipartUploadTracker =
-            serde_json::from_str(&meta_content).unwrap();
+        let tracker = tracker_from_disk(&multipart_dir, cache_key);
 
         let mut part_files_exist = 0;
         for part_info in &tracker.parts {
@@ -4281,29 +4729,18 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        // Manually add part 2 to the tracker without creating the actual file
-        // This simulates the scenario where another proxy instance cached part 2
+        // Record part 2 WITHOUT creating its data file, simulating a part that another
+        // proxy instance recorded but whose bytes this instance cannot see. Written as
+        // its own `part2.json` record, which is where part state now lives.
         let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
-        let upload_meta_file = multipart_dir.join("upload.meta");
-
-        // Read existing tracker
-        let meta_content = std::fs::read_to_string(&upload_meta_file).unwrap();
-        let mut tracker: crate::cache_types::MultipartUploadTracker =
-            serde_json::from_str(&meta_content).unwrap();
-
-        // Add part 2 to tracker without creating the file (simulates missing part)
         let part2_info = crate::cache_types::CachedPartInfo {
             part_number: 2,
             size: 20,
             etag: "test-etag-2".to_string(),
             compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
         };
-        tracker.parts.push(part2_info);
-        tracker.total_size = 40; // 20 + 20
-
-        // Write updated tracker
-        let updated_meta = serde_json::to_string_pretty(&tracker).unwrap();
-        std::fs::write(&upload_meta_file, updated_meta).unwrap();
+        SignedPutHandler::record_part_blocking(&multipart_dir, 2, &part2_info)
+            .expect("record part 2 without its data file");
 
         // Verify part 1 file exists in upload dir but part 2 doesn't
         let part1_file = multipart_dir.join("part1.bin");
@@ -4312,9 +4749,31 @@ mod tests {
         let part2_file = multipart_dir.join("part2.bin");
         assert!(!part2_file.exists());
 
+        // Both parts are in the tracker, so the part-record wait is satisfied and
+        // the missing-part guard is reached on the strength of part2.bin being
+        // absent from disk — which is the case this test is about. Previously this
+        // passed `None`, which derived the requested set from the tracker itself;
+        // that path is gone because it also disabled the guards.
+        let requested_parts = vec![
+            RequestedPart {
+                part_number: 1,
+                etag: etag1.to_string(),
+            },
+            RequestedPart {
+                part_number: 2,
+                etag: "test-etag-2".to_string(),
+            },
+        ];
+
         // Attempt to finalize - should skip caching and clean up
         let result = handler
-            .finalize_multipart_upload(cache_key, upload_id, etag, &response_headers, None)
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                etag,
+                &response_headers,
+                &requested_parts,
+            )
             .await;
 
         // Should succeed (not fail the operation)
@@ -4343,9 +4802,10 @@ mod tests {
         // Don't create any multipart directory or parts
         // This simulates CompleteMultipartUpload succeeding on S3 but no local state
 
-        // Attempt to finalize - should skip caching gracefully
+        // Attempt to finalize - should skip caching gracefully. The requested part
+        // list is irrelevant here: the missing directory is checked first.
         let result = handler
-            .finalize_multipart_upload(cache_key, upload_id, etag, &response_headers, None)
+            .finalize_multipart_upload(cache_key, upload_id, etag, &response_headers, &[])
             .await;
 
         // Should succeed (not fail the operation)
@@ -4436,10 +4896,7 @@ mod tests {
         // The tracker written by the streaming path must be byte-schema-compatible
         // with what finalize reads.
         let multipart_dir = cache_dir.join("mpus_in_progress").join(upload_id);
-        let tracker: crate::cache_types::MultipartUploadTracker = serde_json::from_str(
-            &std::fs::read_to_string(multipart_dir.join("upload.meta")).unwrap(),
-        )
-        .unwrap();
+        let tracker = tracker_from_disk(&multipart_dir, cache_key);
         assert_eq!(tracker.parts.len(), 3);
         assert_eq!(tracker.total_size, 1024 + 2048 + 512);
 
@@ -4464,7 +4921,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await
             .unwrap();
@@ -4502,8 +4959,21 @@ mod tests {
     }
 
     /// A requested part that was never streamed/cached locally fails the
-    /// "every requested part cached" gate: finalize cleans up and writes no
-    /// cache entry, exactly as for the buffered staging path.
+    /// "every requested part cached" gate: finalize writes no cache entry.
+    ///
+    /// It also no longer DELETES the staging directory, and this test asserts
+    /// that survival deliberately. Deleting it here is what produced the
+    /// ENOENT/ESTALE error cascade: the parts being declared missing may still
+    /// be mid-write, on this instance or another, and `remove_dir_all` pulls
+    /// the directory (including `upload.lock`) out from under them. Staging is
+    /// now left to the TTL sweep. The assertion is inverted from what it
+    /// originally checked, which is the point — the old expectation encoded the
+    /// behaviour that caused the cascade.
+    ///
+    /// Note this test necessarily takes `MULTIPART_COMPLETE_CACHE_WAIT` to run:
+    /// part 2 never lands in the tracker, so the bounded wait runs to its
+    /// deadline before the missing-part guard is reached. That is the wait doing
+    /// its job, not a slow test.
     #[tokio::test]
     async fn test_finalize_multipart_upload_streamed_parts_cleanup_on_missing_part() {
         let temp_dir = TempDir::new().unwrap();
@@ -4536,12 +5006,12 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await
             .unwrap();
 
-        // Cleanup: no object metadata, in-progress dir removed.
+        // No object metadata: the missing part means nothing is cached.
         let metadata_dir = cache_dir.join("metadata");
         let metadata_file =
             crate::disk_cache::get_sharded_path(&metadata_dir, cache_key, ".meta").unwrap();
@@ -4549,9 +5019,302 @@ mod tests {
             !metadata_file.exists(),
             "no cache entry when a requested streamed part is missing"
         );
+        // ...but the staging directory SURVIVES. A part this instance is
+        // declaring missing may still be mid-write elsewhere, so deleting the
+        // directory it is writing into is what produced the ENOENT/ESTALE
+        // cascade. The TTL sweep reaps it instead.
         assert!(
-            !cache_dir.join("mpus_in_progress").join(upload_id).exists(),
-            "in-progress dir should be cleaned up on missing part"
+            cache_dir.join("mpus_in_progress").join(upload_id).exists(),
+            "staging dir must be left for the TTL sweep, not deleted out from \
+             under part tasks that may still be writing into it"
+        );
+    }
+
+    // =====================================================================
+    // Phase 2 — the truncation path (Requirement 5.1, 5.2)
+    //
+    // Both tests below were written AFTER the fix they cover, which is worth
+    // recording rather than hiding. Their red side was recovered by temporarily
+    // reverting the two Phase 2 changes. One caveat on that revert: the fix
+    // removes the defective argument from the signature, so the reverted call
+    // site necessarily differs by that argument and the reproduction is not
+    // byte-identical to the original defect.
+    // =====================================================================
+
+    /// Requirement 5.1 — a `CompleteMultipartUpload` whose XML does not parse
+    /// MUST NOT finalize the cache.
+    ///
+    /// Two halves, because the requirement spans a parse and a decision:
+    ///
+    /// (a) the parser reports `Err` for malformed part XML, which is what
+    ///     drives the caller's skip branch; and
+    /// (b) the requested part list is AUTHORITATIVE — finalizing against an
+    ///     empty list writes nothing even though the tracker holds a complete,
+    ///     healthy three-part upload.
+    ///
+    /// Half (b) is the one with teeth. The removed `None` fallback derived the
+    /// requested set from the tracker itself, so on a parse failure the filter
+    /// became a no-op and every guard downstream of it was vacuous — a
+    /// partially recorded upload finalized as a short object. With the list
+    /// authoritative, "no parts were requested" can only ever mean "cache
+    /// nothing".
+    #[tokio::test]
+    async fn unparseable_complete_body_does_not_finalize_the_cache() {
+        // (a) Malformed part XML is an Err, not a silently empty list. This is
+        // the branch that must lead to skipping finalization.
+        let malformed = br#"<CompleteMultipartUpload>
+            <Part><PartNumber>not-a-number</PartNumber><ETag>"e1"</ETag></Part>
+        </CompleteMultipartUpload>"#;
+        assert!(
+            parse_complete_mpu_request(malformed).is_err(),
+            "malformed PartNumber must be reported as a parse error, since that \
+             is what makes the caller skip cache finalization"
+        );
+
+        // (b) A complete, healthy tracker plus an EMPTY requested list must
+        // still cache nothing.
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_dir = temp_dir.path();
+
+        let cache_key = "test-bucket/unparseable-complete";
+        let upload_id = "upload-unparseable-complete";
+        let response_headers = std::collections::HashMap::new();
+
+        stage_streamed_part(
+            cache_dir,
+            cache_key,
+            upload_id,
+            1,
+            &vec![1u8; 1024],
+            "etag1",
+        )
+        .await;
+        stage_streamed_part(
+            cache_dir,
+            cache_key,
+            upload_id,
+            2,
+            &vec![2u8; 2048],
+            "etag2",
+        )
+        .await;
+        stage_streamed_part(cache_dir, cache_key, upload_id, 3, &vec![3u8; 512], "etag3").await;
+
+        handler
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                "\"abc123-3\"",
+                &response_headers,
+                &[], // what an unparseable body morally yields: nothing requested
+            )
+            .await
+            .unwrap();
+
+        let metadata_file =
+            crate::disk_cache::get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
+                .unwrap();
+        assert!(
+            !metadata_file.exists(),
+            "an empty requested-part list must cache nothing, even with a fully \
+             populated tracker — otherwise the tracker's own contents are acting \
+             as a fallback and every guard downstream of the filter is vacuous"
+        );
+    }
+
+    /// Requirement 5.2 — a tracker holding a SUBSET of the requested parts MUST
+    /// NOT produce object metadata whose `content_length` is the subset sum.
+    ///
+    /// This is the truncation signature itself. Offsets and `content_length` are
+    /// derived purely by summing the tracker's part sizes, so a tracker holding
+    /// two parts of a three-part upload yields entirely self-consistent metadata
+    /// that describes a SHORTER object — and a later GET then serves the wrong
+    /// length and the wrong bytes with a success status.
+    ///
+    /// The assertion is deliberately stronger than "no `.meta` exists": it also
+    /// names the specific wrong value (the 3,072-byte two-part sum against a
+    /// 3,584-byte object), so a future change that writes metadata here fails
+    /// with a message saying what was truncated rather than just that a file
+    /// appeared.
+    ///
+    /// The requested list is EMPTY rather than naming all three parts, and that
+    /// choice is what gives the test a reachable red side. A non-empty list
+    /// naming part 3 is caught by the pre-existing missing-parts guard even
+    /// without this spec's changes, so it would pass either way. An empty list is
+    /// the shape an unparseable Complete body produces, and it is where the
+    /// removed "use all cached parts" fallback did its damage: it substituted the
+    /// tracker's own two parts for the request's three and wrote metadata for a
+    /// 3,072-byte object.
+    #[tokio::test]
+    async fn tracker_holding_a_subset_does_not_finalize_a_short_object() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_dir = temp_dir.path();
+
+        let cache_key = "test-bucket/subset-truncation";
+        let upload_id = "upload-subset-truncation";
+        let response_headers = std::collections::HashMap::new();
+
+        // Only parts 1 and 2 land locally; part 3 never does.
+        stage_streamed_part(
+            cache_dir,
+            cache_key,
+            upload_id,
+            1,
+            &vec![1u8; 1024],
+            "etag1",
+        )
+        .await;
+        stage_streamed_part(
+            cache_dir,
+            cache_key,
+            upload_id,
+            2,
+            &vec![2u8; 2048],
+            "etag2",
+        )
+        .await;
+
+        // No parts requested, and S3's ETag says the real object has three.
+        handler
+            .finalize_multipart_upload(cache_key, upload_id, "\"abc123-3\"", &response_headers, &[])
+            .await
+            .unwrap();
+
+        let metadata_file =
+            crate::disk_cache::get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
+                .unwrap();
+
+        if metadata_file.exists() {
+            let metadata: crate::cache_types::NewCacheMetadata =
+                serde_json::from_str(&std::fs::read_to_string(&metadata_file).unwrap()).unwrap();
+            panic!(
+                "a tracker holding 2 of 3 requested parts finalized anyway, \
+                 producing metadata for a SHORTER object: content_length={} \
+                 (the two-part subset sum) against a real object of 3584 bytes. \
+                 A later GET would serve {} bytes with HTTP 200.",
+                metadata.object_metadata.content_length, metadata.object_metadata.content_length
+            );
+        }
+    }
+
+    // =====================================================================
+    // Phase 3 — the lifecycle race (Phase 1 task 3)
+    // =====================================================================
+
+    /// The race this spec exists for: `CompleteMultipartUpload` arrives while
+    /// per-part cache tasks are still running, and the object must still be
+    /// cached with the FULL part set.
+    ///
+    /// Shape, mirroring the measured production sequence rather than a
+    /// convenient one: part 1 has landed (so the staging directory and tracker
+    /// exist, as they do by Complete time in the real flow), parts 2 and 3 are
+    /// still in flight on their own tasks, and Complete runs concurrently with
+    /// them. Before the fix, Complete read a tracker holding only part 1,
+    /// declared 2 and 3 "not cached locally", and cached nothing — that is the
+    /// red side, recovered by neutralising `await_tracker_parts`.
+    ///
+    /// The staggered delays are load-bearing. Sequential staging lets each part
+    /// task finish before the next request, so the lag Complete races against
+    /// never builds and the test passes with or without the fix — the same trap
+    /// recorded for the fleet probe, where sequential `s3api upload-part` calls
+    /// could not reproduce the race either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_arriving_before_part_tasks_finish_still_caches_every_part() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut handler = create_test_handler(&temp_dir);
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        let cache_key = "test-bucket/complete-races-parts";
+        let upload_id = "upload-complete-races-parts";
+        let response_headers = std::collections::HashMap::new();
+
+        // Part 1 is already recorded, exactly as in the measured case where
+        // Complete arrived 147 ms after the first part was recorded.
+        stage_streamed_part(
+            &cache_dir,
+            cache_key,
+            upload_id,
+            1,
+            &vec![1u8; 1024],
+            "etag1",
+        )
+        .await;
+
+        // Parts 2 and 3 are still in flight, landing after Complete has begun.
+        let mut stragglers = Vec::new();
+        for (part_number, size, etag, delay_ms) in [
+            (2u32, 2048usize, "etag2", 150u64),
+            (3u32, 512usize, "etag3", 400u64),
+        ] {
+            let cache_dir = cache_dir.clone();
+            stragglers.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                stage_streamed_part(
+                    &cache_dir,
+                    cache_key,
+                    upload_id,
+                    part_number,
+                    &vec![part_number as u8; size],
+                    etag,
+                )
+                .await;
+            }));
+        }
+
+        let requested_parts = vec![
+            RequestedPart {
+                part_number: 1,
+                etag: "etag1".to_string(),
+            },
+            RequestedPart {
+                part_number: 2,
+                etag: "etag2".to_string(),
+            },
+            RequestedPart {
+                part_number: 3,
+                etag: "etag3".to_string(),
+            },
+        ];
+
+        handler
+            .finalize_multipart_upload(
+                cache_key,
+                upload_id,
+                "\"abc123-3\"",
+                &response_headers,
+                &requested_parts,
+            )
+            .await
+            .unwrap();
+
+        for straggler in stragglers {
+            straggler.await.expect("straggler part task panicked");
+        }
+
+        let metadata_file =
+            crate::disk_cache::get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
+                .unwrap();
+        assert!(
+            metadata_file.exists(),
+            "Complete raced the still-running part tasks and cached NOTHING. \
+             This is the defect: it read a tracker holding only part 1 and \
+             declared parts 2 and 3 missing, when both landed milliseconds later."
+        );
+
+        let metadata: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_file).unwrap()).unwrap();
+        assert_eq!(
+            metadata.object_metadata.parts_count,
+            Some(3),
+            "the cached object must carry the full part set, not the subset that \
+             happened to have landed when Complete looked"
+        );
+        assert_eq!(
+            metadata.object_metadata.content_length,
+            1024 + 2048 + 512,
+            "cached content_length must be the whole object, not a subset sum"
         );
     }
 
@@ -4592,7 +5355,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await
             .unwrap();
@@ -4860,7 +5623,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -4914,7 +5677,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -4965,7 +5728,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -5048,7 +5811,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -5154,7 +5917,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -5280,7 +6043,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -5404,7 +6167,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -5532,7 +6295,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -5666,7 +6429,7 @@ mod tests {
                 upload_id,
                 etag,
                 &response_headers,
-                Some(&requested_parts),
+                &requested_parts,
             )
             .await;
 
@@ -5726,26 +6489,9 @@ mod tests {
                 return TestResult::failed();
             }
 
-            // Verify upload.meta exists
+            // Part state lives in per-part records now, not in `upload.meta`.
             let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
-            let upload_meta_file = multipart_dir.join("upload.meta");
-
-            if !upload_meta_file.exists() {
-                return TestResult::failed();
-            }
-
-            // Read and verify tracker
-            let meta_content = match std::fs::read_to_string(&upload_meta_file) {
-                Ok(c) => c,
-                Err(_) => return TestResult::failed(),
-            };
-
-            let tracker: crate::cache_types::MultipartUploadTracker =
-                match serde_json::from_str(&meta_content) {
-                    Ok(t) => t,
-                    Err(_) => return TestResult::failed(),
-                };
-
+            let tracker = tracker_from_disk(&multipart_dir, cache_key);
             // Verify tracker contains correct info
             let part_found = tracker
                 .parts
@@ -5783,9 +6529,16 @@ mod tests {
 
             let cache_key = "test-bucket/test-object";
             let upload_id = "test-upload-complete";
-            let final_etag = "\"abc123-5\""; // Multipart ETag format
+            // Multipart ETag format, whose `-N` suffix is S3's own statement of the
+            // part count. It must agree with the number of parts actually cached:
+            // finalization now cross-checks the two and declines rather than
+            // caching an object S3 says has a different shape. This fixture used a
+            // hardcoded `-5` for every part count, which that check correctly reads
+            // as a truncated assembly.
+            let final_etag = format!("\"abc123-{}\"", part_count);
 
             // First, cache multiple parts
+            let mut requested_parts = Vec::new();
             for part_num in 1..=part_count {
                 let data: Vec<u8> = (0..1024).map(|i| (i + part_num as usize) as u8).collect();
                 let etag = format!("\"part-etag-{}\"", part_num);
@@ -5797,12 +6550,22 @@ mod tests {
                 if result.is_err() {
                     return TestResult::failed();
                 }
+                requested_parts.push(RequestedPart {
+                    part_number: part_num as u32,
+                    etag,
+                });
             }
 
             // Now finalize the multipart upload
             let test_headers = std::collections::HashMap::new(); // Empty headers for test
             let result = handler
-                .finalize_multipart_upload(cache_key, upload_id, final_etag, &test_headers, None)
+                .finalize_multipart_upload(
+                    cache_key,
+                    upload_id,
+                    &final_etag,
+                    &test_headers,
+                    &requested_parts,
+                )
                 .await;
 
             if result.is_err() {
@@ -5906,25 +6669,8 @@ mod tests {
 
             // Verify parts were cached
             let multipart_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
-            let upload_meta_file = multipart_dir.join("upload.meta");
+            let tracker = tracker_from_disk(&multipart_dir, cache_key);
 
-            if !upload_meta_file.exists() {
-                return TestResult::failed();
-            }
-
-            // Read tracker to get part file paths
-            let meta_content = match std::fs::read_to_string(&upload_meta_file) {
-                Ok(c) => c,
-                Err(_) => return TestResult::failed(),
-            };
-
-            let tracker: crate::cache_types::MultipartUploadTracker =
-                match serde_json::from_str(&meta_content) {
-                    Ok(t) => t,
-                    Err(_) => return TestResult::failed(),
-                };
-
-            // Verify part files exist in the upload directory before cleanup
             for part in &tracker.parts {
                 let part_path = multipart_dir.join(format!("part{}.bin", part.part_number));
 
@@ -6696,7 +7442,7 @@ mod tests {
         );
     }
 
-    /// Read-after-write parity (deployment-verification T9/T10): a streamed PUT
+    /// Read-after-write parity — an immediate GET after a PUT must hit: a streamed PUT
     /// committed through `run_streaming_cache_write` against a real `CacheManager`
     /// must write the `.meta` **immediately**, so an immediate post-PUT GET is a
     /// cache hit. This guards the parity fix that finalizes the range and stores the
@@ -6801,7 +7547,6 @@ mod tests {
     #[tokio::test]
     async fn streaming_part_cache_non_chunked_records_part_and_round_trips() {
         use crate::cache::CacheManager;
-        use crate::cache_types::MultipartUploadTracker;
         use std::io::Read;
 
         let temp_dir = TempDir::new().unwrap();
@@ -6861,8 +7606,7 @@ mod tests {
             part_path
         );
 
-        let meta = std::fs::read_to_string(upload_dir.join("upload.meta")).unwrap();
-        let tracker = MultipartUploadTracker::from_json(&meta).unwrap();
+        let tracker = tracker_from_disk(&upload_dir, cache_key);
         assert_eq!(tracker.parts.len(), 1);
         assert_eq!(tracker.parts[0].part_number, part_number);
         assert_eq!(
@@ -6891,7 +7635,6 @@ mod tests {
     #[tokio::test]
     async fn streaming_part_cache_aws_chunked_decodes_and_records() {
         use crate::cache::CacheManager;
-        use crate::cache_types::MultipartUploadTracker;
         use std::io::Read;
 
         let temp_dir = TempDir::new().unwrap();
@@ -6938,8 +7681,7 @@ mod tests {
         assert_eq!(outcome, StreamingCacheOutcome::Committed);
 
         let upload_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
-        let meta = std::fs::read_to_string(upload_dir.join("upload.meta")).unwrap();
-        let tracker = MultipartUploadTracker::from_json(&meta).unwrap();
+        let tracker = tracker_from_disk(&upload_dir, cache_key);
         assert_eq!(
             tracker.parts[0].size,
             payload.len() as u64,

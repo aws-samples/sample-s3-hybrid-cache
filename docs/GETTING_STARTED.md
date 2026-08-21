@@ -993,9 +993,21 @@ mount-s3 --endpoint-url http://s3.us-east-1.amazonaws.com \
 
 **DNS routing**: If using Route53 private hosted zones or hosts file DNS routing, the endpoint URL should match your configured DNS zone. The proxy will cache HEAD responses (metadata) and range requests from Mountpoint, significantly improving performance for repeated reads.
 
+**Addressing**: with `--endpoint-url` set and no other flags, Mountpoint connects virtual-hosted, sending `your-bucket.s3.us-east-1.amazonaws.com` rather than `s3.us-east-1.amazonaws.com/your-bucket`. Both styles share cache entries for the same bucket and key (see [Access Point Endpoint Summary](#access-point-endpoint-summary)), so this is a DNS question, not a caching one.
+
+Virtual-hosted needs the bucket subdomain to resolve to the proxy. [Option B](#option-b-dns-zone-production-deployments) covers that with its `*.s3.{region}.amazonaws.com` wildcard CNAME. A hosts file cannot express a wildcard, so under [Option C](#option-c-hosts-file-testingdevelopment) either add a line per bucket or pass `--force-path-style` and let the apex entry serve every bucket:
+
+```bash
+mount-s3 --endpoint-url http://s3.us-east-1.amazonaws.com \
+  --region us-east-1 --force-path-style \
+  your-bucket /mnt/s3
+```
+
+Option A (`HTTP_PROXY`) needs neither: the proxy is addressed directly and the bucket name never has to resolve.
+
 **Mountpoint caching**: When using Mountpoint with the proxy, configure Mountpoint's [metadata TTL](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#metadata-cache) but disable Mountpoint's [data cache](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#data-cache). The proxy provides data caching, so Mountpoint's data cache would be redundant. Use `--metadata-ttl` to control how long Mountpoint caches file metadata.
 
-**Performance**: Internal testing with synthetic workloads showed 2x faster cached downloads, with the proxy handling Mountpoint's HEAD and range requests efficiently.
+**Performance**: Measured with upstream Mountpoint's own `fs_bench.sh` fio harness (single proxy, FSx for OpenZFS shared cache, m5dn.24xlarge client, 10-iteration average): a single-threaded sequential read through the proxy reached 1,491 MiB/s against 1,097 MiB/s direct to S3 from the same client — 1.36x, from the read being served out of the shared cache rather than fetched from S3 on every request. A single-threaded read at direct I/O landed close to parity (1.03x). The proxy's four-thread and write figures on this run were bound by a single proxy's own capacity rather than by Mountpoint or the caching path; scale proxies to raise those. Treat these as one configuration's numbers, not a general claim — instance type, shared-cache backend and working-set size all move them, so measure your own shape.
 
 ### Shell Profile Configuration
 

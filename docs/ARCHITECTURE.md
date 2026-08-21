@@ -136,7 +136,6 @@ src/
 │
 │   # Observability
 ├── logging.rs           # Access and application logging
-├── log_sampler.rs       # Rate-based log sampling for high-frequency operations
 ├── metrics.rs           # Metrics collection
 ├── otlp.rs              # OpenTelemetry Protocol export
 ├── health.rs            # Health check endpoints and system status monitoring
@@ -206,7 +205,6 @@ cache_dir/
 ```
 
 **Why BLAKE3**:
-- 10x faster than SHA-256
 - Cryptographically secure (prevents collision attacks)
 - Excellent distribution properties
 - Native Rust implementation

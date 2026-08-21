@@ -178,17 +178,49 @@ cat "$ACCESS_LOG_DIR"/2026/08/19/*   # Every instance, one date
 Because instances buffer independently, records from different hosts interleave
 arbitrarily. Sort by field 3 across the whole set rather than relying on per-file order.
 
+## Retention applies to the directory, not to the writer
+
+`access_log_retention_days` is a property of `access_log_dir`. The cleanup sweep runs
+whether or not this instance is writing access logs, so setting
+`access_log_enabled: false` stops new records but does **not** stop old files being
+reaped. A deployment that disabled access logging and left files behind will see them
+removed on the first cleanup pass after upgrading to 2.6.0 — see
+[UPGRADING.md](UPGRADING.md).
+
+Only files matching the naming convention above are removed. Anything else in
+`access_log_dir` is left alone regardless of age, so an unrelated file placed there is
+never deleted.
+
+The sweep also covers files written by **other** instances, which is what makes an
+orphaned series reapable at all: a host that is decommissioned leaves files no live
+instance would otherwise claim. A file this instance did not write gets one extra day of
+grace before it becomes a candidate, so a badly skewed clock on one host cannot reach a
+live peer's in-retention files.
+
+The effective guarantee is therefore:
+
+| File | Deleted after |
+|---|---|
+| Written by this instance | `access_log_retention_days` |
+| Written by another instance (or an orphan) | `access_log_retention_days` + 1 day |
+
+**For a compliance-driven hard cap at N days, configure `N - 1`.** The +1 day of grace is
+deliberate and is not configurable.
+
+The same rules apply to `app_log_retention_days` and `app_log_dir`, including the
+per-hostname subdirectories the application log uses.
+
 ## Related configuration
 
 | Field | Effect |
 |---|---|
 | `logging.access_log_dir` | Root directory |
-| `logging.access_log_enabled` | `false` writes no access log at all |
+| `logging.access_log_enabled` | `false` writes no access log at all. Does **not** disable retention cleanup |
 | `logging.access_log_mode` | `all`, or `cached_only` to log only cache hits |
 | `logging.access_log_flush_interval` | Buffer flush cadence |
 | `logging.access_log_buffer_size` | Entries before a forced flush |
 | `logging.access_log_file_rotation_interval` | New-file cadence within a date |
-| `logging.access_log_retention_days` | Age at which the cleanup task deletes files |
+| `logging.access_log_retention_days` | Age at which the cleanup task deletes files matching the naming convention, anywhere in `access_log_dir`. Add a day for files written by another instance |
 
 Only the directory has an environment override (`ACCESS_LOG_DIR`). The others must be set
 in the config file — see

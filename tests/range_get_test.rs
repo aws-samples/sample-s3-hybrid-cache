@@ -72,11 +72,25 @@ async fn test_head_cache_for_content_length() {
         .expect("Failed to get HEAD cache entry")
         .expect("HEAD cache entry should exist");
 
-    // Verify content-length is available
+    // Verify the object's length is available — from the OBJECT metadata, which is
+    // where it now lives.
+    //
+    // This assertion used to read `head_entry.headers.get("content-length")`. As of
+    // 2.6.0 a per-response `content-length` is deliberately NOT stored as object
+    // metadata: storing it is what let a part-scoped HEAD's 5 MiB length be replayed
+    // as a 50 MiB object's, truncating every later read with HTTP 200. The
+    // authoritative length is `metadata.content_length`, and every serve path takes
+    // it from there, so that is what this test checks.
     assert_eq!(
-        head_entry.headers.get("content-length"),
-        Some(&"1000".to_string()),
-        "Content-length should be cached in HEAD response"
+        head_entry.metadata.content_length, 1000,
+        "The object's length should be available from the cached HEAD metadata"
+    );
+    assert!(
+        !head_entry
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-length")),
+        "A per-response content-length must not be stored as object metadata"
     );
 
     // This validates that non-range GET can use cached HEAD to determine
@@ -143,9 +157,19 @@ async fn test_head_cache_hit_and_miss() {
     );
 
     let head_entry = result2.unwrap();
-    assert_eq!(
-        head_entry.headers.get("content-length"),
-        Some(&"5000".to_string())
-    );
+    // Length comes from the object metadata, not from a stored per-response header
+    // — see the note in `test_head_cache_for_content_length` above.
     assert_eq!(head_entry.metadata.content_length, 5000);
+    assert!(
+        !head_entry
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-length")),
+        "A per-response content-length must not be stored as object metadata"
+    );
+    // The headers that genuinely describe the object survive.
+    assert_eq!(
+        head_entry.headers.get("etag"),
+        Some(&"test-etag-123".to_string())
+    );
 }

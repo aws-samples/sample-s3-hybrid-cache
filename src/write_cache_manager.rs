@@ -749,15 +749,32 @@ impl WriteCacheManager {
                 if let Ok(tracker) =
                     serde_json::from_str::<crate::cache_types::MultipartUploadTracker>(&content)
                 {
-                    // Use file mtime for age calculation (accounts for recent activity)
-                    let age = if let Ok(metadata) = tokio::fs::metadata(&upload_meta_path).await {
-                        if let Ok(modified) = metadata.modified() {
-                            now.duration_since(modified).unwrap_or_default()
-                        } else {
-                            now.duration_since(tracker.started_at).unwrap_or_default()
+                    // Age is measured from the most recent sign of activity, which is
+                    // the NEWEST of the upload directory's mtime and `upload.meta`'s.
+                    //
+                    // The directory is what matters now. `upload.meta` is written once,
+                    // at CreateMultipartUpload, and never touched again — parts write
+                    // their own `part{N}.json` records rather than rewriting it. So its
+                    // mtime is the upload's START time, and using it alone would evict a
+                    // long-running upload out from under itself the moment it passed the
+                    // TTL, however recently a part had landed. The directory's mtime does
+                    // move, because each part creates files in it.
+                    let newest_mtime = {
+                        let mut newest: Option<std::time::SystemTime> = None;
+                        for path in [&upload_dir, &upload_meta_path] {
+                            if let Ok(md) = tokio::fs::metadata(path).await {
+                                if let Ok(modified) = md.modified() {
+                                    if newest.is_none_or(|current| modified > current) {
+                                        newest = Some(modified);
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        now.duration_since(tracker.started_at).unwrap_or_default()
+                        newest
+                    };
+                    let age = match newest_mtime {
+                        Some(modified) => now.duration_since(modified).unwrap_or_default(),
+                        None => now.duration_since(tracker.started_at).unwrap_or_default(),
                     };
 
                     if age > self.incomplete_upload_ttl {
@@ -1556,6 +1573,17 @@ mod property_tests {
                 std::time::SystemTime::now() - Duration::from_secs((ttl_seconds as u64) + 10);
             let old_filetime = filetime::FileTime::from_system_time(old_time);
             filetime::set_file_mtime(&upload_meta_path, old_filetime).unwrap();
+            // Backdate the DIRECTORY too, not just `upload.meta`.
+            //
+            // The sweep judges an upload abandoned from the newest of the two, because
+            // `upload.meta` is written once at CreateMultipartUpload and is therefore
+            // the upload's START time — parts write their own records rather than
+            // rewriting it. Backdating only the file would leave the directory looking
+            // freshly active, which is what a live long-running upload looks like and
+            // is exactly the case the sweep must NOT evict. A genuinely abandoned
+            // upload has no recent activity in its directory either, so backdating
+            // both is the faithful fixture.
+            filetime::set_file_mtime(&mpus_dir, old_filetime).unwrap();
 
             // Verify parts exist before eviction
             for part in &tracker.parts {

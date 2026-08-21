@@ -31,7 +31,6 @@ pub mod inflight_ledger;
 pub mod inflight_tracker;
 pub mod journal_consolidator;
 pub mod journal_manager;
-pub mod log_sampler;
 pub mod logging;
 pub mod metadata_cache;
 pub mod metadata_lock_manager;

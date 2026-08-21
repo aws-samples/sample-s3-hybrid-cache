@@ -99,8 +99,130 @@ pub struct LogCleanupResult {
     pub access_files_deleted: u32,
     /// Number of application log files deleted
     pub app_files_deleted: u32,
+    /// Of `access_files_deleted`, how many belonged to another hostname.
+    ///
+    /// A non-zero value is the signal that an instance which used to write to
+    /// this directory has stopped reaping its own files — a terminated peer, a
+    /// hostname change, or a broken cleanup task (Req 5.4).
+    pub access_files_adopted: u32,
+    /// Of `app_files_deleted`, how many belonged to another hostname (Req 5.4).
+    pub app_files_adopted: u32,
     /// Number of errors encountered during cleanup
     pub errors: u32,
+}
+
+/// Extra time a file belonging to *another* hostname is kept beyond the
+/// configured retention.
+///
+/// This is not politeness, it is what keeps clock agreement out of the
+/// correctness argument. Every instance computes its cutoff from its own
+/// `SystemTime::now()` and compares it against an mtime a peer set, so a flat
+/// directory-wide cutoff means an instance whose clock runs ahead deletes a
+/// peer's file that is still inside the peer's retention window. One day absorbs
+/// any plausible skew on a shared volume, and as a side effect the steady state
+/// involves no cross-instance deletion at all — so N proxies no longer contend
+/// on the same `remove_file` with the losers counting `ENOENT` as an error.
+///
+/// Deliberately a fixed internal constant rather than a config field (Req 3.4):
+/// every value below a day reintroduces the skew exposure it exists to remove.
+///
+/// Consequence, which `docs/ACCESS_LOG_FORMAT.md` states: a file survives at
+/// most `retention_days + 1`, and exactly `retention_days` when its writer is
+/// healthy. A compliance-driven hard cap at N means configuring N-1.
+const FOREIGN_GRACE: Duration = Duration::from_secs(24 * 3600);
+
+/// Which naming convention a sweep is matching against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepKind {
+    /// `{access_log_dir}/YYYY/MM/DD/{YYYY-MM-DD-HH-MM-SS}-{hostname}`
+    Access,
+    /// `{app_log_dir}/{hostname}/s3-proxy.log.YYYY-MM-DD`
+    App,
+}
+
+/// Running totals for one directory sweep.
+#[derive(Debug, Default)]
+struct SweepCounts {
+    deleted: u32,
+    adopted: u32,
+    errors: u32,
+}
+
+/// What a sweep may delete, and when.
+struct SweepPolicy<'a> {
+    kind: SweepKind,
+    hostname: &'a str,
+    /// `now - retention`, applied to files this instance wrote.
+    own_cutoff: std::time::SystemTime,
+    /// `now - retention - FOREIGN_GRACE`, applied to every other hostname's.
+    foreign_cutoff: std::time::SystemTime,
+}
+
+impl SweepPolicy<'_> {
+    /// Is this file one the proxy's own naming convention produces?
+    ///
+    /// Everything else is left alone at any age (Req 2.1, 2.2). This gate is
+    /// what makes the ungated sweep safe: without it, "retention applies to this
+    /// directory" would mean "anything under this path is deleted after N days",
+    /// including files the proxy never wrote.
+    fn matches(&self, name: &str) -> bool {
+        match self.kind {
+            SweepKind::Access => is_access_log_filename(name),
+            SweepKind::App => name.starts_with("s3-proxy.log"),
+        }
+    }
+
+    /// Did *this* instance write the file?
+    ///
+    /// Needs no new state: ownership is already encoded in the access-log
+    /// filename suffix and in the app-log parent directory (Req 3.1).
+    fn owned_by_us(&self, path: &std::path::Path, name: &str) -> bool {
+        match self.kind {
+            SweepKind::Access => owns_access_file(name, self.hostname),
+            SweepKind::App => {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(self.hostname)
+            }
+        }
+    }
+}
+
+/// Does `name` have the shape `{YYYY-MM-DD-HH-MM-SS}-{something}`?
+///
+/// Deliberately a shape check rather than a date parse: the sweep decides on
+/// mtime, and the filename only has to establish authorship. `get(..19)` is
+/// byte-indexed and returns `None` rather than panicking on a non-ASCII name
+/// whose 19th byte is mid-character.
+///
+/// Matching the leaf name rather than the `YYYY/MM/DD` path is the point — a
+/// date directory tells you nothing about who wrote a file, since anything can
+/// be dropped into one, whereas this leaf form is produced by `AccessLogBuffer`
+/// and by nothing else. A file that survives is then visibly not ours.
+fn is_access_log_filename(name: &str) -> bool {
+    let Some(stamp) = name.get(..19) else {
+        return false;
+    };
+    let mut parts = stamp.split('-');
+    for width in [4, 2, 2, 2, 2, 2] {
+        match parts.next() {
+            Some(p) if p.len() == width && p.bytes().all(|b| b.is_ascii_digit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none() && matches!(name.as_bytes().get(19), Some(b'-')) && name.len() > 20
+}
+
+/// Does this access log filename belong to `hostname`?
+///
+/// The timestamp prefix is fixed-width, so the hostname is exactly the remainder
+/// after byte 20. Compared as an exact suffix rather than with `contains`, so an
+/// instance whose hostname is a prefix of another's (`host-a` versus `host-a-2`)
+/// cannot claim its files and reap them a day early. EC2 private DNS names
+/// contain `-`, so tokenising on `-` is not an option either.
+fn owns_access_file(name: &str, hostname: &str) -> bool {
+    name.len() > 20 && &name[20..] == hostname
 }
 
 /// Default flush interval for access log buffer (5 seconds)
@@ -636,120 +758,140 @@ impl LoggerManager {
         Ok(())
     }
 
-    /// Perform log rotation and cleanup
+    /// Perform log rotation and cleanup.
+    ///
+    /// Retention is a property of the **directory**, not of whether this process
+    /// happens to be writing there: both sweeps run on every cycle regardless of
+    /// `access_log_enabled` (Req 1.1). What limits the blast radius is the
+    /// filename predicate and the ownership tiering in [`SweepPolicy`], not the
+    /// old gate.
     pub fn rotate_logs(
         &self,
         access_log_retention_days: u32,
         app_log_retention_days: u32,
     ) -> Result<LogCleanupResult> {
         let mut result = LogCleanupResult::default();
-        let host_log_dir = self.config.app_log_dir.join(&self.config.hostname);
 
-        // Clean up old application log files
-        let (deleted, errors) = self.cleanup_old_logs(&host_log_dir, app_log_retention_days)?;
-        result.app_files_deleted = deleted;
-        result.errors += errors;
+        // Application logs: the whole `app_log_dir`, every hostname directory,
+        // not just our own (Req 4.2).
+        let app = self.sweep_directory(
+            &self.config.app_log_dir,
+            SweepKind::App,
+            app_log_retention_days,
+        )?;
+        result.app_files_deleted = app.deleted;
+        result.app_files_adopted = app.adopted;
+        result.errors += app.errors;
 
-        // Clean up old access logs if access logging is enabled
-        if self.config.access_log_enabled {
-            let (deleted, errors) = self.cleanup_old_access_logs(access_log_retention_days)?;
-            result.access_files_deleted = deleted;
-            result.errors += errors;
-        }
+        // Access logs: unconditional (Req 1.1). Tolerates a missing or
+        // unreadable directory — `read_dir` failure is swallowed (Req 1.2).
+        let access = self.sweep_directory(
+            &self.config.access_log_dir,
+            SweepKind::Access,
+            access_log_retention_days,
+        )?;
+        result.access_files_deleted = access.deleted;
+        result.access_files_adopted = access.adopted;
+        result.errors += access.errors;
 
         info!("Log rotation and cleanup completed");
         Ok(result)
     }
 
-    /// Clean up old application log files
-    /// Returns (files_deleted, errors)
-    fn cleanup_old_logs(&self, log_dir: &PathBuf, keep_days: u32) -> Result<(u32, u32)> {
-        let cutoff_time = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(keep_days as u64 * 24 * 3600);
+    /// Sweep one log directory under a two-tier cutoff.
+    fn sweep_directory(
+        &self,
+        dir: &std::path::Path,
+        kind: SweepKind,
+        keep_days: u32,
+    ) -> Result<SweepCounts> {
+        let now = std::time::SystemTime::now();
+        let retention = std::time::Duration::from_secs(keep_days as u64 * 24 * 3600);
+        let policy = SweepPolicy {
+            kind,
+            hostname: &self.config.hostname,
+            own_cutoff: now - retention,
+            foreign_cutoff: now - retention - FOREIGN_GRACE,
+        };
 
-        let mut deleted = 0u32;
-        let mut errors = 0u32;
+        let mut counts = SweepCounts::default();
+        Self::cleanup_directory_recursive(dir, &policy, &mut counts)?;
+        Ok(counts)
+    }
 
-        if let Ok(entries) = std::fs::read_dir(log_dir) {
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified < cutoff_time {
-                            if let Err(e) = std::fs::remove_file(entry.path()) {
-                                warn!("Failed to remove old log file {:?}: {}", entry.path(), e);
-                                errors += 1;
-                            } else {
-                                debug!("Removed old log file: {:?}", entry.path());
-                                deleted += 1;
-                            }
+    /// Recursively sweep `dir`, deleting only files the policy both recognises
+    /// as ours-by-convention and considers past the cutoff for their owner.
+    ///
+    /// An associated function rather than a method: the policy carries everything
+    /// the walk needs, so nothing here reads `self` (which is what let the old
+    /// `#[allow(clippy::only_used_in_recursion)]` be removed).
+    fn cleanup_directory_recursive(
+        dir: &std::path::Path,
+        policy: &SweepPolicy<'_>,
+        counts: &mut SweepCounts,
+    ) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            // Missing, empty or unreadable is not an error (Req 1.2).
+            return Ok(());
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                Self::cleanup_directory_recursive(&path, policy, counts)?;
+
+                // Prune a directory the sweep left empty. A live instance's
+                // hostname directory always holds a current file, so it is
+                // never empty and never removed (Req 4.4).
+                if let Ok(mut dir_entries) = std::fs::read_dir(&path) {
+                    if dir_entries.next().is_none() {
+                        if let Err(e) = std::fs::remove_dir(&path) {
+                            debug!("Failed to remove empty directory {:?}: {}", path, e);
+                        } else {
+                            debug!("Removed empty directory: {:?}", path);
                         }
                     }
                 }
+                continue;
             }
-        }
 
-        Ok((deleted, errors))
-    }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
 
-    /// Clean up old access log files
-    /// Returns (files_deleted, errors)
-    fn cleanup_old_access_logs(&self, keep_days: u32) -> Result<(u32, u32)> {
-        let cutoff_time = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(keep_days as u64 * 24 * 3600);
+            // Req 2.1/2.2, 4.2: anything not produced by our own naming
+            // convention is left alone at any age and is not counted.
+            if !policy.matches(name) {
+                continue;
+            }
 
-        let mut deleted = 0u32;
-        let mut errors = 0u32;
+            let owned = policy.owned_by_us(&path, name);
+            let cutoff = if owned {
+                policy.own_cutoff
+            } else {
+                policy.foreign_cutoff
+            };
 
-        // Walk through the date-partitioned directory structure
-        self.cleanup_directory_recursive(
-            &self.config.access_log_dir,
-            cutoff_time,
-            &mut deleted,
-            &mut errors,
-        )?;
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if modified >= cutoff {
+                continue;
+            }
 
-        Ok((deleted, errors))
-    }
-
-    /// Recursively clean up directories and files older than cutoff time
-    #[allow(clippy::only_used_in_recursion)]
-    fn cleanup_directory_recursive(
-        &self,
-        dir: &PathBuf,
-        cutoff_time: std::time::SystemTime,
-        deleted: &mut u32,
-        errors: &mut u32,
-    ) -> Result<()> {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-
-                if path.is_dir() {
-                    // Recursively clean subdirectories
-                    self.cleanup_directory_recursive(&path, cutoff_time, deleted, errors)?;
-
-                    // Remove empty directories
-                    if let Ok(mut dir_entries) = std::fs::read_dir(&path) {
-                        if dir_entries.next().is_none() {
-                            if let Err(e) = std::fs::remove_dir(&path) {
-                                debug!("Failed to remove empty directory {:?}: {}", path, e);
-                            } else {
-                                debug!("Removed empty directory: {:?}", path);
-                            }
-                        }
-                    }
-                } else if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified < cutoff_time {
-                            if let Err(e) = std::fs::remove_file(&path) {
-                                warn!("Failed to remove old access log file {:?}: {}", path, e);
-                                *errors += 1;
-                            } else {
-                                debug!("Removed old access log file: {:?}", path);
-                                *deleted += 1;
-                            }
-                        }
-                    }
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!("Failed to remove old log file {:?}: {}", path, e);
+                counts.errors += 1;
+            } else {
+                debug!(
+                    "Removed old log file: {:?} (owner={})",
+                    path,
+                    if owned { "own" } else { "adopted" }
+                );
+                counts.deleted += 1;
+                if !owned {
+                    counts.adopted += 1;
                 }
             }
         }
@@ -2018,8 +2160,18 @@ mod log_lifecycle_property_tests {
     // after running cleanup:
     //   (a) no file older than the retention period should remain
     //   (b) all files newer than the retention period should be preserved
-    //   (c) application log cleanup only touches files within the current hostname's directory
+    //   (c) another hostname's application logs are reaped only once they exceed
+    //       retention + FOREIGN_GRACE (one day), and survive inside that band
     //   (d) access log cleanup traverses the entire date-partitioned tree
+    //
+    // (c) previously asserted that a foreign hostname's directory was never
+    // touched at all. That encoded retention-as-a-property-of-the-writer, which
+    // is the behaviour the access-log-retention-scope work deliberately removed:
+    // a survivor now reaps a terminated peer's logs, but only a full day past
+    // the policy so it can never reach a live peer's in-retention file. The
+    // filenames here are also now suffixed with the local hostname so the
+    // access-log half exercises the OWN cutoff; before, they ended in
+    // `-access-{i}`, which the ownership rule correctly reads as foreign.
     #[quickcheck]
     fn prop_cleanup_deletes_exactly_expired_files(
         file_ages_days: Vec<u16>,
@@ -2091,7 +2243,9 @@ mod log_lifecycle_property_tests {
         let mut expected_access_deleted = 0u32;
         for (i, &age_raw) in file_ages_days.iter().enumerate() {
             let age_days = age_raw % 730;
-            let path = access_date_dir.join(format!("2024-01-15-00-00-00-access-{}", i));
+            // Owned by the local hostname (so the own cutoff applies), with a
+            // distinct second in the fixed-width stamp to keep names unique.
+            let path = access_date_dir.join(format!("2024-01-15-00-00-{:02}-{}", i % 60, hostname));
             std::fs::write(&path, format!("access log content {}", i)).unwrap();
 
             let mtime_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
@@ -2125,12 +2279,21 @@ mod log_lifecycle_property_tests {
         // Run cleanup
         let result = manager.rotate_logs(retention_days, retention_days).unwrap();
 
+        // A hostname directory the sweep leaves empty is now pruned (Req 4.4), so
+        // the directory may legitimately be gone rather than present-and-empty.
+        // Treat absent as zero files rather than panicking on `read_dir`.
+        fn surviving_files(dir: &std::path::Path) -> Vec<std::fs::DirEntry> {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_file())
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+
         // (a) & (b): Check app log files — only non-expired files for our hostname remain
-        let remaining_app_files: Vec<_> = std::fs::read_dir(&host_app_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file())
-            .collect();
+        let remaining_app_files = surviving_files(&host_app_dir);
 
         if remaining_app_files.len() as u32 != expected_app_surviving {
             return TestResult::error(format!(
@@ -2140,24 +2303,52 @@ mod log_lifecycle_property_tests {
             ));
         }
 
-        if result.app_files_deleted != expected_app_deleted {
+        // The app sweep now walks the whole `app_log_dir`, so the reported total
+        // covers the foreign hostname directory too. Count its expected
+        // deletions at the grace-widened cutoff and add them in.
+        let expected_other_deleted = other_host_ages
+            .iter()
+            .filter(|&&age_raw| (age_raw % 730) as u32 > retention_days)
+            .count() as u32;
+
+        if result.app_files_deleted != expected_app_deleted + expected_other_deleted {
             return TestResult::error(format!(
-                "App log: expected {} deleted, result reports {}",
-                expected_app_deleted, result.app_files_deleted
+                "App log: expected {} own + {} adopted deleted, result reports {} ({} adopted)",
+                expected_app_deleted,
+                expected_other_deleted,
+                result.app_files_deleted,
+                result.app_files_adopted
             ));
         }
 
-        // (c): Other hostname's files must ALL still exist (hostname-scoped cleanup)
-        let remaining_other_files: Vec<_> = std::fs::read_dir(&other_host_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file())
-            .collect();
-
-        if remaining_other_files.len() != other_host_file_count {
+        if result.app_files_adopted != expected_other_deleted {
             return TestResult::error(format!(
-                "Other host: expected {} files untouched, got {}",
+                "App log: expected {} adopted, result reports {}",
+                expected_other_deleted, result.app_files_adopted
+            ));
+        }
+
+        // (c): Another hostname's files are reaped only past retention + grace.
+        // Inside the band they must survive — that is the property that makes
+        // sweeping the whole app_log_dir safe against a live peer.
+        let expected_other_surviving = other_host_ages
+            .iter()
+            .filter(|&&age_raw| {
+                let age_days = age_raw % 730;
+                // Foreign cutoff is retention + 1 day, so a file is a candidate
+                // only once strictly older than that.
+                (age_days as u32) < retention_days + 1
+            })
+            .count();
+
+        let remaining_other_files = surviving_files(&other_host_dir);
+
+        if remaining_other_files.len() != expected_other_surviving {
+            return TestResult::error(format!(
+                "Other host: expected {} of {} files to survive retention {}d + 1d grace, got {}",
+                expected_other_surviving,
                 other_host_file_count,
+                retention_days,
                 remaining_other_files.len()
             ));
         }
@@ -2879,5 +3070,329 @@ mod sanitize_log_field_tests {
         assert!(!formatted.contains('\r'));
         assert!(!formatted.contains('\n'));
         assert!(formatted.contains("\\r\\n"));
+    }
+}
+
+/// Retention-sweep scoping tests.
+///
+/// Retention is a property of the **directory**, enforced in two tiers: the
+/// local instance's own files at `retention_days`, any other hostname's files
+/// at `retention_days + FOREIGN_GRACE`. The grace band exists so that deleting
+/// a peer's file never depends on this instance's clock agreeing with the
+/// peer's — a flat cutoff makes NTP a correctness dependency.
+///
+/// The two `*_inside_the_grace_band` tests are the load-bearing ones: a
+/// regression to a single flat cutoff passes every other test in this module.
+#[cfg(test)]
+mod access_log_retention_tests {
+    use super::*;
+    use filetime::{set_file_mtime, FileTime};
+    use tempfile::TempDir;
+
+    const DAY: i64 = 86_400;
+
+    /// Backdate `path` by `secs` seconds relative to now.
+    fn age_by(path: &std::path::Path, secs: i64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        set_file_mtime(path, FileTime::from_unix_time(now - secs, 0)).unwrap();
+    }
+
+    fn write_file(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// A `LoggingConfig` for the sweep under test. `hostname` is what makes a
+    /// file "ours"; `enabled` exercises the gate that Req 1.1 removes.
+    fn cfg(
+        access_log_dir: &std::path::Path,
+        app_log_dir: &std::path::Path,
+        hostname: &str,
+        enabled: bool,
+        retention_days: u32,
+    ) -> LoggingConfig {
+        LoggingConfig {
+            access_log_dir: access_log_dir.to_path_buf(),
+            app_log_dir: app_log_dir.to_path_buf(),
+            access_log_enabled: enabled,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        }
+    }
+
+    /// Standard fixture: temp dirs, a date partition, and a 30-day retention.
+    struct Fixture {
+        _temp: TempDir,
+        access_dir: std::path::PathBuf,
+        app_dir: std::path::PathBuf,
+        date_dir: std::path::PathBuf,
+        hostname: String,
+        retention_days: u32,
+    }
+
+    fn fixture(hostname: &str) -> Fixture {
+        let temp = TempDir::new().unwrap();
+        let access_dir = temp.path().join("access");
+        let app_dir = temp.path().join("app");
+        let date_dir = access_dir.join("2026/06/02");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        std::fs::create_dir_all(app_dir.join(hostname)).unwrap();
+        Fixture {
+            _temp: temp,
+            access_dir,
+            app_dir,
+            date_dir,
+            hostname: hostname.to_string(),
+            retention_days: 30,
+        }
+    }
+
+    impl Fixture {
+        /// An access log file named per the documented convention:
+        /// `{YYYY-MM-DD-HH-MM-SS}-{hostname}`.
+        fn access_file(&self, host: &str) -> std::path::PathBuf {
+            self.date_dir.join(format!("2026-06-02-11-32-05-{}", host))
+        }
+
+        fn sweep(&self, enabled: bool) -> LogCleanupResult {
+            let manager = LoggerManager::new(cfg(
+                &self.access_dir,
+                &self.app_dir,
+                &self.hostname,
+                enabled,
+                self.retention_days,
+            ));
+            manager
+                .rotate_logs(self.retention_days, self.retention_days)
+                .unwrap()
+        }
+
+        fn retention_secs(&self) -> i64 {
+            self.retention_days as i64 * DAY
+        }
+    }
+
+    // Req 1.1, 7.2 — the defect itself. The sweep must run even when this
+    // instance is not writing access logs.
+    #[test]
+    fn sweeps_access_dir_when_access_logging_disabled() {
+        let f = fixture("host-a");
+        let own = f.access_file("host-a");
+        write_file(&own, "old record\n");
+        age_by(&own, f.retention_secs() + DAY);
+
+        let result = f.sweep(false);
+
+        assert!(
+            !own.exists(),
+            "an own file a day past retention must be reaped with access_log_enabled: false, \
+             but it survived (the retention sweep never ran)"
+        );
+        assert_eq!(
+            result.access_files_deleted, 1,
+            "the sweep must report the deletion"
+        );
+    }
+
+    // Req 2.2 — the hazard the gate was accidentally masking. Removing the gate
+    // widens a sweep that currently deletes ANY old file in the directory.
+    #[test]
+    fn leaves_unmatched_files_regardless_of_age() {
+        let f = fixture("host-a");
+        let foreign_shape = f.date_dir.join("not-an-access-log.txt");
+        write_file(&foreign_shape, "someone else's file\n");
+        age_by(&foreign_shape, f.retention_secs() + 400 * DAY);
+
+        let result = f.sweep(true);
+
+        assert!(
+            foreign_shape.exists(),
+            "a file not matching the access-log naming convention must never be deleted, \
+             however old — this sweep would destroy files the proxy never wrote"
+        );
+        assert_eq!(
+            result.access_files_deleted, 0,
+            "an unmatched file must not be counted as deleted"
+        );
+    }
+
+    // Req 3.2, 5.4 — a terminated peer's file is adopted past retention + grace.
+    #[test]
+    fn reaps_foreign_access_file_past_retention_plus_grace() {
+        let f = fixture("host-a");
+        let foreign = f.access_file("host-b");
+        write_file(&foreign, "dead peer's record\n");
+        age_by(&foreign, f.retention_secs() + 2 * DAY);
+
+        let result = f.sweep(true);
+
+        assert!(
+            !foreign.exists(),
+            "a foreign file past retention + grace must be adopted and reaped"
+        );
+        assert_eq!(result.access_files_deleted, 1);
+        assert_eq!(
+            result.access_files_adopted, 1,
+            "a reaped foreign file must be reported as adopted, since a non-zero \
+             adopted count is the only signal that a peer stopped cleaning up"
+        );
+    }
+
+    // Req 3.2, 3.3 — LOAD-BEARING. Without this, a regression to a single flat
+    // cutoff passes every other test in this module.
+    #[test]
+    fn keeps_foreign_access_file_inside_the_grace_band() {
+        let f = fixture("host-a");
+        let foreign = f.access_file("host-b");
+        write_file(&foreign, "live peer's record\n");
+        // Past our own retention, but inside the one-day foreign grace band.
+        age_by(&foreign, f.retention_secs() + DAY / 2);
+
+        let result = f.sweep(true);
+
+        assert!(
+            foreign.exists(),
+            "a foreign file inside the grace band MUST survive — deleting it makes \
+             correctness depend on this instance's clock agreeing with the peer's"
+        );
+        assert_eq!(result.access_files_deleted, 0);
+        assert_eq!(result.access_files_adopted, 0);
+    }
+
+    // Req 3.1 — pairs with the previous test: together they prove the two
+    // cutoffs are genuinely different rather than one value used twice.
+    #[test]
+    fn reaps_own_access_file_at_retention_without_grace() {
+        let f = fixture("host-a");
+        let own = f.access_file("host-a");
+        write_file(&own, "our own aged record\n");
+        // Past retention but well inside the grace band a foreign file would get.
+        age_by(&own, f.retention_secs() + 3600);
+
+        let result = f.sweep(true);
+
+        assert!(
+            !own.exists(),
+            "our own file must be reaped at retention, with no grace period"
+        );
+        assert_eq!(result.access_files_deleted, 1);
+        assert_eq!(
+            result.access_files_adopted, 0,
+            "our own file must not be counted as adopted"
+        );
+    }
+
+    // Design § 2b — ownership is an exact suffix match, never `contains`, so a
+    // hostname that is a prefix of another cannot claim its files and reap them
+    // a day early.
+    #[test]
+    fn does_not_claim_a_hostname_that_merely_shares_a_prefix() {
+        let f = fixture("host-a");
+        let neighbour = f.access_file("host-a-2");
+        write_file(&neighbour, "different instance\n");
+        age_by(&neighbour, f.retention_secs() + 3600);
+
+        let result = f.sweep(true);
+
+        assert!(
+            neighbour.exists(),
+            "host-a must not claim host-a-2's file: an exact suffix match is required, \
+             otherwise a prefix collision reaps a live peer's file a day early"
+        );
+        assert_eq!(result.access_files_deleted, 0);
+    }
+
+    // Req 3.7 — the file the local instance is currently appending to.
+    // Green both before and after the fix; a guard, not a red demonstration.
+    #[test]
+    fn does_not_delete_the_active_access_file() {
+        let f = fixture("host-a");
+        let active = f.access_file("host-a");
+        write_file(&active, "current record\n");
+        // Fresh mtime, as a file being appended to has.
+
+        let result = f.sweep(true);
+
+        assert!(active.exists(), "the active access log file must survive");
+        assert_eq!(result.access_files_deleted, 0);
+    }
+
+    // Req 4.2, 4.3 — app logs follow the same principle. Today the app sweep is
+    // scoped to app_log_dir/{hostname}, so a terminated peer's logs are never
+    // reaped by a survivor.
+    #[test]
+    fn sweeps_app_logs_under_a_foreign_hostname_directory() {
+        let f = fixture("host-a");
+        let foreign = f.app_dir.join("host-b").join("s3-proxy.log.2026-06-02");
+        write_file(&foreign, "dead peer's app log\n");
+        age_by(&foreign, f.retention_secs() + 2 * DAY);
+
+        let result = f.sweep(true);
+
+        assert!(
+            !foreign.exists(),
+            "a foreign hostname's app log past retention + grace must be reaped — \
+             retention cannot be a property of the directory for access logs and a \
+             property of the writer for app logs"
+        );
+        assert_eq!(result.app_files_deleted, 1);
+        assert_eq!(result.app_files_adopted, 1);
+    }
+
+    // Req 4.3 — the app-log mirror of the grace-band survival assertion, and
+    // the property that makes sweeping the whole directory safe.
+    #[test]
+    fn keeps_foreign_app_log_inside_the_grace_band() {
+        let f = fixture("host-a");
+        let foreign = f.app_dir.join("host-b").join("s3-proxy.log.2026-06-02");
+        write_file(&foreign, "LIVE peer's app log\n");
+        age_by(&foreign, f.retention_secs() + DAY / 2);
+
+        let result = f.sweep(true);
+
+        assert!(
+            foreign.exists(),
+            "a live peer's app log inside the grace band MUST survive — this is the \
+             safety property that makes the widened app-log sweep acceptable"
+        );
+        assert_eq!(result.app_files_deleted, 0);
+        assert_eq!(result.app_files_adopted, 0);
+    }
+
+    // Req 4.4 — an emptied hostname directory from a terminated instance is
+    // pruned; a live one always holds a current file, so it never is.
+    #[test]
+    fn prunes_emptied_hostname_directory_but_not_a_live_one() {
+        let f = fixture("host-a");
+
+        let dead_dir = f.app_dir.join("host-dead");
+        let dead_log = dead_dir.join("s3-proxy.log.2026-06-02");
+        write_file(&dead_log, "terminated instance\n");
+        age_by(&dead_log, f.retention_secs() + 2 * DAY);
+
+        let live_log = f.app_dir.join("host-a").join("s3-proxy.log.2026-08-20");
+        write_file(&live_log, "our current app log\n");
+
+        let _ = f.sweep(true);
+
+        assert!(
+            !dead_dir.exists(),
+            "a hostname directory left empty by the sweep should be pruned"
+        );
+        assert!(
+            f.app_dir.join("host-a").exists(),
+            "a live instance's hostname directory must never be removed"
+        );
+        assert!(live_log.exists(), "our current app log must survive");
     }
 }

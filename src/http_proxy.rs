@@ -2265,6 +2265,53 @@ impl HttpProxy {
         None
     }
 
+    /// Is this request scoped to a single part (`?partNumber=N`) rather than to
+    /// the whole object?
+    ///
+    /// Distinct from [`Self::is_get_object_part`], which is GET-only because it
+    /// routes into the part-serving pipeline — that pipeline emits `206` with a
+    /// body and must never receive a HEAD. This predicate answers the narrower
+    /// question the CACHE needs to ask, and it must consider HEAD as well.
+    ///
+    /// Why HEAD matters: S3 answers a part-scoped HEAD with that PART's
+    /// `Content-Length` plus a `Content-Range`, and the cache key does not carry
+    /// the query string ([`CacheManager::generate_cache_key`] keys on the path
+    /// alone). So treating a part-scoped HEAD as a plain `HeadObject` files a
+    /// PARTIAL response under the WHOLE-OBJECT key, after which a plain HEAD
+    /// reports part 1's length as the object's and a whole-object GET returns
+    /// that many bytes with HTTP 200. Measured: 5,242,880 of 52,428,800, and a
+    /// client cannot detect it.
+    ///
+    /// The `uploadId` exclusion mirrors `is_get_object_part`: with an `uploadId`
+    /// present the request is upload verification, not a part read.
+    pub fn is_part_scoped_request(query_params: &HashMap<String, String>) -> bool {
+        !query_params.contains_key("uploadId")
+            && query_params
+                .get("partNumber")
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some_and(|n| n > 0)
+    }
+
+    /// Parse a URI's query string into a parameter map.
+    ///
+    /// Extracted so the early part-scoped-HEAD bypass can ask about query
+    /// parameters before the main path's parse (which happens much later, after
+    /// the cache key has already been generated).
+    fn parse_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
+        uri.query()
+            .map(|q| {
+                q.split('&')
+                    .filter_map(|pair| {
+                        let mut parts = pair.splitn(2, '=');
+                        let key = parts.next()?.to_string();
+                        let value = parts.next().unwrap_or("").to_string();
+                        Some((key, value))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Handle GET and HEAD requests with caching and range support
     #[allow(clippy::too_many_arguments)]
     async fn handle_get_head_request(
@@ -2322,6 +2369,57 @@ impl HttpProxy {
                 header_map,
                 s3_client,
                 Some("SSE-C"),
+                proxy_referer,
+                permit,
+            )
+            .await;
+        }
+
+        // Part-scoped HEAD bypass: a `HEAD ?partNumber=N` must neither read from
+        // nor write to the whole-object cache entry.
+        //
+        // S3 answers such a request with that PART's `Content-Length` and a
+        // `Content-Range`, but the cache key is path-only, so the response would
+        // be filed under the whole-object key — and the HEAD cache-hit path then
+        // replays the part's `content-length` as the object's. Measured on a
+        // 50 MiB ten-part object: after one `HEAD ?partNumber=1`, a plain HEAD
+        // reported 5,242,880 instead of 52,428,800 and a whole-object GET
+        // returned exactly that many bytes with HTTP 200 and a success status,
+        // deterministically, with no load and no race. Present since v0.5.0.
+        //
+        // Bypassing removes BOTH observed defects at once: the poisoning, and
+        // the converse case where a part-scoped HEAD issued after a plain one is
+        // answered FROM the whole-object entry and returns the object's length
+        // with no `PartsCount`. Caching a part-scoped HEAD under a part key was
+        // considered and rejected — it would add a HEAD-entry grammar with its
+        // own TTL and invalidation, i.e. new surface for exactly the bug class
+        // being fixed, to serve a request type that is rare and cheap.
+        //
+        // Placement is load-bearing: this sits with the SSE-C bypass, which is
+        // already ahead of `generate_cache_key` and `resolve_settings`, so no
+        // lookup and no store can happen. It parses the query itself because the
+        // main path's `query_params` is not built until well after the cache key
+        // exists.
+        if method == Method::HEAD && Self::is_part_scoped_request(&Self::parse_query_params(&uri)) {
+            debug!(
+                "Cache bypass: part-scoped HEAD forwarded to S3 without caching: path={} query={:?}",
+                path,
+                uri.query()
+            );
+            if let Some(metrics_mgr) = metrics_manager.clone() {
+                let reason = "part-scoped-head".to_string();
+                tokio::spawn(async move {
+                    let mgr = metrics_mgr.read().await;
+                    mgr.record_cache_bypass(&reason).await;
+                });
+            }
+            return Self::forward_get_head_to_s3_without_caching(
+                method,
+                uri,
+                host,
+                header_map,
+                s3_client,
+                Some("part-scoped-head"),
                 proxy_referer,
                 permit,
             )
@@ -3209,13 +3307,32 @@ impl HttpProxy {
                         )
                         .await;
 
-                    // Build response from HEAD cache
+                    // Build response from HEAD cache.
+                    //
+                    // `content-length` comes from the OBJECT metadata, and a
+                    // cached `content-range` is never emitted. Replaying the
+                    // stored header map verbatim is what turned one part-scoped
+                    // HEAD into permanent silent truncation for the object: the
+                    // part's 5 MiB `content-length` was stored under the
+                    // whole-object key and then replayed here as the object's
+                    // length, so a CRT client sized the object from it and read
+                    // exactly that many bytes. The full-object and buffered-range
+                    // serves have always filtered both headers; this is matching
+                    // them, not inventing a third convention.
                     let mut response_builder = Response::builder()
                         .status(StatusCode::OK)
-                        .header("x-cache", "HIT"); // R9: metadata HEAD hits must carry the cache-hit signal
+                        .header("x-cache", "HIT") // R9: metadata HEAD hits must carry the cache-hit signal
+                        .header(
+                            "content-length",
+                            head_entry.metadata.content_length.to_string(),
+                        );
 
                     // Add cached headers
                     for (key, value) in &head_entry.headers {
+                        let key_lower = key.to_ascii_lowercase();
+                        if key_lower == "content-length" || key_lower == "content-range" {
+                            continue;
+                        }
                         response_builder = response_builder.header(key, value);
                     }
 
@@ -8068,6 +8185,31 @@ impl HttpProxy {
     }
 
     /// Add cached S3 headers to a response builder.
+    /// Emit cached object headers for a metadata-only response (a HEAD hit, or a
+    /// zero-length object), taking `content-length` from the OBJECT metadata and
+    /// never replaying a cached `content-range`.
+    ///
+    /// These paths used to replay `object_metadata.response_headers` verbatim,
+    /// which is how a stored part-scoped `content-length` reached clients as the
+    /// object's length. `content-length` and `content-range` describe a RESPONSE;
+    /// the object's authoritative length is `ObjectMetadata::content_length`, so
+    /// it is set from there and the stored copies are skipped. Matches the filter
+    /// the full-object and buffered-range serves already apply.
+    fn add_object_metadata_headers(
+        mut builder: hyper::http::response::Builder,
+        object_metadata: &crate::cache_types::ObjectMetadata,
+    ) -> hyper::http::response::Builder {
+        builder = builder.header("content-length", object_metadata.content_length.to_string());
+        for (k, v) in &object_metadata.response_headers {
+            let k_lower = k.to_ascii_lowercase();
+            if k_lower == "content-length" || k_lower == "content-range" {
+                continue;
+            }
+            builder = builder.header(k, v);
+        }
+        builder
+    }
+
     /// Shared between streaming and buffered response paths.
     fn add_cached_s3_headers(
         mut response_builder: hyper::http::response::Builder,
@@ -10072,13 +10214,14 @@ impl HttpProxy {
                     .await;
 
                 if method == Method::HEAD {
-                    // Return cached metadata headers with empty body.
-                    let mut builder = Response::builder()
-                        .status(StatusCode::OK)
-                        .header("x-cache", "HIT");
-                    for (k, v) in &metadata.object_metadata.response_headers {
-                        builder = builder.header(k, v);
-                    }
+                    // Return cached metadata headers with empty body. Length
+                    // comes from the object metadata, not the stored header map.
+                    let builder = Self::add_object_metadata_headers(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("x-cache", "HIT"),
+                        &metadata.object_metadata,
+                    );
                     return Ok(builder
                         .body(
                             Full::new(Bytes::new())
@@ -10092,10 +10235,10 @@ impl HttpProxy {
                 if total_size == 0 {
                     // Zero-length object — return an empty body with the
                     // cached headers, same convention as an empty success.
-                    let mut builder = Response::builder().status(StatusCode::OK);
-                    for (k, v) in &metadata.object_metadata.response_headers {
-                        builder = builder.header(k, v);
-                    }
+                    let builder = Self::add_object_metadata_headers(
+                        Response::builder().status(StatusCode::OK),
+                        &metadata.object_metadata,
+                    );
                     return Ok(builder
                         .body(
                             Full::new(Bytes::new())
@@ -10371,10 +10514,12 @@ impl HttpProxy {
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         let total_size = metadata.object_metadata.content_length;
         if total_size == 0 {
-            let mut builder = Response::builder().status(StatusCode::OK);
-            for (k, v) in &metadata.object_metadata.response_headers {
-                builder = builder.header(k, v);
-            }
+            // Length from the object metadata; never replay a cached
+            // content-range. See `add_object_metadata_headers`.
+            let builder = Self::add_object_metadata_headers(
+                Response::builder().status(StatusCode::OK),
+                &metadata.object_metadata,
+            );
             return Ok(builder
                 .body(
                     Full::new(Bytes::new())
@@ -10384,12 +10529,12 @@ impl HttpProxy {
                 .unwrap());
         }
         if method == Method::HEAD {
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("x-cache", "HIT");
-            for (k, v) in &metadata.object_metadata.response_headers {
-                builder = builder.header(k, v);
-            }
+            let builder = Self::add_object_metadata_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-cache", "HIT"),
+                &metadata.object_metadata,
+            );
             return Ok(builder
                 .body(
                     Full::new(Bytes::new())

@@ -564,6 +564,10 @@ async fn main() -> Result<()> {
     let cleanup_interval = config.logging.log_cleanup_interval;
     let access_retention = config.logging.access_log_retention_days;
     let app_retention = config.logging.app_log_retention_days;
+    // Captured as owned strings so the cleanup task can name the directories it
+    // swept without holding a borrow on `config`.
+    let access_log_dir_display = config.logging.access_log_dir.display().to_string();
+    let app_log_dir_display = config.logging.app_log_dir.display().to_string();
     let mut cleanup_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
 
     info!(
@@ -576,9 +580,23 @@ async fn main() -> Result<()> {
         {
             let logger = cleanup_logger.lock().await;
             match logger.rotate_logs(access_retention, app_retention) {
+                // Name the directories actually walked, and split deletions by
+                // tier. A non-zero adopted count is the only signal that an
+                // instance which used to write here has stopped cleaning up
+                // after itself. Reporting the paths is also what stops this line
+                // reading as a successful sweep when no sweep happened, which is
+                // how a gated access-log sweep looked identical to an empty one.
                 Ok(result) => info!(
-                    "Startup log cleanup: {} access files, {} app files deleted",
-                    result.access_files_deleted, result.app_files_deleted
+                    "Startup log cleanup: access={} {} deleted ({} own, {} adopted), app={} {} deleted ({} own, {} adopted), {} errors",
+                    access_log_dir_display,
+                    result.access_files_deleted,
+                    result.access_files_deleted - result.access_files_adopted,
+                    result.access_files_adopted,
+                    app_log_dir_display,
+                    result.app_files_deleted,
+                    result.app_files_deleted - result.app_files_adopted,
+                    result.app_files_adopted,
+                    result.errors
                 ),
                 Err(e) => warn!("Startup log cleanup failed: {}", e),
             }
@@ -595,8 +613,16 @@ async fn main() -> Result<()> {
                     match logger.rotate_logs(access_retention, app_retention) {
                         Ok(result) => {
                             if result.access_files_deleted > 0 || result.app_files_deleted > 0 || result.errors > 0 {
-                                info!("Log cleanup: {} access files, {} app files deleted, {} errors",
-                                    result.access_files_deleted, result.app_files_deleted, result.errors);
+                                info!("Log cleanup: access={} {} deleted ({} own, {} adopted), app={} {} deleted ({} own, {} adopted), {} errors",
+                                    access_log_dir_display,
+                                    result.access_files_deleted,
+                                    result.access_files_deleted - result.access_files_adopted,
+                                    result.access_files_adopted,
+                                    app_log_dir_display,
+                                    result.app_files_deleted,
+                                    result.app_files_deleted - result.app_files_adopted,
+                                    result.app_files_adopted,
+                                    result.errors);
                             }
                         }
                         Err(e) => warn!("Log cleanup failed: {}", e),

@@ -6867,7 +6867,15 @@ impl CacheManager {
                 .clone(),
             content_length: total_size,
             content_type: headers.get("content-type").cloned(),
-            response_headers: headers.clone(),
+            // Strip the response-scoped headers. This path is CORRECT for length
+            // — `content_length` above comes from `Content-Range`'s total, which
+            // is the whole object — so this is not a correctness fix here. It is
+            // what stops a legitimately part-populated entry carrying the same
+            // fingerprint as a poisoned one, which would otherwise make
+            // `is_part_scoped_entry` revalidate a healthy entry on every read: a
+            // cache-hit-rate regression with no obvious cause. The part count is
+            // preserved in the typed field just below.
+            response_headers: Self::strip_response_scoped_headers(headers),
             parts_count: multipart_info.parts_count,
             ..Default::default()
         };
@@ -7041,6 +7049,22 @@ impl CacheManager {
                 );
                 metadata_updated = true;
             }
+        }
+
+        // Drop response-scoped headers an earlier release may have stored on this
+        // entry, so a part GET landing on a pre-fix entry leaves it clean instead
+        // of preserving the fingerprint `is_part_scoped_entry` looks for.
+        //
+        // Without this the entry keeps being detected on every HEAD read until a
+        // HEAD miss happens to merge into it — correct, but it revalidates a
+        // healthy entry in the meantime, which is a cache-hit-rate regression with
+        // no obvious cause. Stripping here is the same "strip at the source" rule
+        // applied at the third write site.
+        let stripped =
+            Self::strip_response_scoped_headers(&metadata.object_metadata.response_headers);
+        if stripped.len() != metadata.object_metadata.response_headers.len() {
+            metadata.object_metadata.response_headers = stripped;
+            metadata_updated = true;
         }
 
         // Persist updated metadata to disk if any changes were made (Requirement 3.4, 6.3, 11.4)
@@ -7249,9 +7273,28 @@ impl CacheManager {
                 now,
             );
             if head_fresh {
-                debug!("HEAD cache hit (MetadataCache RAM) for key: {}", cache_key);
-                self.metadata_cache.record_head_hit();
-                return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
+                // An entry written by a pre-fix release from a part-scoped
+                // response cannot be trusted for its length, so it is not
+                // eligible to answer a HEAD. Reporting a miss sends the request
+                // down the existing forward-and-cache path, which revalidates
+                // against S3 and rewrites the entry clean — no new serve logic,
+                // and no operator action on upgrade. Compatibility code with a
+                // documented expiry: see `is_part_scoped_entry`.
+                if Self::is_part_scoped_entry(&metadata.object_metadata) {
+                    warn!(
+                        "Ignoring a part-scoped HEAD cache entry for {} (written by a release before the part-scoped-HEAD fix); revalidating against S3 and rewriting it clean",
+                        cache_key
+                    );
+                    // Drop the poisoned RAM copy, or the repair never converges:
+                    // the rewrite lands on disk, but a HEAD-only entry has no
+                    // ranges and so is not re-published to RAM, leaving this
+                    // stale copy to be detected again on every subsequent read.
+                    self.metadata_cache.invalidate(cache_key).await;
+                } else {
+                    debug!("HEAD cache hit (MetadataCache RAM) for key: {}", cache_key);
+                    self.metadata_cache.record_head_hit();
+                    return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
+                }
             } else {
                 debug!("HEAD expired in MetadataCache for key: {}", cache_key);
                 // HEAD expired but metadata may still be valid for ranges
@@ -7278,9 +7321,21 @@ impl CacheManager {
                         now,
                     );
                     if head_fresh {
-                        debug!("HEAD cache hit (disk .meta) for key: {}", cache_key);
-                        self.metadata_cache.record_head_disk_hit();
-                        return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
+                        // Same poisoned-entry guard as the RAM tier above.
+                        if Self::is_part_scoped_entry(&metadata.object_metadata) {
+                            warn!(
+                                "Ignoring a part-scoped HEAD cache entry for {} (written by a release before the part-scoped-HEAD fix); revalidating against S3 and rewriting it clean",
+                                cache_key
+                            );
+                            // This tier published the entry to RAM just above,
+                            // before the freshness check. Undo that, for the same
+                            // convergence reason as the RAM tier.
+                            self.metadata_cache.invalidate(cache_key).await;
+                        } else {
+                            debug!("HEAD cache hit (disk .meta) for key: {}", cache_key);
+                            self.metadata_cache.record_head_disk_hit();
+                            return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
+                        }
                     } else {
                         debug!("HEAD expired in disk .meta for key: {}", cache_key);
                     }
@@ -7348,6 +7403,33 @@ impl CacheManager {
             return Err(e);
         }
 
+        // Refuse a response that describes PART of the object as object metadata.
+        //
+        // Belt and braces behind the request-path bypass, and the half that
+        // protects call sites that do not exist yet: a response carrying
+        // `Content-Range` or `x-amz-mp-parts-count` is scoped to a range or a
+        // part, and storing it under the whole-object key is what produced silent
+        // truncation for every release from v0.5.0 to 2.5.0. Rejecting is safe —
+        // both callers treat a HEAD cache-write failure as non-fatal and return
+        // the S3 response to the client regardless.
+        //
+        // This also gives `x-amz-mp-parts-count` its first reader in the
+        // codebase. It is the one header that unambiguously marks a response as
+        // part-scoped, and it was being discarded.
+        if let Some(scope_header) = headers.keys().find(|k| {
+            k.eq_ignore_ascii_case("content-range")
+                || k.eq_ignore_ascii_case("x-amz-mp-parts-count")
+        }) {
+            warn!(
+                "Refusing to store a partial response as object metadata for {}: response carries '{}', so it describes part of the object rather than the object",
+                cache_key, scope_header
+            );
+            return Err(ProxyError::CacheError(format!(
+                "refusing to store a part-scoped response as whole-object HEAD metadata for {} (carries '{}')",
+                cache_key, scope_header
+            )));
+        }
+
         // Store in the unified NewCacheMetadata format
         // Try to read existing metadata from disk instead of using exists() check.
         // On NFS, exists() can return false due to attribute caching even when the file
@@ -7409,6 +7491,73 @@ impl CacheManager {
                 }
             }
         }
+    }
+
+    /// Strip headers that describe the RESPONSE rather than the OBJECT.
+    ///
+    /// `content-length` and `content-range` are per-response facts. Storing them
+    /// as object metadata is what let a part-scoped HEAD's 5 MiB length be
+    /// replayed as a 50 MiB object's length: they were copied verbatim into
+    /// `ObjectMetadata::response_headers` and every metadata-only serve path
+    /// replayed them onto a response of a different scope.
+    ///
+    /// The object's authoritative length is `ObjectMetadata::content_length`, and
+    /// every serve path takes it from there. Note this also makes the
+    /// "`content_length` may not disagree with a stored `content-length` header"
+    /// invariant trivially true rather than merely asserted — no such header is
+    /// stored, so the disagreement is unrepresentable.
+    ///
+    /// `x-amz-mp-parts-count` is stripped alongside them, which the design left
+    /// ambiguous and is resolved here deliberately. S3 returns that header only
+    /// when the request named a `partNumber`, so it too describes the response
+    /// scope rather than the stored object — and it must be stripped for
+    /// [`Self::is_part_scoped_entry`] to be able to use it as a fingerprint
+    /// without firing on entries this release itself writes. Nothing is lost:
+    /// the part count survives as the typed `ObjectMetadata::parts_count` field,
+    /// which `store_part_as_range` populates from this same header.
+    fn strip_response_scoped_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+        headers
+            .iter()
+            .filter(|(k, _)| {
+                let k = k.to_ascii_lowercase();
+                k != "content-length" && k != "content-range" && k != "x-amz-mp-parts-count"
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Was this cache entry written from a response scoped to part of the object?
+    ///
+    /// A correct whole-object entry never carries a stored `content-range` or
+    /// `x-amz-mp-parts-count`: [`Self::strip_response_scoped_headers`] removes
+    /// both at every write site, including `store_part_as_range`, so an entry
+    /// legitimately populated by a part GET does not trip this. Their presence in
+    /// stored object metadata is therefore the fingerprint of the
+    /// part-scoped-HEAD defect present from v0.5.0 (2026-01-02) through 2.5.0, so
+    /// an entry carrying one cannot be trusted for its length regardless of what
+    /// `content_length` says.
+    ///
+    /// Why the length cannot be trusted even though it usually looks right: a
+    /// poisoned entry's `content_length` is correct only because the
+    /// `Content-Range` total was numeric and got parsed. A `Content-Range` whose
+    /// total is `*` yields no total, leaving `content_length` holding the PART's
+    /// length — a genuinely poisoned value that serving from `content_length`
+    /// would faithfully serve. S3 does not send `*` for a part HEAD today, so
+    /// that case is latent rather than observed, but "no operator action on
+    /// upgrade" cannot be a guarantee if it depends on that staying true.
+    ///
+    /// # This is compatibility code with an expiry
+    ///
+    /// It exists ONLY to heal entries written by releases before the fix. It can
+    /// be deleted once no pre-fix entry can still be within its TTL — in
+    /// practice, one release cycle after every fleet has upgraded and the
+    /// configured `get_ttl` / `head_ttl` have elapsed. Delete the detector, its
+    /// call site in the read path, and the tests that plant a poisoned entry.
+    pub fn is_part_scoped_entry(om: &crate::cache_types::ObjectMetadata) -> bool {
+        om.response_headers.keys().any(|k| {
+            k.eq_ignore_ascii_case("content-range")
+                || k.eq_ignore_ascii_case("x-amz-mp-parts-count")
+        })
     }
 
     /// Update HEAD fields in an existing NewCacheMetadata file
@@ -7487,12 +7636,21 @@ impl CacheManager {
         }
 
         // Merge response headers - S3 HEAD response headers are authoritative
-        for (key, value) in headers {
-            metadata
-                .object_metadata
-                .response_headers
-                .insert(key.clone(), value.clone());
+        //
+        // Response-scoped headers are stripped first. This merge loop previously
+        // copied EVERY header from the HEAD response into the persisted
+        // `response_headers` of a `.meta` that may hold real ranges, so a HEAD
+        // carrying a part's `content-length` overwrote the whole-object value and
+        // was later replayed as the object's length.
+        for (key, value) in Self::strip_response_scoped_headers(headers) {
+            metadata.object_metadata.response_headers.insert(key, value);
         }
+
+        // Drop any response-scoped headers an EARLIER release stored on this
+        // entry. Stripping only the incoming merge would leave a poisoned
+        // pre-fix entry poisoned forever, since nothing else rewrites these keys.
+        metadata.object_metadata.response_headers =
+            Self::strip_response_scoped_headers(&metadata.object_metadata.response_headers);
 
         // Write back atomically
         let temp_path = metadata_path.with_extension("meta.tmp");
@@ -7534,7 +7692,10 @@ impl CacheManager {
             last_modified: legacy_metadata.last_modified.clone(),
             content_length: legacy_metadata.content_length,
             content_type,
-            response_headers: headers.clone(),
+            // Response-scoped headers never become object metadata: see
+            // `strip_response_scoped_headers`. This site is where a part-scoped
+            // HEAD's `content-length` used to enter the cache verbatim.
+            response_headers: Self::strip_response_scoped_headers(headers),
             ..Default::default()
         };
 
@@ -8689,8 +8850,8 @@ impl CacheManager {
     /// cache). Writing the `.meta` synchronously is what preserves read-after-write
     /// cache semantics — an immediate post-PUT GET is a hit. The streaming sink's
     /// journal-only `commit` defers the `.meta` until consolidation, which would
-    /// turn that GET into a miss and regress deployment-verification T9/T10, so the
-    /// streaming cache task uses `finalize` + this method instead of `commit`.
+    /// turn that GET into a miss, so the streaming cache task uses `finalize` +
+    /// this method instead of `commit`.
     pub(crate) async fn store_streamed_write_cache_metadata(
         &self,
         cache_key: &str,
@@ -15695,5 +15856,271 @@ mod head_anchor_integration_tests {
             .await
             .unwrap()
             .is_some());
+    }
+}
+
+/// Storage-layer coverage for the part-scoped-HEAD cache-poisoning fix.
+///
+/// These need only a `CacheManager` over a `TempDir` — no request path. The
+/// routing half of the fix (a part-scoped HEAD neither reading nor writing the
+/// whole-object entry) is a branch inside `handle_get_head_request` and cannot be
+/// reached from a `#[cfg(test)]` unit test; it lives in
+/// `tests/part_scoped_head_cache_test.rs`.
+#[cfg(test)]
+mod part_scoped_head_storage_tests {
+    use super::*;
+    use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec};
+    use tempfile::TempDir;
+
+    fn whole_object_head_metadata() -> CacheMetadata {
+        CacheMetadata {
+            etag: "\"whole-object-etag\"".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: 52_428_800,
+            part_number: None,
+            cache_control: None,
+            access_count: 0,
+            last_accessed: SystemTime::now(),
+        }
+    }
+
+    fn stored_headers(manager: &CacheManager, key: &str) -> HashMap<String, String> {
+        let path = manager.get_new_metadata_file_path(key);
+        let metadata: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        metadata.object_metadata.response_headers
+    }
+
+    /// `content-length` describes a RESPONSE, not an object, and must not be
+    /// stored as object metadata on a fresh HEAD-only entry.
+    ///
+    /// Note this test does NOT also plant a `Content-Range`: such a response is
+    /// now refused outright by `store_head_cache_entry_unified`, which is
+    /// `store_head_entry_refuses_a_partial_response` below. The two together are
+    /// the requirement; either alone would leave a gap.
+    #[tokio::test]
+    async fn head_metadata_does_not_store_content_length_or_content_range() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/fresh-head-entry";
+
+        let headers = HashMap::from([
+            (String::from("content-length"), String::from("5242880")),
+            (String::from("content-type"), String::from("text/plain")),
+            (String::from("etag"), String::from("\"whole-object-etag\"")),
+        ]);
+        manager
+            .store_head_cache_entry_unified(key, headers, whole_object_head_metadata())
+            .await
+            .unwrap();
+
+        let stored = stored_headers(&manager, key);
+        assert!(
+            !stored
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-length")),
+            "a per-response content-length must not be stored as object metadata; \
+             it is what let a part's 5 MiB length be replayed as a 50 MiB object's. \
+             Stored headers: {:?}",
+            stored
+        );
+        assert!(
+            !stored
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-range")),
+            "no content-range may be stored as object metadata. Stored: {:?}",
+            stored
+        );
+        // The headers that genuinely describe the object are untouched.
+        assert_eq!(
+            stored.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+    }
+
+    /// Same property on the MERGE path, which is a separate code path and a
+    /// separate red case: when a `.meta` already exists,
+    /// `update_metadata_head_fields` runs instead, and its merge loop used to
+    /// copy every header from the HEAD response into a persisted entry that may
+    /// hold real ranges.
+    ///
+    /// This also covers the repair of an ALREADY-poisoned entry: the pre-planted
+    /// `.meta` carries both headers from a notional pre-fix release, and the
+    /// merge must leave neither behind.
+    #[tokio::test]
+    async fn head_metadata_merge_does_not_store_content_length_or_content_range() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/existing-head-entry";
+        let now = SystemTime::now();
+
+        // An entry as a pre-fix release would have left it: real ranges, plus
+        // part-scoped headers stored as object metadata.
+        let poisoned_headers = HashMap::from([
+            (String::from("content-length"), String::from("5242880")),
+            (
+                String::from("content-range"),
+                String::from("bytes 0-5242879/52428800"),
+            ),
+            (String::from("x-amz-mp-parts-count"), String::from("10")),
+            (String::from("content-type"), String::from("text/plain")),
+        ]);
+        let metadata = NewCacheMetadata {
+            cache_key: key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"whole-object-etag\"".to_string(),
+                last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                content_length: 52_428_800,
+                response_headers: poisoned_headers,
+                ..Default::default()
+            },
+            ranges: vec![RangeSpec::new(
+                0,
+                1023,
+                "existing_0-1023.bin".to_string(),
+                CompressionAlgorithm::None,
+                1024,
+                1024,
+            )],
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: Some(now + Duration::from_secs(60)),
+            head_last_accessed: Some(now),
+            head_access_count: 1,
+            head_cached_at: Some(now),
+        };
+        manager.write_metadata_to_disk(&metadata).await.unwrap();
+
+        // A fresh plain HEAD merges into it.
+        let headers = HashMap::from([
+            (String::from("content-length"), String::from("52428800")),
+            (String::from("content-type"), String::from("text/plain")),
+        ]);
+        manager
+            .store_head_cache_entry_unified(key, headers, whole_object_head_metadata())
+            .await
+            .unwrap();
+
+        let stored = stored_headers(&manager, key);
+        for banned in ["content-length", "content-range", "x-amz-mp-parts-count"] {
+            assert!(
+                !stored.keys().any(|k| k.eq_ignore_ascii_case(banned)),
+                "the merge path must neither store nor PRESERVE '{}' as object \
+                 metadata — stripping only the incoming headers would leave a \
+                 poisoned pre-fix entry poisoned forever, since nothing else \
+                 rewrites these keys. Stored: {:?}",
+                banned,
+                stored
+            );
+        }
+
+        // The ranges the entry already held survive the merge.
+        let refreshed = manager.get_metadata_from_disk(key).await.unwrap().unwrap();
+        assert_eq!(
+            refreshed.ranges.len(),
+            1,
+            "merge must preserve cached ranges"
+        );
+    }
+
+    /// A response describing PART of an object must be refused as whole-object
+    /// metadata outright, not merely filtered.
+    ///
+    /// This is the layer that protects call sites that do not exist yet: the
+    /// request-path bypass stops the one trigger found, and this stops the
+    /// mechanism. Safe to reject — both production callers treat a HEAD
+    /// cache-write failure as non-fatal and return the S3 response regardless.
+    #[tokio::test]
+    async fn store_head_entry_refuses_a_partial_response() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+
+        let with_content_range = HashMap::from([
+            (String::from("content-length"), String::from("5242880")),
+            (
+                String::from("content-range"),
+                String::from("bytes 0-5242879/52428800"),
+            ),
+        ]);
+        assert!(
+            manager
+                .store_head_cache_entry_unified(
+                    "bucket/partial-cr",
+                    with_content_range,
+                    whole_object_head_metadata()
+                )
+                .await
+                .is_err(),
+            "a response carrying Content-Range must be refused as whole-object \
+             HEAD metadata"
+        );
+        assert!(
+            !manager
+                .get_new_metadata_file_path("bucket/partial-cr")
+                .exists(),
+            "a refused partial response must leave no .meta behind"
+        );
+
+        let with_parts_count = HashMap::from([
+            (String::from("content-length"), String::from("5242880")),
+            (String::from("x-amz-mp-parts-count"), String::from("10")),
+        ]);
+        assert!(
+            manager
+                .store_head_cache_entry_unified(
+                    "bucket/partial-pc",
+                    with_parts_count,
+                    whole_object_head_metadata()
+                )
+                .await
+                .is_err(),
+            "x-amz-mp-parts-count unambiguously marks a response as part-scoped \
+             and must be refused too — this is its first reader in the codebase"
+        );
+    }
+
+    /// The detector, which is new code and therefore GREEN ON ARRIVAL. Listed for
+    /// completeness, not as red/green evidence: there is no prior behaviour for a
+    /// function that did not exist.
+    #[test]
+    fn is_part_scoped_entry_detects_a_poisoned_entry() {
+        let clean = ObjectMetadata {
+            content_length: 52_428_800,
+            response_headers: HashMap::from([(
+                String::from("content-type"),
+                String::from("text/plain"),
+            )]),
+            ..Default::default()
+        };
+        assert!(!CacheManager::is_part_scoped_entry(&clean));
+
+        let by_content_range = ObjectMetadata {
+            response_headers: HashMap::from([(
+                String::from("content-range"),
+                String::from("bytes 0-5242879/52428800"),
+            )]),
+            ..Default::default()
+        };
+        assert!(CacheManager::is_part_scoped_entry(&by_content_range));
+
+        let by_parts_count = ObjectMetadata {
+            response_headers: HashMap::from([(
+                String::from("x-amz-mp-parts-count"),
+                String::from("10"),
+            )]),
+            ..Default::default()
+        };
+        assert!(CacheManager::is_part_scoped_entry(&by_parts_count));
+
+        // Header names arrive in whatever case S3 sent.
+        let mixed_case = ObjectMetadata {
+            response_headers: HashMap::from([(
+                String::from("Content-Range"),
+                String::from("bytes 0-5242879/52428800"),
+            )]),
+            ..Default::default()
+        };
+        assert!(CacheManager::is_part_scoped_entry(&mixed_case));
     }
 }

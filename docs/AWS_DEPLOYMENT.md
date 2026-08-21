@@ -126,9 +126,84 @@ EFS is least competitive when the cache is cold or churning. Metering minimums (
 
 Scale out, not up: adding proxies raises aggregate throughput, while enlarging a single one mainly buys more concurrent connections, because the bottleneck is per-connection processing rather than total CPU.
 
-**Recommended starting point**: 3× `c6in.large` (2 vCPU, 4 GiB, up to 25 Gbps) — the network-optimized family, sized for the proxy's actual resource use. Every upload path and cache-miss GET streams rather than buffering whole objects, so memory on them is independent of object size. What still buffers is read-side: range merge, page widening, buffered range serving, and the recovery fallbacks. Those are bounded in aggregate by `server.max_inflight_buffer_bytes` (opt-in, disabled by default — see [Configuration → In-Flight Memory Ceiling](CONFIGURATION.md#in-flight-memory-ceiling)).
+**Recommended starting point**: 3× `c6in.large` (2 vCPU, 4 GiB, **3.125 Gbps sustained**, 25 Gbps burst) — the network-optimized family, sized for the proxy's actual resource use. Every upload path and cache-miss GET streams rather than buffering whole objects, so memory on them is independent of object size. What still buffers is read-side: range merge, page widening, buffered range serving, and the recovery fallbacks. Those are bounded in aggregate by `server.max_inflight_buffer_bytes` (opt-in, disabled by default — see [Configuration → In-Flight Memory Ceiling](CONFIGURATION.md#in-flight-memory-ceiling)).
 
-For what a fleet delivers, see the measured figures in [Performance](../README.md#performance). Against a cross-region bucket, 8 proxies reached **2.0 GiB/s** on cache misses and **5.5 GiB/s** on cache hits — roughly double the same test on 3 proxies. A separate same-Region test isolating one large proxy peaked at **3.6 GiB/s** on misses and **7.1 GiB/s** on RAM cache hits. Scale to 8 or more proxies when throughput requires it; scale up to `c6in.xlarge` or `m6in.2xlarge` only if you need more connections per instance.
+#### Sizing the network
+
+`c6in.large` and `m6in.large` sustain 3.125 Gbps (≈373 MiB/s) indefinitely. The "up
+to 25 Gbps" in their spec is credit-based burst: credits accrue below baseline and
+drain above it.
+
+**Burst suits a cache.** Cache traffic is usually spiky — a working set is pulled in,
+read hard for a few minutes, then the fleet idles and rebuilds credit. Sizing every
+proxy for its own peak means paying continuously for capacity you use in bursts. If
+your peaks are short relative to the gaps between them, count the burst figure in
+your capacity plan.
+
+Size against baseline in two cases:
+
+- **Sustained load.** Run above baseline long enough to exhaust credits and
+  throughput drops to baseline mid-flight, which looks like an unexplained slowdown.
+  Bulk ingest, long analytics scans, and overnight migrations all qualify.
+- **Benchmarking.** A benchmark is sustained by design, so one run on burst credit
+  measures capacity the instance cannot hold: high at the start, dropping as credits
+  drain, and dependent on how idle the instance was beforehand. The result is not
+  reproducible.
+
+[Sizing the file system](#sizing-the-file-system) makes the same point about burst
+credits for FSx throughput tiers.
+
+Whichever figure you size against, the proxy's NIC carries each byte more than once:
+
+| Operation | NIC crossings per byte | Client-facing share of baseline |
+|---|---|---|
+| Cache hit from the shared volume | 2 (read the volume, write the client) | ~50% |
+| Cache hit from the RAM cache | 1 (write the client) | ~100% |
+| Cache miss | 2 (fetch from S3, write the client) plus the cache write | ~50% or less |
+| Write (PUT or `UploadPart`) | ~3 (ingest, forward to S3, write the part to the volume) | ~33% |
+
+A 3× `c6in.large` fleet has ~1,118 MiB/s of aggregate baseline, so about **560 MiB/s
+of client-facing reads on shared-volume cache hits and 370 MiB/s of sustained
+writes**. Divide your required client-facing throughput by the relevant share above;
+do not compare it to the raw baseline. Writes are the expensive direction.
+
+The multiplier applies to burst too, so the same fleet has roughly 3,750 MiB/s of
+client-facing read headroom while credits last. A RAM hit crosses the NIC once, so
+raising `cache.max_ram_cache_size` buys network capacity as well as latency, often
+more cheaply than adding instances.
+
+#### A client faster than the fleet fails rather than slows
+
+When a client's throughput ceiling exceeds the fleet's aggregate, requests queue and
+time-to-first-byte grows. Clients built on the AWS Common Runtime (Mountpoint for
+Amazon S3, and the AWS CLI and SDKs using the CRT S3 client) enforce a minimum
+per-connection throughput and tear down connections that fall below it.
+
+Measured 2026-08-20: a 96-vCPU, 100 Gbps client wrote a 100 GiB file through
+Mountpoint into three `m6in.large` proxies. `UploadPart` kept returning `HTTP 200`,
+but time-to-first-byte reached about 30 seconds, at which point the client aborted
+the upload with `AWS_ERROR_HTTP_CHANNEL_THROUGHPUT_FAILURE` and the filesystem write
+returned `EIO`. The proxies stayed healthy and rejected nothing; the client gave up
+first.
+
+Two mitigations, which compose:
+
+- **Size for the write direction** using the table above, so the queue never forms.
+  Do this first.
+- **Set `server.max_concurrent_requests` to what the instance can service**, rather
+  than leaving the default of 1000. A permit spans the whole transfer, so the limit
+  is an admission-control gate: over-budget requests are shed immediately with
+  `503 SlowDown` and a `Retry-After`, which CRT-based clients retry with backoff,
+  instead of being accepted and left to stall. Check
+  `request_metrics.permits_held_peak` in `/metrics` to see how close a value is to
+  binding before lowering it.
+
+For what a fleet delivers, see the measured figures in [Performance](../README.md#performance). Against a cross-region bucket, 8 proxies reached **2.0 GiB/s** on cache misses and **5.5 GiB/s** on cache hits — roughly double the same test on 3 proxies. A separate same-Region test isolating one large proxy peaked at **3.6 GiB/s** on misses and **7.1 GiB/s** on RAM cache hits. Scale to 8 or more proxies when throughput requires it.
+
+Scaling up buys more connections per instance and raises the per-instance baseline:
+`m6in.2xlarge` sustains 12.5 Gbps against `m6in.large`'s 3.125. Scale out for
+aggregate throughput; scale up when a single client is fast enough to overrun one
+proxy, as in [A client faster than the fleet](#a-client-faster-than-the-fleet-fails-rather-than-slows).
 
 Sizing memory: `server.max_concurrent_requests` now bounds the whole request including its transfer, not just setup, so the streaming-path memory formula `~200 MiB + max_concurrent_requests × ~5 MiB` (see [Configuration → Memory Impact](CONFIGURATION.md#server-configuration)) is a sound fleet-wide ceiling for the streaming paths. It does not cover the read paths that still buffer a whole range — those are bounded in aggregate across concurrent requests by the opt-in `max_inflight_buffer_bytes` ceiling. On a 4 GiB `c6in.large` with the default 512 MiB RAM cache, 512 MiB (`536870912`) is a reasonable starting ceiling. `cache.max_ram_cache_size` (default 512 MiB) is a third, independent budget on top of both. Confirm all three against measured peak resident memory and the corresponding `/metrics` fields (`request_metrics.permits_held_peak`, `inflight_memory.peak_reserved_bytes`) under representative load.
 

@@ -590,7 +590,10 @@ This design ensures any new headers S3 adds will automatically be preserved with
 
 ### Verifying Header Consistency
 
-To verify cached responses match direct S3 responses:
+To verify cached responses match direct S3 responses. These commands use the proxy's
+HTTP interception endpoint — see
+[What a Cleartext Hop Exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes) for the
+transport implications and the encrypted alternative:
 
 ```bash
 # First request (cache miss - fetches from S3)

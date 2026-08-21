@@ -179,7 +179,10 @@ All counters. `corruption_metadata_total`, `corruption_missing_range_total`,
 `cache_etag_mismatches_total`, `cache_range_invalidations_total`,
 `cache_orphaned_ranges_cleaned_total`.
 
-`cache_bypasses_by_reason` is a map of reason string to count. See
+`cache_bypasses_by_reason` is a map of reason string to count. Reasons include
+`sse-c`, `no-cache directive`, `no-store directive`, `read_cache_disabled`, and
+`part-scoped-head` (a `HEAD` naming a single part, which is always forwarded — see
+[CACHING.md](CACHING.md#operations-that-bypass-cache)). See
 [ERROR_HANDLING.md](ERROR_HANDLING.md) for what each failure class means.
 
 ### Part cache (multipart)

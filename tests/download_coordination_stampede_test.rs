@@ -8,10 +8,12 @@
 //! authoritative revalidation per expired-cache flight) against real AWS SigV4,
 //! real IAM, and real S3 response semantics.
 //!
-//! **Test bucket**: `s3-proxy-stampede-test-111122223333-us-west-2` in us-west-2.
-//! Replace with your own bucket name before running.
+//! **Test bucket**: supplied at run time via the `STAMPEDE_TEST_BUCKET` env var — a
+//! bucket you own in us-west-2. No bucket name is compiled into this test, so a
+//! predictable name cannot be pre-registered by anyone else and silently used.
 //!
-//! Gate: `RUN_INTEGRATION_TESTS=1` env var (early return if not set).
+//! Gate: `RUN_INTEGRATION_TESTS=1` env var (early return if not set). Set
+//! `STAMPEDE_TEST_BUCKET` as well; the test panics naming the variable if it is absent.
 //!
 //! **Test matrix (8 runs total = 4 scenarios × 2 TTL values):**
 //!
@@ -57,7 +59,6 @@ use s3_proxy::S3ClientApi;
 // Constants
 // =========================================================================
 
-const TEST_BUCKET: &str = "s3-proxy-stampede-test-111122223333-us-west-2";
 const TEST_REGION: &str = "us-west-2";
 const TEST_OBJECT_KEY: &str = "stampede-test/coordination-stampede-object-4mib.bin";
 const OBJECT_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
@@ -71,6 +72,19 @@ const FAKE_SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 // =========================================================================
 // Env-var gate
 // =========================================================================
+
+/// The test bucket, supplied by the operator at run time.
+///
+/// Deliberately not a compiled-in constant: a hardcoded name is predictable, and a
+/// predictable name can be registered by someone else and then used by anyone who runs
+/// this test without substituting their own. Requiring the variable makes the bucket an
+/// explicit, owned input.
+fn test_bucket() -> String {
+    std::env::var("STAMPEDE_TEST_BUCKET").expect(
+        "STAMPEDE_TEST_BUCKET must be set to a bucket you own in us-west-2 \
+         before running the stampede integration test",
+    )
+}
 
 /// Returns true if integration tests should run.
 fn should_run() -> bool {
@@ -206,14 +220,14 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Sign a GET request for the test object.
 fn sign_get_request(signer: &AwsSigner, object_key: &str) -> HashMap<String, String> {
-    let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
+    let host = format!("{}.s3.{}.amazonaws.com", test_bucket(), TEST_REGION);
     let uri_path = format!("/{}", object_key);
     signer.sign_request("GET", &host, &uri_path, "", &[], "UNSIGNED-PAYLOAD")
 }
 
 /// Sign a PUT request to upload the test object.
 fn sign_put_request(signer: &AwsSigner, object_key: &str, body: &[u8]) -> HashMap<String, String> {
-    let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
+    let host = format!("{}.s3.{}.amazonaws.com", test_bucket(), TEST_REGION);
     let uri_path = format!("/{}", object_key);
     let payload_hash = hex::encode(Sha256::digest(body));
     let content_length = body.len().to_string();
@@ -325,7 +339,7 @@ async fn upload_test_object(
     object_key: &str,
     body: &[u8],
 ) {
-    let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
+    let host = format!("{}.s3.{}.amazonaws.com", test_bucket(), TEST_REGION);
     let uri_path = format!("/{}", object_key);
     let uri: hyper::Uri = format!("https://{}{}", host, uri_path)
         .parse()
@@ -358,7 +372,7 @@ async fn upload_test_object(
 
 /// Verify the test bucket exists by issuing a HEAD request.
 async fn assert_bucket_exists(s3_client: &Arc<dyn S3ClientApi + Send + Sync>, signer: &AwsSigner) {
-    let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
+    let host = format!("{}.s3.{}.amazonaws.com", test_bucket(), TEST_REGION);
     let uri: hyper::Uri = format!("https://{}/", host).parse().expect("valid URI");
 
     let headers = signer.sign_request("HEAD", &host, "/", "", &[], "UNSIGNED-PAYLOAD");
@@ -383,7 +397,7 @@ async fn assert_bucket_exists(s3_client: &Arc<dyn S3ClientApi + Send + Sync>, si
         response.status.is_success(),
         "Test bucket '{}' does not exist or is not accessible (status {}). \
          Ensure the bucket exists and AWS credentials are configured.",
-        TEST_BUCKET,
+        test_bucket(),
         response.status
     );
 }
@@ -409,7 +423,7 @@ async fn pre_warm_cache(
     config: &Arc<Config>,
     mm: &Arc<tokio::sync::RwLock<MetricsManager>>,
 ) {
-    let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
+    let host = format!("{}.s3.{}.amazonaws.com", test_bucket(), TEST_REGION);
     let full_uri = format!("https://{}/{}", host, TEST_OBJECT_KEY);
     let uri: hyper::Uri = full_uri.parse().expect("valid URI");
     let headers = sign_get_request(signer, TEST_OBJECT_KEY);
@@ -553,7 +567,7 @@ async fn run_scenario(
         Arc::clone(&disk_cache_manager),
     ));
 
-    let cache_key = format!("{}/{}", TEST_BUCKET, TEST_OBJECT_KEY);
+    let cache_key = format!("{}/{}", test_bucket(), TEST_OBJECT_KEY);
 
     // Setup cache state
     match scenario.cache_state {
@@ -589,7 +603,7 @@ async fn run_scenario(
     // Reset metrics for the stampede phase
     let mm = make_metrics();
 
-    let host = format!("{}.s3.{}.amazonaws.com", TEST_BUCKET, TEST_REGION);
+    let host = format!("{}.s3.{}.amazonaws.com", test_bucket(), TEST_REGION);
     let full_uri = format!("https://{}/{}", host, TEST_OBJECT_KEY);
     let wait_timeout = Duration::from_secs(config.cache.download_coordination.wait_timeout_secs);
 
@@ -897,7 +911,8 @@ async fn stampede_100_concurrent_clients() {
     let expected_sha256 = hex::encode(Sha256::digest(&test_data));
     println!(
         "Uploading 4 MiB test object to s3://{}/{}",
-        TEST_BUCKET, TEST_OBJECT_KEY
+        test_bucket(),
+        TEST_OBJECT_KEY
     );
     upload_test_object(&s3_client, &valid_signer, TEST_OBJECT_KEY, &test_data).await;
     println!("Upload complete. Expected SHA256: {}", expected_sha256);

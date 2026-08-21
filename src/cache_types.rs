@@ -1910,6 +1910,15 @@ mod tests {
             if filetime::set_file_mtime(&upload_meta_file, old_filetime).is_err() {
                 return TestResult::failed();
             }
+            // Backdate the DIRECTORY too, for the same reason as the sibling fixture in
+            // `write_cache_manager.rs`: the sweep takes the newest of the directory's
+            // mtime and `upload.meta`'s, because that file is written once at
+            // CreateMultipartUpload and so records the upload's START. A fresh
+            // directory is what a live long-running upload looks like, and the sweep
+            // must not evict one of those.
+            if filetime::set_file_mtime(&multipart_dir, old_filetime).is_err() {
+                return TestResult::failed();
+            }
 
             // Run eviction
             let freed_bytes = match manager.evict_incomplete_uploads().await {

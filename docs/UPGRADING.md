@@ -25,6 +25,7 @@ cannot be read.
 
 | Version | Action |
 |---|---|
+| 2.6.0 | To keep log files older than the configured retention, copy them off or raise `logging.access_log_retention_days` / `logging.app_log_retention_days` before upgrading — the first cleanup pass now enforces retention across the whole of `access_log_dir` and `app_log_dir`, including on a deployment running with `access_log_enabled: false`, where neither sweep previously ran. |
 | 2.5.0 | If you set `server.max_concurrent_requests` explicitly, review the value — a permit is now held for the whole transfer, not just request setup, so the same number admits far fewer concurrent large transfers than before. Remove `server.max_buffered_request_body_bytes` if you set it — it is deprecated, has no effect, and logs a startup warning; if you had lowered it to reject large uploads, S3's own limits apply instead. On FSx for OpenZFS, add `nconnect=16` to the mount and remount, or disk-cache reads stay capped near 625 MB/s; EFS needs no change. |
 | 2.2.0 | Copy the hardened `config/s3-proxy.service` unit if you installed the old one — it adds systemd sandbox directives and a `ReadWritePaths` allowlist. |
 | 2.0.0 | Hand-translate any per-bucket `_settings.json` into `cache_dir/cache_rules.json`. No auto-migration; see [below](#upgrading-to-200-per-bucket-_settingsjson-removed). |

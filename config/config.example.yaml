@@ -456,6 +456,16 @@ logging:
   # Log lifecycle management
   # Each proxy instance manages its own log cleanup independently.
   # No inter-instance coordination is needed on shared storage.
+  #
+  # Retention is a property of the DIRECTORY, not of whether this instance is
+  # writing. Both sweeps run regardless of access_log_enabled, and both cover files
+  # left by other instances, so an orphaned file is reaped even though its writer is
+  # gone. Only files matching the documented naming convention are ever removed.
+  #
+  # A file this instance did not write gets one extra day of grace before it becomes
+  # a candidate, so the effective guarantee is `retention_days` for a live writer's
+  # own files and `retention_days + 1` for an orphaned one. For a compliance-driven
+  # hard cap at N days, configure N-1. See docs/ACCESS_LOG_FORMAT.md.
   access_log_retention_days: 30              # Days to retain access log files (default: 30, range: 1-365)
   app_log_retention_days: 30                 # Days to retain application log files (default: 30, range: 1-365)
   log_cleanup_interval: "24h"                # How often the background cleanup task runs (default: 24h, range: 1h-7d)
@@ -687,6 +697,10 @@ dashboard:
   #   "0.0.0.0"   — all interfaces (convenient, but you MUST restrict access via security
   #                  groups, firewall rules, or network segmentation when non-loopback)
   #
+  # The value below is deliberately "0.0.0.0" so the dashboard is reachable in the example
+  # deployment. See docs/DASHBOARD.md "Security Considerations" for the access model and the
+  # operator responsibilities that come with a non-loopback bind.
+  #
   # For remote monitoring without exposing the port: bind to 127.0.0.1 and use an SSH tunnel:
   #   ssh -L 8081:127.0.0.1:8081 proxy-host
   # Then open http://localhost:8081 in your browser.
@@ -712,7 +726,8 @@ dashboard:
 #   cache_dir: "/mnt/cache"
 #   max_cache_size: 524288000  # 500MB
 #
-# Client usage:
+# Client usage (see docs/ARCHITECTURE.md "What a Cleartext Hop Exposes" for the transport
+# implications of the http:// endpoint below, and the TLS variant that follows):
 #   export HTTP_PROXY=http://127.0.0.1:3128
 #   export NO_PROXY=169.254.169.254
 #   aws s3 cp s3://bucket/key ./local \

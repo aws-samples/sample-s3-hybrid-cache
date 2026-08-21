@@ -674,7 +674,6 @@ Range path: ranges/my-bucket/a7/f3c/photos%2Fvacation.jpg_0-1048575.bin
 ### Hash-Based Sharding
 
 **Why BLAKE3?**
-- 10x faster than SHA-256
 - Cryptographically secure
 - Excellent distribution properties
 - Uniform file distribution across directories
