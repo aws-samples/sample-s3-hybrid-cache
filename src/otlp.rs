@@ -178,6 +178,13 @@ impl OtlpExporter {
                             opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
                             env!("CARGO_PKG_VERSION"),
                         ),
+                        // Prometheus's OTLP receiver derives `job` from service.name
+                        // and `instance` from service.instance.id only; without the
+                        // id every instance's series collide into one.
+                        KeyValue::new(
+                            opentelemetry_semantic_conventions::resource::SERVICE_INSTANCE_ID,
+                            hostname.clone(),
+                        ),
                         KeyValue::new("host.name", hostname),
                     ])
                     .build(),
@@ -537,14 +544,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Regression guard (telemetry-enhancements Req 9.2): `opentelemetry-otlp`'s
-    /// default features pull in `reqwest-blocking-client`, whose blocking client
-    /// cannot be constructed inside the Tokio runtime and makes the HTTP exporter
-    /// fail at init with "no http client specified" — silently disabling all
-    /// telemetry. With default features disabled and the async `reqwest-client`
-    /// enabled, `initialize()` must succeed inside a Tokio runtime.
+    /// `initialize()` runs inside the Tokio runtime; `opentelemetry-otlp` builds
+    /// its blocking reqwest client on a helper thread so that this works. An init
+    /// failure here would silently disable all telemetry.
     #[tokio::test]
-    async fn otlp_exporter_initializes_without_blocking_client() {
+    async fn otlp_exporter_initializes_inside_tokio_runtime() {
         let cfg = OtlpConfig {
             enabled: true,
             endpoint: "http://localhost:4318/v1/metrics".to_string(),
@@ -559,6 +563,93 @@ mod tests {
             "OTLP exporter init must succeed (no http client regression): {:?}",
             res.err()
         );
+        let _ = exporter.shutdown().await;
+    }
+
+    /// Regression guard for the reader thread: opentelemetry_sdk's PeriodicReader
+    /// exports from a plain thread via `futures_executor::block_on`, so the
+    /// exporter's HTTP client must not need a Tokio reactor. With the async
+    /// `reqwest-client` feature the first export panics ("there is no reactor
+    /// running"), the reader thread dies, and the process never pushes a payload —
+    /// silently. Drives one real export over HTTP into a local listener and checks
+    /// the payload carries the identity Prometheus derives `instance` from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn otlp_exporter_exports_over_http() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (body_start, content_length) = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client hung up before the headers were complete");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    break (pos + 4, len);
+                }
+            };
+            while buf.len() < body_start + content_length {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client hung up mid-body");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = tx.send(buf);
+        });
+
+        let cfg = OtlpConfig {
+            enabled: true,
+            endpoint: format!("http://{}/api/v1/otlp/v1/metrics", addr),
+            export_interval: Duration::from_secs(3600), // only the flush below exports
+            timeout: Duration::from_secs(10),
+            ..OtlpConfig::default()
+        };
+        let mut exporter = OtlpExporter::new(cfg);
+        exporter.initialize().await.expect("init");
+        // The reader skips an empty collection, so record one value first.
+        exporter
+            .instruments
+            .as_ref()
+            .unwrap()
+            .uptime_seconds
+            .record(1, &[]);
+        let provider = exporter.provider.clone().unwrap();
+        // force_flush blocks on the reader thread's round trip; keep it off the
+        // runtime workers so the listener task can answer.
+        tokio::task::spawn_blocking(move || provider.force_flush())
+            .await
+            .unwrap()
+            .expect("force_flush: the reader thread must be alive and the export must succeed");
+
+        let request = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("no export reached the listener within 10s")
+            .unwrap();
+        let request_line = String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(request_line, "POST /api/v1/otlp/v1/metrics HTTP/1.1");
+        let has = |needle: &[u8]| request.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            has(b"service.instance.id"),
+            "payload lacks service.instance.id"
+        );
+        assert!(has(b"s3-proxy"), "payload lacks service.name");
         let _ = exporter.shutdown().await;
     }
 
