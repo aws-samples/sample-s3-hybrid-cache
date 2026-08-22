@@ -106,10 +106,13 @@ dashmap = "6.0"
 # graph" — see the reverted GitHub PR #10 that only bumped opentelemetry_sdk alone).
 opentelemetry = { version = "0.32", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
-# default features pull in `reqwest-blocking-client`, whose blocking client cannot
-# be constructed inside the Tokio runtime and makes the HTTP exporter fail at init
-# with "no http client specified". Disable defaults and use the async reqwest-client.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "http-proto", "reqwest-client"] }
+# The exporter's HTTP client must be the BLOCKING reqwest client: opentelemetry_sdk's
+# PeriodicReader exports from its own plain thread (`futures_executor::block_on`, no
+# Tokio reactor), so the async `reqwest-client` panics there on the first export
+# ("there is no reactor running") and the reader thread dies silently — no metrics
+# ever leave the process. The crate builds the blocking client on a helper thread,
+# so constructing the exporter from inside the Tokio runtime (initialize()) is fine.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-semantic-conventions = "0.32"
 
 # Platform-specific dependencies
