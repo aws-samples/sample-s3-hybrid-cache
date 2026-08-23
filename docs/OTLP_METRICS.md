@@ -85,7 +85,10 @@ This is the OTLP-exported subset. For every field the `/metrics` endpoint return
 including the many that are not exported here, see
 [METRICS_REFERENCE.md](METRICS_REFERENCE.md).
 
-Every metric carries the resource attributes `host.name`, `service.name`, and `service.version`.
+Every metric carries the resource attributes `host.name`, `service.name`, `service.version`, and
+`service.instance.id`. `host.name` and `service.instance.id` both carry the hostname; the latter is what
+Prometheus's OTLP receiver uses to derive the `instance` label, so without it every instance's
+series collapse into one. Backends that key on `host.name` instead are unaffected either way.
 
 Most metrics are **gauges with no per-metric dimensions**. Two groups are exceptions:
 

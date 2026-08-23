@@ -5,21 +5,30 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.6.1] - 2026-08-22
 
 ### Fixed
 
-- **OTLP metrics export panicked on the first export and never recovered.** The
-  exporter was built with the async `reqwest-client`, but `opentelemetry_sdk`'s
-  `PeriodicReader` exports from its own plain thread with no Tokio reactor, so the
-  first export panicked (`there is no reactor running, must be called from the
-  context of a Tokio 1.x runtime`), the reader thread died, and no payload was ever
-  posted — the only trace was one panic line at startup. The exporter now uses the
-  `reqwest-blocking-client`, which `opentelemetry-otlp` 0.32 constructs on a helper
-  thread so it can be built from inside the runtime. The exporter's resource also
-  gains `service.instance.id` (the hostname): Prometheus's OTLP receiver derives
-  the `instance` label from that attribute alone, so multiple proxy instances
-  previously collapsed into one series.
+- **Upgrade impact:** Only affects deployments running with `metrics.otlp.enabled:
+  true`. Metrics now reach your collector where previously none did, so expect
+  telemetry volume and collector cost to rise from zero. Each instance now reports
+  its own `service.instance.id`, so a Prometheus OTLP receiver that had been folding
+  every instance into one `instance` label now produces one series per instance —
+  update dashboards and alarms built on the old single series.
+
+- **OTLP metrics export never sent a payload.** The exporter's HTTP client required
+  a Tokio reactor, but `opentelemetry_sdk`'s `PeriodicReader` exports from its own
+  plain thread, which has none. The first export panicked (`there is no reactor
+  running, must be called from the context of a Tokio 1.x runtime`), the reader
+  thread died, and nothing was posted for the life of the process — the only trace
+  was a single panic line at startup. The exporter now uses a blocking HTTP client,
+  which the reader thread supports.
+
+- **OTLP resource attributes now include `service.instance.id`** (the hostname).
+  Prometheus's OTLP receiver derives the `instance` label from that attribute alone,
+  so metrics from multiple proxy instances previously collapsed into a single series.
+
+  Thanks to [@fenos](https://github.com/fenos) for diagnosing and fixing both issues.
 
 ## [2.6.0] - 2026-08-21
 
