@@ -5,6 +5,32 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.3] - 2026-08-23
+
+### Changed
+
+- **Build toolchain bumped from Rust 1.96 to 1.98.** No behavior change; this is a
+  scheduled, isolated toolchain bump per the pre-push checklist's toolchain-currency
+  policy. Fixed six new clippy lints the newer compiler surfaced on existing code:
+  four `useless_borrows_in_formatting` in a test helper, one `drain_collect` in the
+  RAM range tier's deferred access-reorder buffer, and one `result_large_err` on an
+  internal range-fetch helper (suppressed with justification rather than reworked,
+  since boxing the error type would ripple through every call site for no functional
+  benefit).
+
+## [2.6.2] - 2026-08-23
+
+### Fixed
+
+- **Stale RAM range data could be served after the proxy detected an object had
+  changed.** When a cached object's ETag no longer matched, the proxy invalidated the
+  object's range files and metadata on disk but left the RAM copies of those ranges in
+  place, so a later read could return the previous version's bytes. The RAM range cache
+  has no expiry of its own, so such an entry persisted until it was evicted for capacity
+  or the proxy restarted. Range invalidation now clears the RAM tier as well, on the
+  ETag-mismatch path and on both paths that retry after S3 rejects a proxy-issued
+  precondition. Reads of unchanged objects are unaffected.
+
 ## [2.6.1] - 2026-08-22
 
 ### Fixed
@@ -29,32 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so metrics from multiple proxy instances previously collapsed into a single series.
 
   Thanks to [@fenos](https://github.com/fenos) for diagnosing and fixing both issues.
-
-## [2.6.2] - 2026-08-23
-
-### Fixed
-
-- **Stale RAM range data could be served after the proxy detected an object had
-  changed.** When a cached object's ETag no longer matched, the proxy invalidated the
-  object's range files and metadata on disk but left the RAM copies of those ranges in
-  place, so a later read could return the previous version's bytes. The RAM range cache
-  has no expiry of its own, so such an entry persisted until it was evicted for capacity
-  or the proxy restarted. Range invalidation now clears the RAM tier as well, on the
-  ETag-mismatch path and on both paths that retry after S3 rejects a proxy-issued
-  precondition. Reads of unchanged objects are unaffected.
-
-## [2.6.3] - 2026-08-23
-
-### Changed
-
-- **Build toolchain bumped from Rust 1.96 to 1.98.** No behavior change; this is a
-  scheduled, isolated toolchain bump per the pre-push checklist's toolchain-currency
-  policy. Fixed six new clippy lints the newer compiler surfaced on existing code:
-  four `useless_borrows_in_formatting` in a test helper, one `drain_collect` in the
-  RAM range tier's deferred access-reorder buffer, and one `result_large_err` on an
-  internal range-fetch helper (suppressed with justification rather than reworked,
-  since boxing the error type would ripple through every call site for no functional
-  benefit).
 
 ## [2.6.0] - 2026-08-21
 
