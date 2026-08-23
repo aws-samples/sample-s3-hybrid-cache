@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Thanks to [@fenos](https://github.com/fenos) for diagnosing and fixing both issues.
 
+## [2.6.2] - 2026-08-23
+
+### Fixed
+
+- **Stale RAM range data could be served after the proxy detected an object had
+  changed.** When a cached object's ETag no longer matched, the proxy invalidated the
+  object's range files and metadata on disk but left the RAM copies of those ranges in
+  place, so a later read could return the previous version's bytes. The RAM range cache
+  has no expiry of its own, so such an entry persisted until it was evicted for capacity
+  or the proxy restarted. Range invalidation now clears the RAM tier as well, on the
+  ETag-mismatch path and on both paths that retry after S3 rejects a proxy-issued
+  precondition. Reads of unchanged objects are unaffected.
+
 ## [2.6.0] - 2026-08-21
 
 ### Fixed

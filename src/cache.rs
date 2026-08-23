@@ -7126,6 +7126,26 @@ impl CacheManager {
 
     /// Remove cache entry from RAM cache - unified invalidation for both GET and HEAD entries
     /// Requirements: 11.1, 11.3, 11.4
+    /// Invalidate every RAM range entry for a key.
+    ///
+    /// Exists because `DiskCacheManager::invalidate_all_ranges` cannot do it.
+    /// That method removes the `.bin` range files and the `.meta`, but it lives on
+    /// `DiskCacheManager`, which holds no handle on the RAM tier — so before this
+    /// wrapper existed, every caller that invalidated a stale object left the RAM
+    /// copy readable. `ShardedRamCache::get` has no expiry concept, so such an
+    /// entry survived until LRU eviction or restart, and the widened range path
+    /// consults RAM *before* the ETag comparison, which made it servable.
+    ///
+    /// Call this alongside `invalidate_all_ranges` at every site that concludes a
+    /// cached object is stale. Safe to call while holding a `DiskCacheManager`
+    /// read guard: it touches only `self.ram_cache`.
+    ///
+    /// Demonstrated by `tests/ram_etag_invalidation_gap_test.rs`, which was red
+    /// before this existed.
+    pub async fn invalidate_ram_ranges(&self, cache_key: &str) -> Result<()> {
+        self.remove_from_ram_cache_unified(cache_key).await
+    }
+
     async fn remove_from_ram_cache_unified(&self, cache_key: &str) -> Result<()> {
         if !self.ram_cache_enabled {
             return Ok(());

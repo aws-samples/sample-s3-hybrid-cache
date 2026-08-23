@@ -13122,6 +13122,16 @@ impl HttpProxy {
                     );
                     {
                         let disk_cache = range_handler.get_disk_cache_manager().read().await;
+                        if let Err(e) = range_handler
+                            .get_cache_manager()
+                            .invalidate_ram_ranges(&cache_key)
+                            .await
+                        {
+                            warn!(
+                                "Failed to invalidate stale RAM ranges after 412 retry: cache_key={}, error={}",
+                                cache_key, e
+                            );
+                        }
                         if let Err(e) = disk_cache.invalidate_all_ranges(&cache_key).await {
                             warn!(
                                 "Failed to invalidate stale cache after 412 retry: cache_key={}, error={}",
@@ -13264,6 +13274,16 @@ impl HttpProxy {
                     );
                     {
                         let disk_cache = range_handler.get_disk_cache_manager().read().await;
+                        if let Err(e) = range_handler
+                            .get_cache_manager()
+                            .invalidate_ram_ranges(&cache_key)
+                            .await
+                        {
+                            warn!(
+                                "Failed to invalidate stale RAM ranges after 412 retry (fallback): cache_key={}, error={}",
+                                cache_key, e
+                            );
+                        }
                         if let Err(e) = disk_cache.invalidate_all_ranges(&cache_key).await {
                             warn!(
                                 "Failed to invalidate stale cache after 412 retry (fallback): cache_key={}, error={}",

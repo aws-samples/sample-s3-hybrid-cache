@@ -705,6 +705,18 @@ impl RangeHandler {
                         );
                     }
 
+                    // The disk invalidation above cannot reach the RAM tier —
+                    // `invalidate_all_ranges` is on `DiskCacheManager`, which has no
+                    // handle on it. Without this, the superseded version stays
+                    // readable from RAM with no expiry, and the widened range path
+                    // consults RAM before reaching this ETag check at all.
+                    if let Err(e) = self.cache_manager.invalidate_ram_ranges(cache_key).await {
+                        warn!(
+                            "Failed to invalidate stale RAM ranges after ETag mismatch: cache_key={}, error={}",
+                            cache_key, e
+                        );
+                    }
+
                     // Return empty cached ranges, forcing a fetch from S3
                     return Ok(RangeOverlap {
                         cached_ranges: Vec::new(),
