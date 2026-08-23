@@ -371,7 +371,7 @@ impl ShardedRamCache {
         // Step 1: drain pending_accesses and apply deferred LRU/TinyLFU reordering.
         // We collect first to avoid a borrow-split issue while calling
         // shard_update_access_tracking(&mut guard, ...).
-        let pending: Vec<String> = guard.pending_accesses.drain(..).collect();
+        let pending: Vec<String> = std::mem::take(&mut guard.pending_accesses);
         for key in pending {
             // Only update ordering for keys that still exist in the shard.
             if guard.data.contains_key(&key) {

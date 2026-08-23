@@ -8466,6 +8466,11 @@ impl HttpProxy {
 
     /// Common logic to get cached range data
     #[allow(clippy::too_many_arguments)]
+    // The Err variant is a full `Response` used to short-circuit directly into the
+    // HTTP response path via `?` at every call site. Boxing it would ripple through
+    // every construction and every `?` site for a toolchain-lint-only change; not
+    // worth the churn here. See clippy::result_large_err.
+    #[allow(clippy::result_large_err)]
     async fn get_cached_range_data(
         range_spec: &RangeSpec,
         overlap: &crate::range_handler::RangeOverlap,

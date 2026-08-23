@@ -4005,10 +4005,10 @@ mod tests {
         }
 
         // Build a prefix hierarchy: "a/", "a/b/", "a/b/c/" style from prefix_base
-        let short_prefix = format!("{}/", &prefix_base);
-        let long_prefix = format!("{}/sub/", &prefix_base);
+        let short_prefix = format!("{}/", prefix_base);
+        let long_prefix = format!("{}/sub/", prefix_base);
         // Object key that matches both prefixes
-        let object_key = format!("{}/sub/object{}", &prefix_base, &key_suffix);
+        let object_key = format!("{}/sub/object{}", prefix_base, key_suffix);
 
         let prefixes = vec![short_prefix.clone(), long_prefix.clone()];
         let result = resolve_traffic_key(&bucket, &object_key, Some(&prefixes));

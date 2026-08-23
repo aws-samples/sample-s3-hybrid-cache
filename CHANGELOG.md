@@ -43,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ETag-mismatch path and on both paths that retry after S3 rejects a proxy-issued
   precondition. Reads of unchanged objects are unaffected.
 
+## [2.6.3] - 2026-08-23
+
+### Changed
+
+- **Build toolchain bumped from Rust 1.96 to 1.98.** No behavior change; this is a
+  scheduled, isolated toolchain bump per the pre-push checklist's toolchain-currency
+  policy. Fixed six new clippy lints the newer compiler surfaced on existing code:
+  four `useless_borrows_in_formatting` in a test helper, one `drain_collect` in the
+  RAM range tier's deferred access-reorder buffer, and one `result_large_err` on an
+  internal range-fetch helper (suppressed with justification rather than reworked,
+  since boxing the error type would ripple through every call site for no functional
+  benefit).
+
 ## [2.6.0] - 2026-08-21
 
 ### Fixed

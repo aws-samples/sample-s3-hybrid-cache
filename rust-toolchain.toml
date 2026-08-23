@@ -8,5 +8,5 @@
 # Keep this in sync with the `image: rust:<version>` tag in .gitlab-ci.yml.
 # Bump both together, deliberately, and run the full pre-push checklist when you do.
 [toolchain]
-channel = "1.96"
+channel = "1.98"
 components = ["rustfmt", "clippy"]
