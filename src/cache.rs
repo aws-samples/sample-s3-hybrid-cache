@@ -40,6 +40,76 @@ fn is_head_fresh(
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
 const OBJECT_CONCURRENCY_LIMIT: usize = 8;
 
+/// Reason label recorded on `signed_put.skipped_puts_total` when the Disk_Safety_Bound
+/// declines to cache an upload (R8.1). A closed set of reason keys is documented in
+/// `docs/METRICS_REFERENCE.md`; this is the fifth.
+pub(crate) const DISK_SAFETY_SKIP_REASON: &str = "disk_safety";
+
+/// Free space kept in reserve on the cache volume above whatever an incoming object
+/// needs, so write-through caching stops short of driving the volume to genuinely zero
+/// bytes free (R4.2).
+///
+/// 1 GiB, chosen to be comfortably larger than the in-flight writes a single instance can
+/// have outstanding plus the journal, delta and metadata files the cache needs room to
+/// write. It is deliberately a flat figure rather than a percentage: the failure being
+/// prevented — a full filesystem — is absolute, and on a large volume a percentage would
+/// reserve absurdly much while on a small one it would reserve too little.
+pub(crate) const DISK_SAFETY_FREE_SPACE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Unix seconds of the most recent Disk_Safety_Bound refusal, process-wide.
+///
+/// Backs the `/health` cache-component degradation for a persistent breach (R4.4). A
+/// **recency** signal rather than a count, deliberately: `skipped_puts_total["disk_safety"]`
+/// already counts refusals cumulatively, and a cumulative counter cannot answer "is the
+/// cache volume full *now*" — it stays non-zero forever after one refusal, so health would
+/// latch Degraded for the life of the process.
+static LAST_DISK_SAFETY_REFUSAL_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How recently a Disk_Safety_Bound refusal must have happened for `/health` to report the
+/// cache component Degraded.
+///
+/// 300s spans several consolidation and eviction cycles, so a single refusal during a
+/// transient burst clears on its own, while a volume that is genuinely out of space keeps
+/// refusing and keeps the signal lit. "Persistent" in R4.4 means "still happening", not
+/// "happened once".
+const DISK_SAFETY_DEGRADED_WINDOW_SECS: u64 = 300;
+
+/// Whether a Disk_Safety_Bound refusal happened recently enough to degrade health.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 4.4
+pub fn disk_safety_recently_breached() -> Option<u64> {
+    let last = LAST_DISK_SAFETY_REFUSAL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return None;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let age = now.saturating_sub(last);
+    (age <= DISK_SAFETY_DEGRADED_WINDOW_SECS).then_some(age)
+}
+
+/// Maximum Write_Ledger entries examined in one staging eviction pass.
+///
+/// The pass is O(evicted + skipped) by design, but "skipped" is unbounded if the ledger
+/// has accumulated a long tail of stale entries, so this caps one pass's work. Entries
+/// beyond the cap are the *newest* ones (the read is oldest-first), so they are exactly
+/// the ones eviction wants least, and the next pass sees them again.
+///
+/// **They are only preserved because the retire step names what to remove.** This
+/// comment used to claim "entries beyond the cap are not lost" as though it followed
+/// from the ordering, and it did not: the pass then handed
+/// `read_entries - retired` to a retain-set rewrite that deleted everything absent from
+/// it, so every entry past the cap was destroyed unread, across all instances' files
+/// (task 77). `read_merged_oldest_first` truncates after the global sort and returns no
+/// truncation signal, so the caller could not detect that its view was partial. The
+/// invariant now holds by construction via `WriteLedger::retire_identities` — do not
+/// reintroduce a retain-set API here, and do not treat this ordering argument as the
+/// thing that makes the cap safe.
+const STAGING_EVICTION_CANDIDATE_CAP: usize = 10_000;
+
 /// Idle duration after which a decayed frequency halves. Compile-time constant
 /// (not config). Decay bounds immortality under capacity pressure; TTL expiry is the
 /// hard ceiling for the no-pressure case.
@@ -560,16 +630,71 @@ pub struct EvictionLockPayload {
 
 /// Tracks active S3 part fetches for per-instance request deduplication
 ///
+/// The three whole-cache size figures, which are **derived on read** rather than
+/// maintained incrementally.
+///
+/// They live behind an [`Option`] on [`CacheStatistics`] for one reason: they can only be
+/// computed by [`CacheManager::get_cache_size_stats`], which reads shared storage, and
+/// the synchronous [`CacheManager::get_statistics`] cannot produce them. Before
+/// 2026-08-26 they were plain fields that `get_statistics` silently returned as 0, and
+/// **three separate defects** came from reading them off that copy:
+///
+/// - the `/health` cache-usage check divided by zero, reported `NaN%`, and therefore never
+///   fired on any deployment (task 62);
+/// - both signed-PUT capacity checks computed available capacity from a usage of 0, so the
+///   write-through bypass could only trigger for an object larger than the whole cache
+///   (task 65);
+/// - `total_cache_size` itself was a sum of non-disjoint gauges (task 56).
+///
+/// Comments on the fields did not prevent the second and third. The `Option` does: there
+/// is no way to read a size from `get_statistics()` without matching on `None` first, and
+/// `None` means "ask `get_cache_size_stats()`" rather than "the cache is empty" — a
+/// distinction the old plain `0` could not express.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CacheSizes {
+    /// Total bytes held on the shared cache volume. Exactly
+    /// [`Self::read_cache_size`] + [`Self::write_cache_size`], which are disjoint.
+    /// [`CacheStatistics::ram_cache_size`] is **not** part of it.
+    pub total_cache_size: u64,
+    /// Non-staged bytes on the shared cache volume: `total_size - write_cache_size`.
+    ///
+    /// Fleet-wide — every instance sharing the volume reports the same figure — and
+    /// **disjoint** from [`Self::write_cache_size`], so the two sum to
+    /// [`Self::total_cache_size`] exactly.
+    ///
+    /// Before 2026-08-26 this carried the whole-cache total including the staged subset,
+    /// so anything adding it to `write_cache_size` counted the staged bytes twice.
+    pub read_cache_size: u64,
+    /// Staged write-cache bytes: objects written through the cache and not yet read.
+    /// Fleet-wide, and disjoint from [`Self::read_cache_size`] — an entry leaves this
+    /// figure and joins that one when it graduates on its first read, with no change to
+    /// [`Self::total_cache_size`].
+    pub write_cache_size: u64,
+}
+
 /// Cache statistics for monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheStatistics {
-    pub total_cache_size: u64,
-    /// Configured maximum cache size limit (from config)
+    /// The whole-cache size figures, or [`None`] when they have not been computed.
+    ///
+    /// [`CacheManager::get_statistics`] always yields `None` here — it is synchronous and
+    /// cannot read shared storage. [`CacheManager::get_cache_size_stats`] always yields
+    /// `Some`. See [`CacheSizes`] for why this is an `Option` and not three plain fields.
+    pub sizes: Option<CacheSizes>,
+    /// Configured maximum cache size limit (from config).
+    ///
+    /// This is the capacity figure. Every eviction and capacity comparison in
+    /// [`CacheManager`] measures against this, and so does the cache health check.
+    /// 0 means no limit is configured.
     pub max_cache_size_limit: u64,
-    pub read_cache_size: u64,
-    pub write_cache_size: u64,
     pub write_cache_percent: f32,
     pub max_write_cache_percent: f32,
+    /// RAM-resident range bytes on **this instance only**, counting promoted copies of
+    /// bytes that are also on disk. Not comparable across instances, and not additive
+    /// with the disk figures in [`CacheSizes`].
+    ///
+    /// Unlike those, this one **is** maintained on the stored statistics, so
+    /// [`CacheManager::get_statistics`] returns a real value for it.
     pub ram_cache_size: u64,
     pub ram_cache_hit_rate: f32,
     pub compression_ratio: f32,
@@ -623,10 +748,11 @@ pub struct CacheStatistics {
 impl Default for CacheStatistics {
     fn default() -> Self {
         Self {
-            total_cache_size: 0,
+            // Not computed. `None` rather than zeros, deliberately: the difference
+            // between "not measured" and "the cache is empty" is what three defects
+            // turned on. See `CacheSizes`.
+            sizes: None,
             max_cache_size_limit: 0,
-            read_cache_size: 0,
-            write_cache_size: 0,
             write_cache_percent: 0.0,
             max_write_cache_percent: 10.0, // Default 10%
             ram_cache_size: 0,
@@ -666,26 +792,16 @@ impl Default for CacheStatistics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteCacheSizeTracker {
     pub current_size: u64,
-    pub max_size: u64,
     pub max_object_size: u64,
     pub max_percent: f32,
-    pub total_cache_size: u64,
-    pub entries_count: u64,
-    pub oldest_entry_timestamp: Option<SystemTime>,
-    pub newest_entry_timestamp: Option<SystemTime>,
 }
 
 impl Default for WriteCacheSizeTracker {
     fn default() -> Self {
         Self {
             current_size: 0,
-            max_size: 0,
             max_object_size: 256 * 1024 * 1024, // 256 MiB default
             max_percent: 10.0,                  // 10% default
-            total_cache_size: 0,
-            entries_count: 0,
-            oldest_entry_timestamp: None,
-            newest_entry_timestamp: None,
         }
     }
 }
@@ -741,15 +857,6 @@ pub struct RamCacheRead {
     pub compression_algorithm: crate::compression::CompressionAlgorithm,
 }
 
-/// Cache hierarchy statistics combining RAM and disk cache stats
-#[derive(Debug, Clone)]
-pub struct CacheHierarchyStats {
-    pub ram_cache_enabled: bool,
-    pub ram_stats: Option<crate::ram_cache::RamCacheStats>,
-    pub disk_stats: CacheStatistics,
-    pub total_cache_size: u64,
-}
-
 /// Multipart object cache statistics
 #[derive(Debug, Clone)]
 pub struct MultipartCacheStats {
@@ -800,6 +907,98 @@ pub struct RangeEvictionCandidate {
     pub meta_file_path: PathBuf,
     /// Whether this range belongs to a write-cached object (for write cache tracking)
     pub is_write_cached: bool,
+    /// The range's OWN recorded staging membership, copied from its `RangeSpec`.
+    ///
+    /// Carried alongside `is_write_cached` rather than replacing it, because the two
+    /// answer different questions and the eviction debit needs both: this is the
+    /// range's tier, `is_write_cached` is the object's, and the second is only the
+    /// fallback for a range written before membership was recorded. `None` here means
+    /// "not recorded", not "not staged" — see
+    /// [`crate::cache_types::is_staged_range_spec`].
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 12.3, 12.4
+    pub staged: Option<bool>,
+}
+
+/// The journal-system components that MUST exist exactly once per process.
+///
+/// Each of these three is a rendezvous point between the request path and a
+/// background task started at startup: the consolidator's `SizeAccumulator`
+/// collects size deltas that only `run_consolidation_cycle` flushes, the
+/// `CacheHitUpdateBuffer` holds cache-hit updates in RAM that only its 5-second
+/// flush task writes to the journal, and the `HybridMetadataWriter` is the handle
+/// the orphan-recovery sweep is built around. A second instance of any of them is
+/// therefore not a duplicate — it is a sink whose contents are dropped, because
+/// nothing holds a reference to it that will ever drain it.
+///
+/// `create_configured_disk_cache_manager` used to construct all three on every
+/// call, including on the request path, and install them over the `CacheManager`
+/// slots the background tasks had already read. Measured consequence on the fleet
+/// (2026-08-25): of 1,535 write-cached ranges committed since 2026-05-20, **9**
+/// produced a surviving `write_cache_size` credit — a 0.6% survival rate,
+/// determined by whether a credit happened to land on an accumulator that got
+/// flushed before the next request replaced it. Nothing about it failed loudly:
+/// the code compiled, the credit site logged success, and the whole test suite
+/// passed.
+///
+/// Held in a `OnceLock` so construction cannot race and the identity is stable for
+/// the life of the process.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+#[derive(Clone)]
+struct JournalComponents {
+    consolidator: Arc<crate::journal_consolidator::JournalConsolidator>,
+    hybrid_writer: Arc<tokio::sync::Mutex<crate::hybrid_metadata_writer::HybridMetadataWriter>>,
+    cache_hit_buffer: Arc<crate::cache_hit_update_buffer::CacheHitUpdateBuffer>,
+}
+
+/// An evicted range, carrying everything both the accumulator debit and the Remove
+/// journal entry need.
+///
+/// Replaced a seven-element tuple on 2026-08-27. The design note for R12 asked for a
+/// named struct rather than an eighth tuple element, and the reason is specific
+/// rather than stylistic: the tuple held one `bool`, one `String` and four `u64`s, so
+/// inserting a field in the wrong position still compiles and the resulting debit is
+/// silently charged against the wrong figure. That is precisely the class of error
+/// this phase exists to remove, and introducing one here to fix it would be a poor
+/// trade.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 12.3, 12.4
+struct EvictedRange {
+    cache_key: String,
+    start: u64,
+    end: u64,
+    /// On-disk size, which is what the Remove journal entry records.
+    size: u64,
+    /// Absolute `.bin` path, the form `write_eviction_journal_entries` expects.
+    bin_path: String,
+    /// The figure to debit from the accumulators, for symmetry with the credit sites.
+    compressed_size: u64,
+    /// The object's flag, used only as the fallback for an unrecorded range.
+    is_write_cached: bool,
+    /// The range's own recorded membership. `None` means unrecorded, not unstaged.
+    staged: Option<bool>,
+}
+
+/// A range whose `.bin` existed on disk and was deleted successfully, carrying
+/// everything the accounting debit needs.
+///
+/// Produced only by [`CacheManager::remove_range_files`] and consumed only by
+/// [`CacheManager::debit_removed_ranges`]. The pairing is deliberate: a debit built
+/// from anything wider — an object's whole `ranges` list, say — charges for files
+/// that were already absent.
+struct RemovedRange {
+    start: u64,
+    end: u64,
+    /// The figure to debit. Always `compressed_size`, for symmetry with the credit
+    /// sites; an on-disk `len()` would drift silently.
+    compressed_size: u64,
+    /// Absolute path, which is the form `write_eviction_journal_entries` expects.
+    bin_path: String,
+    /// Evaluated by `is_staged_range_spec` at delete time — the range's own recorded
+    /// membership, falling back to the `is_write_cached` of the `.meta` that was
+    /// actually read.
+    counts_as_staged: bool,
 }
 
 /// Cache manager for handling all caching operations
@@ -848,6 +1047,18 @@ pub struct CacheManager {
             Option<Arc<tokio::sync::Mutex<crate::hybrid_metadata_writer::HybridMetadataWriter>>>,
         >,
     >,
+    // The canonical, process-wide instances of the three fields above. The three
+    // `RwLock` slots exist for async readers and are published *from* here; this is
+    // the source of truth, and it is what makes the publication idempotent rather
+    // than a per-request replacement. See `JournalComponents`.
+    journal_components: std::sync::OnceLock<JournalComponents>,
+    /// Guard so a burst of uploads spawns one staging eviction pass rather than one per
+    /// upload. Per-process only — the global eviction lock inside `evict_staging_tier` is
+    /// what makes staging eviction safe fleet-wide. Mirrors the consolidator's
+    /// `eviction_in_progress` flag, which serves the same purpose for read-tier eviction.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 3.2
+    staging_eviction_in_progress: Arc<std::sync::atomic::AtomicBool>,
     // Eviction lock file handle (kept open while lock is held)
     eviction_lock_file: Arc<Mutex<Option<std::fs::File>>>,
     // UUID fence token for the current eviction pass (Requirement 5)
@@ -1121,6 +1332,8 @@ impl CacheManager {
             journal_consolidator: Arc::new(tokio::sync::RwLock::new(None)), // Will be initialized in create_configured_disk_cache_manager()
             cache_hit_update_buffer: Arc::new(tokio::sync::RwLock::new(None)), // Will be initialized in create_configured_disk_cache_manager()
             hybrid_metadata_writer: Arc::new(tokio::sync::RwLock::new(None)), // Will be initialized in create_configured_disk_cache_manager()
+            journal_components: std::sync::OnceLock::new(), // Populated once, on the first create_configured_disk_cache_manager()
+            staging_eviction_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata_cache: Arc::new(crate::metadata_cache::MetadataCache::new(
                 metadata_cache_config.to_metadata_cache_config(),
             )),
@@ -1182,6 +1395,16 @@ impl CacheManager {
     /// Forwards `compression_enabled_global` and `compression_threshold` as
     /// captured at `CacheManager` construction time (compression-content-aware-fix
     /// spec, Requirement 2.3).
+    ///
+    /// A **fresh** `DiskCacheManager` per call is intended — it is cheap and several
+    /// request paths take ownership of one for the duration of a request. What is
+    /// *not* per-call is the journal system: the `JournalConsolidator`,
+    /// `HybridMetadataWriter` and `CacheHitUpdateBuffer` wired in below are the
+    /// process-wide singletons from [`Self::journal_components`], created on the
+    /// first call and reused thereafter. This function is still what brings them into
+    /// existence, which is why the many tests that need a wired consolidator call it
+    /// before `initialize`; it is no longer what *replaces* them. See
+    /// [`JournalComponents`] for the defect that distinction fixes.
     pub fn create_configured_disk_cache_manager(&self) -> crate::disk_cache::DiskCacheManager {
         // Share the CacheManagerInner compression stats Arc so this manager's
         // write paths (streaming writers + store_range) are visible in the
@@ -1219,7 +1442,77 @@ impl CacheManager {
             }
         }
 
-        // Create and set HybridMetadataWriter with proper configuration
+        // Wire the process-wide journal components. Constructed on the first call
+        // and reused by every later one, so a request-path call can no longer
+        // replace the instances the startup background tasks hold. See
+        // `JournalComponents` for what that used to cost.
+        let components = self.journal_components();
+
+        disk_cache.set_hybrid_metadata_writer(components.hybrid_writer.clone());
+        // Wire JournalConsolidator to DiskCacheManager for direct size tracking
+        // This fixes the size tracking bug where HybridMetadataWriter writes metadata immediately,
+        // causing consolidation to see size_delta=0 (range already in metadata)
+        disk_cache.set_journal_consolidator(components.consolidator.clone());
+        disk_cache.set_cache_hit_update_buffer(components.cache_hit_buffer.clone());
+
+        disk_cache
+    }
+
+    /// The process-wide [`JournalComponents`], constructing them on first use.
+    ///
+    /// Also publishes them into the three `RwLock` slots that async readers
+    /// (`get_journal_consolidator`, `get_hybrid_metadata_writer`,
+    /// `get_cache_hit_update_buffer`, `credit_staged_range`, `initialize`) use. The
+    /// publication is *idempotent* — after the first call it writes the same `Arc`s
+    /// back, and `publish_journal_component` skips the write entirely once a slot
+    /// already holds them — which is the whole difference from the previous
+    /// behaviour, where each call installed fresh instances and orphaned the ones
+    /// already in flight.
+    ///
+    /// Publication is retried on every call rather than done once inside the
+    /// `OnceLock` initializer on purpose: the slots are `tokio::sync::RwLock` read
+    /// from this synchronous function via `try_write`, which fails rather than waits
+    /// under contention. A single attempt that lost that race would leave the slot
+    /// `None` permanently, and `initialize` reports that as a hard error. Retrying is
+    /// safe precisely because the value being published no longer changes.
+    fn journal_components(&self) -> JournalComponents {
+        let components = self
+            .journal_components
+            .get_or_init(|| self.build_journal_components())
+            .clone();
+
+        Self::publish_journal_component(&self.journal_consolidator, &components.consolidator);
+        Self::publish_journal_component(&self.hybrid_metadata_writer, &components.hybrid_writer);
+        Self::publish_journal_component(
+            &self.cache_hit_update_buffer,
+            &components.cache_hit_buffer,
+        );
+
+        components
+    }
+
+    /// Publish `value` into an `Option<Arc<T>>` slot, skipping the write when the
+    /// slot already holds that exact `Arc`.
+    ///
+    /// The `Arc::ptr_eq` short-circuit keeps the steady state to one uncontended
+    /// `try_read` per call instead of taking the write lock on every request.
+    fn publish_journal_component<T>(slot: &tokio::sync::RwLock<Option<Arc<T>>>, value: &Arc<T>) {
+        if let Ok(guard) = slot.try_read() {
+            if guard
+                .as_ref()
+                .is_some_and(|existing| Arc::ptr_eq(existing, value))
+            {
+                return;
+            }
+        }
+        if let Ok(mut guard) = slot.try_write() {
+            *guard = Some(value.clone());
+        }
+    }
+
+    /// Construct the journal system's three singletons. Called exactly once per
+    /// `CacheManager`, from the `OnceLock` initializer in [`Self::journal_components`].
+    fn build_journal_components(&self) -> JournalComponents {
         // Use the shared_storage configuration from the cache manager
         let shared_storage_config = &self.shared_storage;
 
@@ -1248,7 +1541,7 @@ impl CacheManager {
         );
         let journal_manager = std::sync::Arc::new(crate::journal_manager::JournalManager::new(
             self.cache_dir.clone(),
-            instance_id,
+            instance_id.clone(),
         ));
 
         // Create JournalConsolidator for background consolidation
@@ -1269,17 +1562,12 @@ impl CacheManager {
             consolidation_cycle_timeout: shared_storage_config.consolidation_cycle_timeout,
             max_keys_per_cycle: 5000,
         };
-        let journal_consolidator = Arc::new(crate::journal_consolidator::JournalConsolidator::new(
+        let consolidator = Arc::new(crate::journal_consolidator::JournalConsolidator::new(
             self.cache_dir.clone(),
             journal_manager.clone(),
             lock_manager.clone(),
             consolidation_config,
         ));
-
-        // Store journal consolidator for background task access
-        if let Ok(mut guard) = self.journal_consolidator.try_write() {
-            *guard = Some(journal_consolidator);
-        }
 
         // Create ConsolidationTrigger
         let consolidation_trigger =
@@ -1289,52 +1577,33 @@ impl CacheManager {
             ));
 
         // Create HybridMetadataWriter
-        let hybrid_writer = crate::hybrid_metadata_writer::HybridMetadataWriter::new(
-            self.cache_dir.clone(),
-            lock_manager,
-            journal_manager,
-            consolidation_trigger,
-        );
-
-        // Wire HybridMetadataWriter to DiskCacheManager for shared storage mode
-        let hybrid_writer_arc = std::sync::Arc::new(tokio::sync::Mutex::new(hybrid_writer));
-        disk_cache.set_hybrid_metadata_writer(hybrid_writer_arc.clone());
-
-        // Wire JournalConsolidator to DiskCacheManager for direct size tracking
-        // This fixes the size tracking bug where HybridMetadataWriter writes metadata immediately,
-        // causing consolidation to see size_delta=0 (range already in metadata)
-        if let Ok(guard) = self.journal_consolidator.try_read() {
-            if let Some(consolidator) = guard.as_ref() {
-                disk_cache.set_journal_consolidator(consolidator.clone());
-            }
-        }
-
-        // Store HybridMetadataWriter in CacheManager for background orphan recovery access
-        if let Ok(mut guard) = self.hybrid_metadata_writer.try_write() {
-            *guard = Some(hybrid_writer_arc);
-        }
+        let hybrid_writer = Arc::new(tokio::sync::Mutex::new(
+            crate::hybrid_metadata_writer::HybridMetadataWriter::new(
+                self.cache_dir.clone(),
+                lock_manager,
+                journal_manager,
+                consolidation_trigger,
+            ),
+        ));
 
         // Create CacheHitUpdateBuffer for journal-based cache-hit updates
-        let cache_hit_buffer_instance_id = format!(
-            "{}:{}",
-            gethostname::gethostname().to_string_lossy(),
-            std::process::id()
-        );
-        let cache_hit_update_buffer =
+        let cache_hit_buffer =
             std::sync::Arc::new(crate::cache_hit_update_buffer::CacheHitUpdateBuffer::new(
                 self.cache_dir.clone(),
-                cache_hit_buffer_instance_id,
+                instance_id,
             ));
-        disk_cache.set_cache_hit_update_buffer(cache_hit_update_buffer.clone());
 
-        // Store CacheHitUpdateBuffer in CacheManager for background flush task access
-        if let Ok(mut guard) = self.cache_hit_update_buffer.try_write() {
-            *guard = Some(cache_hit_update_buffer);
-        }
-
+        // Logged once per process now, not once per request. That distinction is
+        // load-bearing: a second occurrence of this line at the moment of a PUT is
+        // exactly how the per-request replacement was found, so it stays here as
+        // the fingerprint of a regression rather than moving to `debug!`.
         info!("Shared storage mode enabled: HybridMetadataWriter, JournalConsolidator, and CacheHitUpdateBuffer initialized");
 
-        disk_cache
+        JournalComponents {
+            consolidator,
+            hybrid_writer,
+            cache_hit_buffer,
+        }
     }
 
     /// Create a new cache manager with default compression settings
@@ -1533,6 +1802,16 @@ impl CacheManager {
         // This must happen before creating the size tracker so the consolidator
         // has the correct size state for the tracker to delegate to
         consolidator.initialize().await?;
+
+        // Wire the consolidator into the write cache manager so staging eviction can
+        // debit the size accumulator and write Remove journal entries instead of
+        // deleting data while `write_cache_size` ratchets upward. Must happen before
+        // `initialize_with_locking` below, which is the first thing to touch the
+        // manager. Mirrors `disk_cache.set_journal_consolidator`.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 5.1, 5.2
+        if let Some(wcm) = write_cache_manager.as_mut() {
+            wcm.set_journal_consolidator(consolidator.clone());
+        }
 
         let mut size_tracker = Some(Arc::new(
             crate::cache_size_tracker::CacheSizeTracker::new(
@@ -2163,6 +2442,7 @@ impl CacheManager {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         };
 
         self.store_full_object_as_range_new(cache_key, response, object_metadata)
@@ -2323,13 +2603,27 @@ impl CacheManager {
                     // (not just evicted through the normal eviction path)
                     if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
                         for range_spec in &new_metadata.ranges {
-                            consolidator
-                                .size_accumulator()
-                                .subtract(range_spec.compressed_size);
-                            // Check if write-cached
-                            if range_spec.file_path.contains("mpus_in_progress/")
-                                || new_metadata.object_metadata.is_write_cached
-                            {
+                            // `subtract_range`, so the dedup entry goes with the bytes.
+                            // This site matters most for that: invalidate-then-re-cache
+                            // of the same range is the ordinary stale-ETag flow, and
+                            // with a plain `subtract` the re-cache credits nothing.
+                            // See `SizeAccumulator::subtract_range`.
+                            consolidator.size_accumulator().subtract_range(
+                                cache_key,
+                                range_spec.start,
+                                range_spec.end,
+                                range_spec.compressed_size,
+                            );
+                            // Check if write-cached — single shared predicate, so this
+                            // subtract cannot disagree with the add sites. Per range,
+                            // reading the membership the range recorded when it was
+                            // credited: invalidating a mixed object must debit only the
+                            // ranges the staging tier was ever charged for.
+                            // Spec: write-cache-accounting-and-eviction. Requirements: 6.2, 12.3, 12.4
+                            if crate::cache_types::is_staged_range_spec(
+                                range_spec,
+                                new_metadata.object_metadata.is_write_cached,
+                            ) {
                                 consolidator
                                     .size_accumulator()
                                     .subtract_write_cache(range_spec.compressed_size);
@@ -2344,6 +2638,17 @@ impl CacheManager {
                             "Failed to remove new metadata file {:?}: {}",
                             new_metadata_file_path, e
                         ),
+                    }
+
+                    // Staged-entry gauge: this whole object is leaving the staging
+                    // tier by invalidation (expiry, eviction, or explicit removal
+                    // funnelled through this path), not by graduation. The object
+                    // flag is read once here rather than per range, because the
+                    // gauge counts objects: a mixed object still leaves as one
+                    // occupant of the tier when its `.meta` is deleted.
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+                    if new_metadata.object_metadata.is_write_cached {
+                        self.decrement_write_cache_staged_entries().await;
                     }
 
                     // Delete lock file if it exists
@@ -2911,13 +3216,23 @@ impl CacheManager {
                 .to_string_lossy()
                 .to_string();
 
-            let range_spec = crate::cache_types::RangeSpec::new(
+            // Live write path, so membership is recorded explicitly (R12.2) rather
+            // than left `None` for a reader to re-derive from the object flag. Read
+            // from the `.meta` this function is updating in place, so a part inherits
+            // the tier of the object it completes.
+            // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+            let counts_as_staged = crate::cache_types::classify_new_range_as_staged(
+                &range_file_relative_path,
+                metadata.object_metadata.is_write_cached,
+            );
+            let range_spec = crate::cache_types::RangeSpec::new_staged(
                 start,
                 end,
                 range_file_relative_path,
                 compression_algorithm,
                 compressed_size,
                 uncompressed_size,
+                counts_as_staged,
             );
 
             range_specs.push(range_spec);
@@ -3204,11 +3519,6 @@ impl CacheManager {
         self.inner.lock().unwrap().statistics.clone()
     }
 
-    /// Update total cache size (for testing and configuration)
-    pub fn update_total_cache_size(&self, size: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.statistics.total_cache_size = size;
-    }
     /// Set metrics manager reference for eviction coordination metrics
     /// Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
     pub async fn set_metrics_manager(
@@ -3510,6 +3820,584 @@ impl CacheManager {
                 None
             }
         }
+    }
+
+    /// Increment the write cache's live staged-entry gauge. Call after a
+    /// successful write-cache commit (a new `.meta` written with
+    /// `is_write_cached: true`).
+    ///
+    /// No-op when `WriteCacheManager` is not initialized.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+    pub async fn increment_write_cache_staged_entries(&self) {
+        if let Some(wcm_arc) = self.write_cache_manager.read().await.as_ref() {
+            wcm_arc.read().await.increment_staged_entries();
+        }
+    }
+
+    /// Decrement the write cache's live staged-entry gauge. Call on
+    /// graduation (first read transitions an entry out of the write tier).
+    ///
+    /// No-op when `WriteCacheManager` is not initialized.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+    pub async fn decrement_write_cache_staged_entries(&self) {
+        if let Some(wcm_arc) = self.write_cache_manager.read().await.as_ref() {
+            wcm_arc.read().await.decrement_staged_entries();
+        }
+    }
+
+    /// Get the write cache's current in-flight reservation total (per-instance
+    /// bytes currently reserved via `WriteReservation`, i.e.
+    /// `WriteCacheManager::current_usage()`), and the live staged-entry gauge.
+    /// Returns `(inflight_bytes, staged_entries)`, both `0` when
+    /// `WriteCacheManager` is not initialized.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+    pub async fn get_write_cache_manager_gauges(&self) -> (u64, u64) {
+        if let Some(wcm_arc) = self.write_cache_manager.read().await.as_ref() {
+            let wcm = wcm_arc.read().await;
+            (wcm.current_usage(), wcm.staged_entries())
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Increment the write cache's cumulative graduation counter. Call once per
+    /// graduation performed by this instance.
+    ///
+    /// No-op when `WriteCacheManager` is not initialized.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+    pub async fn increment_write_cache_graduations(&self) {
+        if let Some(wcm_arc) = self.write_cache_manager.read().await.as_ref() {
+            wcm_arc.read().await.increment_graduations();
+        }
+    }
+
+    /// Get the write cache's cumulative graduation count (`graduations_total`), `0`
+    /// when `WriteCacheManager` is not initialized. Per-instance; see the field doc on
+    /// `WriteCacheManager::graduations_total` for why it is not a fleet-wide figure.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+    pub async fn get_write_cache_graduations_total(&self) -> u64 {
+        if let Some(wcm_arc) = self.write_cache_manager.read().await.as_ref() {
+            wcm_arc.read().await.graduations_total()
+        } else {
+            0
+        }
+    }
+
+    /// Get the write cache's cumulative staging-eviction counters:
+    /// `(staging_evictions_total, staging_eviction_bytes_total)`, both `0`
+    /// when `WriteCacheManager` is not initialized. Deliberately separate
+    /// from `cache.evictions`, which reflects read-cache eviction only.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.4
+    pub async fn get_write_cache_eviction_counters(&self) -> (u64, u64) {
+        if let Some(wcm_arc) = self.write_cache_manager.read().await.as_ref() {
+            let wcm = wcm_arc.read().await;
+            (
+                wcm.staging_evictions_total(),
+                wcm.staging_eviction_bytes_total(),
+            )
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Get the configured maximum write-cache object size
+    /// (`WriteCacheManager::max_object_size()`). Objects larger than this are
+    /// refused by `try_reserve` regardless of available capacity. Callers use
+    /// this to attribute a `None` from `try_reserve_write_cache` to either
+    /// `object_too_large` or a generic capacity refusal, without changing
+    /// `try_reserve`'s own control flow. Returns `u64::MAX` when
+    /// `WriteCacheManager` is not initialized, so a caller comparing against
+    /// it never misattributes a skip as `object_too_large`.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.1
+    pub async fn get_write_cache_max_object_size(&self) -> u64 {
+        if let Some(wcm_arc) = self.write_cache_manager.read().await.as_ref() {
+            wcm_arc.read().await.max_object_size()
+        } else {
+            u64::MAX
+        }
+    }
+
+    // =========================================================================
+    // Staging tier: residency, bounds, and ledger-driven eviction
+    // (Phase E/F — Requirements 2, 3, 4, 7)
+    // =========================================================================
+
+    /// Resident_Bytes: staged bytes on the **shared** volume, read from Size_State.
+    ///
+    /// This is the figure the Staging_Bound is enforced against (R7.1), and reading it
+    /// from Size_State rather than from a per-instance counter is the whole point: a
+    /// write on one instance is visible to every instance, so `write_cache_percent`
+    /// bounds the fleet rather than each proxy separately.
+    ///
+    /// Returns `None` when it cannot be read, which callers MUST treat as **fail open**
+    /// (R7.5): admit and cache. Silently disabling write-through caching is the more
+    /// damaging failure and is the outage this whole spec exists to fix, so an
+    /// unreadable size must never be allowed to look like a full cache.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 7.1, 7.5
+    pub async fn get_staging_resident_bytes(&self) -> Option<u64> {
+        let consolidator = self.journal_consolidator.read().await.clone()?;
+        Some(consolidator.get_write_cache_size().await)
+    }
+
+    /// The Staging_Bound: `write_cache_percent` of `max_cache_size`.
+    ///
+    /// Same arithmetic as [`Self::get_write_cache_capacity`], which is the figure
+    /// `WriteCacheManager::max_size` was built from, so the bound reported on `/metrics`
+    /// and the bound eviction targets cannot drift apart.
+    pub fn get_staging_bound_bytes(&self) -> u64 {
+        self.get_write_cache_capacity()
+    }
+
+    /// Trigger and target for staging eviction, as absolute byte figures.
+    ///
+    /// # Why the read tier's percentages, deliberately rather than by omission
+    ///
+    /// R3.4 requires a trigger/target gap so eviction does not thrash at the boundary,
+    /// and task 28 required the gap be *sized against measured staging-eviction
+    /// throughput* rather than guessed. **That measurement does not exist and could not
+    /// be taken**: task 6b tried, and `discussion.md` §6 records why it failed — nothing
+    /// was staged on the fleet to evict, so there was no throughput to time, and it
+    /// explicitly defers the figure to "once Phase E lands".
+    ///
+    /// So this adopts the read tier's `eviction_trigger_percent` / `eviction_target_percent`
+    /// (95/80 by default) as a **deliberate decision, not an omission**, on three grounds:
+    ///
+    /// 1. The gap is proportional, so it scales with the allocation instead of being a
+    ///    fixed byte figure that is wrong at some size. At the fleet's 10 GiB allocation
+    ///    it is ~1.5 GiB of hysteresis.
+    /// 2. Overshoot is now *safe* rather than merely tolerated. The Staging_Bound no
+    ///    longer refuses anything (R3.1), so a gap that turns out too narrow costs extra
+    ///    eviction wake-ups, not refused uploads — the failure mode the old hard gate had.
+    ///    That asymmetry is what makes guessing acceptable here where it would not be for
+    ///    an admission gate.
+    /// 3. Using the same knobs as the read tier means an operator who has already tuned
+    ///    hysteresis for their volume gets that tuning applied here too, rather than
+    ///    discovering a second independent pair of percentages.
+    ///
+    /// **The measurement is still owed**, and it is now takeable for the first time,
+    /// because Phase E is what finally produces staged objects to evict. If small-object
+    /// staging eviction turns out to free bytes materially slower than the write path
+    /// fills them, widen the gap here — do not reintroduce a refusal.
+    ///
+    /// Returns `(trigger_bytes, target_bytes)`. `(0, 0)` when no bound is configured,
+    /// which callers read as "no staging eviction".
+    pub fn get_staging_eviction_thresholds(&self) -> (u64, u64) {
+        let bound = self.get_staging_bound_bytes();
+        if bound == 0 {
+            return (0, 0);
+        }
+        let trigger = (bound as f64 * self.eviction_trigger_percent as f64 / 100.0) as u64;
+        let target = (bound as f64 * self.eviction_target_percent as f64 / 100.0) as u64;
+        (trigger, target)
+    }
+
+    /// Whether caching `incoming_bytes` would breach the Disk_Safety_Bound.
+    ///
+    /// # This is the only bound that may decline caching (R4.1, R4.2)
+    ///
+    /// The Staging_Bound is a target — going over it triggers eviction and still caches.
+    /// This one is a genuine wall, because the failure it prevents is running the shared
+    /// volume out of space, which degrades every instance and every tier at once.
+    ///
+    /// Two independent components, and it is **not** a fraction of the Staging_Bound
+    /// (R4.2). A percentage gap against the write allocation is meaningless: 15% of a
+    /// 10 GiB allocation is ~1.5 GiB, about **one second** at the fleet's measured
+    /// ~1,490 MiB/s sustained write rate.
+    ///
+    /// 1. **Global `max_cache_size` headroom.** The whole cache, read tier included, is
+    ///    bounded by `max_cache_size`; staging bytes are part of that total, so caching
+    ///    past it would push the volume over the figure every eviction decision is made
+    ///    against. Against a 100 GiB cache with a 10 GiB staging allocation this leaves
+    ///    ~90 GiB of slack, so it is far away and rarely reached — which is the point.
+    /// 2. **Filesystem free space.** `max_cache_size` is a configured intention;
+    ///    free space is a fact. A volume that is smaller than configured, or shared with
+    ///    something else, will hit this first, and running a shared cache volume to 0
+    ///    bytes free is materially worse than declining to cache one object.
+    ///
+    /// Fails **open** on any read failure, consistent with R7.5 — an unreadable size or
+    /// an unavailable `statvfs` must not silently stop write-through caching.
+    ///
+    /// Returns `Some(reason)` when caching must be declined, `None` when it may proceed.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 4.1, 4.2
+    pub async fn disk_safety_refusal(&self, incoming_bytes: u64) -> Option<&'static str> {
+        let refusal = self.disk_safety_refusal_inner(incoming_bytes).await;
+        if refusal.is_some() {
+            // Stamp the recency signal `/health` reads (R4.4).
+            LAST_DISK_SAFETY_REFUSAL_SECS.store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        refusal
+    }
+
+    async fn disk_safety_refusal_inner(&self, incoming_bytes: u64) -> Option<&'static str> {
+        // Component 1: global max_cache_size headroom.
+        let max_cache_size = {
+            let inner = self.inner.lock().unwrap();
+            inner.statistics.max_cache_size_limit
+        };
+        if max_cache_size > 0 {
+            if let Some(consolidator) = self.journal_consolidator.read().await.clone() {
+                let total = consolidator.get_current_size().await;
+                if total.saturating_add(incoming_bytes) > max_cache_size {
+                    warn!(
+                        "Disk safety: declining to write-through cache {} bytes — total cache \
+                         {} + incoming would exceed max_cache_size {}. The upload itself is \
+                         unaffected and still streams to S3.",
+                        incoming_bytes, total, max_cache_size
+                    );
+                    return Some(DISK_SAFETY_SKIP_REASON);
+                }
+            }
+        }
+
+        // Component 2: actual filesystem free space, with a floor so the volume is never
+        // driven to genuinely zero. Deliberately checked second: it needs a syscall,
+        // whereas the headroom check above is two in-memory reads.
+        match fs2::available_space(&self.cache_dir) {
+            Ok(available) => {
+                let required = incoming_bytes.saturating_add(DISK_SAFETY_FREE_SPACE_FLOOR_BYTES);
+                if available < required {
+                    warn!(
+                        "Disk safety: declining to write-through cache {} bytes — only {} bytes \
+                         free on the cache volume, need {} (object + {} reserve). The upload \
+                         itself is unaffected and still streams to S3.",
+                        incoming_bytes, available, required, DISK_SAFETY_FREE_SPACE_FLOOR_BYTES
+                    );
+                    return Some(DISK_SAFETY_SKIP_REASON);
+                }
+                None
+            }
+            Err(e) => {
+                // Fail open (R7.5). An unavailable statvfs is an environment problem, not
+                // evidence the disk is full, and treating it as full would reintroduce
+                // exactly the silent caching outage this spec exists to fix.
+                debug!(
+                    "Disk safety: could not read free space for {:?} ({}), proceeding with \
+                     caching (fail-open)",
+                    self.cache_dir, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Run one ledger-driven staging eviction pass.
+    ///
+    /// This is the replacement for `WriteCacheManager::evict_to_target`, and the
+    /// differences are the whole of Phase E:
+    ///
+    /// | | Old (`evict_to_target`) | This |
+    /// |---|---|---|
+    /// | Candidate discovery | `WalkDir` over all of `metadata/`, parsing every `.meta` | merged Write_Ledger heads |
+    /// | Cost | O(cache) | O(evicted + skipped) |
+    /// | Decision input | this instance's private in-flight counter | Resident_Bytes from shared Size_State |
+    /// | Coordination | none — three proxies could sweep concurrently | global eviction lock |
+    /// | Where it ran | inline, on the request path of a refused PUT | off the request path |
+    ///
+    /// That third row is the one that caused real data loss: a local decision with a
+    /// shared effect, demonstrated on 2026-08-24 when one proxy deleted a 32 MiB object
+    /// another had just cached. See `cache-coherency-invariants.md` §"Invariant 2's
+    /// dangerous corollary".
+    ///
+    /// # Never call this from a request path
+    ///
+    /// R3.2 is explicit, and it is the reason the old code was removed. Callers should
+    /// spawn it. `nudge_staging_eviction` is the intended entry point.
+    ///
+    /// Returns the bytes actually freed.
+    ///
+    /// Spec: write-cache-accounting-and-eviction.
+    /// Requirements: 2.2, 2.3, 2.4, 7.1, 7.3, 7.4, 7.5
+    pub async fn evict_staging_tier(&self) -> u64 {
+        let (trigger, target) = self.get_staging_eviction_thresholds();
+        if trigger == 0 {
+            return 0;
+        }
+
+        // R7.5: fail open. An unreadable Resident_Bytes means we do not know whether
+        // eviction is needed, and guessing "yes" would delete data on no evidence.
+        let Some(resident) = self.get_staging_resident_bytes().await else {
+            warn!(
+                "Staging eviction: Resident_Bytes unreadable from Size_State, skipping this \
+                 pass (fail-open). Write-through caching continues unaffected."
+            );
+            return 0;
+        };
+
+        if resident <= trigger {
+            debug!(
+                "Staging eviction not needed: resident={} <= trigger={}",
+                resident, trigger
+            );
+            return 0;
+        }
+
+        // R7.3 / R7.4: exactly one instance evicts at a time, and a skip is counted.
+        match self.try_acquire_global_eviction_lock().await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!("Staging eviction: another instance holds the eviction lock, skipping");
+                if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
+                    metrics_manager
+                        .read()
+                        .await
+                        .record_staging_eviction_skipped_lock_held()
+                        .await;
+                }
+                return 0;
+            }
+            Err(e) => {
+                warn!("Staging eviction: failed to acquire eviction lock: {}", e);
+                return 0;
+            }
+        }
+
+        // Do the work, then release. Split this way rather than releasing inside a
+        // `scopeguard` closure because `release_global_eviction_lock` is **async and does
+        // more than drop the file handle**: it takes the stored eviction UUID and
+        // truncates the lockfile only if that UUID still matches, which is the fencing
+        // that stops a slow instance from clearing a lock another instance has since
+        // taken. A synchronous guard that only cleared the handle would leave the UUID
+        // set and the lockfile populated, so the next release would see a mismatch and
+        // the file would look held until its timeout. Mirrors
+        // `enforce_disk_cache_limits_internal`, which brackets
+        // `perform_eviction_with_lock` the same way.
+        let freed = self.evict_staging_tier_locked(trigger, target).await;
+
+        if let Err(e) = self.release_global_eviction_lock().await {
+            warn!("Staging eviction: failed to release eviction lock: {}", e);
+        }
+        freed
+    }
+
+    /// The body of a staging eviction pass, run with the global eviction lock held.
+    ///
+    /// Separate from [`Self::evict_staging_tier`] so every early return here is covered by
+    /// that function's single release, rather than needing one release per branch.
+    async fn evict_staging_tier_locked(&self, trigger: u64, target: u64) -> u64 {
+        use crate::write_ledger::StagedCandidateVerdict;
+
+        // R7.3: re-read after acquiring the lock. Another instance may have evicted
+        // while we waited, in which case there is nothing left to do and proceeding
+        // would delete data that is now within bound.
+        let Some(resident) = self.get_staging_resident_bytes().await else {
+            warn!("Staging eviction: Resident_Bytes unreadable after acquiring lock, skipping");
+            return 0;
+        };
+        if resident <= trigger {
+            info!(
+                "Staging eviction: no longer over trigger after acquiring lock \
+                 (resident={}, trigger={}), skipping",
+                resident, trigger
+            );
+            return 0;
+        }
+
+        let bytes_to_free = resident.saturating_sub(target);
+        let Some(consolidator) = self.journal_consolidator.read().await.clone() else {
+            warn!("Staging eviction: journal consolidator not wired, skipping");
+            return 0;
+        };
+        let ledger = consolidator.write_ledger().clone();
+
+        let entries = match ledger
+            .read_merged_oldest_first(STAGING_EVICTION_CANDIDATE_CAP)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!("Staging eviction: failed to read Write_Ledger: {}", e);
+                return 0;
+            }
+        };
+        if entries.is_empty() {
+            // Not an error and not "nothing is staged": a fleet upgrading in place has
+            // an empty ledger until the first Validation_Scan re-appends its staged
+            // entries (R2.7 / R6.6), which is exactly the in-place upgrade path.
+            info!(
+                "Staging eviction: over trigger (resident={}, trigger={}) but the Write_Ledger \
+                 is empty. If this deployment was just upgraded, the next full validation scan \
+                 populates it; no migration step is required.",
+                resident, trigger
+            );
+            return 0;
+        }
+
+        let candidates = crate::write_ledger::WriteLedger::group_by_key(entries);
+
+        // R2.4: expired-unread ranks ahead of fresh-unread, via a `now - put_ttl`
+        // watermark. Under a uniform `put_ttl` write order already *is* expiry order, so
+        // this partition changes nothing; it earns its keep when per-key `put_ttl` rules
+        // make the two orders differ. A fresh-unread entry stays a candidate at lower
+        // priority and is explicitly NOT exempt.
+        //
+        // The watermark uses the manager's default `put_ttl`, not a per-key resolution:
+        // resolving rules for every candidate would reintroduce per-candidate I/O, and
+        // the design accepts the resulting misordering as bounded by the TTL spread.
+        let watermark = SystemTime::now()
+            .checked_sub(self.put_ttl)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let ordered = crate::write_ledger::order_staging_candidates(candidates, watermark);
+
+        let mut total_freed: u64 = 0;
+        let mut evicted_objects: u64 = 0;
+        let mut retired: std::collections::HashSet<(String, u64, u64, SystemTime, String)> =
+            std::collections::HashSet::new();
+        let mut skips: std::collections::HashMap<&'static str, u64> =
+            std::collections::HashMap::new();
+
+        for candidate in &ordered {
+            if total_freed >= bytes_to_free {
+                break;
+            }
+
+            // R2.2: verify against the authoritative `.meta` before acting. One decision
+            // covering absent / graduated / superseded / unreadable.
+            let verdict =
+                crate::write_ledger::verify_staged_candidate(&self.cache_dir, candidate).await;
+
+            match verdict {
+                StagedCandidateVerdict::Evictable => {
+                    match self.evict_staged_object(&candidate.cache_key).await {
+                        Ok(freed) => {
+                            total_freed = total_freed.saturating_add(freed);
+                            evicted_objects += 1;
+                            retired.extend(candidate.identities.iter().cloned());
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Staging eviction: failed to evict {}: {}",
+                                candidate.cache_key, e
+                            );
+                        }
+                    }
+                }
+                StagedCandidateVerdict::MetadataAbsent
+                | StagedCandidateVerdict::Graduated
+                | StagedCandidateVerdict::Superseded => {
+                    // Terminal: this entry can never become evictable, so retire it here.
+                    // Eviction therefore compacts opportunistically as it scans, which is
+                    // most of what keeps the ledger proportional to the staged set.
+                    *skips.entry(verdict.reason()).or_insert(0) += 1;
+                    retired.extend(candidate.identities.iter().cloned());
+                }
+                StagedCandidateVerdict::Unreadable => {
+                    // Deliberately NOT retired. A `.meta` we failed to read may be
+                    // perfectly valid and transiently unavailable on shared storage;
+                    // dropping the entry would lose a live staged object's only eviction
+                    // hint on the strength of one failed read.
+                    *skips.entry(verdict.reason()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // R2.6: retire consumed and terminal entries, naming exactly what to remove.
+        //
+        // This used to compute `all_identities - retired` and hand it to a retain-set
+        // rewrite that deleted everything absent from it. That is only correct if
+        // `all_identities` covers the whole ledger, and it does not: the read above is
+        // capped at `STAGING_EVICTION_CANDIDATE_CAP`, so on a longer ledger every entry
+        // past the cap was absent from the retain set and silently deleted — from every
+        // instance's file, without ever having been read. Task 77.
+        //
+        // Naming the removals removes the dependency on the read being complete. An
+        // entry beyond the cap, and an entry appended by another instance after the read,
+        // are both simply not named.
+        if !retired.is_empty() {
+            if let Err(e) = ledger.retire_identities(&retired).await {
+                warn!(
+                    "Staging eviction: failed to retire {} consumed Write_Ledger entries: {}. \
+                     They will be re-verified and skipped next pass.",
+                    retired.len(),
+                    e
+                );
+            }
+        }
+
+        info!(
+            "Staging eviction complete: resident_before={}, trigger={}, target={}, \
+             bytes_to_free={}, evicted_objects={}, freed={}, candidates={}, skips={:?}",
+            resident,
+            trigger,
+            target,
+            bytes_to_free,
+            evicted_objects,
+            total_freed,
+            ordered.len(),
+            skips
+        );
+
+        total_freed
+    }
+
+    /// Evict one staged object, delegating to the accounting-correct implementation on
+    /// `WriteCacheManager`.
+    ///
+    /// Thin on purpose: `WriteCacheManager::evict_write_cached_object` already does the
+    /// R5 accounting (both accumulator channels, `Remove` journal entries,
+    /// `cached_objects`, the accumulator flush) and got a two-sided test for the
+    /// graduation double-debit race. Phase E changes *which* objects get evicted and
+    /// *who* is allowed to decide, not what eviction does once it has decided.
+    async fn evict_staged_object(&self, cache_key: &str) -> Result<u64> {
+        let wcm_guard = self.write_cache_manager.read().await;
+        let Some(wcm_arc) = wcm_guard.as_ref() else {
+            return Err(ProxyError::CacheError(
+                "WriteCacheManager not initialized; cannot evict staged object".to_string(),
+            ));
+        };
+        let wcm = wcm_arc.read().await;
+        wcm.evict_write_cached_object(cache_key).await
+    }
+
+    /// Spawn a staging eviction pass if the tier is over its trigger.
+    ///
+    /// The **only** entry point a request path may call (R3.2): it spawns and returns
+    /// immediately, so no upload ever waits on eviction. The old code's inline sweep is
+    /// what made a refused PUT cost 7-9 seconds.
+    ///
+    /// Guarded by `staging_eviction_in_progress` so a burst of uploads spawns one pass
+    /// rather than one per upload. That flag is per-process; the global eviction lock
+    /// inside `evict_staging_tier` is what makes it safe fleet-wide.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 3.1, 3.2
+    pub fn nudge_staging_eviction(self: &Arc<Self>) {
+        if self
+            .staging_eviction_in_progress
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            debug!("Staging eviction already in progress, not spawning another");
+            return;
+        }
+
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let freed = this.evict_staging_tier().await;
+            this.staging_eviction_in_progress
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            if freed > 0 {
+                debug!("Staging eviction pass freed {} bytes", freed);
+            }
+        });
     }
 
     /// Check if write cache can accommodate new entry (non-atomic, legacy).
@@ -4140,10 +5028,9 @@ impl CacheManager {
         let mut total_ranges_evicted: u64 = 0;
         let mut total_keys_evicted: u64 = 0; // Count of objects with all ranges evicted
         let mut all_deleted_paths: Vec<PathBuf> = Vec::new();
-        // Collect evicted ranges for journal Remove entries and accumulator tracking
-        // Tuple: (cache_key, range_start, range_end, size, bin_file_path, compressed_size, is_write_cached)
-        let mut evicted_ranges_for_journal: Vec<(String, u64, u64, u64, String, u64, bool)> =
-            Vec::new();
+        // Collect evicted ranges for journal Remove entries and accumulator tracking.
+        // Named fields rather than a tuple — see [`EvictedRange`] for why.
+        let mut evicted_ranges_for_journal: Vec<EvictedRange> = Vec::new();
 
         for result in object_results.into_iter().flatten() {
             if total_bytes_freed >= bytes_to_free {
@@ -4169,15 +5056,16 @@ impl CacheManager {
 
             // Collect evicted ranges for journal Remove entries and accumulator tracking
             for range in &ranges {
-                evicted_ranges_for_journal.push((
-                    cache_key.clone(),
-                    range.range_start,
-                    range.range_end,
-                    range.size,
-                    range.bin_file_path.to_string_lossy().to_string(),
-                    range.compressed_size,
-                    range.is_write_cached,
-                ));
+                evicted_ranges_for_journal.push(EvictedRange {
+                    cache_key: cache_key.clone(),
+                    start: range.range_start,
+                    end: range.range_end,
+                    size: range.size,
+                    bin_path: range.bin_file_path.to_string_lossy().to_string(),
+                    compressed_size: range.compressed_size,
+                    is_write_cached: range.is_write_cached,
+                    staged: range.staged,
+                });
             }
 
             // Check if metadata file was deleted (all ranges evicted for this key)
@@ -4204,22 +5092,56 @@ impl CacheManager {
         if !evicted_ranges_for_journal.is_empty() {
             if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
                 // Decrement accumulator for each evicted range using compressed_size
-                for (
-                    _cache_key,
-                    _range_start,
-                    _range_end,
-                    _size,
-                    bin_file_path,
-                    compressed_size,
-                    is_write_cached,
-                ) in &evicted_ranges_for_journal
-                {
-                    consolidator.size_accumulator().subtract(*compressed_size);
-                    // Check if write-cached: either mpus_in_progress path or is_write_cached flag
-                    if bin_file_path.contains("mpus_in_progress/") || *is_write_cached {
+                for evicted in &evicted_ranges_for_journal {
+                    // `subtract_range` rather than `subtract`, so the range's dedup
+                    // entry leaves with its bytes. Otherwise an evicted range that is
+                    // later re-cached is deduplicated on the way back in and credits
+                    // nothing, leaving the total short — undershoot, the direction that
+                    // over-admits. See `SizeAccumulator::subtract_range`.
+                    consolidator.size_accumulator().subtract_range(
+                        &evicted.cache_key,
+                        evicted.start,
+                        evicted.end,
+                        evicted.compressed_size,
+                    );
+                    // Debit the write tier only for a range that belongs to it, taken
+                    // from the membership the range recorded when it was credited and
+                    // falling back to the object flag only for a range written before
+                    // that field existed. Evicting a read-tier range that happens to
+                    // hang off a still-flagged object must debit `total_size` alone —
+                    // the object flag by itself would charge `write_cache_size` for
+                    // bytes the staging tier never received.
+                    //
+                    // Via `is_staged_range_parts` rather than an inline
+                    // `match evicted.staged { … }`, because this site holds an
+                    // `EvictedRange` and not a `RangeSpec`: restating the
+                    // recorded-else-fallback rule here would make it a second
+                    // definition site, which is the disagreement R12.4 exists to
+                    // prevent.
+                    //
+                    // This test is also what makes eviction safe against a concurrent
+                    // graduation, and it relies on an ordering in
+                    // `refresh_write_cache_ttl`: that function writes the `.meta` with
+                    // the flag cleared BEFORE appending its `Graduation` journal entry.
+                    // So in the window where an entry has graduated but its entry has
+                    // not yet been consolidated, the `.meta` read here already reports
+                    // the flag clear, this site debits `total_size` only, and the
+                    // pending `Graduation` entry supplies the single `write_cache_size`
+                    // debit. Reverse that ordering and the same bytes are debited twice.
+                    //
+                    // Note `bin_path` is ABSOLUTE here where `RangeSpec::file_path` is
+                    // relative to `ranges/`. The legacy path arm is a `contains`, so it
+                    // matches either form; this is the same string the pre-R12 code
+                    // passed.
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 6.2, 12.3, 12.4
+                    if crate::cache_types::is_staged_range_parts(
+                        evicted.staged,
+                        &evicted.bin_path,
+                        evicted.is_write_cached,
+                    ) {
                         consolidator
                             .size_accumulator()
-                            .subtract_write_cache(*compressed_size);
+                            .subtract_write_cache(evicted.compressed_size);
                     }
                 }
 
@@ -4228,19 +5150,15 @@ impl CacheManager {
                 let journal_entries: Vec<(String, u64, u64, u64, String)> =
                     evicted_ranges_for_journal
                         .into_iter()
-                        .map(
-                            |(
-                                cache_key,
-                                range_start,
-                                range_end,
-                                size,
-                                bin_file_path,
-                                _compressed_size,
-                                _is_write_cached,
-                            )| {
-                                (cache_key, range_start, range_end, size, bin_file_path)
-                            },
-                        )
+                        .map(|evicted| {
+                            (
+                                evicted.cache_key,
+                                evicted.start,
+                                evicted.end,
+                                evicted.size,
+                                evicted.bin_path,
+                            )
+                        })
                         .collect();
 
                 // Write Remove journal entries for metadata cleanup
@@ -4809,6 +5727,7 @@ impl CacheManager {
                 bin_file_path,
                 meta_file_path: meta_path.to_path_buf(),
                 is_write_cached: new_metadata.object_metadata.is_write_cached,
+                staged: range_spec.staged,
             };
 
             candidates.push(candidate);
@@ -5050,21 +5969,68 @@ impl CacheManager {
     pub async fn get_cache_size_stats(&self) -> Result<CacheStatistics> {
         let mut stats = self.get_statistics();
 
+        // Total bytes on the shared volume, and the staged subset of it. Both are
+        // whole-cache figures; `read_cache_size` is derived from the pair below rather
+        // than assigned here, because it is defined as the difference.
+        let total_on_disk: u64;
+        let mut write_cache_size: u64 = 0;
+
         // Use consolidator for current disk cache size (single source of truth)
         // Read from shared disk file for multi-instance consistency
         if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
             let size_state = consolidator.get_size_state().await;
-            stats.read_cache_size = size_state.total_size;
-            stats.write_cache_size = size_state.write_cache_size;
+            total_on_disk = size_state.total_size;
+            write_cache_size = size_state.write_cache_size;
         } else {
             // Fallback to filesystem walk only if consolidator not initialized
             warn!("Consolidator not available, falling back to filesystem walk for cache stats");
-            stats.read_cache_size = self.calculate_disk_cache_size().await?;
+            total_on_disk = self.calculate_disk_cache_size().await?;
             // Write cache fallback
             if let Some(write_cache_manager) = self.write_cache_manager.read().await.as_ref() {
-                stats.write_cache_size = write_cache_manager.read().await.current_usage();
+                write_cache_size = write_cache_manager.read().await.current_usage();
             }
         }
+
+        // `read_cache_size` is the NON-staged remainder, so that it and
+        // `write_cache_size` are disjoint and `total_cache_size` is their exact sum.
+        //
+        // This is the relationship `SizeState::write_cache_size`'s own field doc states
+        // ("a subset of `total_size`, not an addition to it, so `read_cache_size` is
+        // `total_size - write_cache_size`") and that Requirement 6.4's clamp in
+        // `update_size_from_validation` exists to protect — that clamp's doc comment
+        // says an out-of-range staged figure is rejected precisely "because accepting it
+        // would make `read_cache_size = total_size - write_cache_size` underflow at every
+        // reporting site downstream". Until 2026-08-26 no reporting site performed the
+        // subtraction, so `read_cache_size` carried the whole-cache total under a name
+        // that said otherwise, and anything adding it to `write_cache_size` counted the
+        // staged bytes twice.
+        //
+        // Checked rather than `saturating_sub`, and WARN rather than silence: R6.4's
+        // clamp covers `update_size_from_validation`, but `atomic_update_size_delta`
+        // applies the two deltas independently and enforces no relationship between
+        // them, so `write_cache_size > total_size` is reachable on the delta path. It has
+        // been reached — the state this spec was opened for had `write_cache_size` at
+        // 16,922,745,347 bytes. Reporting 0 read bytes silently would hide an inverted
+        // accounting state behind a plausible number, which is the failure mode this
+        // spec keeps finding.
+        //
+        // Spec: write-cache-accounting-and-eviction. Requirements: 8.3, 6.4
+        let read_cache_size = match total_on_disk.checked_sub(write_cache_size) {
+            Some(non_staged) => non_staged,
+            None => {
+                warn!(
+                    "Cache size accounting inverted: write_cache_size ({}) exceeds \
+                     total_size ({}) by {} bytes, violating the Requirement 6.4 subset \
+                     invariant. Reporting read_cache_size=0. A validation scan will \
+                     re-ground both figures; if this persists, the accumulator delta \
+                     path has drifted.",
+                    write_cache_size,
+                    total_on_disk,
+                    write_cache_size - total_on_disk
+                );
+                0
+            }
+        };
 
         // Update with RAM cache size
         if self.ram_cache_enabled {
@@ -5074,9 +6040,28 @@ impl CacheManager {
             }
         }
 
-        // Update total cache size
-        stats.total_cache_size =
-            stats.read_cache_size + stats.write_cache_size + stats.ram_cache_size;
+        // `total_cache_size` is the bytes on the shared volume. With `read_cache_size`
+        // now the non-staged remainder, this is their exact sum:
+        //
+        //     total_cache_size == read_cache_size + write_cache_size
+        //
+        // a TRUE identity over two disjoint figures, which `T51k` asserts on the fleet.
+        //
+        // `ram_cache_size` is deliberately NOT part of it. It counts promoted COPIES of
+        // bytes already on disk plus per-entry overhead, so adding it would double-count;
+        // and it is per-instance where these two are fleet-wide, so including it made
+        // three proxies sharing one cache report three different "totals". Measured
+        // 2026-08-26, one instant, before that summand was dropped: the shared on-disk
+        // figure was identical at 20,767,307,686 on all three proxies while the reported
+        // totals were 20,801,829,502 / 20,955,894,211 / 21,049,285,813 — three answers
+        // for one cache, none of them its size. It is still exposed as its own gauge.
+        //
+        // Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+        stats.sizes = Some(CacheSizes {
+            total_cache_size: total_on_disk,
+            read_cache_size,
+            write_cache_size,
+        });
 
         Ok(stats)
     }
@@ -6107,7 +7092,10 @@ impl CacheManager {
         // Create lock directory if it doesn't exist
         if let Some(parent) = lock_file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create lock directory: {}", e))
+                ProxyError::CacheError(format!(
+                    "Failed to create lock directory: path={:?}, error={}",
+                    parent, e
+                ))
             })?;
         }
 
@@ -7979,6 +8967,7 @@ impl CacheManager {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         };
 
         // Store full object as range using new architecture
@@ -8386,124 +9375,6 @@ impl CacheManager {
             inner.statistics.ram_cache_hit_rate = ram_stats.hit_rate;
         }
     }
-    /// Store PUT request in write-through cache with compression - Requirement 10.1
-    pub async fn store_write_cache_entry(
-        &self,
-        cache_key: &str,
-        response_body: &[u8],
-        headers: HashMap<String, String>,
-        metadata: CacheMetadata,
-        response_headers: HashMap<String, String>,
-    ) -> Result<()> {
-        debug!(
-            "Storing write cache entry for key: {} using new range storage format",
-            cache_key
-        );
-
-        // Atomically reserve write cache capacity (Requirement 9.1, 9.2)
-        let entry_size = response_body.len() as u64;
-        let _reservation = match self.try_reserve_write_cache(entry_size).await {
-            Some(reservation) => reservation,
-            None => {
-                debug!(
-                    "Write cache cannot accommodate entry of size {} bytes for key: {}",
-                    entry_size, cache_key
-                );
-                return Ok(());
-            }
-        };
-
-        // Requirement 8.1: Invalidate any existing cached data before storing new PUT
-        // This handles conflicts where a new PUT overwrites existing cached data
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        if metadata_file_path.exists() {
-            debug!(
-                "Existing metadata found for key: {}, invalidating before PUT storage",
-                cache_key
-            );
-
-            // Read existing metadata to get range files to delete
-            if let Ok(Some(existing_metadata)) = self.get_metadata_from_disk(cache_key).await {
-                // Delete all associated range files
-                for range_spec in &existing_metadata.ranges {
-                    let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
-                    if range_file_path.exists() {
-                        match std::fs::remove_file(&range_file_path) {
-                            Ok(_) => {
-                                debug!(
-                                    "Deleted existing range file: key={}, range={}-{}, path={:?}",
-                                    cache_key, range_spec.start, range_spec.end, range_file_path
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to delete existing range file: key={}, path={:?}, error={}",
-                                    cache_key, range_file_path, e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Delete metadata file
-            match std::fs::remove_file(&metadata_file_path) {
-                Ok(_) => {
-                    info!(
-                        "Invalidated existing cache entry for key: {} before PUT storage, path={:?}",
-                        cache_key, metadata_file_path
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to delete existing metadata file: key={}, path={:?}, error={}",
-                        cache_key, metadata_file_path, e
-                    );
-                }
-            }
-        }
-
-        // Create ObjectMetadata for new range storage architecture
-        let content_length = response_body.len() as u64;
-        let object_metadata = crate::cache_types::ObjectMetadata {
-            etag: metadata.etag.clone(),
-            last_modified: metadata.last_modified.clone(),
-            content_length,
-            content_type: headers.get("content-type").cloned(),
-            upload_state: crate::cache_types::UploadState::Complete, // Mark as Complete for PUT
-            cumulative_size: content_length,
-            parts: Vec::new(),
-            response_headers,
-            ..Default::default()
-        };
-
-        // Store PUT body as range 0 to content_length-1 using new architecture
-        // This enables range request support for PUT-cached objects
-        self.store_full_object_as_range_new(cache_key, response_body, object_metadata)
-            .await?;
-
-        // Set expiration to PUT_TTL (resolve per-bucket override)
-        let now = SystemTime::now();
-        let resolved = self.resolve_settings(cache_key).await;
-        let expires_at = now + resolved.put_ttl;
-        self.update_metadata_expiration_new(cache_key, expires_at)
-            .await?;
-
-        // NOTE: Write cache size tracking is now handled by JournalConsolidator through journal entries.
-        // The journal entry contains is_write_cached flag and compressed_size for size delta calculation.
-
-        info!(
-            "Successfully stored write cache entry for key: {} ({} bytes) using range storage",
-            cache_key, content_length
-        );
-
-        // NOTE: PUT-cached objects are NOT stored in RAM cache (disk only)
-        // This is per Requirement 1.6
-
-        Ok(())
-    }
-
     /// Store PUT data directly as a single range with write cache metadata
     ///
     /// This method implements the write-through cache finalization design:
@@ -8571,6 +9442,13 @@ impl CacheManager {
         // held for the sink's lifetime, auto-releasing on drop — preserving the
         // buffered path's capacity accounting.
         let reservation = if content_length > 0 {
+            // R4.1: the Disk_Safety_Bound is the only bound that may decline caching.
+            // Checked before reserving so a declined upload never appears as in-flight.
+            // The upload itself is unaffected — the caller still streams the body to S3
+            // and returns S3's response unchanged.
+            if self.disk_safety_refusal(content_length).await.is_some() {
+                return Ok(());
+            }
             match self.try_reserve_write_cache(content_length).await {
                 Some(reservation) => Some(reservation),
                 None => {
@@ -8607,6 +9485,7 @@ impl CacheManager {
                 write_cache_expires_at: Some(now + effective_put_ttl),
                 write_cache_created_at: Some(now),
                 write_cache_last_accessed: Some(now),
+                graduation_accounted: false,
             };
 
             let metadata = NewCacheMetadata {
@@ -8619,7 +9498,26 @@ impl CacheManager {
                 ..Default::default()
             };
 
-            return self.store_new_metadata(&metadata).await;
+            // A re-PUT to an empty body still supersedes whatever `.meta` was here.
+            // This branch returns before the non-empty path's dereference block runs,
+            // so without this check a key that was staged non-empty and is then
+            // re-PUT as empty would never decrement — the increment below would be
+            // its second count while the first was never released.
+            // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+            let empty_put_metadata_path = self.get_new_metadata_file_path(cache_key);
+            let existing_was_staged = std::fs::read_to_string(&empty_put_metadata_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<NewCacheMetadata>(&content).ok())
+                .is_some_and(|existing| existing.object_metadata.is_write_cached);
+
+            let store_result = self.store_new_metadata(&metadata).await;
+            if store_result.is_ok() {
+                if existing_was_staged {
+                    self.decrement_write_cache_staged_entries().await;
+                }
+                self.increment_write_cache_staged_entries().await;
+            }
+            return store_result;
         }
 
         // Acquire write lock for concurrent operation safety
@@ -8631,23 +9529,42 @@ impl CacheManager {
             );
         }
 
-        // Check for existing cache entry and remove old ranges if needed
+        // Check for existing cache entry and remove old ranges if needed.
+        //
+        // The `.meta` written at the end of this function replaces `ranges` wholesale
+        // with the single new full-object range, so every range this entry currently
+        // references is about to be dereferenced — hence the unconditional removal.
+        // The debit is what was missing: without it this function deleted one copy of
+        // the bytes and then credited another, so each overwrite of a key added a
+        // phantom copy to `write_cache_size`. See `debit_removed_ranges`.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
         let metadata_file_path = self.get_new_metadata_file_path(cache_key);
         if metadata_file_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&metadata_file_path) {
                 if let Ok(existing_metadata) = serde_json::from_str::<NewCacheMetadata>(&content) {
-                    // Remove old range files
-                    for range_spec in &existing_metadata.ranges {
-                        let range_file_path =
-                            self.cache_dir.join("ranges").join(&range_spec.file_path);
-                        if range_file_path.exists() {
-                            if let Err(e) = std::fs::remove_file(&range_file_path) {
-                                warn!(
-                                    "Failed to remove old range file: cache_key={}, path={:?}, error={}",
-                                    cache_key, range_file_path, e
-                                );
-                            }
-                        }
+                    let (removed, failed) = self.remove_range_files(
+                        cache_key,
+                        &existing_metadata.ranges,
+                        existing_metadata.object_metadata.is_write_cached,
+                    );
+                    if failed > 0 {
+                        warn!(
+                            "Re-PUT range cleanup incomplete: cache_key={}, removed={}, failed={}; \
+                             the undeleted files are orphaned and are deliberately not debited",
+                            cache_key,
+                            removed.len(),
+                            failed
+                        );
+                    }
+                    self.debit_removed_ranges(cache_key, &removed).await;
+                    // The staged-entry gauge counts objects, not bytes: this re-PUT is
+                    // superseding whatever `.meta` was here, and if that entry was
+                    // still staged it must leave the gauge now, or the new entry's
+                    // increment below double-counts what is really one occupant of
+                    // the staging tier across the life of this key.
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+                    if existing_metadata.object_metadata.is_write_cached {
+                        self.decrement_write_cache_staged_entries().await;
                     }
                 }
             }
@@ -8699,8 +9616,8 @@ impl CacheManager {
         // sink retains the capacity reservation until it drops at the end of this
         // function — after the metadata write below — matching the buffered path's
         // reservation lifetime.
-        let range_spec = match sink.finalize() {
-            Ok(range_spec) => range_spec,
+        let (mut range_spec, range_already_existed) = match sink.finalize() {
+            Ok(pair) => pair,
             Err(e) => {
                 if lock_acquired {
                     let _ = self.release_write_lock(cache_key).await;
@@ -8731,7 +9648,25 @@ impl CacheManager {
             write_cache_expires_at: Some(now + effective_put_ttl),
             write_cache_created_at: Some(now),
             write_cache_last_accessed: Some(now),
+            graduation_accounted: false,
         };
+
+        // Record staging membership ON the range before the `.meta` is written, so
+        // the persisted range carries its own tier rather than having it re-derived
+        // from the object flag by every later reader (R12.2).
+        //
+        // Derived from `object_metadata.is_write_cached` rather than from the literal
+        // `true` set a few lines above, for the reason `credit_staged_range`'s own
+        // contract gives: a literal is correct today and stops being correct silently
+        // the moment this path is reached with the flag unset. It must be set BEFORE
+        // `store_new_metadata` below — the credit call at the end of this function
+        // happens after the `.meta` is already on disk, so recording it there would
+        // persist `None`.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+        range_spec.staged = Some(crate::cache_types::classify_new_range_as_staged(
+            &range_spec.file_path,
+            object_metadata.is_write_cached,
+        ));
 
         // Create cache metadata
         let metadata = NewCacheMetadata {
@@ -8761,6 +9696,20 @@ impl CacheManager {
             }
         }
 
+        if store_result.is_ok() {
+            // Same credit as the streaming path — this path has the identical hole and
+            // is NOT reached through `store_streamed_write_cache_metadata`, so fixing
+            // only that one would leave buffered write-through PUTs uncounted.
+            // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+            self.credit_staged_range(
+                cache_key,
+                &metadata.ranges[0],
+                metadata.object_metadata.is_write_cached,
+                range_already_existed,
+            )
+            .await;
+            self.increment_write_cache_staged_entries().await;
+        }
         store_result?;
 
         // Requirement 11.1: Log PUT cache operations with key, size, TTL
@@ -8792,6 +9741,14 @@ impl CacheManager {
         cache_key: &str,
         content_length: u64,
     ) -> Result<Option<WriteCacheRangeSink>> {
+        // R4.1: the Disk_Safety_Bound is the only bound that may decline caching. The
+        // Staging_Bound no longer refuses — going over it triggers asynchronous eviction
+        // instead (R3.1) — so this is the one check that can turn a cacheable upload into
+        // an uncached one. The upload still streams to S3 either way.
+        if self.disk_safety_refusal(content_length).await.is_some() {
+            return Ok(None);
+        }
+
         let reservation = match self.try_reserve_write_cache(content_length).await {
             Some(reservation) => reservation,
             None => {
@@ -8872,12 +9829,319 @@ impl CacheManager {
     /// journal-only `commit` defers the `.meta` until consolidation, which would
     /// turn that GET into a miss, so the streaming cache task uses `finalize` +
     /// this method instead of `commit`.
+    /// Credit the size accumulator for a range published by a write-cache PUT sink.
+    ///
+    /// # Why this exists at all
+    ///
+    /// Both single-PUT write-cache paths — the streaming one
+    /// (`signed_put_handler::run_streaming_cache_write`) and the buffered one
+    /// ([`Self::store_put_as_write_cached_range_with_ttl`]) — publish their `.bin`
+    /// through [`WriteCacheRangeSink::finalize`] and then write the `.meta`
+    /// **directly** via `store_new_metadata`, deliberately bypassing the journal so
+    /// an immediate post-PUT GET is a cache hit. That choice is correct for
+    /// read-after-write, and it silently removed both paths from every accounting
+    /// mechanism: `finalize_incremental_range` documents that it does no size
+    /// tracking, `store_new_metadata` writes no journal entry, and
+    /// `consolidate_key` hardcodes its own `size_delta` to 0 (crediting only
+    /// graduation's negative `write_cache_delta`). So nothing credited either
+    /// channel for a write-through PUT.
+    ///
+    /// Measured on the fleet 2026-08-25 before this fix: 1,594 accumulator flushes
+    /// since 2026-05-20, 1,566 of them `write_cache_delta=+0`, **9** positive
+    /// write-cache credits in total against **1,535** `committed write-cached range`
+    /// log lines. The 9 came from the paths that do journal (`CompleteMPU` and
+    /// `store_full_object_as_range_new`, both via
+    /// `JournalConsolidator::write_multipart_journal_entries`). The consequence was
+    /// not merely a wrong gauge: with R6 grounding `write_cache_size` from the
+    /// `.meta` files, the figure returned to ~0 and stayed there, so
+    /// `write_cache_percent` bounded nothing at all — while eviction and
+    /// invalidation kept debiting it, saturating at zero and pushing the accounting
+    /// toward undershoot, the direction that over-admits instead of refusing.
+    ///
+    /// # Contract
+    ///
+    /// Mirrors the two credit sites in `DiskCacheManager` (`store_range` and
+    /// `commit_incremental_range`) exactly, so all four agree:
+    ///
+    /// - `add_range` for the total, which dedups on `(key_hash, start, end)`.
+    /// - `add_write_cache` only when [`crate::cache_types::is_staged_range_spec`]
+    ///   holds for this range — i.e. the membership the range recorded when it was
+    ///   built, falling back to the **caller's own**
+    ///   `object_metadata.is_write_cached` rather than assumed. Both current callers
+    ///   set it to `true`, so passing a literal would be correct today and would
+    ///   quietly stop being correct the moment a third caller appears — and
+    ///   `add_write_cache` has no dedup of its own, so its correctness rests
+    ///   entirely on this guard.
+    /// - Both skipped when `range_already_existed`, because another instance on the
+    ///   shared volume had already published and credited that `.bin`.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+    pub(crate) async fn credit_staged_range(
+        &self,
+        cache_key: &str,
+        range_spec: &crate::cache_types::RangeSpec,
+        is_write_cached: bool,
+        range_already_existed: bool,
+    ) {
+        // Logged at INFO, not `debug!`, and deliberately so: every outcome of this
+        // function is otherwise invisible on a fleet running at the default level, and
+        // that is exactly what made the 2026-08-25 investigation stall. The credit was
+        // observed not to happen, the binary and the wiring were both verified correct,
+        // and the only remaining branch — this skip — could not be distinguished from
+        // "the function was never called" without redeploying at a raised log level.
+        // One line per write-through PUT is the same order of volume as the
+        // `SIZE_ACCUM flush` lines already emitted at INFO, and it makes the decision
+        // readable from the journal.
+        if range_already_existed {
+            info!(
+                "SIZE_ACCUM write-cache credit SKIPPED (range already existed on shared storage): \
+                 key={}, range={}-{}, size={}",
+                cache_key, range_spec.start, range_spec.end, range_spec.compressed_size
+            );
+            return;
+        }
+
+        let Some(consolidator) = self.journal_consolidator.read().await.clone() else {
+            warn!(
+                "Journal consolidator not wired: write-cache PUT of {} ({} bytes) will not be \
+                 counted in total_size or write_cache_size until the next full validation scan",
+                cache_key, range_spec.compressed_size
+            );
+            return;
+        };
+
+        consolidator.size_accumulator().add_range(
+            cache_key,
+            range_spec.start,
+            range_spec.end,
+            range_spec.compressed_size,
+        );
+        // Reads the membership its callers recorded on the range before writing the
+        // `.meta`, falling back to the object flag only for a range that predates the
+        // field. So the credit is charged against exactly the tier the persisted range
+        // claims, which is the invariant R12.5 states.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.3, 12.5
+        let staged = crate::cache_types::is_staged_range_spec(range_spec, is_write_cached);
+        if staged {
+            consolidator
+                .size_accumulator()
+                .add_write_cache(range_spec.compressed_size);
+            // Record the range in the Write_Ledger so staging eviction can find it
+            // without walking `metadata/`. Paired with the credit above deliberately:
+            // "a staged range was credited" and "a staged range exists" are the same
+            // event, and keeping the two calls adjacent is what makes the ledger's
+            // coverage checkable against the accounting. Requirements: 2.1
+            consolidator
+                .record_staged_range(
+                    cache_key,
+                    range_spec.start,
+                    range_spec.end,
+                    range_spec.compressed_size,
+                )
+                .await;
+        }
+        info!(
+            "SIZE_ACCUM write-cache credit APPLIED: key={}, range={}-{}, size={}, staged={}",
+            cache_key, range_spec.start, range_spec.end, range_spec.compressed_size, staged
+        );
+    }
+
+    /// Delete the `.bin` files backing `ranges`, returning only the ones that
+    /// **existed and were removed cleanly**.
+    ///
+    /// That filter is the whole point of returning a list rather than a count: it is
+    /// the only list [`Self::debit_removed_ranges`] may be built from. Debiting from
+    /// `metadata.ranges` instead would charge for files that were already gone —
+    /// R5.4's phantom debit, and the reason
+    /// `WriteCacheManager::evict_write_cached_object` collects `deleted_ranges` the
+    /// same way. Both re-PUT sites route through here so that filter cannot drift
+    /// apart between them.
+    ///
+    /// `is_write_cached` is the flag from the `.meta` **this call read**, not an
+    /// assumption about the caller — see `debit_removed_ranges` for why that
+    /// matters.
+    ///
+    /// Returns `(removed, failed)`. A file that was already absent counts as
+    /// neither: it is not an error, and it must not be debited.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+    fn remove_range_files(
+        &self,
+        cache_key: &str,
+        ranges: &[crate::cache_types::RangeSpec],
+        is_write_cached: bool,
+    ) -> (Vec<RemovedRange>, usize) {
+        let mut removed = Vec::new();
+        let mut failed = 0usize;
+
+        for range_spec in ranges {
+            let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
+            if !range_file_path.exists() {
+                debug!(
+                    "Range file already absent, nothing to remove or debit: cache_key={}, range={}-{}, path={:?}",
+                    cache_key, range_spec.start, range_spec.end, range_file_path
+                );
+                continue;
+            }
+            match std::fs::remove_file(&range_file_path) {
+                Ok(()) => removed.push(RemovedRange {
+                    start: range_spec.start,
+                    end: range_spec.end,
+                    compressed_size: range_spec.compressed_size,
+                    bin_path: range_file_path.to_string_lossy().to_string(),
+                    // Classified from the `.meta` this call read, against the same
+                    // shared predicate every add and subtract site uses — per range,
+                    // reading the membership the range itself recorded, so a re-PUT
+                    // that dereferences a mixed object debits only the ranges the
+                    // staging tier was charged for.
+                    // Requirements: 12.3, 12.4
+                    counts_as_staged: crate::cache_types::is_staged_range_spec(
+                        range_spec,
+                        is_write_cached,
+                    ),
+                }),
+                Err(e) => {
+                    failed += 1;
+                    warn!(
+                        "Failed to remove dereferenced range file: cache_key={}, range={}-{}, path={:?}, error={}",
+                        cache_key, range_spec.start, range_spec.end, range_file_path, e
+                    );
+                }
+            }
+        }
+
+        (removed, failed)
+    }
+
+    /// Debit both size channels for range files removed because the ranges they held
+    /// are no longer referenced by the object's metadata.
+    ///
+    /// # Why this exists
+    ///
+    /// The mirror image of [`Self::credit_staged_range`], and it was missing. Both
+    /// paths that replace an object's cached content —
+    /// [`Self::store_put_as_write_cached_range_with_ttl`] on a re-PUT and
+    /// [`Self::store_full_object_as_range_new`] when it supersedes partial ranges —
+    /// deleted the old `.bin` files and then credited the new one, with nothing in
+    /// between. One overwrite therefore left `write_cache_size` holding two copies of
+    /// an object the disk held once, and the inflation compounded per overwrite.
+    ///
+    /// Measured on 2026-08-25 by
+    /// `re_put_of_the_same_range_does_not_double_credit_write_cache`: a second PUT of
+    /// the same 64 KiB body took the write-cache delta from 287 to 574 — two credits
+    /// of the compressed size, zero debits. It had passed until then only because
+    /// each PUT minted a fresh `SizeAccumulator` (see [`JournalComponents`]), so the
+    /// second reading started from zero and looked like one copy of the bytes.
+    ///
+    /// # Contract
+    ///
+    /// Mirrors `WriteCacheManager::evict_write_cached_object` and read-tier
+    /// eviction's Step 5, so all the debit sites agree:
+    ///
+    /// - `subtract` unconditionally — the bytes left the disk either way.
+    /// - `subtract_write_cache` only where
+    ///   [`crate::cache_types::is_staged_range_spec`]
+    ///   held at delete time. This is also the guard against double-debiting a
+    ///   concurrent graduation: `refresh_write_cache_ttl` writes the flag-cleared
+    ///   `.meta` **before** appending its `Graduation` entry, so an entry that has
+    ///   graduated but not yet consolidated reads as unstaged here, this site debits
+    ///   `total_size` only, and the pending entry supplies the single
+    ///   `write_cache_size` debit. `graduation_accounted` is deliberately not
+    ///   consulted — it is the consolidator's token and no debit site reads it.
+    /// - `Remove` journal entries so the other instances converge, and so an
+    ///   unconsolidated `Add` for one of these ranges cannot resurrect a reference to
+    ///   a `.bin` that is gone.
+    /// - No `decrement_cached_objects`. Both callers overwrite the `.meta` rather than
+    ///   deleting it, so the object still exists; that debit belongs to eviction.
+    ///
+    /// # Why this does not flush the accumulator, when eviction does
+    ///
+    /// `evict_write_cached_object` flushes immediately, reasoning that the files are
+    /// already gone so an unflushed debit is lost outright on a crash. Deliberately
+    /// not copied here, for two reasons. These are PUT-path calls rather than a cold
+    /// eviction pass, so a delta file per overwrite is per-request shared-storage I/O.
+    /// More importantly the debit is **paired** with a credit a few lines later that
+    /// does not flush either: flushing one and not the other would make a crash window
+    /// that loses only the credit, biasing `write_cache_size` toward undershoot — the
+    /// direction that silently over-admits. Losing both together nets to zero, and the
+    /// periodic flush closes the window within `consolidation_interval` anyway.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+    async fn debit_removed_ranges(&self, cache_key: &str, removed: &[RemovedRange]) {
+        if removed.is_empty() {
+            return;
+        }
+
+        let Some(consolidator) = self.journal_consolidator.read().await.clone() else {
+            warn!(
+                "Journal consolidator not wired: {} dereferenced range(s) of {} were deleted but \
+                 will not be debited from total_size or write_cache_size until the next full \
+                 validation scan",
+                removed.len(),
+                cache_key
+            );
+            return;
+        };
+
+        let mut total_debited = 0u64;
+        let mut staged_debited = 0u64;
+        for range in removed {
+            // `subtract_range`, not `subtract`: the range's dedup entry has to go with
+            // its bytes, or the re-publish a few lines later is deduplicated away and
+            // the total ends up short by one copy instead of long by one. Measured —
+            // see the method's doc.
+            consolidator.size_accumulator().subtract_range(
+                cache_key,
+                range.start,
+                range.end,
+                range.compressed_size,
+            );
+            total_debited += range.compressed_size;
+            if range.counts_as_staged {
+                consolidator
+                    .size_accumulator()
+                    .subtract_write_cache(range.compressed_size);
+                staged_debited += range.compressed_size;
+            }
+        }
+
+        consolidator
+            .write_eviction_journal_entries(
+                removed
+                    .iter()
+                    .map(|range| {
+                        (
+                            cache_key.to_string(),
+                            range.start,
+                            range.end,
+                            range.compressed_size,
+                            range.bin_path.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
+
+        // At INFO for the same reason `credit_staged_range` logs its outcome at INFO:
+        // the credit and the debit are a pair, and a fleet that can read one but not
+        // the other cannot tell a missing debit from a double credit. That ambiguity is
+        // exactly what stalled the 2026-08-25 investigation.
+        info!(
+            "SIZE_ACCUM dereferenced-range debit APPLIED: key={}, ranges={}, total=-{}, write_cache=-{}",
+            cache_key,
+            removed.len(),
+            total_debited,
+            staged_debited
+        );
+    }
+
     pub(crate) async fn store_streamed_write_cache_metadata(
         &self,
         cache_key: &str,
-        range_spec: crate::cache_types::RangeSpec,
+        mut range_spec: crate::cache_types::RangeSpec,
         mut object_metadata: crate::cache_types::ObjectMetadata,
         effective_put_ttl: std::time::Duration,
+        range_already_existed: bool,
     ) -> Result<()> {
         use crate::cache_types::NewCacheMetadata;
 
@@ -8886,6 +10150,84 @@ impl CacheManager {
         // as the buffered path copies them off its `range_spec`.
         object_metadata.compression_algorithm = range_spec.compression_algorithm.clone();
         object_metadata.compressed_size = range_spec.compressed_size;
+
+        // Record staging membership on the range before the `.meta` is written, for
+        // the same reason and in the same way as the buffered path — this is the
+        // streaming twin of that site, and leaving it out would make the streaming
+        // write path the one that persists `None` and keeps re-deriving from the
+        // object flag.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+        range_spec.staged = Some(crate::cache_types::classify_new_range_as_staged(
+            &range_spec.file_path,
+            object_metadata.is_write_cached,
+        ));
+
+        // Dereference and debit the ranges this overwrite replaces.
+        //
+        // The `.meta` written below replaces `ranges` wholesale with the single new
+        // range, so anything the previous entry referenced is about to become
+        // unreachable. Without this the streaming path credited the new copy while
+        // leaving the old `.bin` on disk and still counted — the same inflation the
+        // buffered path (`store_put_as_write_cached_range_with_ttl`) was fixed for. The
+        // add side of both paths had "the identical hole" and both were fixed; the remove
+        // side was done on the buffered path only.
+        //
+        // ONE DIFFERENCE FROM THE BUFFERED PATH, and it is load-bearing: there, removal
+        // runs BEFORE the new `.bin` is written. Here `sink.finalize()` has ALREADY
+        // published it, so a straight copy of that block would delete the file this call
+        // is about to reference. Ranges are therefore filtered by `file_path` against the
+        // newly published range.
+        //
+        // That filter also explains why the same-length case needs no special handling:
+        // a `.bin` path is derived from key + offsets, so a same-length overwrite
+        // republishes the identical path, the filter excludes it, and nothing is removed
+        // or debited — which is correct, because `range_already_existed` suppresses the
+        // credit too, leaving exactly one counted copy. Only a LENGTH-CHANGING overwrite
+        // produces a genuinely different file to reclaim.
+        //
+        // As on the buffered path, a failure of the `.meta` write below leaves the old
+        // files deleted and the old `.meta` still referencing them; the read path repairs
+        // a missing `.bin` by refetching, and the alternative is permanently orphaned
+        // files.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
+        if metadata_file_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&metadata_file_path) {
+                if let Ok(existing_metadata) = serde_json::from_str::<NewCacheMetadata>(&content) {
+                    let superseded: Vec<crate::cache_types::RangeSpec> = existing_metadata
+                        .ranges
+                        .iter()
+                        .filter(|r| r.file_path != range_spec.file_path)
+                        .cloned()
+                        .collect();
+                    if !superseded.is_empty() {
+                        let (removed, failed) = self.remove_range_files(
+                            cache_key,
+                            &superseded,
+                            existing_metadata.object_metadata.is_write_cached,
+                        );
+                        if failed > 0 {
+                            warn!(
+                                "Streamed re-PUT range cleanup incomplete: cache_key={}, removed={}, failed={}; \
+                                 the undeleted files are orphaned and are deliberately not debited",
+                                cache_key,
+                                removed.len(),
+                                failed
+                            );
+                        }
+                        self.debit_removed_ranges(cache_key, &removed).await;
+                    }
+                    // Same object-count release as the buffered path's twin site: a
+                    // length-changing overwrite supersedes the whole previous entry,
+                    // and if it was staged the gauge must release it now rather than
+                    // double-count when this overwrite's own increment runs below.
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+                    if existing_metadata.object_metadata.is_write_cached {
+                        self.decrement_write_cache_staged_entries().await;
+                    }
+                }
+            }
+        }
 
         let now = SystemTime::now();
         let metadata = NewCacheMetadata {
@@ -8902,6 +10244,23 @@ impl CacheManager {
         // Invalidate RAM metadata cache so subsequent requests see the new PUT data,
         // mirroring `store_put_as_write_cached_range_with_ttl`.
         self.invalidate_metadata_cache(cache_key).await;
+        if store_result.is_ok() {
+            // Credit both size channels. Only on success: a failed `.meta` write means
+            // the object is not cached (the `.bin` is orphaned and reclaimed later), so
+            // crediting it would inflate both figures for bytes no reader can reach.
+            // Ordered after the write for the same reason `refresh_write_cache_ttl`
+            // journals after its `.meta` transition — the observable state leads, the
+            // accounting follows.
+            // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+            self.credit_staged_range(
+                cache_key,
+                &metadata.ranges[0],
+                metadata.object_metadata.is_write_cached,
+                range_already_existed,
+            )
+            .await;
+            self.increment_write_cache_staged_entries().await;
+        }
         store_result
     }
 
@@ -8986,62 +10345,56 @@ impl CacheManager {
                                     content_length,
                                 );
 
-                            // Only remove partial ranges if ETag has changed (object is different)
+                            // Reported, not branched on. It used to gate the removal
+                            // below, and the two arms had been transposed: the
+                            // `etag_changed` arm logged "invalidating N partial ranges"
+                            // and removed nothing, while the `!etag_changed` arm logged
+                            // "keeping N partial ranges" and removed them all. `git
+                            // blame` explains it — the removal loop predates the ETag
+                            // condition (1603206, 2025-11-26, where it was
+                            // unconditional) and the condition was retrofitted around it
+                            // (9cd5444, 2025-12-12) with the loop left under the wrong
+                            // arm.
+                            //
+                            // The condition is gone rather than corrected, because the
+                            // ETag cannot decide this: the `.meta` written at the end of
+                            // this function replaces `ranges` wholesale with the single
+                            // new full-object range, so these partial ranges are
+                            // dereferenced either way. Keeping their `.bin` files back
+                            // would orphan them on disk with nothing referencing them —
+                            // which is what the transposed `etag_changed` arm was doing
+                            // for every changed object.
                             let etag_changed =
                                 existing_metadata.object_metadata.etag != object_metadata.etag;
 
-                            if has_partial_ranges && etag_changed {
+                            if has_partial_ranges {
                                 info!(
-                                    "Full object caching: invalidating {} partial ranges for key: {}, old_etag={}, new_etag={}",
+                                    "Full object caching: superseding {} partial range(s) for key: {}, etag_changed={}, old_etag={}, new_etag={}",
                                     existing_metadata.ranges.len(),
                                     cache_key,
+                                    etag_changed,
                                     existing_metadata.object_metadata.etag,
                                     object_metadata.etag
                                 );
-                            } else if has_partial_ranges && !etag_changed {
-                                debug!(
-                                    "Full object caching: keeping {} partial ranges for key: {} (ETag unchanged: {})",
-                                    existing_metadata.ranges.len(),
-                                    cache_key,
-                                    object_metadata.etag
-                                );
 
-                                // Remove all existing range files atomically
-                                let mut removed_count = 0;
-                                let mut failed_count = 0;
-                                for range_spec in &existing_metadata.ranges {
-                                    let range_file_path =
-                                        self.cache_dir.join("ranges").join(&range_spec.file_path);
-                                    if range_file_path.exists() {
-                                        match std::fs::remove_file(&range_file_path) {
-                                            Ok(_) => {
-                                                removed_count += 1;
-                                                debug!(
-                                                    "Removed partial range file: key={}, range={}-{}, path={:?}",
-                                                    cache_key, range_spec.start, range_spec.end, range_file_path
-                                                );
-                                            }
-                                            Err(e) => {
-                                                failed_count += 1;
-                                                warn!(
-                                                    "Failed to remove partial range file: key={}, range={}-{}, path={:?}, error={}",
-                                                    cache_key, range_spec.start, range_spec.end, range_file_path, e
-                                                );
-                                                // Continue anyway - we'll overwrite metadata
-                                            }
-                                        }
-                                    } else {
-                                        removed_count += 1; // Count as removed since it's not there
-                                        debug!(
-                                            "Partial range file not found (already deleted?): key={}, range={}-{}, path={:?}",
-                                            cache_key, range_spec.start, range_spec.end, range_file_path
-                                        );
-                                    }
-                                }
+                                // Remove the dereferenced range files and debit for the
+                                // ones that really went. A file that was already absent
+                                // is neither removed nor debited — the old loop counted
+                                // it as removed, which inflated the figure it logged.
+                                // Spec: write-cache-accounting-and-eviction.
+                                // Requirements: 1.1, 6.2
+                                let (removed, failed) = self.remove_range_files(
+                                    cache_key,
+                                    &existing_metadata.ranges,
+                                    existing_metadata.object_metadata.is_write_cached,
+                                );
+                                self.debit_removed_ranges(cache_key, &removed).await;
 
                                 info!(
-                                    "Full object range replacement completed: key={}, removed_ranges={}, failed_removals={}, old_etag={}, new_etag={}",
-                                    cache_key, removed_count, failed_count, existing_metadata.object_metadata.etag, object_metadata.etag
+                                    "Full object range replacement completed: key={}, removed_ranges={}, failed_removals={}",
+                                    cache_key,
+                                    removed.len(),
+                                    failed
                                 );
                             } else if !existing_metadata.ranges.is_empty() {
                                 debug!(
@@ -9154,13 +10507,25 @@ impl CacheManager {
             .to_string_lossy()
             .to_string();
 
-        let range_spec = RangeSpec::new(
+        // The fourth `RangeSpec` producer, and a live write path, so R12.2 requires it
+        // to record membership explicitly rather than leaving `None` for a later
+        // reader to re-derive. It is the READ-tier producer — a full-object GET store —
+        // so on the ordinary path the recorded value is `Some(false)`, which is exactly
+        // the value that stops such a range being counted as staged when it is attached
+        // to an object whose flag is still set. Derived rather than hardcoded, because
+        // this function is also reachable with an already-flagged `object_metadata`.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+        let range_spec = RangeSpec::new_staged(
             start,
             end,
             range_file_relative_path.clone(),
             compression_algorithm,
             compressed_size,
             uncompressed_size,
+            crate::cache_types::classify_new_range_as_staged(
+                &range_file_relative_path,
+                object_metadata.is_write_cached,
+            ),
         );
 
         // Create metadata
@@ -9295,40 +10660,6 @@ impl CacheManager {
         Ok(())
     }
 
-    /// Update metadata expiration time for new range storage architecture
-    /// Requirements: 1.4
-    async fn update_metadata_expiration_new(
-        &self,
-        cache_key: &str,
-        expires_at: SystemTime,
-    ) -> Result<()> {
-        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-
-        if !metadata_file_path.exists() {
-            return Err(ProxyError::CacheError(format!(
-                "Metadata file does not exist for key: {}",
-                cache_key
-            )));
-        }
-
-        // Read current metadata
-        let metadata_content = std::fs::read_to_string(&metadata_file_path)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to read metadata: {}", e)))?;
-
-        let mut metadata =
-            serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content)
-                .map_err(|e| ProxyError::CacheError(format!("Failed to parse metadata: {}", e)))?;
-
-        // Update expiration time
-        metadata.expires_at = expires_at;
-
-        // Store updated metadata
-        self.store_new_metadata(&metadata).await?;
-
-        debug!("Updated metadata expiration for key: {}", cache_key);
-        Ok(())
-    }
-
     /// Refresh write cache TTL on GET access
     ///
     /// When a write-cached object is first accessed via GET, this method transitions
@@ -9338,37 +10669,94 @@ impl CacheManager {
     /// # Requirements (write-through-cache-finalization)
     /// - Requirement 1.4: When a cached PUT object is accessed via GET, transition the TTL
     /// - Requirement 5.2: When a write-cached object is accessed via GET, transition to read-cached
+    ///
+    /// # Accounting (R1) and return contract (R1.7)
+    ///
+    /// This function performs the graduation that `write_cache_size` accounting hangs
+    /// off. Before R1 it did the metadata half and made no accounting call at all, so
+    /// `write_cache_size` was credited on every write and never debited — it accumulated
+    /// every byte ever write-cached. That was the primary leak.
+    ///
+    /// The debit is **not** applied here. It is recorded as a `Graduation` journal entry
+    /// and applied by the consolidator under the per-key metadata lock, because it must
+    /// be exactly once fleet-wide (R1.2) and this `.meta` read-modify-write offers no
+    /// protection on NFS — two proxies can both observe the flag set and both clear it.
+    /// The metadata transition is harmlessly idempotent; a decrement is not.
+    ///
+    /// `total_size` is deliberately untouched: the bytes stay on disk and only change
+    /// tier.
+    ///
+    /// Return values are now distinguishable, which they were not before (every failure
+    /// path returned `Ok(false)`, identical to "this object was not write-cached"). With
+    /// accounting attached, a silent failure is a silent leak, so:
+    ///
+    /// - `Ok(true)` — graduated, and the accounting entry was written.
+    /// - `Ok(false)` — nothing to do: no `.meta`, or the object is not write-cached
+    ///   (the overwhelmingly common case, since this is called on every cached GET).
+    /// - `Err(_)` — the `.meta` could not be read, parsed, or written back, or the
+    ///   graduation could not be journaled. The caller logs it; see the two call sites
+    ///   in `http_proxy.rs`.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 1.2, 1.3, 1.7, 1.8
     pub async fn refresh_write_cache_ttl(&self, cache_key: &str) -> Result<bool> {
         let metadata_file_path = self.get_new_metadata_file_path(cache_key);
 
-        if !metadata_file_path.exists() {
-            debug!(
-                "No metadata file found for write cache TTL refresh: {}",
-                cache_key
-            );
-            return Ok(false);
-        }
-
-        // Read current metadata
-        let metadata_content = match std::fs::read_to_string(&metadata_file_path) {
-            Ok(content) => content,
-            Err(e) => {
-                warn!("Failed to read metadata for write cache TTL refresh: {}", e);
-                return Ok(false);
+        // R1.8: the read and parse run off the async worker. This function is awaited
+        // inline on the request task on the FIRST GET of every written object, and the
+        // read happens for every cached GET — including the common non-write-cached case
+        // that returns below — so on NFS/EFS it is a network round-trip on the hot path.
+        // Same `spawn_blocking`-around-a-blocking-helper shape as
+        // `get_metadata_classified`.
+        let path_for_read = metadata_file_path.clone();
+        let read_outcome = match tokio::task::spawn_blocking(move || {
+            if !path_for_read.exists() {
+                return Ok(None);
+            }
+            std::fs::read_to_string(&path_for_read).map(Some)
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(join_err) => {
+                return Err(ProxyError::CacheError(format!(
+                    "spawn_blocking JoinError reading metadata for write cache TTL refresh: cache_key={}, error={}",
+                    cache_key, join_err
+                )));
             }
         };
 
-        let mut metadata =
-            match serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!(
-                        "Failed to parse metadata for write cache TTL refresh: {}",
-                        e
-                    );
-                    return Ok(false);
-                }
-            };
+        let metadata_content = match read_outcome {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                debug!(
+                    "No metadata file found for write cache TTL refresh: {}",
+                    cache_key
+                );
+                return Ok(false);
+            }
+            Err(e) => {
+                return Err(ProxyError::CacheError(format!(
+                    "Failed to read metadata for write cache TTL refresh: cache_key={}, error={}",
+                    cache_key, e
+                )));
+            }
+        };
+
+        // Bound to a local first: inlining this into the `match` scrutinee puts a
+        // turbofished generic and a long literal in one expression, which rustfmt
+        // formats inconsistently between runs (`cargo fmt` and `cargo fmt --check`
+        // disagreed, so the gate could never go green).
+        let parsed =
+            serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content);
+        let mut metadata = match parsed {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(ProxyError::CacheError(format!(
+                    "Failed to parse metadata for write cache TTL refresh: key={}, error={}",
+                    cache_key, e
+                )));
+            }
+        };
 
         // Check if this is a write-cached object
         if !metadata.object_metadata.is_write_cached {
@@ -9379,6 +10767,13 @@ impl CacheManager {
             return Ok(false);
         }
 
+        // The bytes leaving the write tier, summed per range through the single shared
+        // staged-range predicate — the same figure the add sites credited, so the debit
+        // is symmetric. Must be read BEFORE the flag is cleared below, since the
+        // predicate consults it.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+        let staged_compressed_size = metadata.staged_compressed_size();
+
         // Transition from write-cached (PUT_TTL) to read-cached (GET_TTL)
         // This should only happen once when the object is first accessed via GET
         let now = SystemTime::now();
@@ -9387,17 +10782,91 @@ impl CacheManager {
         metadata.object_metadata.write_cache_created_at = None;
         metadata.object_metadata.write_cache_last_accessed = None;
 
+        // Record the tier change on every range, not just on the object.
+        //
+        // MUST happen after `staged_compressed_size` is read above — that predicate
+        // consults this field, so clearing first would compute a debit of zero and the
+        // graduation would account for nothing.
+        //
+        // Clearing the object flag alone is not enough, and this is the whole of task
+        // 76. `is_staged_range_parts` is `match staged { Some(s) => s, None =>
+        // classify(..) }`: a range left at `Some(true)` short-circuits the flag
+        // entirely, so it keeps reading as staged however many times it is
+        // re-classified. Every debit site's protection against double-debiting a
+        // graduation is the sentence "the `.meta` read here already reports the flag
+        // clear" — which is a statement about the `None` arm and silently does not
+        // apply to a recorded range. The result was the same bytes debited twice, once
+        // by the `Graduation` entry appended below and once by whichever debit site
+        // touched the ranges next, driving `write_cache_size` into undershoot. Since
+        // Phase F, ledger-driven staging eviction is the only Staging_Bound
+        // enforcement, so an undershooting figure reads as under bound and eviction
+        // stops running.
+        //
+        // `Some(false)` rather than `None`: `None` means "this range predates the
+        // field" and falls back to the object flag, which is the right answer only by
+        // coincidence here and would re-derive on every read. The graduated state is
+        // known for certain at this moment, which is exactly when R12.2 says to record
+        // it.
+        //
+        // Ranges under `mpus_in_progress/` are not special-cased. A completed object
+        // being graduated has no in-progress parts by definition — the multipart
+        // completion path rewrites those ranges to their final locations before the
+        // object is readable, so nothing reaching here holds one.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 1.2, 12.2, 12.3
+        for range in &mut metadata.ranges {
+            range.staged = Some(false);
+        }
+        // NOTE: `graduation_accounted` is deliberately NOT set here. It is the
+        // consolidator's exactly-once token and the consolidator is its only writer;
+        // setting it here would suppress the very decrement this graduation is recording.
+        // Whatever value was read is preserved by writing the whole struct back.
+
         // Transition to GET_TTL
         metadata.expires_at = safe_expiry(now, self.get_effective_get_ttl(cache_key).await);
 
-        // Store updated metadata
+        // R1.4: only the `.meta` is rewritten. No range file is moved, rewritten, or
+        // deleted by graduation — the bytes are already in the right place and only
+        // their tier changes.
         if let Err(e) = self.store_new_metadata(&metadata).await {
-            warn!(
-                "Failed to store updated metadata for write cache TTL refresh: {}",
-                e
-            );
-            return Ok(false);
+            return Err(ProxyError::CacheError(format!(
+                "Failed to store updated metadata for write cache TTL refresh: cache_key={}, error={}",
+                cache_key, e
+            )));
         }
+
+        // R1.1/1.2/1.3: record the decrement for the consolidator to apply under the
+        // global lock. Written AFTER the `.meta` transition, so a crash between the two
+        // leaves an entry that has graduated but not yet been debited — recoverable by
+        // the next full Validation_Scan. The reverse order would debit an entry that is
+        // still flagged staged, which the scan would then re-credit, oscillating.
+        match self.journal_consolidator.read().await.as_ref() {
+            Some(consolidator) => {
+                if !consolidator
+                    .write_graduation_journal_entry(cache_key, staged_compressed_size)
+                    .await
+                {
+                    return Err(ProxyError::CacheError(format!(
+                        "Graduated {} ({} staged bytes) but failed to journal the accounting; \
+                         write_cache_size stays inflated until the next full validation scan",
+                        cache_key, staged_compressed_size
+                    )));
+                }
+            }
+            None => {
+                warn!(
+                    "Graduated {} ({} staged bytes) with no journal consolidator wired: \
+                     write_cache_size will not be decremented",
+                    cache_key, staged_compressed_size
+                );
+            }
+        }
+
+        // Live staged-entry gauge: this entry just left the write tier. Paired with
+        // `graduations_total` so "the tier is draining" is observable rather than
+        // inferred from a flat gauge.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+        self.decrement_write_cache_staged_entries().await;
+        self.increment_write_cache_graduations().await;
 
         // Format expires_in in human-readable format
         let expires_in = metadata
@@ -9507,39 +10976,47 @@ impl CacheManager {
             cache_key, metadata.object_metadata.write_cache_expires_at
         );
 
-        // Delete all range files
-        for range_spec in &metadata.ranges {
-            let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
-            if range_file_path.exists() {
-                if let Err(e) = std::fs::remove_file(&range_file_path) {
-                    warn!(
-                        "Failed to remove expired write cache range file {:?}: {}",
-                        range_file_path, e
-                    );
-                } else {
-                    debug!(
-                        "Removed expired write cache range file: {:?}",
-                        range_file_path
-                    );
-                }
+        // Delete all range files and debit both size channels for what was actually
+        // removed. Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+        let (removed, _failed) = self.remove_range_files(
+            cache_key,
+            &metadata.ranges,
+            metadata.object_metadata.is_write_cached,
+        );
+        self.debit_removed_ranges(cache_key, &removed).await;
+
+        // Delete metadata file
+        let metadata_deleted = match std::fs::remove_file(&metadata_file_path) {
+            Ok(()) => {
+                debug!(
+                    "Removed expired write cache metadata file: {:?}",
+                    metadata_file_path
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to remove expired write cache metadata file {:?}: {}",
+                    metadata_file_path, e
+                );
+                false
+            }
+        };
+
+        // The `.meta` is gone, so the object no longer exists — decrement
+        // `cached_objects` so it converges with reality, mirroring
+        // `WriteCacheManager::evict_write_cached_object`'s `metadata_deleted` gate.
+        if metadata_deleted {
+            if let Some(consolidator) = self.journal_consolidator.read().await.clone() {
+                consolidator.decrement_cached_objects(1).await;
             }
         }
 
-        // Delete metadata file
-        if let Err(e) = std::fs::remove_file(&metadata_file_path) {
-            warn!(
-                "Failed to remove expired write cache metadata file {:?}: {}",
-                metadata_file_path, e
-            );
-        } else {
-            debug!(
-                "Removed expired write cache metadata file: {:?}",
-                metadata_file_path
-            );
-        }
-
-        // NOTE: Write cache size tracking is now handled by JournalConsolidator through journal entries.
-        // The Remove operation in the journal contains the size delta.
+        // The early return above guarantees `metadata.object_metadata.is_write_cached`
+        // was true to reach here, so this entry is unconditionally leaving the
+        // staging tier by lazy expiration rather than by graduation.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+        self.decrement_write_cache_staged_entries().await;
 
         Ok(true)
     }
@@ -9701,29 +11178,30 @@ impl CacheManager {
                         new_metadata.ranges.len()
                     );
 
-                    // Delete all range binary files
-                    for range_spec in &new_metadata.ranges {
-                        let range_file_path =
-                            self.cache_dir.join("ranges").join(&range_spec.file_path);
-                        if range_file_path.exists() {
-                            match std::fs::remove_file(&range_file_path) {
-                                Ok(_) => debug!("Removed range file: {:?}", range_file_path),
-                                Err(e) => warn!(
-                                    "Failed to remove range file {:?}: {}",
-                                    range_file_path, e
-                                ),
-                            }
-                        }
-                    }
+                    // Delete all range binary files and debit both size channels for
+                    // what was actually removed.
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+                    let (removed, _failed) = self.remove_range_files(
+                        cache_key,
+                        &new_metadata.ranges,
+                        new_metadata.object_metadata.is_write_cached,
+                    );
+                    self.debit_removed_ranges(cache_key, &removed).await;
 
                     // Delete metadata file
-                    match std::fs::remove_file(&new_metadata_file_path) {
-                        Ok(_) => debug!("Removed new metadata file: {:?}", new_metadata_file_path),
-                        Err(e) => warn!(
-                            "Failed to remove new metadata file {:?}: {}",
-                            new_metadata_file_path, e
-                        ),
-                    }
+                    let metadata_deleted = match std::fs::remove_file(&new_metadata_file_path) {
+                        Ok(_) => {
+                            debug!("Removed new metadata file: {:?}", new_metadata_file_path);
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to remove new metadata file {:?}: {}",
+                                new_metadata_file_path, e
+                            );
+                            false
+                        }
+                    };
 
                     // Delete lock file if it exists
                     let lock_file_path = new_metadata_file_path.with_extension("meta.lock");
@@ -9736,7 +11214,23 @@ impl CacheManager {
                         }
                     }
 
-                    // NOTE: Write cache size tracking is now handled by JournalConsolidator through journal entries.
+                    // The `.meta` is gone, so the object no longer exists — decrement
+                    // `cached_objects`, mirroring `evict_write_cached_object`'s
+                    // `metadata_deleted` gate.
+                    if metadata_deleted {
+                        if let Some(consolidator) = self.journal_consolidator.read().await.clone() {
+                            consolidator.decrement_cached_objects(1).await;
+                        }
+                    }
+
+                    // Unlike `check_and_invalidate_expired_write_cache`, this function
+                    // has no early `is_write_cached` guard — it is reachable for a
+                    // read-cached (already-graduated) entry too, which must not move
+                    // the gauge. Gate on the flag this call actually read.
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+                    if new_metadata.object_metadata.is_write_cached {
+                        self.decrement_write_cache_staged_entries().await;
+                    }
 
                     info!(
                         "Invalidated write cache entry with new architecture for key: {}",
@@ -10396,6 +11890,7 @@ impl CacheManager {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         };
 
         // Resolve per-bucket compression settings (Requirements 5.1, 5.2, 5.3)
@@ -11166,16 +12661,27 @@ impl WriteCacheRangeSink {
     /// after the metadata write — matching the buffered path's reservation
     /// lifetime. Once called, the writer is consumed; a later `commit`/`discard`
     /// would error / be a no-op, and `Drop` will not double-finalize.
-    pub(crate) fn finalize(&mut self) -> Result<crate::cache_types::RangeSpec> {
+    ///
+    /// Returns the `RangeSpec` **and whether the final `.bin` already existed**. The
+    /// second element is not decoration: both write-cache PUT paths must credit the
+    /// size accumulator themselves (this sink deliberately does not journal, so
+    /// nothing downstream credits for them — see
+    /// `CacheManager::credit_staged_range`), and crediting an overwrite would
+    /// double-count a range another instance already published on the shared volume.
+    /// `commit_incremental_range` gates its own credits on the same flag
+    /// (`disk_cache.rs`), so this keeps the two paths symmetric.
+    ///
+    /// It used to discard the flag, which is how the credit came to be missing
+    /// entirely: with nothing to gate, there was nothing to gate.
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+    pub(crate) fn finalize(&mut self) -> Result<(crate::cache_types::RangeSpec, bool)> {
         let writer = self.writer.take().ok_or_else(|| {
             ProxyError::CacheError(format!(
                 "WriteCacheRangeSink::finalize called after commit/discard/finalize: key={}",
                 self.cache_key
             ))
         })?;
-        let (range_spec, _range_already_existed) =
-            self.disk_cache.finalize_incremental_range(writer, None)?;
-        Ok(range_spec)
+        self.disk_cache.finalize_incremental_range(writer, None)
     }
 
     /// Finalize the range: flush any residual batch, validate the written length,
@@ -12248,6 +13754,7 @@ mod cache_key_sanitization_tests {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         };
 
         // Create range for part 1 (0-8388607)
@@ -12424,6 +13931,7 @@ mod cache_key_sanitization_tests {
                 write_cache_expires_at: None,
                 write_cache_created_at: None,
                 write_cache_last_accessed: None,
+                graduation_accounted: false,
             };
 
             // Get expected range from part_ranges
@@ -12661,6 +14169,7 @@ mod cache_key_sanitization_tests {
                 write_cache_expires_at: None,
                 write_cache_created_at: None,
                 write_cache_last_accessed: None,
+                graduation_accounted: false,
             };
 
             // Get expected range from part_ranges
@@ -15606,6 +17115,7 @@ mod range_tinylfu_sort_tests {
             bin_file_path: PathBuf::from(format!("ranges/{}.bin", cache_key)),
             meta_file_path: PathBuf::from(format!("metadata/{}.meta", cache_key)),
             is_write_cached: false,
+            staged: None,
         }
     }
 
@@ -16142,5 +17652,1683 @@ mod part_scoped_head_storage_tests {
             ..Default::default()
         };
         assert!(CacheManager::is_part_scoped_entry(&mixed_case));
+    }
+}
+
+/// Unit tests for [`CacheManager::credit_staged_range`], the credit site both
+/// single-PUT write-cache paths share.
+///
+/// These exist because the two production callers both hardcode
+/// `is_write_cached: true` when they build their `ObjectMetadata`, so the
+/// integration tests in `tests/write_cache_add_accounting_test.rs` cannot reach the
+/// `false` case at all. A credit site that ignored the staging flag entirely and
+/// always debited would pass every one of those tests. Driving this function
+/// directly is the only way to show the predicate is actually consulted — which is
+/// the "assert the predicate the code evaluates" discipline applied to a guard
+/// rather than to a measurement.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+#[cfg(test)]
+mod credit_staged_range_tests {
+    use super::*;
+
+    const RANGE_BYTES: u64 = 4096;
+
+    fn staged_range_spec() -> crate::cache_types::RangeSpec {
+        crate::cache_types::RangeSpec::new(
+            0,
+            RANGE_BYTES - 1,
+            "test-bucket/ab/cde/object.bin_0-4095.bin".to_string(),
+            crate::compression::CompressionAlgorithm::Lz4,
+            RANGE_BYTES,
+            RANGE_BYTES,
+        )
+    }
+
+    /// Build a manager with the consolidator wired, as `credit_staged_range`
+    /// requires to reach the accumulator.
+    fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            CacheEvictionAlgorithm::LRU,
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+    }
+
+    async fn deltas(manager: &CacheManager) -> (i64, i64) {
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let acc = consolidator.size_accumulator();
+        (acc.current_delta(), acc.current_write_cache_delta())
+    }
+
+    #[tokio::test]
+    async fn staged_range_credits_both_channels() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        manager
+            .credit_staged_range("test-bucket/object.bin", &staged_range_spec(), true, false)
+            .await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (RANGE_BYTES as i64, RANGE_BYTES as i64),
+            "a staged range must credit total_size AND write_cache_size by compressed_size"
+        );
+    }
+
+    #[tokio::test]
+    async fn unstaged_range_credits_total_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        // Same call, staging flag cleared. `file_path` is under `ranges/` rather than
+        // `mpus_in_progress/`, and `staged_range_spec()` leaves `staged` unrecorded,
+        // so `is_staged_range_spec` takes its fallback and turns entirely on the flag.
+        manager
+            .credit_staged_range("test-bucket/object.bin", &staged_range_spec(), false, false)
+            .await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (RANGE_BYTES as i64, 0),
+            "an unstaged range must credit total_size but NOT write_cache_size"
+        );
+    }
+
+    /// A multipart part staged under `mpus_in_progress/` counts as staged on its
+    /// path alone, even with the object flag clear — the other half of
+    /// `classify_new_range_as_staged`'s union, reached here through
+    /// `is_staged_range_spec`'s unrecorded-membership fallback. Without this, a change
+    /// that reduced the predicate to just the flag would pass the two tests above.
+    #[tokio::test]
+    async fn mpus_in_progress_path_counts_as_staged_regardless_of_flag() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        let mut spec = staged_range_spec();
+        spec.file_path = "mpus_in_progress/upload-1/part1.bin".to_string();
+
+        manager
+            .credit_staged_range("test-bucket/object.bin", &spec, false, false)
+            .await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (RANGE_BYTES as i64, RANGE_BYTES as i64),
+            "an mpus_in_progress/ path is staged by path, independent of is_write_cached"
+        );
+    }
+
+    /// The cross-instance over-count guard: nothing is credited when the `.bin` was
+    /// already on the shared volume, because whichever instance published it
+    /// credited it then.
+    #[tokio::test]
+    async fn already_existing_range_credits_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        manager
+            .credit_staged_range("test-bucket/object.bin", &staged_range_spec(), true, true)
+            .await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (0, 0),
+            "an already-published range must credit neither channel"
+        );
+    }
+}
+
+/// Tests that the journal system's three singletons stay singular.
+///
+/// `create_configured_disk_cache_manager` used to construct a fresh
+/// `JournalConsolidator`, `HybridMetadataWriter` and `CacheHitUpdateBuffer` on
+/// **every** call and install them over the `CacheManager` slots — and it is called
+/// once per request from four sites (`store_put_as_write_cached_range_with_ttl`,
+/// `open_write_cache_sink`, `open_multipart_part_sink`, and the part-scoped-GET store
+/// path). The background tasks in `main.rs` capture their `Arc`s once at startup and
+/// never re-read the slots, so from the first request onward the request path was
+/// crediting and buffering into instances nothing would ever drain.
+///
+/// Nothing in the crate expressed that, which is why it survived: the code compiled,
+/// clippy was clean, and 2,638 tests passed while the fleet lost 99.4% of its
+/// write-cache size credits. The existing `credit_staged_range_tests` could not catch
+/// it either — its `deltas()` helper re-reads the slot, so it follows the replacement
+/// instead of noticing it. Every test below therefore captures the `Arc` **before** a
+/// later factory call, exactly as `main.rs` does.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+#[cfg(test)]
+mod journal_components_identity_tests {
+    use super::*;
+
+    const RANGE_BYTES: u64 = 4096;
+    const KEY: &str = "test-bucket/object.bin";
+
+    fn new_manager(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            CacheEvictionAlgorithm::LRU,
+        )
+    }
+
+    fn staged_range_spec() -> crate::cache_types::RangeSpec {
+        crate::cache_types::RangeSpec::new(
+            0,
+            RANGE_BYTES - 1,
+            "test-bucket/ab/cde/object.bin_0-4095.bin".to_string(),
+            crate::compression::CompressionAlgorithm::Lz4,
+            RANGE_BYTES,
+            RANGE_BYTES,
+        )
+    }
+
+    /// The orphaning expressed directly, on all three components at once.
+    #[tokio::test]
+    async fn a_request_path_call_reuses_the_startup_components() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = new_manager(temp.path());
+
+        // The startup call — `HttpProxy::new` does this once.
+        let _startup = manager.create_configured_disk_cache_manager();
+        let consolidator_before = manager.get_journal_consolidator().await.unwrap();
+        let writer_before = manager.get_hybrid_metadata_writer().await.unwrap();
+        let buffer_before = manager.get_cache_hit_update_buffer().await.unwrap();
+
+        // A request-path call.
+        let _per_request = manager.create_configured_disk_cache_manager();
+
+        assert!(
+            Arc::ptr_eq(
+                &consolidator_before,
+                &manager.get_journal_consolidator().await.unwrap()
+            ),
+            "a request-path call replaced the JournalConsolidator; the accumulator the \
+             consolidation task flushes is now orphaned and every size credit is lost"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &writer_before,
+                &manager.get_hybrid_metadata_writer().await.unwrap()
+            ),
+            "a request-path call replaced the HybridMetadataWriter; its JournalManager \
+             carries the append_mutex that serializes writes to this instance's journal \
+             file, so a second one reintroduces the lost-update race that mutex exists \
+             to prevent"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &buffer_before,
+                &manager.get_cache_hit_update_buffer().await.unwrap()
+            ),
+            "a request-path call replaced the CacheHitUpdateBuffer; it holds pending \
+             updates in RAM with no Drop flush, so entries recorded through the \
+             replacement are dropped rather than journalled"
+        );
+    }
+
+    /// The accounting consequence, asserted on the accumulator the background task
+    /// actually flushes rather than on whichever one the slot currently names.
+    #[tokio::test]
+    async fn a_credit_after_a_request_path_call_reaches_the_background_accumulator() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = new_manager(temp.path());
+
+        let _startup = manager.create_configured_disk_cache_manager();
+        // What `main.rs` does: capture once, hold for the life of the process.
+        let background = manager.get_journal_consolidator().await.unwrap();
+
+        let _per_request = manager.create_configured_disk_cache_manager();
+        manager
+            .credit_staged_range(KEY, &staged_range_spec(), true, false)
+            .await;
+
+        let accumulator = background.size_accumulator();
+        assert_eq!(
+            (
+                accumulator.current_delta(),
+                accumulator.current_write_cache_delta()
+            ),
+            (RANGE_BYTES as i64, RANGE_BYTES as i64),
+            "the credit landed somewhere other than the accumulator the consolidation \
+             task holds, so it will never be written to a delta file"
+        );
+        // The load-bearing half: `run_consolidation_cycle` short-circuits as idle when
+        // this is false, so a credit invisible here is not merely late — it is never
+        // flushed at all.
+        assert!(
+            accumulator.has_pending_delta(),
+            "has_pending_delta() is false on the background accumulator, so the \
+             consolidation cycle will treat the instance as idle and skip the flush"
+        );
+    }
+
+    /// The correctness half, not just accounting: a cache-hit update recorded through
+    /// a per-request `DiskCacheManager` must land in the buffer the flush task drains.
+    /// Asserted on the monotonic `updates_recorded` counter rather than `buffer_len`,
+    /// so an interleaved flush cannot make it pass or fail for the wrong reason.
+    #[tokio::test]
+    async fn cache_hit_updates_after_a_request_path_call_reach_the_flushed_buffer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = new_manager(temp.path());
+
+        let _startup = manager.create_configured_disk_cache_manager();
+        let background = manager.get_cache_hit_update_buffer().await.unwrap();
+        assert_eq!(background.get_stats().await.updates_recorded, 0);
+
+        let per_request = manager.create_configured_disk_cache_manager();
+        per_request
+            .record_range_access(KEY, 0, RANGE_BYTES - 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            background.get_stats().await.updates_recorded,
+            1,
+            "the access update went into a CacheHitUpdateBuffer no task will flush, so \
+             the journal entry is lost when the per-request DiskCacheManager drops"
+        );
+    }
+
+    /// Concurrent first calls must agree on one set of components.
+    ///
+    /// This is not a duplicate of the test above — it rules out the obvious cheap fix.
+    /// A `if slot.is_none() { install }` guard makes the sequential test pass while
+    /// still letting two concurrent first-callers each construct a set and race to
+    /// install, which is the same defect at lower frequency. Constructing under a
+    /// `OnceLock` is what makes this hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_calls_agree_on_one_set_of_components() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(new_manager(temp.path()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            handles.push(tokio::spawn(async move {
+                let _disk_cache = manager.create_configured_disk_cache_manager();
+                manager.get_journal_consolidator().await.unwrap()
+            }));
+        }
+
+        let mut consolidators = Vec::new();
+        for handle in handles {
+            consolidators.push(handle.await.unwrap());
+        }
+
+        let first = &consolidators[0];
+        for (i, other) in consolidators.iter().enumerate().skip(1) {
+            assert!(
+                Arc::ptr_eq(first, other),
+                "concurrent caller {} observed a different JournalConsolidator; \
+                 construction is racing rather than happening once",
+                i
+            );
+        }
+    }
+}
+
+/// Unit tests for [`CacheManager::remove_range_files`] and
+/// [`CacheManager::debit_removed_ranges`] — the mirror image of
+/// `credit_staged_range_tests`, and deliberately laid out the same way so the two can
+/// be read side by side.
+///
+/// The credit side had these tests and the debit side did not exist at all, which is
+/// how a re-PUT came to credit twice and debit never. Driving the two functions
+/// directly is the only way to cover the unstaged case from the write-cache path,
+/// which hardcodes `is_write_cached: true`, and the only way to cover the
+/// already-absent `.bin` case without contriving a partially-deleted cache.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+#[cfg(test)]
+mod debit_removed_ranges_tests {
+    use super::*;
+
+    const RANGE_BYTES: u64 = 4096;
+    const KEY: &str = "test-bucket/object.bin";
+    const REL_PATH: &str = "test-bucket/ab/cde/object.bin_0-4095.bin";
+
+    fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            CacheEvictionAlgorithm::LRU,
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+    }
+
+    fn range_spec(rel_path: &str) -> crate::cache_types::RangeSpec {
+        crate::cache_types::RangeSpec::new(
+            0,
+            RANGE_BYTES - 1,
+            rel_path.to_string(),
+            crate::compression::CompressionAlgorithm::Lz4,
+            RANGE_BYTES,
+            RANGE_BYTES,
+        )
+    }
+
+    /// Materialise the `.bin` so `remove_range_files` has something to delete.
+    fn plant_bin(cache_dir: &std::path::Path, rel_path: &str) -> std::path::PathBuf {
+        let path = cache_dir.join("ranges").join(rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0u8; RANGE_BYTES as usize]).unwrap();
+        path
+    }
+
+    async fn deltas(manager: &CacheManager) -> (i64, i64) {
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let acc = consolidator.size_accumulator();
+        (acc.current_delta(), acc.current_write_cache_delta())
+    }
+
+    #[tokio::test]
+    async fn staged_range_debits_both_channels() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        let bin = plant_bin(temp.path(), REL_PATH);
+
+        let (removed, failed) = manager.remove_range_files(KEY, &[range_spec(REL_PATH)], true);
+        assert_eq!((removed.len(), failed), (1, 0));
+        assert!(!bin.exists(), "the .bin should be gone");
+
+        manager.debit_removed_ranges(KEY, &removed).await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
+            "a staged range must debit total_size AND write_cache_size by compressed_size"
+        );
+    }
+
+    /// The unstaged case, which the write-cache path cannot reach because it hardcodes
+    /// `is_write_cached: true`. A graduated entry reaches it in production: its `.meta`
+    /// reports the flag clear, so only `total_size` may be debited — its write-cache
+    /// bytes were already removed by its `Graduation` entry, and debiting them here
+    /// too would drive the figure into undershoot.
+    #[tokio::test]
+    async fn unstaged_range_debits_total_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        plant_bin(temp.path(), REL_PATH);
+
+        let (removed, _) = manager.remove_range_files(KEY, &[range_spec(REL_PATH)], false);
+        manager.debit_removed_ranges(KEY, &removed).await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (-(RANGE_BYTES as i64), 0),
+            "an unstaged range must debit total_size but NOT write_cache_size"
+        );
+    }
+
+    /// DESIGN TEST 17 (R12) — credit and debit agree per range, across a re-PUT.
+    ///
+    /// The mixed state: range A staged by a write-through PUT, range B credited to
+    /// `total_size` only by a later GET range-miss, and the object flag still set
+    /// because appending a range does not clear it. A re-PUT dereferences both and
+    /// routes them through `remove_range_files` + `debit_removed_ranges`.
+    ///
+    /// The property is that `write_cache_size` returns to **zero** — what was credited
+    /// (A) is what is debited. Under the object-level predicate the debit is A+B, so
+    /// the figure lands at `-B`: undershoot, the direction that silently over-admits.
+    ///
+    /// Covers the debit sites design test 15 does not reach. Test 15 asserts
+    /// `staged_compressed_size()`, which is the graduation and validation figure;
+    /// this drives the accumulator through the removal path instead, and the two
+    /// mis-classify independently.
+    ///
+    /// Note both ranges are passed to ONE `remove_range_files` call with a single
+    /// `is_write_cached: true`, which is how production reaches it — the flag comes
+    /// from the one `.meta` that was read, so it cannot distinguish the two ranges.
+    /// The recorded membership is the only thing that can, which is what makes this a
+    /// test of the recorded value rather than of the caller's argument.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 12.3, 12.4, 12.5
+    #[tokio::test]
+    async fn mixed_object_debits_only_what_the_staging_tier_was_credited() {
+        const A_PATH: &str = "test-bucket/ab/cde/object.bin_0-4095.bin";
+        const B_PATH: &str = "test-bucket/ab/cde/object.bin_4096-8191.bin";
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        plant_bin(temp.path(), A_PATH);
+        plant_bin(temp.path(), B_PATH);
+
+        let mut staged_a = range_spec(A_PATH);
+        staged_a.staged = Some(true);
+        let mut read_tier_b = range_spec(B_PATH);
+        read_tier_b.start = RANGE_BYTES;
+        read_tier_b.end = 2 * RANGE_BYTES - 1;
+        read_tier_b.staged = Some(false);
+
+        // What the credit sites put into write_cache_size: A only. B's store built a
+        // fresh ObjectMetadata from the S3 response, so it was credited to total_size.
+        let credited_to_staging = RANGE_BYTES;
+
+        // The object flag is still set, and is deliberately the SAME for both ranges.
+        let (removed, failed) = manager.remove_range_files(
+            KEY,
+            &[staged_a, read_tier_b],
+            /* is_write_cached */ true,
+        );
+        assert_eq!(
+            (removed.len(), failed),
+            (2, 0),
+            "fixture: both .bin files must have existed and been deleted, or the debit \
+             list is short for a reason unrelated to classification"
+        );
+
+        manager.debit_removed_ranges(KEY, &removed).await;
+
+        let (total_delta, write_cache_delta) = deltas(&manager).await;
+        assert_eq!(
+            total_delta,
+            -(2 * RANGE_BYTES as i64),
+            "both ranges left the disk, so total_size must debit both"
+        );
+        assert_eq!(
+            write_cache_delta,
+            -(credited_to_staging as i64),
+            "write_cache_size must debit only the range the staging tier was credited \
+             for. A debit of {} means the read-tier range was classified from the \
+             object flag, leaving the figure at -{} once the credit is netted off — \
+             undershoot, which silently over-admits rather than refusing",
+            2 * RANGE_BYTES,
+            RANGE_BYTES
+        );
+    }
+
+    /// The other half of `classify_new_range_as_staged`'s union, reached through
+    /// `is_staged_range_spec`'s unrecorded-membership fallback, so reducing the
+    /// predicate to just the flag would be caught here as it is on the credit side.
+    #[tokio::test]
+    async fn mpus_in_progress_path_counts_as_staged_regardless_of_flag() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        let rel = "mpus_in_progress/upload-1/part1.bin";
+        plant_bin(temp.path(), rel);
+
+        let (removed, _) = manager.remove_range_files(KEY, &[range_spec(rel)], false);
+        manager.debit_removed_ranges(KEY, &removed).await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
+            "an mpus_in_progress/ path is staged by path, independent of is_write_cached"
+        );
+    }
+
+    /// R5.4, the phantom debit. A `.meta` can name a range whose `.bin` is already
+    /// gone — an interrupted eviction, another instance's cleanup, a manual deletion.
+    /// Debiting for it would remove bytes from the figure that were never in it, and
+    /// because nothing re-credits them the error is permanent until a validation scan.
+    ///
+    /// This is why `remove_range_files` returns a filtered list rather than a count,
+    /// and it is the assertion that stops a future refactor from iterating
+    /// `metadata.ranges` directly.
+    #[tokio::test]
+    async fn absent_bin_file_is_neither_removed_nor_debited() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        // Deliberately do NOT plant the .bin.
+
+        let (removed, failed) = manager.remove_range_files(KEY, &[range_spec(REL_PATH)], true);
+        assert_eq!(
+            (removed.len(), failed),
+            (0, 0),
+            "an already-absent file is neither a removal nor a failure"
+        );
+
+        manager.debit_removed_ranges(KEY, &removed).await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (0, 0),
+            "no file went, so nothing may be debited"
+        );
+    }
+
+    /// A mixed batch debits exactly the subset that went. The absent range is the
+    /// second of three so that an off-by-one in the filter cannot pass by accident.
+    #[tokio::test]
+    async fn a_mixed_batch_debits_only_the_files_that_went() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        let specs: Vec<_> = ["a/one_0-4095.bin", "a/two_0-4095.bin", "a/three_0-4095.bin"]
+            .iter()
+            .map(|p| range_spec(p))
+            .collect();
+        plant_bin(temp.path(), "a/one_0-4095.bin");
+        plant_bin(temp.path(), "a/three_0-4095.bin");
+
+        let (removed, failed) = manager.remove_range_files(KEY, &specs, true);
+        assert_eq!((removed.len(), failed), (2, 0));
+
+        manager.debit_removed_ranges(KEY, &removed).await;
+
+        assert_eq!(
+            deltas(&manager).await,
+            (-2 * RANGE_BYTES as i64, -2 * RANGE_BYTES as i64),
+            "two of three files went, so exactly two ranges' bytes may be debited"
+        );
+    }
+
+    /// Debiting must release the dedup entry, or the re-publish that follows a re-PUT
+    /// is deduplicated away and the total ends up short instead of long. Expressed on
+    /// the accumulator directly so the ordering is unambiguous.
+    #[tokio::test]
+    async fn debit_releases_the_dedup_entry_so_the_republish_counts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        plant_bin(temp.path(), REL_PATH);
+
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let accumulator = consolidator.size_accumulator();
+
+        // The original credit, as a write-through PUT would have made it.
+        assert!(accumulator.add_range(KEY, 0, RANGE_BYTES - 1, RANGE_BYTES));
+
+        let (removed, _) = manager.remove_range_files(KEY, &[range_spec(REL_PATH)], true);
+        manager.debit_removed_ranges(KEY, &removed).await;
+
+        assert!(
+            accumulator.add_range(KEY, 0, RANGE_BYTES - 1, RANGE_BYTES),
+            "the debit must have released the dedup entry, so re-publishing the same \
+             range credits again — otherwise the total is left short by one copy"
+        );
+        assert_eq!(
+            accumulator.current_delta(),
+            RANGE_BYTES as i64,
+            "one copy on disk, one copy counted"
+        );
+    }
+}
+
+/// Tests that `store_full_object_as_range_new` removes and debits the partial ranges
+/// it supersedes, in **both** ETag cases.
+///
+/// Both cases matter because the removal used to sit under the wrong arm of an
+/// `if has_partial_ranges && etag_changed / else if has_partial_ranges &&
+/// !etag_changed` pair: the `etag_changed` arm logged "invalidating N partial ranges"
+/// and removed nothing, while the `!etag_changed` arm logged "keeping N partial
+/// ranges" and removed them all. `git blame` shows why — the removal loop predates the
+/// ETag condition (1603206, unconditional) and the condition was retrofitted around it
+/// (9cd5444) with the loop left in the wrong place.
+///
+/// So the `etag_changed` case is the one that was broken, and a test that only covered
+/// one case had a 50% chance of covering the working half. Both are asserted.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+#[cfg(test)]
+mod full_object_supersedes_partial_ranges_tests {
+    use super::*;
+
+    const PART_BYTES: u64 = 1024;
+    const OBJECT_BYTES: u64 = 4096;
+    const KEY: &str = "test-bucket/superseded.bin";
+
+    fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            CacheEvictionAlgorithm::LRU,
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+    }
+
+    /// Seed a `.meta` holding two partial ranges, with their `.bin` files present.
+    /// Partial is what puts the call into the superseding branch: `is_full_object_cached`
+    /// requires exactly one range spanning `0..content_length-1`.
+    fn seed_partial_entry(
+        manager: &CacheManager,
+        cache_dir: &std::path::Path,
+        etag: &str,
+    ) -> Vec<std::path::PathBuf> {
+        let mut bins = Vec::new();
+        let mut ranges = Vec::new();
+        for i in 0..2u64 {
+            let start = i * PART_BYTES;
+            let end = start + PART_BYTES - 1;
+            let rel = format!("test-bucket/ab/cde/superseded.bin_{}-{}.bin", start, end);
+            let path = cache_dir.join("ranges").join(&rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![7u8; PART_BYTES as usize]).unwrap();
+            bins.push(path);
+            ranges.push(crate::cache_types::RangeSpec::new(
+                start,
+                end,
+                rel,
+                crate::compression::CompressionAlgorithm::Lz4,
+                PART_BYTES,
+                PART_BYTES,
+            ));
+        }
+
+        let now = SystemTime::now();
+        let metadata = crate::cache_types::NewCacheMetadata {
+            cache_key: KEY.to_string(),
+            object_metadata: crate::cache_types::ObjectMetadata {
+                etag: etag.to_string(),
+                content_length: OBJECT_BYTES,
+                ..Default::default()
+            },
+            ranges,
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let meta_path = manager.get_new_metadata_file_path(KEY);
+        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        bins
+    }
+
+    /// The exact net delta the operation should produce: the two superseded parts
+    /// debited, the new full range credited.
+    ///
+    /// The credit is read back from the `.meta` rather than assumed, because
+    /// `compressed_size` depends on how well the body happens to compress — an
+    /// inequality that ignored it looked right and was wrong by exactly that amount
+    /// (the first version of these tests failed `-2002 <= -2048` for a 46-byte
+    /// compressed range). Reading it makes the assertion exact and pins the whole
+    /// operation's accounting instead of just its sign.
+    fn expected_net_delta(manager: &CacheManager) -> i64 {
+        let meta_path = manager.get_new_metadata_file_path(KEY);
+        let metadata: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(
+            metadata.ranges.len(),
+            1,
+            "the stored object should hold exactly the one new full range"
+        );
+        metadata.ranges[0].compressed_size as i64 - (2 * PART_BYTES) as i64
+    }
+
+    async fn store_full_object(manager: &CacheManager, etag: &str) {
+        let object_metadata = crate::cache_types::ObjectMetadata {
+            etag: etag.to_string(),
+            content_length: OBJECT_BYTES,
+            cumulative_size: OBJECT_BYTES,
+            ..Default::default()
+        };
+        manager
+            .store_full_object_as_range_new(KEY, &vec![3u8; OBJECT_BYTES as usize], object_metadata)
+            .await
+            .expect("full-object store should succeed");
+    }
+
+    /// The case that was broken: a changed ETag. Pre-fix this arm logged
+    /// "invalidating" and removed nothing, leaving both `.bin` files orphaned on disk
+    /// with no metadata referencing them and no debit for their bytes.
+    #[tokio::test]
+    async fn changed_etag_removes_and_debits_the_superseded_ranges() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        let bins = seed_partial_entry(&manager, temp.path(), "\"old-etag\"");
+
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let before = consolidator.size_accumulator().current_delta();
+
+        store_full_object(&manager, "\"new-etag\"").await;
+
+        for bin in &bins {
+            assert!(
+                !bin.exists(),
+                "a superseded partial range must not be left on disk: {:?}",
+                bin
+            );
+        }
+        let after = consolidator.size_accumulator().current_delta();
+        assert_eq!(
+            after - before,
+            expected_net_delta(&manager),
+            "the superseded ranges must be debited and the new range credited, exactly"
+        );
+    }
+
+    /// The case that happened to work. Kept so a future change cannot fix one arm and
+    /// break the other, which is exactly how the transposition survived.
+    #[tokio::test]
+    async fn unchanged_etag_removes_and_debits_the_superseded_ranges() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        let bins = seed_partial_entry(&manager, temp.path(), "\"same-etag\"");
+
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let before = consolidator.size_accumulator().current_delta();
+
+        store_full_object(&manager, "\"same-etag\"").await;
+
+        for bin in &bins {
+            assert!(
+                !bin.exists(),
+                "a superseded partial range must not be left on disk: {:?}",
+                bin
+            );
+        }
+        let after = consolidator.size_accumulator().current_delta();
+        assert_eq!(
+            after - before,
+            expected_net_delta(&manager),
+            "the superseded ranges must be debited and the new range credited, exactly"
+        );
+    }
+}
+
+/// Unit tests for [`CacheManager::check_and_invalidate_expired_write_cache`] and
+/// [`CacheManager::invalidate_write_cache_entry`] — the last two undebited delete
+/// sites from `.kiro/specs/cache-eviction-at-scale/` R7.1. Both delete `.bin` range
+/// files and the `.meta` with no debit and no journal entry before this fix, so a
+/// lazy expiration or an explicit/eviction invalidation freed disk space without ever
+/// relieving `total_size` or `write_cache_size` — the same shape as the R1/R5 leaks
+/// this spec exists to close, just reached from different callers.
+///
+/// Both now route through [`CacheManager::remove_range_files`] and
+/// [`CacheManager::debit_removed_ranges`], exactly as task 47's two sites do, and —
+/// unlike those two — both delete the `.meta`, so both also call
+/// `JournalConsolidator::decrement_cached_objects(1)`, mirroring
+/// `WriteCacheManager::evict_write_cached_object`'s `metadata_deleted` gate.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+#[cfg(test)]
+mod undebited_write_cache_invalidation_tests {
+    use super::*;
+    use crate::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
+
+    const RANGE_BYTES: u64 = 4096;
+    const KEY: &str = "test-bucket/expiring-object.bin";
+
+    fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            CacheEvictionAlgorithm::LRU,
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+    }
+
+    async fn deltas(manager: &CacheManager) -> (i64, i64) {
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let acc = consolidator.size_accumulator();
+        (acc.current_delta(), acc.current_write_cache_delta())
+    }
+
+    async fn cached_objects(manager: &CacheManager) -> u64 {
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        consolidator.load_size_state().await.unwrap().cached_objects
+    }
+
+    /// Plant a staged (`is_write_cached: true`) `.meta` + `.bin`, already expired, and
+    /// seed `cached_objects` to 1 so the decrement is observable.
+    async fn plant_expired_staged_entry(manager: &CacheManager, cache_dir: &std::path::Path) {
+        let rel_path = format!("{}_0-{}.bin", KEY.replace('/', "_"), RANGE_BYTES - 1);
+        let bin_path = cache_dir.join("ranges").join(&rel_path);
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, vec![0u8; RANGE_BYTES as usize]).unwrap();
+
+        let now = SystemTime::now();
+        let range_spec = RangeSpec::new(
+            0,
+            RANGE_BYTES - 1,
+            rel_path,
+            crate::compression::CompressionAlgorithm::Lz4,
+            RANGE_BYTES,
+            RANGE_BYTES,
+        );
+        let metadata = NewCacheMetadata {
+            cache_key: KEY.to_string(),
+            object_metadata: ObjectMetadata {
+                is_write_cached: true,
+                content_length: RANGE_BYTES,
+                write_cache_expires_at: Some(now - Duration::from_secs(60)),
+                write_cache_created_at: Some(now - Duration::from_secs(3600)),
+                ..Default::default()
+            },
+            ranges: vec![range_spec],
+            created_at: now - Duration::from_secs(3600),
+            expires_at: now + Duration::from_secs(3600),
+            ..Default::default()
+        };
+
+        let meta_path = manager.get_new_metadata_file_path(KEY);
+        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        // Seed cached_objects=1 so the decrement this fix adds is observable.
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.cached_objects = 1;
+        consolidator.persist_size_state(&state).await.unwrap();
+    }
+
+    /// Shown failing first: without the fix, both deltas stay (0, 0) and
+    /// `cached_objects` stays 1 after a lazy expiration that genuinely deleted the
+    /// `.bin` and the `.meta`.
+    #[tokio::test]
+    async fn lazy_expiration_debits_both_channels_and_decrements_cached_objects() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        plant_expired_staged_entry(&manager, temp.path()).await;
+
+        let invalidated = manager
+            .check_and_invalidate_expired_write_cache(KEY)
+            .await
+            .unwrap();
+        assert!(invalidated, "an expired staged entry must be invalidated");
+
+        assert_eq!(
+            deltas(&manager).await,
+            (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
+            "lazy expiration must debit both total_size and write_cache_size"
+        );
+        assert_eq!(
+            cached_objects(&manager).await,
+            0,
+            "the .meta is gone, so cached_objects must decrement"
+        );
+    }
+
+    /// Same fixture, driven through `invalidate_write_cache_entry` (the explicit /
+    /// eviction / cleanup path) instead of the lazy-expiration check.
+    #[tokio::test]
+    async fn explicit_invalidation_debits_both_channels_and_decrements_cached_objects() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        plant_expired_staged_entry(&manager, temp.path()).await;
+
+        manager.invalidate_write_cache_entry(KEY).await.unwrap();
+
+        assert_eq!(
+            deltas(&manager).await,
+            (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
+            "explicit invalidation must debit both total_size and write_cache_size"
+        );
+        assert_eq!(
+            cached_objects(&manager).await,
+            0,
+            "the .meta is gone, so cached_objects must decrement"
+        );
+    }
+}
+
+/// Graduation must clear the per-range staging membership, not only the object flag.
+///
+/// # The defect (task 76)
+///
+/// Found 2026-08-27 by the AWS Security Agent diff scan of `src/` against 2.6.3.
+/// `refresh_write_cache_ttl` cleared `ObjectMetadata.is_write_cached` and journalled a
+/// `Graduation` entry debiting `write_cache_size`, but left every
+/// `RangeSpec.staged` at the `Some(true)` the write paths stamped on it (R12.2).
+///
+/// `is_staged_range_parts` is `match staged { Some(s) => s, None => classify(..) }`, and
+/// its contract is that recorded membership is never second-guessed — correct for the
+/// `Some(false)`-on-a-flagged-object defect R12 was opened for, and wrong here. Every
+/// debit site's anti-double-debit reasoning ("the `.meta` read here already reports the
+/// flag clear, so this site debits `total_size` only") describes the `None` arm and
+/// silently did not apply to a graduated object. So the same staged bytes were debited
+/// twice — once by the `Graduation` entry, once by whichever debit site touched the
+/// ranges next — driving `write_cache_size` toward **undershoot**, the direction that
+/// silently over-admits rather than refusing. The Validation_Scan then re-credited them
+/// via `staged_compressed_size`, so the two mechanisms oscillated.
+///
+/// All three debit sites are production-reachable. `evict_write_cached_object`'s doc
+/// claimed otherwise, from task 8's state; Phase E reintroduced a caller
+/// (`evict_staging_tier_locked` → `evict_staged_object`), and that comment is corrected
+/// in the same change as this fix.
+///
+/// # Why no existing test caught it
+///
+/// `unstaged_range_debits_total_only` in `debit_removed_ranges_tests` is the control
+/// that pins the debit as conditional, and its comment describes this exact case. Its
+/// fixture seeds an object that was **never staged**, so it lands on the `None` arm and
+/// passes without ever constructing the state it describes. `staged_range_predicate_test.rs`
+/// covers `Some(true)`+flag-set, `Some(false)`+flag-set, `None`+flag and the mixed
+/// object — every combination except `Some(true)`+flag-**cleared**, which is the
+/// post-graduation state and the only one that matters here.
+///
+/// # Shown failing first
+///
+/// Against the pre-fix code the first test reds at `left: Some(true), right: Some(false)`
+/// on the range's recorded membership, and the second reds at
+/// `left: -4096, right: 0` on the write-cache delta — the double-debit, in the units the
+/// defect is measured in.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.2, 12.3, 12.4, 12.5
+#[cfg(test)]
+mod graduation_clears_staged_membership_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const BODY_LEN: usize = 4096;
+
+    /// Same shape as `staged_entries_lifecycle_tests::setup` and for the same reason:
+    /// `write_cache_enabled: true` at construction, then `initialize()`, so the write
+    /// path and the graduation path are both wired.
+    async fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_shared_storage(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            10 * 1024 * 1024 * 1024,
+            CacheEvictionAlgorithm::LRU,
+            1024,
+            true,
+            std::time::Duration::from_secs(315360000),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            64,
+            std::time::Duration::from_secs(5),
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+            .initialize()
+            .await
+            .expect("initialize() must populate write_cache_manager");
+        manager
+    }
+
+    async fn put_write_cached(manager: &CacheManager, cache_key: &str, body: &[u8]) {
+        manager
+            .store_put_as_write_cached_range_with_ttl(
+                cache_key,
+                body,
+                "\"graduation-staged-test\"".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                Some("application/octet-stream".to_string()),
+                HashMap::new(),
+                Duration::from_secs(86_400),
+            )
+            .await
+            .expect("write-cache store should succeed");
+    }
+
+    /// Read the `.meta` straight off disk. Deliberately not through a cache-manager
+    /// accessor: the assertion is about what graduation **persisted**, so a RAM
+    /// metadata copy would be the wrong source.
+    fn read_meta(manager: &CacheManager, cache_key: &str) -> crate::cache_types::NewCacheMetadata {
+        let path = manager.get_new_metadata_file_path(cache_key);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("fixture: .meta must exist at {:?}: {}", path, e));
+        serde_json::from_str(&content).expect("fixture: .meta must parse")
+    }
+
+    /// The direct assertion: after graduation every range records `Some(false)`.
+    ///
+    /// The pre-state is asserted too, so a fixture that never staged anything cannot
+    /// pass this vacuously — which is precisely how the existing control test came to
+    /// describe this case without exercising it.
+    #[tokio::test]
+    async fn graduation_records_every_range_as_unstaged() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let cache_key = "test-bucket/graduation-staged-membership.bin";
+        let body = vec![7u8; BODY_LEN];
+
+        put_write_cached(&manager, cache_key, &body).await;
+
+        let before = read_meta(&manager, cache_key);
+        assert!(
+            before.object_metadata.is_write_cached,
+            "fixture: the object must be staged before graduation"
+        );
+        assert!(
+            !before.ranges.is_empty(),
+            "fixture: the write path must have recorded at least one range"
+        );
+        assert!(
+            before.ranges.iter().all(|r| r.staged == Some(true)),
+            "fixture: R12.2 requires every live write path to stamp Some(true); got {:?}. \
+             Without this the test below cannot distinguish the fix from the defect",
+            before.ranges.iter().map(|r| r.staged).collect::<Vec<_>>()
+        );
+        let staged_before = before.staged_compressed_size();
+        assert!(
+            staged_before > 0,
+            "fixture: the staged figure must be non-zero, or the debit under test is zero"
+        );
+
+        let graduated = manager
+            .refresh_write_cache_ttl(cache_key)
+            .await
+            .expect("graduation call should succeed");
+        assert!(graduated, "the staged entry must actually graduate");
+
+        let after = read_meta(&manager, cache_key);
+        assert!(
+            !after.object_metadata.is_write_cached,
+            "graduation must clear the object flag"
+        );
+        for range in &after.ranges {
+            assert_eq!(
+                range.staged,
+                Some(false),
+                "graduation must record each range as unstaged. A range left at \
+                 Some(true) short-circuits the object flag in is_staged_range_parts, \
+                 so every later debit site subtracts these bytes again — the \
+                 Graduation entry already debited them"
+            );
+        }
+        assert_eq!(
+            after.staged_compressed_size(),
+            0,
+            "a graduated object holds no staged bytes, so the validation scan must \
+             not re-credit write_cache_size for it"
+        );
+    }
+
+    /// The consequence at the debit site: a graduated object's ranges must classify as
+    /// **unstaged**, so nothing debits `write_cache_size` a second time.
+    ///
+    /// This is the reachable half. Read-tier eviction Step 5 and
+    /// `debit_removed_ranges` both classify per range from the `.meta` they read, so a
+    /// graduated object reaching either of them is ordinary steady-state behaviour
+    /// rather than a corner case.
+    ///
+    /// # Why this asserts `counts_as_staged` and not the accumulator delta
+    ///
+    /// The first version of this test read `current_write_cache_delta()` either side of
+    /// the removal, which looked like the more direct measurement and is not usable.
+    /// `SizeAccumulator::flush` **swaps both channels to zero**, and a background
+    /// consolidation cycle can flush inside the measurement window — observed here,
+    /// reading `total 46->0 wc 46->0` on a run where the classification was already
+    /// correct. The `total` arm then "passed" only because a flush to zero from 46
+    /// happens to equal the -46 the assertion wanted, which is a false green sitting
+    /// next to a false red.
+    ///
+    /// `counts_as_staged` is the field `debit_removed_ranges` actually branches on
+    /// (`if range.counts_as_staged { subtract_write_cache(..) }`), so asserting it tests
+    /// the gate rather than a figure that is only correlated with it. It is also
+    /// immune to concurrent flushes, because it is computed per call rather than
+    /// accumulated. The `Graduation` entry's own debit is applied by the consolidator
+    /// under the per-key lock, not by this accumulator, so no local reading could have
+    /// shown the two debits together anyway.
+    #[tokio::test]
+    async fn a_graduated_objects_ranges_do_not_debit_write_cache_again() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let cache_key = "test-bucket/graduation-no-double-debit.bin";
+        let body = vec![3u8; BODY_LEN];
+
+        put_write_cached(&manager, cache_key, &body).await;
+        assert!(
+            manager
+                .refresh_write_cache_ttl(cache_key)
+                .await
+                .expect("graduation call should succeed"),
+            "fixture: the entry must graduate, or this tests the staged path instead"
+        );
+
+        let meta = read_meta(&manager, cache_key);
+        assert!(
+            !meta.object_metadata.is_write_cached,
+            "fixture: post-graduation the flag must be clear"
+        );
+
+        // The flag comes from the `.meta` this call read, exactly as production does
+        // it — cleared, because the object graduated.
+        let (removed, failed) = manager.remove_range_files(
+            cache_key,
+            &meta.ranges,
+            meta.object_metadata.is_write_cached,
+        );
+        assert_eq!(
+            (removed.len(), failed),
+            (meta.ranges.len(), 0),
+            "fixture: every .bin must have existed and been deleted, or the debit list \
+             is short for a reason unrelated to classification"
+        );
+        let removed_bytes: u64 = removed.iter().map(|r| r.compressed_size).sum();
+        assert!(
+            removed_bytes > 0,
+            "fixture: the removal must cover a non-zero number of bytes, or the debit \
+             under test is zero whatever the classification says"
+        );
+
+        for range in &removed {
+            assert!(
+                !range.counts_as_staged,
+                "a graduated object's range must NOT count as staged at the debit site. \
+                 `debit_removed_ranges` branches on exactly this field, so a `true` here \
+                 subtracts {} bytes from write_cache_size that the Graduation entry \
+                 already subtracted — undershoot, and since Phase F ledger-driven \
+                 eviction is the only Staging_Bound enforcement, an undershooting \
+                 figure reads as under bound and eviction never runs",
+                range.compressed_size
+            );
+        }
+
+        // Runs for its side effects: with every range unstaged this must debit
+        // `total_size` alone. Asserting the resulting figure is deliberately avoided —
+        // see the note on this test for why the accumulator delta is not a sound
+        // instrument across a concurrent flush.
+        manager.debit_removed_ranges(cache_key, &removed).await;
+    }
+}
+
+/// `write_cache.staged_entries` must count entries **entering and leaving** the
+/// staging tier, not entering and graduating.
+///
+/// # The defect
+///
+/// `decrement_write_cache_staged_entries` had exactly one caller,
+/// `refresh_write_cache_ttl` (graduation). So an entry leaving the tier any other
+/// way — a re-PUT that supersedes it, an eviction, an explicit or lazy-expiry
+/// invalidation — was never subtracted: the re-PUT case incremented again while the
+/// superseded entry's own increment was never released, and the other three left a
+/// `.meta` and its `.bin` deleted with the gauge unmoved. The gauge therefore
+/// drifted upward monotonically on any workload that overwrites or evicts, which is
+/// exactly the behaviour observed on the fleet (task 44's record: `staged_entries`
+/// incrementing 4 → 5 on a re-PUT of the *same* key, where the object count did not
+/// change).
+///
+/// It is a `/metrics` observability gauge feeding no admission or eviction decision
+/// (`write_cache_manager.rs:144` says so explicitly), so this is deliberately its
+/// own task rather than bundled with the R12 (per-range membership) work that found
+/// it — landing it inside that commit would make a later failure unattributable.
+///
+/// # Shown failing first
+///
+/// Both tests below assert on `CacheManager::get_write_cache_manager_gauges().await`,
+/// whose second element is `staged_entries`. Against the pre-fix code (the
+/// decrement calls removed from the re-PUT and invalidation sites) the first test
+/// reads `staged_entries == 2` where it must be `1`, and the second reads `1` where
+/// it must be `0` — the exact drift signature.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+#[cfg(test)]
+mod staged_entries_lifecycle_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const BODY_LEN: usize = 4096;
+
+    /// `write_cache_enabled: true` is essential here — `get_write_cache_manager_gauges`
+    /// reads `self.write_cache_manager`, which `CacheManager::initialize()` only
+    /// populates when write caching is enabled at construction. The other test
+    /// modules in this file don't need the gauge, so they leave it at the
+    /// constructor default (disabled) and skip `initialize()` entirely.
+    async fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_shared_storage(
+            cache_dir.to_path_buf(),
+            false,                   // ram_cache_enabled
+            0,                       // max_ram_cache_size
+            10 * 1024 * 1024 * 1024, // max_cache_size
+            CacheEvictionAlgorithm::LRU,
+            1024,                                      // compression_threshold
+            true,                                      // compression_enabled
+            std::time::Duration::from_secs(315360000), // get_ttl
+            std::time::Duration::from_secs(3600),      // head_ttl
+            std::time::Duration::from_secs(3600),      // put_ttl
+            false,                                     // actively_remove_cached_data
+            crate::config::SharedStorageConfig::default(),
+            10.0, // write_cache_percent
+            true, // write_cache_enabled — the point of this constructor call
+            std::time::Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true, // read_cache_enabled
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            64,
+            std::time::Duration::from_secs(5),
+        );
+        // Must call create_configured_disk_cache_manager() before initialize() to
+        // set up the JournalConsolidator (see test_lookup_part_basic for the
+        // precedent).
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+            .initialize()
+            .await
+            .expect("initialize() must populate write_cache_manager");
+        manager
+    }
+
+    async fn put_write_cached(manager: &CacheManager, cache_key: &str, body: &[u8]) {
+        manager
+            .store_put_as_write_cached_range_with_ttl(
+                cache_key,
+                body,
+                "\"staged-entries-test\"".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                Some("application/octet-stream".to_string()),
+                HashMap::new(),
+                Duration::from_secs(86_400),
+            )
+            .await
+            .expect("write-cache store should succeed");
+    }
+
+    async fn staged_entries(manager: &CacheManager) -> u64 {
+        manager.get_write_cache_manager_gauges().await.1
+    }
+
+    /// A re-PUT of the same key must leave the gauge at 1, not 2: the key occupies
+    /// one slot in the staging tier throughout, and the second PUT supersedes the
+    /// first rather than adding to it.
+    #[tokio::test]
+    async fn re_put_of_the_same_key_leaves_staged_entries_at_one() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let cache_key = "test-bucket/staged-entries-re-put.bin";
+        let body = vec![9u8; BODY_LEN];
+
+        put_write_cached(&manager, cache_key, &body).await;
+        assert_eq!(
+            staged_entries(&manager).await,
+            1,
+            "the first PUT must increment the gauge to 1"
+        );
+
+        // Same key, same length. Not a graduation, so the decrement this fix adds
+        // must come from the re-PUT's own dereference of the superseded entry.
+        put_write_cached(&manager, cache_key, &body).await;
+        assert_eq!(
+            staged_entries(&manager).await,
+            1,
+            "a re-PUT of the same key must leave staged_entries at 1, not 2 — \
+             the superseded entry's increment must be released before the new \
+             one is counted"
+        );
+    }
+
+    /// Explicit invalidation (the eviction / cleanup path) of a staged entry must
+    /// return the gauge to 0. Covers the decrement task 51's fix left ungated in
+    /// `invalidate_write_cache_entry` and `invalidate_cache_hierarchy`.
+    #[tokio::test]
+    async fn invalidating_a_staged_entry_returns_staged_entries_to_zero() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let cache_key = "test-bucket/staged-entries-invalidate.bin";
+        let body = vec![5u8; BODY_LEN];
+
+        put_write_cached(&manager, cache_key, &body).await;
+        assert_eq!(staged_entries(&manager).await, 1);
+
+        manager
+            .invalidate_write_cache_entry(cache_key)
+            .await
+            .expect("invalidation should succeed");
+
+        assert_eq!(
+            staged_entries(&manager).await,
+            0,
+            "invalidating a staged entry must return staged_entries to 0"
+        );
+    }
+
+    /// A re-PUT of the SAME key where the first entry has already GRADUATED must
+    /// not decrement the gauge a second time: graduation already released its slot,
+    /// so the re-PUT's dereference must see the flag cleared and do nothing.
+    /// Without this, an already-graduated key re-staged by a re-PUT would drive the
+    /// gauge negative-saturating on paper (caught by `saturating_sub`, but the
+    /// symptom would be a gauge permanently one low).
+    #[tokio::test]
+    async fn re_put_after_graduation_does_not_double_decrement() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path()).await;
+        let cache_key = "test-bucket/staged-entries-post-graduation.bin";
+        let body = vec![2u8; BODY_LEN];
+
+        put_write_cached(&manager, cache_key, &body).await;
+        assert_eq!(staged_entries(&manager).await, 1);
+
+        // Graduate it (the existing single decrement site).
+        let graduated = manager
+            .refresh_write_cache_ttl(cache_key)
+            .await
+            .expect("graduation call should succeed");
+        assert!(graduated, "the staged entry must actually graduate");
+        assert_eq!(
+            staged_entries(&manager).await,
+            0,
+            "graduation must release the slot"
+        );
+
+        // Re-PUT the same key. The dereferenced `.meta` now has `is_write_cached:
+        // false` (graduation cleared it), so this must be a plain increment to 1,
+        // not a spurious decrement-then-increment that would net to 0.
+        put_write_cached(&manager, cache_key, &body).await;
+        assert_eq!(
+            staged_entries(&manager).await,
+            1,
+            "re-staging an already-graduated key must not double-decrement"
+        );
+    }
+}
+
+/// `total_cache_size` must be the shared on-disk figure, not a sum of gauges that
+/// overlap each other.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+#[cfg(test)]
+mod total_cache_size_definition_tests {
+    use super::*;
+
+    /// The figures measured on all three verification-fleet proxies at the same
+    /// instant, 2026-08-26, which is what made this concrete: `total_size` was
+    /// byte-identical fleet-wide while the reported "total" was not.
+    const DISK_BYTES: u64 = 20_767_307_686;
+    const STAGED_BYTES: u64 = 34_521_816;
+
+    fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        // RAM caching ON with a real budget: `ram_cache_size` has to be a non-zero
+        // summand or this test cannot tell the two definitions apart.
+        let manager = CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            true,
+            64 * 1024 * 1024,
+            CacheEvictionAlgorithm::LRU,
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+    }
+
+    /// Shown failing first: under the old definition `total_cache_size` was
+    /// `read + write_cache + ram`, so the final two assertions here fail — the total
+    /// comes back larger than the disk figure by the staged bytes plus RAM residency.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn total_cache_size_is_the_on_disk_figure_not_a_sum_of_overlapping_gauges() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        // Seed Size_State with the live fleet figures. `write_cache_size` is a subset
+        // of `total_size`, which is exactly why summing them double-counts.
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = DISK_BYTES;
+        state.write_cache_size = STAGED_BYTES;
+        consolidator.persist_size_state(&state).await.unwrap();
+
+        // Make the RAM tier non-empty. These bytes are a promoted copy of bytes already
+        // counted on disk, so they must not be added to the total.
+        assert!(
+            manager.promote_range_to_ram_cache_frame(
+                "test-bucket/ram-resident.bin",
+                (0, 4095),
+                vec![7u8; 4096],
+                crate::compression::CompressionAlgorithm::Lz4,
+                "\"etag\"".to_string(),
+                "Wed, 26 Aug 2026 00:00:00 GMT".to_string(),
+            ),
+            "fixture: the RAM promotion must be accepted, or ram_cache_size stays 0 \
+             and this test cannot distinguish the two definitions"
+        );
+
+        let stats = manager.get_cache_size_stats().await.unwrap();
+
+        // Fixture preconditions. `ram_cache_size` must be non-zero or this test cannot
+        // tell the current definition from the retired three-way sum.
+        let sizes = stats
+            .sizes
+            .expect("get_cache_size_stats must always populate CacheSizes");
+
+        assert_eq!(sizes.write_cache_size, STAGED_BYTES);
+        assert!(
+            stats.ram_cache_size > 0,
+            "fixture: ram_cache_size must be non-zero, got 0"
+        );
+
+        // `read_cache_size` is the NON-staged remainder, not the whole-cache total.
+        assert_eq!(
+            sizes.read_cache_size,
+            DISK_BYTES - STAGED_BYTES,
+            "read_cache_size must exclude the staged subset"
+        );
+
+        // The total is the on-disk figure.
+        assert_eq!(
+            sizes.total_cache_size, DISK_BYTES,
+            "total_cache_size must be the shared on-disk figure"
+        );
+
+        // The identity, stated as its own assertion: the two disk figures are disjoint
+        // and sum exactly to the total. This is what `T51k` checks on the fleet.
+        assert_eq!(
+            sizes.total_cache_size,
+            sizes.read_cache_size + sizes.write_cache_size,
+            "total_cache_size must equal read_cache_size + write_cache_size exactly"
+        );
+
+        // And explicitly NOT the retired definition, which added the per-instance RAM
+        // figure to two fleet-wide ones. Stated separately so a change that reinstates
+        // it fails with a message naming the reason rather than an opaque mismatch.
+        let retired_three_way_sum =
+            sizes.read_cache_size + sizes.write_cache_size + stats.ram_cache_size;
+        assert_ne!(
+            sizes.total_cache_size, retired_three_way_sum,
+            "total_cache_size must not include ram_cache_size: it counts copies of bytes \
+             already on disk, and it is per-instance where the other two are fleet-wide"
+        );
+    }
+
+    /// The subset invariant is enforced on the validation path (Requirement 6.4) but NOT
+    /// on the accumulator-delta path, which applies the two deltas independently. So an
+    /// inverted state is reachable, and it has been reached — the state this spec was
+    /// opened for carried `write_cache_size` at 16,922,745,347 bytes.
+    ///
+    /// Reporting `read_cache_size = 0` for it is acceptable; doing so *silently* is not,
+    /// because a plausible number hides the inversion. This asserts the clamp holds and
+    /// does not panic or underflow-wrap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inverted_accounting_clamps_read_cache_size_instead_of_underflowing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        // Staged exceeds total: impossible for consistent inputs, reachable on the
+        // delta path.
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = 1_000;
+        state.write_cache_size = 16_922_745_347;
+        consolidator.persist_size_state(&state).await.unwrap();
+
+        let sizes = manager
+            .get_cache_size_stats()
+            .await
+            .unwrap()
+            .sizes
+            .expect("get_cache_size_stats must always populate CacheSizes");
+
+        assert_eq!(
+            sizes.read_cache_size, 0,
+            "an inverted state must clamp read_cache_size to 0, not wrap"
+        );
+        assert_eq!(
+            sizes.total_cache_size, 1_000,
+            "total_cache_size must still report the on-disk figure it was given"
+        );
+    }
+
+    /// The stored statistics must report "not measured", not zeroes.
+    ///
+    /// This is the guard against a fourth recurrence of the trap behind tasks 56, 62 and
+    /// 65: reading a size off `get_statistics()` and getting a plausible `0`. The `Option`
+    /// makes that a compile error; this asserts the variant is actually `None`, so nobody
+    /// later "helpfully" populates it from a stale copy and restores the trap while
+    /// keeping the type.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stored_statistics_report_no_sizes_rather_than_zeroes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = DISK_BYTES;
+        state.write_cache_size = STAGED_BYTES;
+        consolidator.persist_size_state(&state).await.unwrap();
+
+        // The synchronous getter cannot read shared storage, so it must not claim to know.
+        assert!(
+            manager.get_statistics().sizes.is_none(),
+            "get_statistics() must report sizes as None, never as zeroes — a caller that \
+             reads 0 here cannot tell 'not measured' from 'the cache is empty', which is \
+             what made three separate capacity and health checks silently never fire"
+        );
+
+        // The async one must, over the same state.
+        assert!(
+            manager
+                .get_cache_size_stats()
+                .await
+                .unwrap()
+                .sizes
+                .is_some(),
+            "get_cache_size_stats() must always populate the sizes"
+        );
+    }
+
+    /// The per-instance summand is what made three proxies disagree about one shared
+    /// cache. Two managers over the same seeded disk figure, differing only in RAM
+    /// residency, must now report the same total.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instances_differing_only_in_ram_residency_report_the_same_total() {
+        let temp_a = tempfile::TempDir::new().unwrap();
+        let temp_b = tempfile::TempDir::new().unwrap();
+        let manager_a = setup(temp_a.path());
+        let manager_b = setup(temp_b.path());
+
+        for manager in [&manager_a, &manager_b] {
+            let consolidator = manager.get_journal_consolidator().await.unwrap();
+            let mut state = consolidator.load_size_state().await.unwrap();
+            state.total_size = DISK_BYTES;
+            state.write_cache_size = STAGED_BYTES;
+            consolidator.persist_size_state(&state).await.unwrap();
+        }
+
+        // Only B holds a RAM-resident range — the .34.221 vs .34.83 difference.
+        assert!(manager_b.promote_range_to_ram_cache_frame(
+            "test-bucket/ram-resident.bin",
+            (0, 4095),
+            vec![7u8; 4096],
+            crate::compression::CompressionAlgorithm::Lz4,
+            "\"etag\"".to_string(),
+            "Wed, 26 Aug 2026 00:00:00 GMT".to_string(),
+        ));
+
+        let stats_a = manager_a.get_cache_size_stats().await.unwrap();
+        let stats_b = manager_b.get_cache_size_stats().await.unwrap();
+
+        assert_eq!(
+            stats_a.ram_cache_size, 0,
+            "fixture: instance A must hold no RAM ranges"
+        );
+        assert!(
+            stats_b.ram_cache_size > 0,
+            "fixture: instance B must hold a RAM range, or the two instances do not \
+             actually differ and this test proves nothing"
+        );
+        assert_eq!(
+            stats_a.sizes.unwrap().total_cache_size,
+            stats_b.sizes.unwrap().total_cache_size,
+            "two instances sharing a cache must agree on its size regardless of \
+             per-instance RAM residency"
+        );
+    }
+
+    /// Design test 11: the reporting arithmetic, with the fleet's own figures.
+    ///
+    /// The design calls this "the most direct possible regression guard" and specifies
+    /// the inputs and both outputs, so it is written exactly as specified rather than
+    /// with round numbers. The figures are the pre-fix fleet state: a 19.7 GB cache
+    /// reporting 16.9 GB of staged residency, i.e. 157.61% of its 10 GiB allocation.
+    ///
+    /// Distinct from the tests above, which use the 2026-08-26 post-recovery figures.
+    /// This one is the pathological input — staged is 85.7% of the total here rather than
+    /// 0.17% — so an implementation that happened to work for a nearly-unstaged cache
+    /// cannot pass it.
+    ///
+    /// Shown failing first against the pre-task-63 definition, where `read_cache_size`
+    /// carried the whole total: the first assertion reports 19,748,298,884 where
+    /// 2,825,553,537 is expected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reporting_arithmetic_matches_the_fleets_measured_figures() {
+        // Design testing-strategy test 11, verbatim.
+        const FLEET_TOTAL: u64 = 19_748_298_884;
+        const FLEET_STAGED: u64 = 16_922_745_347;
+        const EXPECTED_READ: u64 = 2_825_553_537;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let mut state = consolidator.load_size_state().await.unwrap();
+        state.total_size = FLEET_TOTAL;
+        state.write_cache_size = FLEET_STAGED;
+        consolidator.persist_size_state(&state).await.unwrap();
+
+        let sizes = manager
+            .get_cache_size_stats()
+            .await
+            .unwrap()
+            .sizes
+            .expect("get_cache_size_stats must always populate CacheSizes");
+
+        assert_eq!(
+            sizes.read_cache_size, EXPECTED_READ,
+            "read_cache_size must be total minus staged"
+        );
+        assert_eq!(
+            sizes.total_cache_size, FLEET_TOTAL,
+            "total_cache_size must be the on-disk figure, unchanged by how much of it \
+             is staged"
+        );
+        // Stated as arithmetic as well as as constants, so a future edit that changes
+        // one constant without the other fails here rather than silently agreeing with
+        // itself.
+        assert_eq!(sizes.read_cache_size + sizes.write_cache_size, FLEET_TOTAL);
     }
 }

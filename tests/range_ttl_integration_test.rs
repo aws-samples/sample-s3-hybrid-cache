@@ -48,6 +48,7 @@ async fn test_range_stored_with_configured_ttl() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store range with a 10-year TTL (like the config default)
@@ -133,6 +134,7 @@ async fn test_range_with_short_ttl_expires() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store range with a 2-second TTL
@@ -208,6 +210,7 @@ async fn test_object_level_ttl_applies_to_all_ranges() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store first range with long TTL

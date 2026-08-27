@@ -475,6 +475,7 @@ For the full multipart upload state machine, correctness gates, concurrency sema
 - **Data in Transit**: S3 data flows unencrypted between client and proxy on port 80. By default the proxy connects to the upstream store over verified TLS on port 443; this is the secure default and applies unless you configure a per-destination [upstream transport override](CONFIGURATION.md#upstream-transport-overrides). The protection-waiving overrides (plaintext HTTP, or HTTPS with certificate validation disabled) are intended for local development or trusted networks only.
 - **Network Controls**: Use security groups, firewalls, or network segmentation to restrict proxy access to authorized clients only
 - **Encrypted Alternative**: The TLS proxy listener (port 3129) terminates TLS using the proxy's own certificate, providing encrypted client-to-proxy traffic with full caching. Clients use `HTTP_PROXY=https://proxy:3129` with `--endpoint-url http://s3.region.amazonaws.com`. See [Getting Started](GETTING_STARTED.md) for configuration details.
+- **Encrypting the hop across a fleet**: a single `HTTP_PROXY` URL reaches one instance, so a multi-instance fleet needs something in front of it to select a member. A load balancer that re-encrypts to the TLS listener is one way ([AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md#load-balancer-encrypting-the-client-hop)); a self-managed L7 router is another, and can also keep the plaintext hop on loopback by running on the client host itself. See [Request-Aware Routing](REQUEST_AWARE_ROUTING.md).
 
 #### What a Cleartext Hop Exposes
 

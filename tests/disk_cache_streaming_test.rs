@@ -37,6 +37,7 @@ async fn test_stream_range_data_8mib_uncompressed() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store the 8 MiB range on disk
@@ -144,6 +145,7 @@ async fn test_stream_range_data_compressed() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store the range (compression enabled, so it should be compressed on disk)

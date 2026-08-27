@@ -6,6 +6,8 @@
 /// - UploadPart (PUT with ?uploadId&partNumber)
 /// - CompleteMultipartUpload (POST with ?uploadId)
 /// - Conflict invalidation
+mod common;
+
 use s3_proxy::cache::CacheManager;
 use s3_proxy::config::SharedStorageConfig;
 use std::collections::HashMap;
@@ -144,16 +146,16 @@ async fn test_regular_put_with_conflict_invalidation() {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            body_data,
-            headers.clone(),
-            metadata.clone(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        body_data,
+        headers.clone(),
+        metadata.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
     println!("✓ Initial PUT cached");
 
     println!("\nTest 2: Trigger conflict invalidation (simulating new PUT)");
@@ -175,16 +177,16 @@ async fn test_regular_put_with_conflict_invalidation() {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            new_body_data,
-            headers,
-            new_metadata,
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        new_body_data,
+        headers,
+        new_metadata,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
     println!("✓ New PUT cached");
 
     println!("\n✅ Regular PUT with conflict invalidation test passed!");

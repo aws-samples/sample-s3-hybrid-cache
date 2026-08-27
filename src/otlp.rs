@@ -56,6 +56,7 @@ struct PerBucketInstruments {
 struct Instruments {
     // -- cache: sizes --
     cache_total_cache_size: Gauge<u64>,
+    cache_max_cache_size_limit: Gauge<u64>,
     cache_read_cache_size: Gauge<u64>,
     cache_write_cache_size: Gauge<u64>,
     cache_ram_cache_size: Gauge<u64>,
@@ -207,6 +208,7 @@ impl OtlpExporter {
         let instruments = Instruments {
             // cache: sizes
             cache_total_cache_size: g_u64!("cache.total_cache_size"),
+            cache_max_cache_size_limit: g_u64!("cache.max_cache_size_limit"),
             cache_read_cache_size: g_u64!("cache.read_cache_size"),
             cache_write_cache_size: g_u64!("cache.write_cache_size"),
             cache_ram_cache_size: g_u64!("cache.ram_cache_size"),
@@ -296,6 +298,8 @@ impl OtlpExporter {
         if let Some(c) = &metrics.cache {
             // sizes
             i.cache_total_cache_size.record(c.total_cache_size, a);
+            i.cache_max_cache_size_limit
+                .record(c.max_cache_size_limit, a);
             i.cache_read_cache_size.record(c.read_cache_size, a);
             i.cache_write_cache_size.record(c.write_cache_size, a);
             i.cache_ram_cache_size.record(c.ram_cache_size, a);

@@ -6,6 +6,8 @@
 //!
 //! Validates Requirements 1.1, 1.2 from legacy-write-cache-removal spec
 
+mod common;
+
 use s3_proxy::{
     cache::CacheManager, cache_types::CacheMetadata, config::SharedStorageConfig, Result,
 };
@@ -57,22 +59,23 @@ fn create_test_metadata(etag: &str, content_length: u64) -> CacheMetadata {
 }
 
 /// Helper function to store write cache entry using unified storage format
-/// This uses the CacheManager API to store data in metadata/ + ranges/ directories
+/// Routes through `common::put_through_write_cache`, which mirrors the production
+/// signed-PUT write-through path, to store data in metadata/ + ranges/ directories
 async fn store_write_cache_entry_unified(
     cache_manager: &CacheManager,
     cache_key: &str,
     data: &[u8],
     metadata: &CacheMetadata,
 ) -> Result<()> {
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            data,
-            std::collections::HashMap::new(),
-            metadata.clone(),
-            std::collections::HashMap::new(),
-        )
-        .await
+    common::put_through_write_cache(
+        cache_manager,
+        cache_key,
+        data,
+        std::collections::HashMap::new(),
+        metadata.clone(),
+        std::collections::HashMap::new(),
+    )
+    .await
 }
 
 /// Test complete PUT then GET workflow using unified storage

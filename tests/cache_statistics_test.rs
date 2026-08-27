@@ -5,8 +5,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tempfile::TempDir;
 
+mod common;
+
 /// Helper to create and initialize a test cache manager with JournalConsolidator
 async fn create_test_cache_manager(cache_dir: std::path::PathBuf) -> Arc<CacheManager> {
+    // Before `initialize()`, or a validation scan starts immediately and can overwrite
+    // the size figures these tests assert on. See `common::seed_validation_metadata`.
+    common::seed_validation_metadata(&cache_dir);
+
     let cache_manager = Arc::new(CacheManager::new_with_defaults(cache_dir, false, 0));
 
     // Must call create_configured_disk_cache_manager() to set up the JournalConsolidator
@@ -23,6 +29,9 @@ async fn create_test_cache_manager_with_eviction(
     cache_dir: std::path::PathBuf,
     eviction_algorithm: CacheEvictionAlgorithm,
 ) -> Arc<CacheManager> {
+    // Same reason as above — before `initialize()`.
+    common::seed_validation_metadata(&cache_dir);
+
     let cache_manager = Arc::new(CacheManager::new_with_all_ttls(
         cache_dir,
         false,
@@ -73,6 +82,7 @@ async fn test_calculate_disk_cache_size_with_new_architecture() {
         created_at: now,
         last_accessed: now,
         access_count: 1,
+        staged: None,
     };
 
     let now = SystemTime::now();
@@ -110,19 +120,24 @@ async fn test_calculate_disk_cache_size_with_new_architecture() {
     }
 
     // Get cache size stats
-    let stats = cache_manager.get_cache_size_stats().await.unwrap();
+    let sizes = cache_manager
+        .get_cache_size_stats()
+        .await
+        .unwrap()
+        .sizes
+        .expect("get_cache_size_stats always populates CacheSizes");
 
     // Verify that both metadata and range files are counted
     assert!(
-        stats.read_cache_size > 0,
+        sizes.read_cache_size > 0,
         "Cache size should be greater than 0"
     );
     assert!(
-        stats.read_cache_size >= 8388608,
+        sizes.read_cache_size >= 8388608,
         "Cache size should include range file size"
     );
 
-    println!("Cache size: {} bytes", stats.read_cache_size);
+    println!("Cache size: {} bytes", sizes.read_cache_size);
 }
 
 #[tokio::test]
@@ -160,6 +175,7 @@ async fn test_collect_cache_entries_for_eviction_with_new_architecture() {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         });
     }
 
@@ -253,6 +269,7 @@ async fn test_collect_cache_entries_for_eviction_full_object() {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         });
     }
 
@@ -345,6 +362,7 @@ async fn test_get_cache_usage_breakdown_with_new_architecture() {
         created_at: now,
         last_accessed: now,
         access_count: 1,
+        staged: None,
     };
 
     let cache_metadata = NewCacheMetadata {

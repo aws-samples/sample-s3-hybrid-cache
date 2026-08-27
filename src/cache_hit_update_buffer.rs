@@ -405,7 +405,16 @@ impl CacheHitUpdateBuffer {
             }
         };
 
-        // Create a minimal RangeSpec for identification purposes
+        // Create a minimal RangeSpec for identification purposes.
+        //
+        // `staged: None` here is safe and is not an R12.2 violation. Traced through
+        // `consolidate_key` on 2026-08-27: the TtlRefresh and AccessUpdate arms locate
+        // the existing range by `(start, end)` and mutate `last_accessed` /
+        // `access_count` **in place** — neither replaces the stored `RangeSpec` — so a
+        // cache hit cannot wipe the recorded membership. That is worth checking rather
+        // than assuming: were either arm to assign `*existing_range = entry.range_spec`
+        // (as the Update arm does), every cache hit would also zero `compressed_size`
+        // and reset `staged`, silently un-tiering the range.
         let range_spec = RangeSpec {
             start: entry.range_start,
             end: entry.range_end,
@@ -416,6 +425,7 @@ impl CacheHitUpdateBuffer {
             created_at: entry.timestamp,
             last_accessed: entry.timestamp,
             access_count: 0,
+            staged: None,
         };
 
         Ok(JournalEntry {
@@ -430,7 +440,6 @@ impl CacheHitUpdateBuffer {
             object_ttl_secs: None, // Cache-hit updates don't set object TTL
             access_increment,
             object_metadata: None, // Cache-hit updates don't need object_metadata - .meta already exists
-            metadata_written: true, // Cache-hit updates are for existing ranges, so metadata already exists
         })
     }
 

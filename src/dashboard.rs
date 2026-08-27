@@ -1769,10 +1769,13 @@ impl ApiHandler {
                 error!("Failed to get cache size stats: {}", e);
                 e
             })?;
+            // Always `Some` from `get_cache_size_stats`; see `cache::CacheSizes` for why
+            // the figures are behind an Option at all.
+            let cache_sizes = cache_stats.sizes.unwrap_or_default();
             debug!(
                 "Cache size stats: read_cache_size={}, write_cache_size={}, ram_cache_size={}",
-                cache_stats.read_cache_size,
-                cache_stats.write_cache_size,
+                cache_sizes.read_cache_size,
+                cache_sizes.write_cache_size,
                 cache_stats.ram_cache_size
             );
 
@@ -1864,14 +1867,17 @@ impl ApiHandler {
                 .saturating_add(cache_stats.cache_misses)
                 .saturating_add(put_total);
 
-            // Calculate correct disk cache size (read cache only, write cache is separate)
-            // Note: disk_cache now shows only read cache, write_cache shows write cache separately
-            let disk_cache_size = cache_stats.read_cache_size;
+            // Disk cache shows the read tier only; the write cache is shown separately.
+            // These two are disjoint as of 2026-08-26 (task 63), so this display no longer
+            // counts the staged bytes twice — before that `read_cache_size` carried the
+            // whole volume including the staged subset, and the comment here claiming
+            // otherwise was wrong.
+            let disk_cache_size = cache_sizes.read_cache_size;
             let max_cache_size = cache_stats.max_cache_size_limit;
 
             // Get write cache size and calculate max write cache size
             // Write cache max is write_cache_percent of total cache (default 10%)
-            let write_cache_size = cache_stats.write_cache_size;
+            let write_cache_size = cache_sizes.write_cache_size;
             let write_cache_max_size =
                 (max_cache_size as f64 * cache_stats.max_write_cache_percent as f64 / 100.0) as u64;
             let write_cache_utilization = if write_cache_max_size > 0 {

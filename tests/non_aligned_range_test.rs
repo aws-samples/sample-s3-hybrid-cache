@@ -88,6 +88,7 @@ async fn test_non_aligned_range_request() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store each cached range
@@ -255,6 +256,7 @@ async fn test_non_aligned_range_multiple_boundaries() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store each cached range
@@ -364,6 +366,7 @@ async fn test_non_aligned_range_at_start() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     for (start, end) in &cached_ranges {
@@ -458,6 +461,7 @@ async fn test_non_aligned_range_at_end() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     for (start, end) in &cached_ranges {

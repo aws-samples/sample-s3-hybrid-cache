@@ -138,6 +138,54 @@ pub struct WriteCacheManager {
     /// Shared with `WriteReservation` handles via `Arc`.
     current_size: Arc<AtomicU64>,
 
+    /// Live (best-effort) count of staged (write-cached, ungraduated) entries.
+    /// Incremented on a successful write-cache commit and decremented on
+    /// graduation (first read) or eviction. This is an approximate gauge for
+    /// observability (`/metrics` `write_cache.staged_entries`) — it is not the
+    /// accounting authority and is not itself journaled; later tasks (R1
+    /// graduation accounting, R5 eviction accounting) make the underlying
+    /// tier transitions precise, at which point this counter's inputs become
+    /// precise too.
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+    staged_entries: Arc<AtomicU64>,
+
+    /// Cumulative count of objects evicted from the write/staging tier by
+    /// `evict_write_cached_object`. Deliberately separate from the read
+    /// cache's `cache.evictions` counter (Requirement 8.4) — before this,
+    /// `cache.evictions` reported 0 regardless of how much staging eviction
+    /// had run, which read as "no eviction happened" when the write tier's
+    /// own eviction path was in fact deleting entries.
+    ///
+    /// Not itself the accounting authority (that is Size_State, updated via
+    /// the journal per R5); this is an observability counter only.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.4
+    staging_evictions_total: Arc<AtomicU64>,
+
+    /// Cumulative compressed bytes freed by staging eviction
+    /// (`evict_write_cached_object`'s `total_freed` per call, summed).
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.4
+    staging_eviction_bytes_total: Arc<AtomicU64>,
+
+    /// Cumulative count of entries that graduated out of the staging tier on their
+    /// first read, counted per instance at the point the graduation is journaled.
+    ///
+    /// Pairs with `staged_entries` to make "the tier is draining" observable: a
+    /// `staged_entries` gauge sitting flat is ambiguous between an idle proxy and a
+    /// broken graduation path, and this counter separates them. It is the natural
+    /// companion to `staging_evictions_total` — together they account for the two ways
+    /// an entry can leave the tier, one of which reclaims disk and one of which does not.
+    ///
+    /// Counts graduations this instance performed, so it is **not** a fleet-wide total
+    /// and is not the accounting authority (that is Size_State's `write_cache_size`,
+    /// moved by the `Graduation` journal entry under the consolidation lock). Two
+    /// proxies racing the same key can both count here while only one decrement is
+    /// applied; that is expected and is why this is an observability counter.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+    graduations_total: Arc<AtomicU64>,
+
     /// Write cache TTL (default: 1 day), refreshed on read access
     write_ttl: Duration,
 
@@ -152,6 +200,28 @@ pub struct WriteCacheManager {
 
     /// Maximum object size for write caching (objects larger than this bypass cache)
     max_object_size: u64,
+
+    /// Journal consolidator, wired after construction via
+    /// [`Self::set_journal_consolidator`] (the consolidator does not exist yet when
+    /// this struct is built in `CacheManager::initialize`).
+    ///
+    /// Staging eviction needs it for two separate things, and conflating them is the
+    /// mistake R5 exists to fix:
+    ///
+    /// - the **size accumulator**, which is the sole authority for
+    ///   `SizeState::{total_size, write_cache_size}`. Eviction debits it and the
+    ///   consolidator folds the debit into Size_State under the global lock. Nothing
+    ///   here writes `size_state.json` directly.
+    /// - the **Remove journal entries**, which are metadata convergence only: they
+    ///   prune the evicted ranges from the shared `.meta` so the other instances
+    ///   observe the removal, and carry the `cached_objects` decrement.
+    ///
+    /// `None` in unit tests that construct a bare manager; eviction then still
+    /// deletes files and moves the local gauges, but performs no shared accounting
+    /// and logs a WARN saying so.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 5.1, 5.2, 5.3
+    journal_consolidator: Option<Arc<crate::journal_consolidator::JournalConsolidator>>,
 }
 
 impl WriteCacheManager {
@@ -195,12 +265,29 @@ impl WriteCacheManager {
         Self {
             max_size,
             current_size: Arc::new(AtomicU64::new(0)),
+            staged_entries: Arc::new(AtomicU64::new(0)),
+            staging_evictions_total: Arc::new(AtomicU64::new(0)),
+            staging_eviction_bytes_total: Arc::new(AtomicU64::new(0)),
+            graduations_total: Arc::new(AtomicU64::new(0)),
             write_ttl,
             incomplete_upload_ttl,
             eviction_algorithm,
             cache_dir,
             max_object_size,
+            journal_consolidator: None,
         }
+    }
+
+    /// Wire the journal consolidator so staging eviction can perform shared
+    /// accounting. Called from `CacheManager::initialize` once the consolidator
+    /// exists; mirrors `DiskCacheManager::set_journal_consolidator`.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 5.1, 5.2
+    pub fn set_journal_consolidator(
+        &mut self,
+        consolidator: Arc<crate::journal_consolidator::JournalConsolidator>,
+    ) {
+        self.journal_consolidator = Some(consolidator);
     }
 
     /// Create a new WriteCacheManager with default settings
@@ -265,29 +352,115 @@ impl WriteCacheManager {
         self.current_size.load(Ordering::SeqCst)
     }
 
-    /// Atomically reserve capacity for a write operation.
+    /// Get the live (approximate) count of staged (write-cached, ungraduated)
+    /// entries. Best-available data source for `/metrics` `write_cache.staged_entries`
+    /// until graduation (R1) and eviction (R5) accounting land.
     ///
-    /// Returns an RAII `WriteReservation` handle that automatically releases
-    /// the reserved capacity on drop (including on cancellation/panic).
-    /// Returns `None` if:
-    /// - The requested size exceeds `max_object_size`
-    /// - There is insufficient capacity (even after attempting eviction)
-    /// - The size would overflow `u64` when added to current usage
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+    pub fn staged_entries(&self) -> u64 {
+        self.staged_entries.load(Ordering::Relaxed)
+    }
+
+    /// Increment the live staged-entry counter. Called on a successful
+    /// write-cache commit (a new `.meta` written with `is_write_cached: true`).
     ///
-    /// This is the single entry point for capacity reservation, replacing the
-    /// previous `ensure_capacity` + `reserve_capacity` two-step pattern.
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+    pub fn increment_staged_entries(&self) {
+        self.staged_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the live staged-entry counter, saturating at zero. Called on
+    /// graduation (first read transitions the entry out of the write tier) or
+    /// on staging eviction.
     ///
-    /// # Arguments
-    /// * `size` - Number of bytes to reserve (compressed size)
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+    pub fn decrement_staged_entries(&self) {
+        self.staged_entries
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    /// Cumulative count of objects evicted from the write/staging tier.
+    /// Distinct from `cache.evictions`, which reflects read-cache eviction
+    /// only — see the field doc for why the split matters.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.4
+    pub fn staging_evictions_total(&self) -> u64 {
+        self.staging_evictions_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative compressed bytes freed by staging eviction.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.4
+    pub fn staging_eviction_bytes_total(&self) -> u64 {
+        self.staging_eviction_bytes_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of entries this instance graduated out of the staging tier.
+    /// See the field doc for why this is per-instance and not the accounting authority.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+    pub fn graduations_total(&self) -> u64 {
+        self.graduations_total.load(Ordering::Relaxed)
+    }
+
+    /// Increment the cumulative graduation counter. Called once per graduation this
+    /// instance performs, at the point the `Graduation` journal entry is written.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+    pub fn increment_graduations(&self) {
+        self.graduations_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Account a write operation's bytes as in-flight, returning an RAII handle that
+    /// releases them on drop (including on cancellation and panic).
+    ///
+    /// # This is no longer an admission gate
+    ///
+    /// It reads as one, and it was one until 2.7.0, which is why the distinction is
+    /// spelled out here. Today the **only** thing it refuses is an object larger than
+    /// `max_object_size` (R3.5). It does not consult the Staging_Bound at all — see
+    /// [`Self::reserve_for_sizing`] for why the bound became a target rather than a gate,
+    /// and `CacheManager::disk_safety_refusal` for the one bound that may still decline
+    /// caching.
+    ///
+    /// Two behaviours were removed on the way here, and both are worth knowing about
+    /// because both were measured on the fleet rather than argued:
+    ///
+    /// **Inline eviction (task 8).** A refusal used to run `evict_to_target` and retry.
+    /// That put a full `metadata/` walk on the request path of every refused PUT — with
+    /// 1,779 entries it dominated PUT latency at 7-9s independent of the object's own
+    /// size, where a 64 MiB body added under 0.3s against a 1.8s run-to-run variance. It
+    /// also deleted *other instances'* freshly-staged entries, because the candidate walk
+    /// scanned shared storage with no ownership filter while the decision to run it came
+    /// from this instance's private counter. Observed 2026-08-24: an instance with a
+    /// correct counter cached a 32 MiB object and an instance with an inflated one deleted
+    /// it seconds later, freeing 33.5 MB against a 6.19 GB shortfall and then refusing its
+    /// own reservation anyway. See `cache-coherency-invariants.md`, "Invariant 2's
+    /// dangerous corollary".
+    ///
+    /// **The capacity refusal itself (task 28).** Staging eviction is now driven by the
+    /// Write_Ledger from `CacheManager::evict_staging_tier`, asynchronously and under the
+    /// global eviction lock, so there is nothing left for a synchronous refusal to
+    /// protect.
     ///
     /// # Returns
-    /// * `Some(WriteReservation)` - Reservation handle; capacity is held until dropped
-    /// * `None` - Insufficient capacity or size exceeds limits
+    /// * `Some(WriteReservation)` — admitted; the bytes are counted as in-flight until dropped
+    /// * `None` — the object exceeds `max_object_size`, or the in-flight total would
+    ///   overflow `u64` (an arithmetic impossibility at real object sizes, not a capacity
+    ///   decision)
     ///
     /// # Requirements
     /// Implements Requirements 9.1, 9.2
     pub async fn try_reserve(&self, size: u64) -> Option<WriteReservation> {
-        // Reject objects exceeding max object size
+        // R3.5 / task 30: the ONLY size-based refusal left, and it is deliberately
+        // ahead of everything else so eviction is never considered for an upload that
+        // could not be cached at any capacity. A regression here would be expensive and
+        // silent — it would make the evictor delete live entries to make room for an
+        // object that is then refused anyway — so it is covered by its own test rather
+        // than resting on this comment.
         if size > self.max_object_size {
             debug!(
                 "Write cache bypass: object size {} exceeds max_object_size {}",
@@ -296,52 +469,76 @@ impl WriteCacheManager {
             return None;
         }
 
-        // Fast path: attempt atomic CAS reservation without eviction
-        if let Some(reservation) = self.try_cas_reserve(size) {
-            return Some(reservation);
-        }
-
-        // Slow path: attempt eviction then retry CAS
-        let current = self.current_size.load(Ordering::SeqCst);
-        let needed = current.saturating_add(size);
-        if needed > self.max_size {
-            let target_size = self.max_size.saturating_sub(size);
-            debug!(
-                "Write cache needs eviction: current={}, needed={}, max={}, target={}",
-                current, needed, self.max_size, target_size
-            );
-
-            match self.evict_to_target(target_size).await {
-                Ok(freed) => {
-                    if freed > 0 {
-                        info!(
-                            "Write cache eviction freed {} bytes for reservation of {}",
-                            freed, size
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!("Write cache eviction failed: {}", e);
-                    return None;
-                }
-            }
-        }
-
-        // Retry CAS after eviction
-        self.try_cas_reserve(size)
+        self.reserve_for_sizing(size)
     }
 
-    /// Attempt a single CAS-loop reservation without eviction.
+    /// Account `size` as in-flight and hand back the RAII release handle.
     ///
-    /// Returns `Some(WriteReservation)` if the reservation succeeds atomically,
-    /// or `None` if current_size + size would exceed max_size or overflow.
-    fn try_cas_reserve(&self, size: u64) -> Option<WriteReservation> {
+    /// # This no longer refuses on Staging_Bound grounds (R3.1, R3.3)
+    ///
+    /// It used to: a CAS loop returned `None` whenever `current_size + size` exceeded
+    /// `max_size`, which made `write_cache_percent` a hard admission gate.
+    ///
+    /// # Why a gate was the wrong shape — and NOT because refusing a PUT costs more
+    ///
+    /// The spec (requirements.md R3, design.md §1) justified this with a cost asymmetry:
+    /// refusing a GET costs one future fetch, whereas refusing a PUT is a "one-shot loss"
+    /// because the write-through opportunity exists only once. **That reasoning is wrong
+    /// and is not why this changed.** The costs are the same. Refuse a GET and the next
+    /// request for that key pays an S3 fetch where it would have hit, then caches; refuse
+    /// a PUT and the next read pays an S3 fetch where it would have hit, then caches. One
+    /// extra fetch either way, and the cache self-heals either way — the write-through
+    /// opportunity being once-only does not matter, because the read path repopulates the
+    /// entry regardless.
+    ///
+    /// If anything the asymmetry runs the other way: a staged entry nobody has read yet is
+    /// speculative, a bet that a read is coming (the spec's own "read-after-write bet"),
+    /// whereas a cached GET reflects demonstrated demand. So the write tier has the
+    /// *weaker* claim on space, not the stronger one.
+    ///
+    /// The actual reasons a gate was wrong here, none of which need an asymmetry:
+    ///
+    /// 1. **Caching is worth doing whenever it is affordable, and refusing buys nothing a
+    ///    target does not.** The bytes are already in hand, so caching costs no extra
+    ///    bandwidth, and the space is reclaimable. Declining is only justified when the
+    ///    space genuinely is not there — which is the Disk_Safety_Bound's job, not this
+    ///    one's.
+    /// 2. **The gate was enforced against a figure that was wrong.** `current_size` was
+    ///    seeded at startup from resident bytes and never drained, so it sat near or above
+    ///    the bound from the moment a proxy started. Refusals were therefore uncorrelated
+    ///    with real capacity pressure. A hard gate on an unreliable number is strictly
+    ///    worse than a soft target with reclamation behind it, whatever the cost model.
+    /// 3. **The read tier already had the right shape** — admit freely, reclaim
+    ///    asynchronously with trigger/target hysteresis — and there was no reason for the
+    ///    write tier to differ. This is a consistency argument, not a cost one.
+    ///
+    /// The bound still exists, and still means something: it is the point at which
+    /// reclamation starts. What changed is that it is enforced by removing staged entries
+    /// rather than by refusing new ones.
+    ///
+    /// What the reservation is still for, and why it was not simply deleted:
+    ///
+    /// - **Sizing.** `open_write_cache_sink` needs `content_length` up front to size the
+    ///   sink, so something has to carry it.
+    /// - **Inflight_Bytes.** A genuine per-instance quantity worth reporting
+    ///   (`/metrics write_cache.inflight_bytes`), and deliberately per-instance rather
+    ///   than shared (R7.2) — uploads in flight on another proxy are not this proxy's
+    ///   concern.
+    ///
+    /// Going over the Staging_Bound now triggers asynchronous eviction toward a target
+    /// below it instead (R3.1), driven from the consolidation cycle. The only bound that
+    /// may still decline caching is the Disk_Safety_Bound, checked by the caller before
+    /// this is reached (R4.1).
+    ///
+    /// `None` is still possible, but only for arithmetic overflow — `current_size + size`
+    /// exceeding `u64` — which is not a capacity decision and cannot happen with real
+    /// object sizes.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 3.1, 3.3, 7.2
+    fn reserve_for_sizing(&self, size: u64) -> Option<WriteReservation> {
         loop {
             let current = self.current_size.load(Ordering::SeqCst);
             let new = current.checked_add(size)?;
-            if new > self.max_size {
-                return None;
-            }
             match self.current_size.compare_exchange_weak(
                 current,
                 new,
@@ -350,7 +547,7 @@ impl WriteCacheManager {
             ) {
                 Ok(_) => {
                     debug!(
-                        "Write cache reserved: size={}, old_total={}, new_total={}",
+                        "Write cache reserved for sizing: size={}, old_inflight={}, new_inflight={}",
                         size, current, new
                     );
                     return Some(WriteReservation {
@@ -409,212 +606,114 @@ impl WriteCacheManager {
         debug!("Write cache released (internal): size={}", compressed_size);
     }
 
-    /// Initialize from coordinated scan results
-    ///
-    /// Called during coordinated initialization to set write cache usage from scan results.
-    /// This replaces the old initialize_from_disk method which performed redundant scanning.
-    /// The coordinated approach eliminates duplicate directory traversal and provides
-    /// consistent initialization across all cache subsystems.
-    ///
-    /// # Requirements
-    /// Implements Requirement 6.3
-    pub fn initialize_from_scan_results(&self, write_cache_size: u64, write_cache_count: u64) {
-        self.current_size.store(write_cache_size, Ordering::SeqCst);
-
-        info!(
-            "Write cache initialized from coordinated scan: {} objects, {} bytes ({:.2}% of max)",
-            write_cache_count,
-            write_cache_size,
-            (write_cache_size as f64 / self.max_size as f64) * 100.0
-        );
-    }
-
     // =========================================================================
-    // Eviction Methods (Requirements 6.5, 6.6, 4.2, 4.3)
+    // Eviction Methods
+    //
+    // Staging eviction is driven by the Write_Ledger from
+    // `CacheManager::evict_staging_tier`, not from here. What remains in this
+    // module is the per-object eviction *mechanism* — `evict_write_cached_object`
+    // below, which owns the R5 accounting — plus incomplete-upload cleanup, which
+    // is a separate TTL-driven concern.
+    //
+    // Removed in task 25, deliberately rather than left alongside: `evict_to_target`,
+    // `collect_eviction_candidates`, `calculate_eviction_score` and
+    // `sort_candidates_for_eviction`. Two implementations of eviction is how one of
+    // them rots, and this one had already rotted in three separate ways —
+    // a `WalkDir` over all of `metadata/` to select O(evicted) victims, a decision
+    // taken from a private counter but applied to shared storage, and a TinyLFU
+    // score that could not express anything useful about a tier whose entries have
+    // by definition never been read (`access_count` is 1 per range, so the score
+    // collapsed to `n_ranges >> (idle/3600)` — a coarse bucket with no tiebreak and
+    // a bias against single-part objects).
+    //
+    // The staging tier needs no eviction score at all: its candidate order is
+    // insertion order, which the ledger expresses directly.
     // =========================================================================
 
-    /// Evict write-cached objects to free space using configured algorithm
+    /// Evict a single write-cached object, decrementing the shared accounting.
     ///
-    /// Uses same eviction algorithm as read cache (LRU or TinyLFU) for consistency.
+    /// # Accounting contract (R5)
     ///
-    /// # Arguments
-    /// * `target_size` - Target size to evict down to
+    /// Before this change the function deleted range files and the `.meta` and then
+    /// adjusted only `self.current_size` — a per-instance, in-memory counter. It wrote
+    /// no journal entries and touched neither the size accumulator nor Size_State, so
+    /// `write_cache_size` ratcheted upward forever while data was being deleted. That
+    /// is the R5 leak; read-tier eviction has always done this correctly
+    /// (`CacheManager::perform_eviction_with_lock`, Step 5), which is the evidence
+    /// that the omission was an oversight rather than a definition difference.
     ///
-    /// # Returns
-    /// * `Ok(bytes_freed)` - Number of compressed bytes freed
-    /// * `Err` - If eviction fails
+    /// Three rules, and each maps to an acceptance criterion:
     ///
-    /// # Requirements
-    /// Implements Requirements 6.5, 6.6
-    pub async fn evict_to_target(&self, target_size: u64) -> Result<u64> {
-        let current = self.current_size.load(Ordering::SeqCst);
-
-        if current <= target_size {
-            debug!(
-                "No eviction needed: current={} <= target={}",
-                current, target_size
-            );
-            return Ok(0);
-        }
-
-        let bytes_to_free = current.saturating_sub(target_size);
-        debug!(
-            "Starting write cache eviction: current={}, target={}, bytes_to_free={}",
-            current, target_size, bytes_to_free
-        );
-
-        // Collect eviction candidates
-        let candidates = self.collect_eviction_candidates().await?;
-
-        if candidates.is_empty() {
-            warn!("No eviction candidates found for write cache");
-            return Ok(0);
-        }
-
-        // Sort candidates by eviction score based on algorithm
-        let sorted_candidates = self.sort_candidates_for_eviction(candidates);
-
-        let mut total_freed: u64 = 0;
-        let mut evicted_count: u64 = 0;
-
-        for candidate in sorted_candidates {
-            if total_freed >= bytes_to_free {
-                break;
-            }
-
-            match self.evict_write_cached_object(&candidate.cache_key).await {
-                Ok(freed) => {
-                    total_freed += freed;
-                    evicted_count += 1;
-                    debug!(
-                        "Evicted write-cached object: key={}, freed={} bytes",
-                        candidate.cache_key, freed
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to evict write-cached object: key={}, error={}",
-                        candidate.cache_key, e
-                    );
-                }
-            }
-        }
-
-        info!(
-            "Write cache eviction complete: evicted={} objects, freed={} bytes",
-            evicted_count, total_freed
-        );
-
-        Ok(total_freed)
-    }
-
-    /// Collect eviction candidates from write-cached objects
-    async fn collect_eviction_candidates(&self) -> Result<Vec<WriteCacheEvictionCandidate>> {
-        use walkdir::WalkDir;
-
-        let metadata_dir = self.cache_dir.join("metadata");
-        let mut candidates = Vec::new();
-
-        if !metadata_dir.exists() {
-            return Ok(candidates);
-        }
-
-        for entry in WalkDir::new(&metadata_dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-
-            // Only process .meta files
-            if path.extension().is_some_and(|ext| ext == "meta") {
-                if let Ok(content) = tokio::fs::read_to_string(path).await {
-                    if let Ok(metadata) =
-                        serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content)
-                    {
-                        // Only consider write-cached objects
-                        if metadata.object_metadata.is_write_cached {
-                            let last_accessed = metadata
-                                .object_metadata
-                                .write_cache_last_accessed
-                                .unwrap_or(metadata.created_at);
-
-                            // Calculate eviction score based on algorithm
-                            let eviction_score =
-                                self.calculate_eviction_score(&metadata, last_accessed);
-
-                            candidates.push(WriteCacheEvictionCandidate {
-                                cache_key: metadata.cache_key.clone(),
-                                eviction_score,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        debug!(
-            "Collected {} write cache eviction candidates",
-            candidates.len()
-        );
-        Ok(candidates)
-    }
-
-    /// Calculate eviction score based on configured algorithm
-    fn calculate_eviction_score(
-        &self,
-        metadata: &crate::cache_types::NewCacheMetadata,
-        last_accessed: SystemTime,
-    ) -> u64 {
-        match self.eviction_algorithm {
-            CacheEvictionAlgorithm::LRU => {
-                // LRU: Lower score = evict first (older access time)
-                last_accessed
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            }
-            CacheEvictionAlgorithm::TinyLFU => {
-                // TinyLFU: frequency decayed by idle time. Higher score = keep longer.
-                //
-                // Must use the same `decayed_frequency` helper as the RAM tier
-                // (`shard_find_tinylfu_victim`) and the disk tier
-                // (`RangeSpec::tinylfu_score`). Dividing frequency by recency inverts the
-                // ranking — it drives a hot-but-idle entry's score toward zero, so it is
-                // evicted ahead of a freshly-read one-hit-wonder. That inversion was
-                // fixed in the other two tiers in 2.3.1; this call site was missed.
-                let total_access_count: u64 = metadata.ranges.iter().map(|r| r.access_count).sum();
-
-                let idle_secs = SystemTime::now()
-                    .duration_since(last_accessed)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                crate::cache::decayed_frequency(total_access_count, idle_secs)
-            }
-        }
-    }
-
-    /// Sort candidates for eviction based on algorithm
-    fn sort_candidates_for_eviction(
-        &self,
-        mut candidates: Vec<WriteCacheEvictionCandidate>,
-    ) -> Vec<WriteCacheEvictionCandidate> {
-        match self.eviction_algorithm {
-            CacheEvictionAlgorithm::LRU => {
-                // LRU: Sort by last accessed (oldest first)
-                candidates.sort_by_key(|c| c.eviction_score);
-            }
-            CacheEvictionAlgorithm::TinyLFU => {
-                // TinyLFU: Sort by score (lowest first = evict first)
-                candidates.sort_by_key(|c| c.eviction_score);
-            }
-        }
-        candidates
-    }
-
-    /// Evict a single write-cached object
-    async fn evict_write_cached_object(&self, cache_key: &str) -> Result<u64> {
+    /// - **R5.1** — debit `subtract` unconditionally and `subtract_write_cache` only for
+    ///   ranges still classified as staged by `cache_types::is_staged_range_spec` —
+    ///   the range's own recorded membership, with the object flag from the `.meta`
+    ///   **this call** loaded as the fallback for an unrecorded range. A staged range
+    ///   counts in `total_size` *and* in
+    ///   `write_cache_size`; a graduated one counts only in `total_size`. Both use
+    ///   `compressed_size`, for symmetry with the add sites
+    ///   (`DiskCacheManager::store_range` and
+    ///   `JournalConsolidator::write_multipart_journal_entries` both credit
+    ///   `compressed_size`); debiting an on-disk `len()` instead would drift silently.
+    /// - **R5.4** — debit only for range files that **existed and deleted cleanly**.
+    ///   The accumulator debits and the journal entries are both built from
+    ///   `deleted_ranges`, the filtered list — never from `metadata.ranges` — so a
+    ///   missing or undeletable file cannot produce a phantom debit.
+    /// - **R5.3** — do NOT also subtract directly. Nothing here writes
+    ///   `size_state.json`; the debit reaches it only via the accumulator's delta file
+    ///   and `collect_and_apply_deltas` under the global consolidation lock. See the
+    ///   equivalent warning in `CacheManager::enforce_disk_cache_limits_internal`.
+    ///
+    /// `release_capacity_internal` is still called and is **not** a direct subtraction
+    /// in the R5.3 sense: it moves this instance's in-flight admission counter
+    /// (`current_size`, exposed as `/metrics write_cache.inflight_bytes`), which is a
+    /// different quantity from `SizeState::write_cache_size` (exposed as
+    /// `resident_bytes`). The two are updated by different mechanisms with different
+    /// visibility and are expected to be able to diverge — see the steering note on
+    /// treating two figures that agree to the byte as a symptom rather than as
+    /// corroboration.
+    ///
+    /// # The graduation race, and why the write-cache debit is conditional
+    ///
+    /// Candidate selection filters on `is_write_cached`, so it is
+    /// tempting to conclude that anything reaching this function is staged by definition
+    /// and to debit `write_cache_size` unconditionally. **That was the first version of
+    /// this code and it was wrong.** The filter runs at *collection* time; this function
+    /// re-reads the `.meta` and the entry may have graduated in between — a first GET on
+    /// any instance clears the flag and appends a `Graduation` entry, which debits the
+    /// write-cache figure by these same bytes.
+    ///
+    /// An unconditional debit therefore removes those bytes **twice**, driving
+    /// `write_cache_size` toward undershoot. Undershoot is the more dangerous direction
+    /// because it silently over-admits rather than refusing, so the symptom is a write
+    /// cache quietly exceeding its allocation rather than an error.
+    ///
+    /// Classifying per range from the `.meta` this call read closes it, and does so
+    /// **independently of the caller**: Phase E's task 21 is also specified to skip
+    /// graduated candidates, but relying on that would make correctness here depend on
+    /// how a not-yet-written check in another phase is worded.
+    ///
+    /// # Cross-instance hazard, unchanged by this task
+    ///
+    /// The removed candidate walk scanned the **shared**
+    /// `metadata/` tree with no instance-ownership filter, while the decision to run it
+    /// comes from this instance's private counter. That is the "local decision, shared
+    /// effect" defect in `cache-coherency-invariants.md`, demonstrated live on
+    /// 2026-08-24 when one proxy deleted a 32 MiB object another had just cached. Task
+    /// 8 removed the only production caller for exactly that reason. R5 makes its
+    /// accounting correct so that Phase E's ledger-driven evictor — which fixes the
+    /// decision input, not the accounting — inherits a correct debit path.
+    ///
+    /// **Phase E has since given it that caller, so this is a live production path
+    /// again**: `CacheManager::evict_staging_tier_locked` → `evict_staged_object` →
+    /// here. The decision input is now the Write_Ledger read under the global eviction
+    /// lock rather than a private counter, which is what makes that safe — the
+    /// "currently reachable only from this module's tests" note this comment used to
+    /// carry was true of task 8's state and is no longer. Corrected 2026-08-27 while
+    /// fixing task 76, where the stale note had led a security scan to under-rate a
+    /// double-debit reaching this site.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 5.1, 5.2, 5.3, 5.4
+    pub(crate) async fn evict_write_cached_object(&self, cache_key: &str) -> Result<u64> {
         // Read metadata to get range files
         let metadata_path = self.get_metadata_path(cache_key)?;
 
@@ -633,6 +732,11 @@ impl WriteCacheManager {
             .map_err(|e| ProxyError::CacheError(format!("Failed to parse metadata: {}", e)))?;
 
         let mut total_freed: u64 = 0;
+        // Ranges whose `.bin` existed AND was removed without error. R5.4: this is the
+        // only list the accounting below may be built from — `metadata.ranges` would
+        // include files that were already gone, producing a phantom debit.
+        // Tuple: (range_start, range_end, compressed_size, bin_file_path, counts_as_staged)
+        let mut deleted_ranges: Vec<(u64, u64, u64, String, bool)> = Vec::new();
 
         // Delete all range files
         for range in &metadata.ranges {
@@ -642,17 +746,142 @@ impl WriteCacheManager {
                     warn!("Failed to remove range file {:?}: {}", range_path, e);
                 } else {
                     total_freed += range.compressed_size;
+                    deleted_ranges.push((
+                        range.start,
+                        range.end,
+                        range.compressed_size,
+                        range_path.to_string_lossy().to_string(),
+                        // Classified from the `.meta` THIS call read, not from the state
+                        // the candidate walk saw — see the graduation-race note on this
+                        // function. Per range, from the membership the range recorded at
+                        // credit time, so evicting a mixed object does not debit
+                        // `write_cache_size` for a read-tier range.
+                        //
+                        // No new tuple element was needed here: `counts_as_staged` was
+                        // already carried, so only the predicate changed. That is why
+                        // this site keeps its tuple while read-tier eviction's Step 5
+                        // moved to a named struct — that one genuinely needed an eighth
+                        // element.
+                        // Requirements: 12.3, 12.4
+                        crate::cache_types::is_staged_range_spec(
+                            range,
+                            metadata.object_metadata.is_write_cached,
+                        ),
+                    ));
                 }
             }
         }
 
         // Delete metadata file
-        if let Err(e) = tokio::fs::remove_file(&metadata_path).await {
-            warn!("Failed to remove metadata file {:?}: {}", metadata_path, e);
+        let metadata_deleted = match tokio::fs::remove_file(&metadata_path).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to remove metadata file {:?}: {}", metadata_path, e);
+                false
+            }
+        };
+
+        // R5.1 / R5.2 / R5.3: shared accounting. Debit both accumulators for the
+        // ranges actually deleted, then write Remove journal entries so the other
+        // instances converge. Nothing below writes `size_state.json`.
+        if !deleted_ranges.is_empty() || metadata_deleted {
+            if let Some(consolidator) = &self.journal_consolidator {
+                // R5.1: by compressed_size, for symmetry with the adds. `subtract` is
+                // unconditional — the bytes left the disk either way — but the
+                // write-cache debit is conditional on the range still being staged,
+                // exactly as read-tier eviction's Step 5 does it. A graduated entry has
+                // already had its write-cache bytes debited by its `Graduation` entry, so
+                // debiting again here would remove them twice.
+                for (start, end, compressed_size, _path, counts_as_staged) in &deleted_ranges {
+                    // `subtract_range` rather than `subtract`, so the range's dedup
+                    // entry is released along with its bytes and a later re-cache of
+                    // the same range can be credited again. See
+                    // `SizeAccumulator::subtract_range`.
+                    consolidator.size_accumulator().subtract_range(
+                        cache_key,
+                        *start,
+                        *end,
+                        *compressed_size,
+                    );
+                    if *counts_as_staged {
+                        consolidator
+                            .size_accumulator()
+                            .subtract_write_cache(*compressed_size);
+                    }
+                }
+
+                // R5.2: Remove journal entries, so the shared `.meta` converges and
+                // the other instances observe the removal. Metadata only — these do
+                // not move any size figure (journal-derived size deltas were retired
+                // in favour of the accumulator; see `consolidate_key`).
+                if !deleted_ranges.is_empty() {
+                    let journal_entries: Vec<(String, u64, u64, u64, String)> = deleted_ranges
+                        .iter()
+                        .map(|(start, end, compressed_size, path, _counts_as_staged)| {
+                            (
+                                cache_key.to_string(),
+                                *start,
+                                *end,
+                                *compressed_size,
+                                path.clone(),
+                            )
+                        })
+                        .collect();
+                    consolidator
+                        .write_eviction_journal_entries(journal_entries)
+                        .await;
+                }
+
+                // R5.2: `cached_objects` converges only when the `.meta` is gone, which
+                // is the same condition read-tier eviction uses (it counts a key as
+                // evicted when a `.meta` appears among the deleted paths).
+                if metadata_deleted {
+                    consolidator.decrement_cached_objects(1).await;
+                }
+
+                // Flush the debit to a delta file now rather than waiting for the
+                // periodic flush. The files are already gone; leaving the subtraction
+                // in memory means losing it entirely on a crash, with the bytes
+                // unrecoverable until the next full validation scan. Read-tier
+                // eviction flushes for the same reason before releasing its lock.
+                if let Err(e) = consolidator.size_accumulator().flush().await {
+                    warn!(
+                        "Failed to flush accumulator after staging eviction: cache_key={}, error={}",
+                        cache_key, e
+                    );
+                }
+            } else {
+                warn!(
+                    "Journal consolidator not wired into WriteCacheManager: staging eviction \
+                     of cache_key={} freed {} bytes that will NOT be reflected in Size_State \
+                     until the next full validation scan",
+                    cache_key, total_freed
+                );
+            }
         }
 
         // Update current size via internal saturating release
         self.release_capacity_internal(total_freed);
+        // Best-effort staged-entry gauge: this entry is no longer staged — but only
+        // if it was staged to begin with. This call has no production caller today
+        // (see the doc comment above), but a caller evicting an already-graduated
+        // read-cache entry must not decrement a gauge it was never counted in.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+        if metadata.object_metadata.is_write_cached {
+            self.decrement_staged_entries();
+        }
+
+        // Staging-eviction observability, deliberately separate from
+        // `cache.evictions` (Requirement 8.4). Counted here regardless of
+        // whether any bytes were actually freed (a metadata-only entry with
+        // no surviving range files still counts as one evicted object), but
+        // `staging_eviction_bytes_total` only accumulates what was actually
+        // freed on disk.
+        self.staging_evictions_total.fetch_add(1, Ordering::Relaxed);
+        if total_freed > 0 {
+            self.staging_eviction_bytes_total
+                .fetch_add(total_freed, Ordering::Relaxed);
+        }
 
         Ok(total_freed)
     }
@@ -949,13 +1178,6 @@ impl WriteCacheManager {
     }
 }
 
-/// Eviction candidate for write cache
-#[derive(Debug, Clone)]
-struct WriteCacheEvictionCandidate {
-    cache_key: String,
-    eviction_score: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1218,418 @@ mod tests {
         assert_eq!(manager.incomplete_upload_ttl(), Duration::from_secs(86400));
     }
 
+    /// Seed a staged (write-cached) `.meta` plus one range file for `cache_key`,
+    /// so `evict_write_cached_object` has a real, evictable object to act on.
+    async fn seed_staged_object(cache_dir: &std::path::Path, cache_key: &str, size: u64) {
+        let metadata_dir = cache_dir.join("metadata");
+        let meta_path = crate::disk_cache::get_sharded_path(&metadata_dir, cache_key, ".meta")
+            .expect("valid cache key");
+        if let Some(parent) = meta_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+
+        let ranges_dir = cache_dir.join("ranges");
+        let range_file_path =
+            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_0-end.bin")
+                .expect("valid cache key");
+        if let Some(parent) = range_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(&range_file_path, vec![0u8; size as usize])
+            .await
+            .unwrap();
+        let range_file_path_str = range_file_path
+            .strip_prefix(&ranges_dir)
+            .unwrap_or(&range_file_path)
+            .to_string_lossy()
+            .to_string();
+
+        let base_time = SystemTime::now();
+        let object_metadata = crate::cache_types::ObjectMetadata {
+            etag: "etag-staged".to_string(),
+            last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            content_length: size,
+            content_type: Some("application/octet-stream".to_string()),
+            is_write_cached: true,
+            write_cache_expires_at: Some(base_time + Duration::from_secs(86400)),
+            write_cache_created_at: Some(base_time - Duration::from_secs(3600)),
+            write_cache_last_accessed: Some(base_time - Duration::from_secs(3600)),
+            ..Default::default()
+        };
+        let range_spec = crate::cache_types::RangeSpec {
+            start: 0,
+            end: size.saturating_sub(1),
+            file_path: range_file_path_str,
+            compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+            compressed_size: size,
+            uncompressed_size: size,
+            created_at: base_time - Duration::from_secs(3600),
+            last_accessed: base_time - Duration::from_secs(3600),
+            access_count: 1,
+            staged: None,
+        };
+        let metadata = crate::cache_types::NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata,
+            ranges: vec![range_spec],
+            created_at: base_time - Duration::from_secs(3600),
+            expires_at: base_time + Duration::from_secs(86400),
+            compression_info: crate::cache_types::CompressionInfo::default(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string_pretty(&metadata).unwrap();
+        tokio::fs::write(&meta_path, json).await.unwrap();
+    }
+
+    /// Staging eviction must count separately from `cache.evictions`
+    /// (Requirement 8.4): eviction deleting a staged object must
+    /// increment both `staging_evictions_total` (by one object) and
+    /// `staging_eviction_bytes_total` (by the bytes actually freed), and
+    /// leave both at zero before any eviction has run.
+    #[tokio::test]
+    async fn test_staging_eviction_counters_increment_separately_from_read_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            1_000_000, // total cache size, irrelevant here
+            10.0,
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::LRU,
+            10 * 1024 * 1024,
+        );
+
+        // Nothing evicted yet: both counters start at zero.
+        assert_eq!(manager.staging_evictions_total(), 0);
+        assert_eq!(manager.staging_eviction_bytes_total(), 0);
+
+        let cache_key = "test-bucket/staged-object";
+        let object_size = 4096u64;
+        seed_staged_object(temp_dir.path(), cache_key, object_size).await;
+
+        // Historical note: the removed `evict_to_target` only walked candidates when
+        // `current_size` exceeded
+        // the target — it tracks in-flight/committed reservations, not what's
+        // actually on disk. Reserve to match the object we just seeded so the
+        // eviction path has something to reduce toward the target=0 below,
+        // mirroring how `try_reserve`'s slow path arrives at this call. The
+        // reservation is intentionally leaked (never dropped): eviction
+        // releases the same bytes via `release_capacity_internal`, and
+        // letting the `WriteReservation` also drop would release them a
+        // second time, tripping the underflow-warning path for an unrelated
+        // reason.
+        let reservation = manager.try_reserve(object_size).await.unwrap();
+        std::mem::forget(reservation);
+
+        // Evict everything (target 0) via the public entry point, same path
+        // `try_reserve`'s slow path uses.
+        let freed = manager.evict_write_cached_object(cache_key).await.unwrap();
+        assert_eq!(freed, object_size, "eviction should report bytes freed");
+
+        assert_eq!(
+            manager.staging_evictions_total(),
+            1,
+            "one object evicted should increment staging_evictions_total by exactly one"
+        );
+        assert_eq!(
+            manager.staging_eviction_bytes_total(),
+            object_size,
+            "staging_eviction_bytes_total should equal the bytes actually freed"
+        );
+
+        // Evicting again with nothing left to evict must not move either counter.
+        // Evicting the same key again: the `.meta` is gone now, so this reports an
+        // error rather than a zero-byte success. Either way neither counter may move,
+        // which is the property under test.
+        let freed_again = manager
+            .evict_write_cached_object(cache_key)
+            .await
+            .unwrap_or(0);
+        assert_eq!(freed_again, 0);
+        assert_eq!(manager.staging_evictions_total(), 1);
+        assert_eq!(manager.staging_eviction_bytes_total(), object_size);
+    }
+
+    /// Build a `WriteCacheManager` with a real `JournalConsolidator` wired in, so the
+    /// R5 accounting assertions below read the accumulator the production path uses.
+    fn manager_with_consolidator(
+        temp_dir: &TempDir,
+    ) -> (
+        WriteCacheManager,
+        Arc<crate::journal_consolidator::JournalConsolidator>,
+    ) {
+        let consolidator = Arc::new(crate::journal_consolidator::JournalConsolidator::new(
+            temp_dir.path().to_path_buf(),
+            Arc::new(crate::journal_manager::JournalManager::new(
+                temp_dir.path().to_path_buf(),
+                "test-instance".to_string(),
+            )),
+            Arc::new(crate::metadata_lock_manager::MetadataLockManager::new(
+                temp_dir.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            crate::journal_consolidator::ConsolidationConfig::default(),
+        ));
+        let mut manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            1_000_000,
+            10.0,
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::LRU,
+            10 * 1024 * 1024,
+        );
+        manager.set_journal_consolidator(consolidator.clone());
+        (manager, consolidator)
+    }
+
+    /// R5.1: staging eviction must debit **both** accumulators by the range's
+    /// `compressed_size`, so the Journal_Consolidator folds the reduction into
+    /// Size_State. Before this, eviction adjusted only the per-instance in-memory
+    /// counter, so `write_cache_size` ratcheted upward forever while data was being
+    /// deleted — the R5 leak.
+    ///
+    /// Both totals move because a staged range counts in `total_size` **and** in
+    /// `write_cache_size`; `write_cache_size` is a subset, not an addition.
+    ///
+    /// Asserting the accumulator (rather than `size_state.json`) is deliberate: the
+    /// accumulator is the predicate the consolidator actually reads, and R5.3 forbids
+    /// this path from writing `size_state.json` itself. `flush()` inside the eviction
+    /// path resets the in-memory deltas to zero after writing a delta file, so these
+    /// assertions read the delta file's contents rather than `current_delta()`.
+    #[tokio::test]
+    async fn staging_eviction_debits_both_accumulators() {
+        let temp_dir = TempDir::new().unwrap();
+        let (manager, consolidator) = manager_with_consolidator(&temp_dir);
+
+        assert_eq!(consolidator.size_accumulator().current_delta(), 0);
+        assert_eq!(
+            consolidator.size_accumulator().current_write_cache_delta(),
+            0
+        );
+
+        let cache_key = "test-bucket/staged-object";
+        let object_size = 4096u64;
+        seed_staged_object(temp_dir.path(), cache_key, object_size).await;
+
+        let reservation = manager.try_reserve(object_size).await.unwrap();
+        std::mem::forget(reservation);
+
+        let freed = manager.evict_write_cached_object(cache_key).await.unwrap();
+        assert_eq!(freed, object_size);
+
+        // The eviction path flushes, so the deltas live in a delta file rather than in
+        // the atomics. Sum what was written.
+        let (flushed_delta, flushed_wc_delta) =
+            consolidator.collect_and_apply_deltas().await.unwrap();
+
+        assert_eq!(
+            flushed_delta,
+            -(object_size as i64),
+            "R5.1: total_size must be debited by the range's compressed_size"
+        );
+        assert_eq!(
+            flushed_wc_delta,
+            -(object_size as i64),
+            "R5.1: write_cache_size must be debited too — this is the half that was \
+             missing, and its absence is why the figure only ever grew"
+        );
+    }
+
+    /// R5.4: a range file that is already absent must NOT be debited. The accumulator
+    /// debits and the Remove journal entries are both built from the list of files that
+    /// existed and deleted cleanly, never from `metadata.ranges` — otherwise an entry
+    /// whose `.bin` was already gone (evicted by the read tier, or lost) would be
+    /// subtracted a second time, driving `write_cache_size` toward undershoot. Undershoot
+    /// is the more dangerous direction because it silently over-admits.
+    ///
+    /// The fixture is the divergence that makes this observable: a `.meta` claiming a
+    /// range whose `.bin` does not exist. A test that seeds both would pass whatever the
+    /// code does.
+    #[tokio::test]
+    async fn staging_eviction_does_not_debit_for_an_absent_range_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let (manager, consolidator) = manager_with_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/staged-object";
+        let object_size = 4096u64;
+        seed_staged_object(temp_dir.path(), cache_key, object_size).await;
+
+        // Delete the `.bin` but leave the `.meta` claiming it — the state R5.4 is about.
+        let ranges_dir = temp_dir.path().join("ranges");
+        let mut removed = 0;
+        for entry in walkdir::WalkDir::new(&ranges_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().extension().is_some_and(|x| x == "bin") {
+                std::fs::remove_file(entry.path()).unwrap();
+                removed += 1;
+            }
+        }
+        assert_eq!(
+            removed, 1,
+            "precondition: exactly one .bin must have been removed, or this test is \
+             asserting against a fixture that never had the divergence it needs"
+        );
+
+        let reservation = manager.try_reserve(object_size).await.unwrap();
+        std::mem::forget(reservation);
+
+        let freed = manager.evict_write_cached_object(cache_key).await.unwrap();
+        assert_eq!(
+            freed, 0,
+            "no bytes were freed, because the file was not there"
+        );
+
+        let (flushed_delta, flushed_wc_delta) =
+            consolidator.collect_and_apply_deltas().await.unwrap();
+        assert_eq!(
+            flushed_delta, 0,
+            "R5.4: no debit for a range file that was already absent"
+        );
+        assert_eq!(flushed_wc_delta, 0, "R5.4: and none to write_cache_size");
+    }
+
+    /// Clear `is_write_cached` on an already-seeded `.meta`, the way a first read on any
+    /// instance does. Used to reproduce the graduation race: the candidate was collected
+    /// while staged, and graduated before it was deleted.
+    async fn graduate_seeded_object(cache_dir: &std::path::Path, cache_key: &str) {
+        let meta_path =
+            crate::disk_cache::get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
+                .expect("valid cache key");
+        let content = tokio::fs::read_to_string(&meta_path).await.unwrap();
+        let mut metadata: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&content).unwrap();
+        metadata.object_metadata.is_write_cached = false;
+        metadata.object_metadata.write_cache_expires_at = None;
+        metadata.object_metadata.write_cache_created_at = None;
+        metadata.object_metadata.write_cache_last_accessed = None;
+        tokio::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// **Evicting an entry that graduated after it was collected must NOT debit
+    /// `write_cache_size` a second time.**
+    ///
+    /// Candidate selection filters on `is_write_cached`, which makes it tempting
+    /// to debit the write-cache figure unconditionally here — everything reaching
+    /// `evict_write_cached_object` was staged when it was picked. But the filter runs at
+    /// *collection* time and this function re-reads the `.meta`, so a first GET on any
+    /// instance can clear the flag in between and append a `Graduation` entry that debits
+    /// these same bytes. Debiting again is a double subtraction, and it drives
+    /// `write_cache_size` toward **undershoot** — the direction that silently over-admits
+    /// instead of refusing.
+    ///
+    /// The fixture is the divergence, and it is the whole test: a `.meta` whose flag was
+    /// cleared between seeding and eviction. A test that evicted a still-staged entry
+    /// would pass with the debit conditional or unconditional, which is why
+    /// `staging_eviction_debits_both_accumulators` above cannot cover this.
+    ///
+    /// `total_size` must still be debited — the bytes did leave the disk.
+    #[tokio::test]
+    async fn staging_eviction_of_a_graduated_entry_debits_total_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let (manager, consolidator) = manager_with_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/graduated-then-evicted";
+        let object_size = 4096u64;
+        seed_staged_object(temp_dir.path(), cache_key, object_size).await;
+
+        // The race: graduation lands after the candidate was collected, before deletion.
+        graduate_seeded_object(temp_dir.path(), cache_key).await;
+
+        // Call the evictor directly. This was already necessary before task 25 removed
+        // the walk-based `evict_to_target`, whose candidate walk filtered on the flag: a
+        // graduated entry was never collected and nothing would be deleted. The
+        // ledger-driven evictor skips a graduated candidate for the same reason
+        // (`StagedCandidateVerdict::Graduated`), so reaching this path still requires
+        // calling the per-object evictor directly.
+        let freed = manager
+            .evict_write_cached_object(cache_key)
+            .await
+            .expect("eviction succeeds");
+        assert_eq!(
+            freed, object_size,
+            "precondition: the entry really was deleted, so there is a debit to get wrong"
+        );
+
+        let (flushed_delta, flushed_wc_delta) =
+            consolidator.collect_and_apply_deltas().await.unwrap();
+
+        assert_eq!(
+            flushed_delta,
+            -(object_size as i64),
+            "total_size must still be debited — the bytes left the disk"
+        );
+        assert_eq!(
+            flushed_wc_delta, 0,
+            "write_cache_size must NOT be debited: the entry graduated, so its \
+             Graduation journal entry already removed these bytes from the figure. \
+             Debiting here too is a double subtraction driving the figure toward \
+             undershoot, which silently over-admits."
+        );
+    }
+
+    /// R5.3, stated as an assertion rather than left to the comments: the eviction path
+    /// must not subtract the freed bytes from Size_State's **size fields** directly. The
+    /// debit must arrive only via the accumulator's delta file, applied under the global
+    /// consolidation lock; a direct subtraction here would remove the bytes twice.
+    ///
+    /// # The predicate here was wrong once — do not "simplify" it back
+    ///
+    /// The first version of this test asserted that eviction does not create
+    /// `size_state.json` at all. It failed, and it *should* have: eviction legitimately
+    /// calls `decrement_cached_objects` for R5.2 (so `cached_objects` converges and the
+    /// other instances' counts do not drift), and that persists the state file. Read-tier
+    /// eviction does exactly the same thing.
+    ///
+    /// "Does not write the file" and "does not subtract sizes" look equivalent and are
+    /// not. Asserting the former forbids behaviour the spec requires; asserting the
+    /// latter is the property R5.3 is about. So this reads `total_size` and
+    /// `write_cache_size` specifically, and deliberately permits `cached_objects` to move.
+    #[tokio::test]
+    async fn staging_eviction_does_not_subtract_sizes_from_size_state_directly() {
+        let temp_dir = TempDir::new().unwrap();
+        let (manager, consolidator) = manager_with_consolidator(&temp_dir);
+
+        // Establish a known non-zero starting point, so a subtraction would be visible
+        // as a change rather than being indistinguishable from the default of 0.
+        consolidator
+            .update_size_from_validation(100_000, Some(50_000), Some(7))
+            .await;
+        let before = consolidator.get_size_state().await;
+        assert_eq!(before.total_size, 100_000, "precondition");
+        assert_eq!(before.write_cache_size, 50_000, "precondition");
+
+        let cache_key = "test-bucket/staged-object";
+        let object_size = 4096u64;
+        seed_staged_object(temp_dir.path(), cache_key, object_size).await;
+
+        let reservation = manager.try_reserve(object_size).await.unwrap();
+        std::mem::forget(reservation);
+        let freed = manager.evict_write_cached_object(cache_key).await.unwrap();
+        assert_eq!(freed, object_size, "precondition: the eviction did happen");
+
+        let after = consolidator.get_size_state().await;
+        assert_eq!(
+            after.total_size, before.total_size,
+            "R5.3: eviction must not subtract from total_size directly — the debit \
+             belongs to the accumulator, applied under the global lock"
+        );
+        assert_eq!(
+            after.write_cache_size, before.write_cache_size,
+            "R5.3: nor from write_cache_size"
+        );
+        // And the one field it IS allowed to move, per R5.2.
+        assert_eq!(
+            after.cached_objects, 6,
+            "R5.2: cached_objects converges, so other instances' counts do not drift"
+        );
+    }
+
     #[tokio::test]
     async fn test_try_reserve_basic() {
         let temp_dir = TempDir::new().unwrap();
@@ -1028,37 +1662,181 @@ mod tests {
         assert_eq!(manager.current_usage(), 0);
     }
 
+    /// The Staging_Bound admits past itself rather than refusing (R3.1, R3.3).
+    ///
+    /// This test previously asserted the **opposite** — that a reservation taking the
+    /// in-flight total past the bound returns `None` — and it was correct to do so until
+    /// task 28. It is inverted here rather than deleted, because "going over the bound
+    /// still caches" is the headline behaviour change of Phase F and deserves a direct
+    /// assertion, not just the absence of the old one.
+    ///
+    /// Why the inversion is the right way round: caching is worth doing whenever the space
+    /// is affordable, and overshoot is now reclaimed by asynchronous eviction toward a
+    /// target below the bound rather than prevented by refusing the upload. See
+    /// [`WriteCacheManager::reserve_for_sizing`] for the full reasoning — including why the
+    /// cost-asymmetry argument the spec gives for this ("refusing a PUT is a one-shot
+    /// loss") is wrong, and what the actual justification is.
     #[tokio::test]
-    async fn test_try_reserve_exceeds_capacity() {
+    async fn reservation_admits_past_the_staging_bound_instead_of_refusing() {
         let temp_dir = TempDir::new().unwrap();
         let manager = WriteCacheManager::new(
             temp_dir.path().to_path_buf(),
             10_000, // 10KB total
-            10.0,   // 10% = 1000 bytes max write cache
+            10.0,   // 10% = 1000 bytes Staging_Bound
             Duration::from_secs(86400),
             Duration::from_secs(86400),
             CacheEvictionAlgorithm::LRU,
             256 * 1024 * 1024,
         );
+        assert_eq!(
+            manager.max_size(),
+            1000,
+            "precondition: bound is 1000 bytes"
+        );
 
-        // Reserve most of the capacity
         let r1 = manager.try_reserve(900).await;
         assert!(r1.is_some());
-
-        // This should fail — would exceed capacity
-        let r2 = manager.try_reserve(200).await;
-        assert!(r2.is_none());
-
-        // Usage should still be 900 (failed reservation doesn't change it)
         assert_eq!(manager.current_usage(), 900);
 
-        // Drop r1, then the 200 reservation should succeed
+        // 900 + 200 = 1100, past the 1000-byte bound. Admitted anyway.
+        let r2 = manager.try_reserve(200).await;
+        assert!(
+            r2.is_some(),
+            "the Staging_Bound must not refuse an upload (R3.1); going over it triggers \
+             asynchronous eviction instead"
+        );
+        assert_eq!(
+            manager.current_usage(),
+            1100,
+            "in-flight bytes are reported honestly even when over the bound, so \
+             `over_bound` on /metrics can be true"
+        );
+
+        // Release still works and is exact.
+        drop(r2);
+        assert_eq!(manager.current_usage(), 900);
         drop(r1);
         assert_eq!(manager.current_usage(), 0);
+    }
 
-        let r3 = manager.try_reserve(200).await;
-        assert!(r3.is_some());
-        assert_eq!(manager.current_usage(), 200);
+    /// R3.5 / task 30: the per-object cap is the one size-based refusal that remains, and
+    /// it must be evaluated **before** anything else, so eviction is never attempted for
+    /// an upload that could not be cached at any capacity.
+    ///
+    /// Asserted at an in-flight total of zero, where no capacity argument could explain a
+    /// refusal, so a pass can only mean the object-size check fired.
+    #[tokio::test]
+    async fn max_object_size_refusal_survives_the_bound_becoming_a_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024 * 1024, // 1 GiB total
+            50.0,               // 512 MiB Staging_Bound — deliberately far above the cap
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::LRU,
+            1024, // 1 KiB max object size
+        );
+
+        assert_eq!(
+            manager.current_usage(),
+            0,
+            "precondition: nothing in flight"
+        );
+        assert!(
+            manager.try_reserve(1025).await.is_none(),
+            "an object above max_object_size must be refused regardless of capacity"
+        );
+        assert_eq!(
+            manager.current_usage(),
+            0,
+            "a refused object must not be counted as in-flight"
+        );
+        assert!(
+            manager.try_reserve(1024).await.is_some(),
+            "exactly at the cap is admissible"
+        );
+    }
+
+    /// Design test 10: the counter-pinning regression guard.
+    ///
+    /// The outage this spec was opened for was not a refusal bug, it was a **pinning**
+    /// bug. `current_size` was seeded from on-disk residency at startup
+    /// (`initialize_from_scan_results`, removed by task 27) and nothing drained it, so
+    /// every proxy came up at 157.61% of its allocation and refused every single-part
+    /// PUT for the life of the process. Restarting did not help: the same persisted
+    /// figure was re-read.
+    ///
+    /// Three properties, and it is the combination that pins the defect rather than any
+    /// one of them:
+    ///
+    /// 1. A fresh manager holds **zero** in-flight bytes. A process with no uploads in
+    ///    flight has no in-flight bytes; there is no state to recover.
+    /// 2. Repeated refusals for a non-capacity reason do not accumulate. A refusal that
+    ///    charged the counter would degrade the tier a little on every attempt, which is
+    ///    the shape of the original defect arrived at incrementally instead of at
+    ///    startup.
+    /// 3. Admission still works afterwards. Without this the first two are satisfiable
+    ///    by a manager that refuses everything and counts nothing.
+    ///
+    /// Deliberately driven through `max_object_size`, which is evaluated ahead of every
+    /// capacity consideration (task 30), so the loop cannot be confused with a capacity
+    /// refusal — after Phase F there is no capacity refusal left to confuse it with, and
+    /// this test should keep passing precisely because the reason is not capacity.
+    ///
+    /// Shown failing first by restoring a seeded counter: constructing the manager and
+    /// then charging it a non-zero starting figure reds assertion 1 and, because the
+    /// figure never drains, assertion 3 as well.
+    #[tokio::test]
+    async fn refusals_do_not_accumulate_in_flight_bytes_over_repeated_attempts() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = WriteCacheManager::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024 * 1024, // 1 GiB total
+            10.0,               // ~102 MiB Staging_Bound
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+            CacheEvictionAlgorithm::LRU,
+            1024, // 1 KiB max object size
+        );
+
+        // 1. A fresh process starts at zero. This is what task 27 restored by deleting
+        //    the scan-results seeding, and it is the whole of the fix for the outage.
+        assert_eq!(
+            manager.current_usage(),
+            0,
+            "a fresh manager must hold no in-flight bytes: nothing is in flight"
+        );
+
+        // 2. Twenty refusals, all for the same non-capacity reason.
+        for attempt in 1..=20 {
+            assert!(
+                manager.try_reserve(2048).await.is_none(),
+                "attempt {attempt}: an object above max_object_size must be refused"
+            );
+            assert_eq!(
+                manager.current_usage(),
+                0,
+                "attempt {attempt}: a refused object must not be charged. A counter that \
+                 crept upward here would reproduce the original defect incrementally \
+                 rather than at startup"
+            );
+        }
+
+        // 3. And the tier is still usable, which is what makes the two assertions above
+        //    mean something. A manager that refused everything would satisfy them both.
+        let reservation = manager
+            .try_reserve(1024)
+            .await
+            .expect("an admissible object must still be admitted after 20 refusals");
+        assert_eq!(manager.current_usage(), 1024);
+        drop(reservation);
+        assert_eq!(
+            manager.current_usage(),
+            0,
+            "and the admitted bytes must drain on release, or the counter is pinned \
+             again by a slower route"
+        );
     }
 
     #[tokio::test]
@@ -1142,23 +1920,30 @@ mod tests {
         assert_eq!(manager.max_size(), 500); // 50% of 1000
     }
 
+    /// Concurrent reservations must account **exactly**, which is the property that
+    /// survives the bound becoming a target.
+    ///
+    /// This test used to be `test_concurrent_reservations_never_exceed_capacity` and its
+    /// final assertion was `total_reserved <= max_size`. That assertion is now false by
+    /// design (R3.1), so it is replaced rather than relaxed: what the CAS loop is still
+    /// responsible for is that every admitted reservation is counted once and no update
+    /// is lost, which is a strictly sharper claim than the inequality it replaces —
+    /// the old bound could be satisfied by silently dropping reservations.
     #[tokio::test]
-    async fn test_concurrent_reservations_never_exceed_capacity() {
+    async fn concurrent_reservations_account_exactly() {
         let temp_dir = TempDir::new().unwrap();
         let manager = Arc::new(WriteCacheManager::new(
             temp_dir.path().to_path_buf(),
             10_000, // 10KB total
-            100.0,  // Will be clamped to 50% = 5000 bytes
+            100.0,  // Clamped to 50% = 5000 bytes Staging_Bound
             Duration::from_secs(86400),
             Duration::from_secs(86400),
             CacheEvictionAlgorithm::LRU,
             5000,
         ));
 
-        let max_size = manager.max_size();
+        let bound = manager.max_size();
         let mut handles = Vec::new();
-
-        // Spawn many concurrent reservation attempts
         for _ in 0..50 {
             let mgr = manager.clone();
             handles.push(tokio::spawn(async move { mgr.try_reserve(100).await }));
@@ -1170,12 +1955,29 @@ mod tests {
             .filter_map(|r| r.ok().flatten())
             .collect();
 
-        // Current usage should equal sum of successful reservations
+        // Every attempt is admitted: 100 bytes is under `max_object_size` and the bound
+        // no longer refuses. This is the behaviour change, asserted head-on.
+        assert_eq!(
+            successful.len(),
+            50,
+            "no reservation may be refused for capacity now that the bound is a target"
+        );
+
+        // No lost updates under concurrency: the counter equals the sum of what was handed out.
         let total_reserved: u64 = successful.iter().map(|r| r.size()).sum();
         assert_eq!(manager.current_usage(), total_reserved);
+        assert_eq!(total_reserved, 5000);
 
-        // Should never exceed capacity
-        assert!(total_reserved <= max_size);
+        // And it genuinely went past the bound, so this is not passing by accident of a
+        // fixture that happened to stay under it.
+        assert!(
+            total_reserved >= bound,
+            "fixture must actually reach the bound to be testing anything: \
+             reserved={total_reserved}, bound={bound}"
+        );
+
+        drop(successful);
+        assert_eq!(manager.current_usage(), 0);
     }
 }
 
@@ -1193,13 +1995,21 @@ mod property_tests {
 
     /// Property 10: Write cache capacity enforcement with eviction
     ///
-    /// *For any* PUT request, if the write cache usage plus request size exceeds
-    /// the configured write cache capacity, the system SHALL first attempt to
-    /// evict existing write-cached objects. If eviction cannot free sufficient
-    /// space, the request SHALL bypass caching.
+    /// *For any* sequence of PUT requests within `max_object_size`, every request is
+    /// admitted and the in-flight total equals exactly the sum of what is outstanding.
     ///
-    /// **Feature: write-through-cache-finalization, Property 10: Write cache capacity enforcement with eviction**
-    /// **Validates: Requirements 6.1, 6.2, 6.5**
+    /// **Restated for task 28.** The original property was "if usage plus request size
+    /// exceeds the write cache capacity, evict first; if eviction cannot free enough,
+    /// bypass caching", asserted as `current_usage() <= max_write_cache` at every step.
+    /// Both halves are now wrong by design: the Staging_Bound does not refuse (R3.1) and
+    /// eviction is neither inline nor synchronous with admission (R3.2).
+    ///
+    /// The property that replaces it is about the accounting rather than the gate, and it
+    /// is sharper: the old inequality could be satisfied by refusing everything, whereas
+    /// exact accounting cannot. Capacity behaviour proper is now a property of
+    /// `CacheManager::evict_staging_tier`, which is where the bound is interpreted.
+    ///
+    /// **Validates: Requirements 3.1, 3.3, 3.5**
     #[quickcheck]
     fn prop_write_cache_capacity_enforcement(
         total_cache_mb: u8,
@@ -1253,13 +2063,17 @@ mod property_tests {
                         active_reservations.push(reservation);
                     }
                     None => {
-                        // Reservation failed — that's fine, capacity was full
+                        // Only reachable for an object above `max_object_size`, which the
+                        // loop already skipped, or u64 overflow, which these sizes cannot
+                        // reach. A refusal here means the bound is gating again.
+                        return TestResult::failed();
                     }
                 }
 
-                // Property: current usage should never exceed max
-                let current = manager.current_usage();
-                if current > max_write_cache {
+                // Exact accounting: the counter equals the sum of what is outstanding,
+                // whether or not that is over the bound.
+                let expected: u64 = active_reservations.iter().map(|r| r.size()).sum();
+                if manager.current_usage() != expected {
                     return TestResult::failed();
                 }
             }
@@ -1270,144 +2084,9 @@ mod property_tests {
                 return TestResult::failed();
             }
 
-            TestResult::passed()
-        })
-    }
-
-    /// Property 12: Write cache eviction order
-    ///
-    /// *For any* write cache eviction triggered by capacity limits, objects SHALL
-    /// be evicted according to the configured eviction algorithm (LRU or TinyLFU),
-    /// consistent with read cache eviction.
-    ///
-    /// **Feature: write-through-cache-finalization, Property 12: Write cache eviction order**
-    /// **Validates: Requirements 6.5**
-    #[quickcheck]
-    fn prop_write_cache_eviction_order(num_objects: u8, use_tinylfu: bool) -> TestResult {
-        // Filter invalid inputs
-        if !(2..=10).contains(&num_objects) {
-            return TestResult::discard();
-        }
-
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-
-            let eviction_algorithm = if use_tinylfu {
-                CacheEvictionAlgorithm::TinyLFU
-            } else {
-                CacheEvictionAlgorithm::LRU
-            };
-
-            let manager = WriteCacheManager::new(
-                temp_dir.path().to_path_buf(),
-                100 * 1024 * 1024, // 100MB total
-                50.0,              // 50% = 50MB write cache
-                Duration::from_secs(86400),
-                Duration::from_secs(86400),
-                eviction_algorithm.clone(),
-                10 * 1024 * 1024, // 10MB max object
-            );
-
-            // Create test metadata files with different access times
-            let metadata_dir = temp_dir.path().join("metadata");
-            tokio::fs::create_dir_all(&metadata_dir).await.unwrap();
-
-            let mut expected_eviction_order: Vec<String> = Vec::new();
-            let base_time = SystemTime::now();
-
-            for i in 0..num_objects {
-                let cache_key = format!("test-bucket/object-{}", i);
-                // Use sharded path structure for metadata files
-                let meta_path =
-                    crate::disk_cache::get_sharded_path(&metadata_dir, &cache_key, ".meta")
-                        .unwrap();
-                // Create parent directories for sharded structure
-                if let Some(parent) = meta_path.parent() {
-                    tokio::fs::create_dir_all(parent).await.unwrap();
-                }
-
-                // Create metadata with varying access times
-                // For LRU: older access time = evict first
-                // For TinyLFU: lower frequency = evict first
-                let access_offset = Duration::from_secs((num_objects - i) as u64 * 100);
-                let last_accessed = base_time - access_offset;
-                let access_count = (i as u64) + 1; // Higher index = more accesses
-
-                let object_metadata = crate::cache_types::ObjectMetadata {
-                    etag: format!("etag-{}", i),
-                    last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-                    content_length: 1024,
-                    content_type: Some("application/octet-stream".to_string()),
-                    is_write_cached: true,
-                    write_cache_expires_at: Some(base_time + Duration::from_secs(86400)),
-                    write_cache_created_at: Some(base_time - Duration::from_secs(3600)),
-                    write_cache_last_accessed: Some(last_accessed),
-                    ..Default::default()
-                };
-
-                // Get the range file path using sharded structure
-                let ranges_dir = temp_dir.path().join("ranges");
-                let range_file_path =
-                    crate::disk_cache::get_sharded_path(&ranges_dir, &cache_key, "_0-1023.bin")
-                        .unwrap();
-                let range_file_path_str = range_file_path
-                    .strip_prefix(&ranges_dir)
-                    .unwrap_or(&range_file_path)
-                    .to_string_lossy()
-                    .to_string();
-
-                let range_spec = crate::cache_types::RangeSpec {
-                    start: 0,
-                    end: 1023,
-                    file_path: range_file_path_str,
-                    compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
-                    compressed_size: 1024,
-                    uncompressed_size: 1024,
-                    created_at: base_time - Duration::from_secs(3600),
-                    last_accessed,
-                    access_count,
-                };
-
-                let metadata = crate::cache_types::NewCacheMetadata {
-                    cache_key: cache_key.clone(),
-                    object_metadata,
-                    ranges: vec![range_spec],
-                    created_at: base_time - Duration::from_secs(3600),
-                    expires_at: base_time + Duration::from_secs(86400),
-                    compression_info: crate::cache_types::CompressionInfo::default(),
-                    ..Default::default()
-                };
-
-                let json = serde_json::to_string_pretty(&metadata).unwrap();
-                tokio::fs::write(&meta_path, json).await.unwrap();
-
-                // For LRU, oldest accessed should be evicted first (lowest index)
-                // For TinyLFU, lowest frequency should be evicted first (lowest index)
-                expected_eviction_order.push(cache_key);
-            }
-
-            // Collect eviction candidates
-            let candidates = manager.collect_eviction_candidates().await.unwrap();
-
-            // Verify we found all objects
-            if candidates.len() != num_objects as usize {
-                return TestResult::failed();
-            }
-
-            // Sort candidates as the eviction algorithm would
-            let sorted = manager.sort_candidates_for_eviction(candidates);
-
-            // Verify eviction order matches expected
-            // For both LRU and TinyLFU with our test data, lower index = evict first
-            for (i, candidate) in sorted.iter().enumerate() {
-                let expected_key = &expected_eviction_order[i];
-                if &candidate.cache_key != expected_key {
-                    // The order might differ slightly due to timing, but the general
-                    // principle should hold: older/less frequent items first
-                    // For this test, we just verify the algorithm is applied consistently
-                }
-            }
+            // `max_write_cache` is deliberately not asserted against: exceeding it is
+            // permitted now, and eviction rather than admission is what brings it back.
+            let _ = max_write_cache;
 
             TestResult::passed()
         })
@@ -1473,7 +2152,10 @@ mod property_tests {
                     if let Some(reservation) = manager.try_reserve(size).await {
                         active_reservations.push(reservation);
                     }
-                    // Reservation may fail (capacity full) — that's fine
+                    // A refusal is possible only for `size > max_object_size`, which this
+                    // fixture sets equal to `capacity`, so a large generated value can
+                    // still be refused. Not asserted either way here — this property is
+                    // about the counter tracking the outstanding set exactly.
                 } else {
                     // Release operation: drop the reservation at index `value % len`
                     if !active_reservations.is_empty() {
@@ -1482,14 +2164,18 @@ mod property_tests {
                     }
                 }
 
-                // Invariant: current_size must be in [0, capacity] at every step
-                let current = manager.current_usage();
-                if current > capacity {
+                // Invariant, restated for task 28: the counter equals the sum of the
+                // outstanding reservations at every step. The previous invariant was
+                // `current <= capacity`, which is no longer true by design — the
+                // Staging_Bound admits past itself (R3.1) — and was in any case weaker,
+                // since dropping an update silently would satisfy it.
+                let expected: u64 = active_reservations.iter().map(|r| r.size()).sum();
+                if manager.current_usage() != expected {
                     return TestResult::failed();
                 }
-                // current_size is u64, so >= 0 is always true, but verify it
-                // matches the sum of active reservations
             }
+            // `capacity` is no longer an upper bound on in-flight bytes.
+            let _ = capacity;
 
             // After dropping all reservations, current_size must be 0
             drop(active_reservations);
@@ -1613,122 +2299,5 @@ mod property_tests {
 
             TestResult::passed()
         })
-    }
-}
-
-#[cfg(test)]
-mod write_cache_tinylfu_scoring_tests {
-    use super::*;
-    use crate::cache_types::NewCacheMetadata;
-    use tempfile::TempDir;
-
-    fn manager_with(algorithm: CacheEvictionAlgorithm) -> (TempDir, WriteCacheManager) {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = WriteCacheManager::new(
-            temp_dir.path().to_path_buf(),
-            10 * 1024 * 1024 * 1024,
-            10.0,
-            Duration::from_secs(86400),
-            Duration::from_secs(86400),
-            algorithm,
-            256 * 1024 * 1024,
-        );
-        (temp_dir, manager)
-    }
-
-    fn metadata_with_access_count(
-        access_count: u64,
-        last_accessed: SystemTime,
-    ) -> NewCacheMetadata {
-        let range_spec = crate::cache_types::RangeSpec {
-            start: 0,
-            end: 1023,
-            file_path: "test.bin".to_string(),
-            compression_algorithm: crate::compression::CompressionAlgorithm::default(),
-            compressed_size: 1024,
-            uncompressed_size: 1024,
-            created_at: last_accessed,
-            last_accessed,
-            access_count,
-        };
-
-        NewCacheMetadata {
-            cache_key: "bucket/key".to_string(),
-            object_metadata: crate::cache_types::ObjectMetadata::default(),
-            ranges: vec![range_spec],
-            created_at: last_accessed,
-            expires_at: SystemTime::now() + Duration::from_secs(86400),
-            compression_info: crate::cache_types::CompressionInfo::default(),
-            ..Default::default()
-        }
-    }
-
-    /// Regression test for the TinyLFU inversion fixed in the RAM and disk tiers in
-    /// 2.3.1 but missed here: a genuinely hot entry that has been idle a while must
-    /// still outrank a freshly-read one-hit-wonder, so it is NOT evicted first.
-    ///
-    /// The old formula was `access_count * 1000 / idle_secs`, which gave the hot-but-idle
-    /// entry 100 * 1000 / 7200 = 13 and the fresh single-read entry 1 * 1000 / 1 = 1000 —
-    /// inverted, so the hot entry was evicted first.
-    #[test]
-    fn hot_but_idle_entry_outranks_fresh_one_hit_wonder() {
-        let (_tmp, manager) = manager_with(CacheEvictionAlgorithm::TinyLFU);
-        let now = SystemTime::now();
-
-        // Accessed 100 times, but idle for 2 hours (two half-lives).
-        let hot_idle = metadata_with_access_count(100, now - Duration::from_secs(7200));
-        // Accessed once, just now.
-        let fresh_cold = metadata_with_access_count(1, now);
-
-        let hot_score =
-            manager.calculate_eviction_score(&hot_idle, now - Duration::from_secs(7200));
-        let fresh_score = manager.calculate_eviction_score(&fresh_cold, now);
-
-        // Higher score = keep longer. 100 >> 2 == 25, versus 1 >> 0 == 1.
-        assert_eq!(hot_score, 25, "two half-lives of decay should quarter 100");
-        assert_eq!(fresh_score, 1);
-        assert!(
-            hot_score > fresh_score,
-            "hot-but-idle entry (score {hot_score}) must outrank fresh one-hit read \
-             (score {fresh_score}); dividing frequency by recency inverts this"
-        );
-    }
-
-    /// The score must never increase as idle time grows, so eviction ranking is stable.
-    #[test]
-    fn score_is_monotonic_non_increasing_in_idle_time() {
-        let (_tmp, manager) = manager_with(CacheEvictionAlgorithm::TinyLFU);
-        let now = SystemTime::now();
-        let mut previous = u64::MAX;
-
-        for hours in 0..6 {
-            let accessed_at = now - Duration::from_secs(hours * 3600);
-            let metadata = metadata_with_access_count(64, accessed_at);
-            let score = manager.calculate_eviction_score(&metadata, accessed_at);
-            assert!(
-                score <= previous,
-                "score rose from {previous} to {score} after {hours}h idle"
-            );
-            previous = score;
-        }
-    }
-
-    /// Sanity check that the write-cache path agrees with the shared helper the other
-    /// two tiers use, so the three cannot drift apart again.
-    #[test]
-    fn agrees_with_shared_decayed_frequency_helper() {
-        let (_tmp, manager) = manager_with(CacheEvictionAlgorithm::TinyLFU);
-        let now = SystemTime::now();
-
-        for (count, idle_secs) in [(1u64, 0u64), (10, 3600), (100, 7200), (5, 100_000)] {
-            let accessed_at = now - Duration::from_secs(idle_secs);
-            let metadata = metadata_with_access_count(count, accessed_at);
-            assert_eq!(
-                manager.calculate_eviction_score(&metadata, accessed_at),
-                crate::cache::decayed_frequency(count, idle_secs),
-                "write-cache scoring diverged from decayed_frequency for \
-                 count={count} idle={idle_secs}"
-            );
-        }
     }
 }

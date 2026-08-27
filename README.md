@@ -93,6 +93,7 @@ The same proxy accelerates access to a cross-region Amazon S3 bucket or an S3-co
 - **[Compression](docs/COMPRESSION.md)** - LZ4 compression and content detection
 - **[Connection Pooling](docs/CONNECTION_POOLING.md)** - Connection management and load balancing
 - **[Hedged Requests](docs/HEDGING.md)** - Racing a duplicate upstream fetch to cut tail latency
+- **[Request-Aware Routing](docs/REQUEST_AWARE_ROUTING.md)** - Optional HAProxy pattern routing by object key and byte range so concurrent readers converge on one instance
 - **[Bandwidth QoS](docs/BANDWIDTH_QOS.md)** - Origin download ceiling and fair sharing
 - **[Dashboard](docs/DASHBOARD.md)** - Web-based monitoring interface
 - **[Error Handling](docs/ERROR_HANDLING.md)** - Error handling patterns

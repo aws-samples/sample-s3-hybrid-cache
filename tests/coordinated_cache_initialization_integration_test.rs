@@ -172,6 +172,7 @@ fn create_test_metadata(
             created_at: SystemTime::now(),
             last_accessed: SystemTime::now(),
             access_count: 1,
+            staged: None,
         }],
         created_at: SystemTime::now(),
         expires_at: SystemTime::now() + Duration::from_secs(3600),

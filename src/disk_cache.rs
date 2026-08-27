@@ -1250,13 +1250,29 @@ impl DiskCacheManager {
             .to_string_lossy()
             .to_string();
 
-        let range_spec = RangeSpec::new(
+        // Classify staging membership BEFORE `range_file_relative_path` is moved into
+        // the `RangeSpec`, so the accounting block below needs neither a clone nor a
+        // second, divergent predicate.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
+        let counts_as_staged = crate::cache_types::classify_new_range_as_staged(
+            &range_file_relative_path,
+            object_metadata.is_write_cached,
+        );
+
+        // Record membership ON the range (R12.2) rather than leaving it to be
+        // re-derived later from the object flag. The object flag is correct only
+        // while every range of the object shares one tier; once a GET range-miss
+        // appends a read-tier range to a still-flagged object, re-deriving
+        // classifies that range as staged though nothing ever credited it.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+        let range_spec = RangeSpec::new_staged(
             start,
             end,
             range_file_relative_path,
             compression_algorithm,
             compressed_size,
             uncompressed_size,
+            counts_as_staged,
         );
 
         // Step 3: Update metadata - use hybrid writer for coordinated metadata updates
@@ -1330,8 +1346,12 @@ impl DiskCacheManager {
                         end,
                         compressed_size,
                     );
-                    // Track write cache if applicable (completed PutObject or CompleteMPU)
-                    if object_metadata.is_write_cached {
+                    // Track write cache if applicable (completed PutObject or CompleteMPU).
+                    // Classified through the single shared predicate (computed above,
+                    // before the path was moved) so this add can never disagree with the
+                    // eviction/invalidation subtract sites.
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
+                    if counts_as_staged {
                         consolidator
                             .size_accumulator()
                             .add_write_cache(compressed_size);
@@ -1893,10 +1913,22 @@ impl DiskCacheManager {
         // partial-range commit ratio so a received prefix of an incomplete range is
         // salvaged as a clamped sub-range (crt-conditional-range-caching Req 2);
         // the PUT write-cache path passes `None` (exact-only).
-        let (range_spec, range_already_existed) =
+        let (mut range_spec, range_already_existed) =
             self.finalize_incremental_range(writer, Some(self.partial_range_commit_ratio))?;
         let (start, end, compressed_size) =
             (range_spec.start, range_spec.end, range_spec.compressed_size);
+        // Classify staging membership before `range_spec` is moved into the journal
+        // write below, through the single shared predicate.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
+        let counts_as_staged = crate::cache_types::classify_new_range_as_staged(
+            &range_spec.file_path,
+            object_metadata.is_write_cached,
+        );
+        // Record it ON the range, so the persisted `.meta` carries the tier this
+        // write decided rather than leaving it to be re-derived from an object flag
+        // that may later cover ranges from both tiers (R12.2). Must precede the
+        // journal write below, which moves `range_spec`.
+        range_spec.staged = Some(counts_as_staged);
 
         // Write journal entry (same pattern as store_range)
         if let Some(hybrid_writer) = &self.hybrid_metadata_writer {
@@ -1927,7 +1959,7 @@ impl DiskCacheManager {
                         end,
                         compressed_size,
                     );
-                    if object_metadata.is_write_cached {
+                    if counts_as_staged {
                         consolidator
                             .size_accumulator()
                             .add_write_cache(compressed_size);
@@ -2077,6 +2109,16 @@ impl DiskCacheManager {
             .to_string_lossy()
             .to_string();
 
+        // Leaves `staged` as `None` on purpose: this function publishes bytes and knows
+        // nothing about the object's tier — it takes no `ObjectMetadata`. Every caller
+        // records membership before the range is persisted, and each is commented at
+        // that point: `commit_incremental_range` (just below, for the journal write),
+        // `CacheManager::store_put_as_write_cached_range_with_ttl` and
+        // `store_streamed_write_cache_metadata` (both via `WriteCacheRangeSink::finalize`,
+        // before their `store_new_metadata`). Adding an `is_write_cached` parameter here
+        // purely to move the assignment would give this function a decision it has no
+        // basis for making.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
         let range_spec = RangeSpec::new(
             writer.start,
             writer.end,
@@ -7088,7 +7130,10 @@ impl DiskCacheManager {
                     "[LOCK_ACQUISITION] Failed to create lock directory: path={:?}, error={}",
                     parent, e
                 );
-                ProxyError::CacheError(format!("Failed to create lock directory: {}", e))
+                ProxyError::CacheError(format!(
+                    "Failed to create lock directory: path={:?}, error={}",
+                    parent, e
+                ))
             })?;
         }
 
@@ -13414,6 +13459,7 @@ mod tests {
                     created_at: now,
                     last_accessed: now,
                     access_count: 1,
+                    staged: None,
                 };
 
                 let metadata = crate::cache_types::NewCacheMetadata {
@@ -13512,6 +13558,7 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
+                staged: None,
             });
         }
 
@@ -13644,6 +13691,7 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
+                staged: None,
             });
         }
 
@@ -14717,6 +14765,7 @@ mod tests {
                 created_at: SystemTime::now(),
                 last_accessed: SystemTime::now(),
                 access_count: 0,
+                staged: None,
             };
 
             // load_range_data should return an error (cache miss) for unsafe paths
@@ -14772,6 +14821,7 @@ mod tests {
             created_at: SystemTime::now(),
             last_accessed: SystemTime::now(),
             access_count: 0,
+            staged: None,
         };
 
         // We need metadata on disk for delete_cache_entry to read it.

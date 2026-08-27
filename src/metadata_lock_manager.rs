@@ -504,7 +504,10 @@ impl MetadataLockManager {
         // Ensure parent directory exists
         if let Some(parent) = lock_file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create lock directory: {}", e))
+                ProxyError::CacheError(format!(
+                    "Failed to create lock directory: path={:?}, error={}",
+                    parent, e
+                ))
             })?;
         }
 
@@ -556,7 +559,10 @@ impl MetadataLockManager {
         // Ensure parent directory exists
         if let Some(parent) = lock_file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::CacheError(format!("Failed to create lock directory: {}", e))
+                ProxyError::CacheError(format!(
+                    "Failed to create lock directory: path={:?}, error={}",
+                    parent, e
+                ))
             })?;
         }
 

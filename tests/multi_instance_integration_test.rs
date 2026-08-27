@@ -3,6 +3,8 @@
 //! These tests validate coordination between multiple proxy instances
 //! using shared cache volumes, write lock coordination, and cache consistency.
 
+mod common;
+
 use s3_proxy::{
     cache::CacheManager,
     cache_types::CacheMetadata,
@@ -12,10 +14,23 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::time::sleep;
 
-/// Test configuration for multi-instance testing
+/// Test configuration for multi-instance testing.
+///
+/// `_temp_dir` owns the actual directory via `tempfile::TempDir`, which both isolates
+/// each test run (no reliance on a nanosecond suffix being unique) and cleans up on
+/// drop. Previously this built a raw path under `std::env::temp_dir()` and never
+/// removed it — 315 leaked `s3_proxy_shared_cache_test_*` directories were found in
+/// `$TMPDIR` this way. `shared_cache_dir` is kept as a separate field (rather than
+/// deriving it from `_temp_dir` on every use) so call sites don't change.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: none — test-infrastructure
+/// defect (task 52).
 struct MultiInstanceTestConfig {
+    /// Kept only for its `Drop` impl — never read directly.
+    _temp_dir: TempDir,
     shared_cache_dir: PathBuf,
     instance_count: usize,
     #[allow(dead_code)]
@@ -25,15 +40,11 @@ struct MultiInstanceTestConfig {
 
 impl Default for MultiInstanceTestConfig {
     fn default() -> Self {
-        // Create unique temp directory for each test run
-        let random_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let temp_dir =
-            std::env::temp_dir().join(format!("s3_proxy_shared_cache_test_{}", random_id));
+        let temp_dir = TempDir::new().expect("failed to create isolated temp dir for test");
+        let shared_cache_dir = temp_dir.path().to_path_buf();
         Self {
-            shared_cache_dir: temp_dir,
+            _temp_dir: temp_dir,
+            shared_cache_dir,
             instance_count: 3,
             test_object_size: 1024 * 1024, // 1MB
             test_data: (0..1024).map(|i| (i % 256) as u8).collect(),
@@ -117,9 +128,15 @@ impl TestProxyInstance {
 
         // Store using the public cache manager API
         let response_headers = HashMap::new();
-        self.cache_manager
-            .store_write_cache_entry(cache_key, data, headers, metadata, response_headers)
-            .await?;
+        common::put_through_write_cache(
+            &self.cache_manager,
+            cache_key,
+            data,
+            headers,
+            metadata,
+            response_headers,
+        )
+        .await?;
 
         Ok(())
     }

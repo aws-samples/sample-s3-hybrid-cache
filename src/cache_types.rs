@@ -341,6 +341,31 @@ pub struct ObjectMetadata {
     /// When the write cache entry was last accessed
     #[serde(default)]
     pub write_cache_last_accessed: Option<SystemTime>,
+
+    /// Whether this entry's graduation has already been charged against
+    /// `SizeState::write_cache_size`.
+    ///
+    /// This is the **exactly-once token** for the graduation decrement (Requirement
+    /// 1.2). The metadata transition itself is harmlessly idempotent — two proxies may
+    /// both see `is_write_cached` set and both clear it — but a decrement is not, and
+    /// the `.meta` read-modify-write in `refresh_write_cache_ttl` offers no protection
+    /// on NFS.
+    ///
+    /// Written **only** by the Journal_Consolidator, while it holds the per-key metadata
+    /// lock, as it applies a `Graduation` journal entry. Two `Graduation` entries for the
+    /// same key are collapsed to one decrement: whichever is applied first sets this,
+    /// and the rest are skipped. Because the consolidator is the only writer and it is
+    /// serialised by the lock, this holds fleet-wide and across cycles.
+    ///
+    /// `#[serde(default)]` means every `.meta` written before this field existed reads
+    /// as `false`. That is correct rather than merely convenient: no `Graduation` entry
+    /// exists for an entry that graduated before this release, so nothing will debit it.
+    /// Those already-lost bytes are re-grounded by the full Validation_Scan (R6), which
+    /// is the only mechanism that can un-inflate a figure that is already inflated.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 1.2, 1.3
+    #[serde(default)]
+    pub graduation_accounted: bool,
 }
 
 impl Default for ObjectMetadata {
@@ -363,6 +388,7 @@ impl Default for ObjectMetadata {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         }
     }
 }
@@ -393,6 +419,7 @@ impl ObjectMetadata {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         }
     }
 
@@ -422,6 +449,7 @@ impl ObjectMetadata {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         }
     }
     /// Create a new ObjectMetadata with compression information and complete headers
@@ -452,6 +480,7 @@ impl ObjectMetadata {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         }
     }
     /// Check if write cache entry is expired
@@ -464,6 +493,114 @@ impl ObjectMetadata {
             None => false, // No expiration set means not expired
         }
     }
+}
+
+/// Decide whether a **newly written** range counts toward the write (staging) tier.
+///
+/// A new range is staged when its object carries `is_write_cached` **or** its range
+/// file sits under `mpus_in_progress/`. This is the *decision*, made once at the
+/// moment a range is created, and its result is recorded in [`RangeSpec::staged`].
+/// Reading an *existing* range's tier is a different operation — use
+/// [`is_staged_range_spec`], which consults the recorded value and only falls back
+/// to this function when there is none.
+///
+/// # Renamed from `is_staged_range` (2026-08-27, R12.4)
+///
+/// The old name and signature — `classify_new_range_as_staged(range_file_path, is_write_cached)` —
+/// read as a per-range predicate and was not one. Its only per-range input is the
+/// path arm below, which cannot fire for a freshly-built `RangeSpec` (see the next
+/// section), so for all live data it reduced to a single object-level bool while
+/// every credit and debit was applied per range. Every reader of it therefore
+/// classified a flagged object's read-tier ranges as staged although nothing had
+/// credited them, and graduation debited more than it credited. Requirements.md R12
+/// has the full mechanism and both error directions.
+///
+/// The function survived the fix because deciding a *new* range's tier genuinely is
+/// this expression; what was retired is its use as a *reader*. The name now says
+/// which of the two it is, so a future reader cannot reach for it by accident, and
+/// `is_staged_range_spec` calls it for the unrecorded case so the union rule still
+/// has exactly one definition.
+///
+/// # Why the union, when the path arm looks dead
+///
+/// Traced 2026-08-25: every `RangeSpec` built by a live write path derives
+/// `file_path` from `strip_prefix(cache_dir/ranges)`, which returns `Err` (and is
+/// propagated) for anything outside `ranges/`. The four producers are
+/// `DiskCacheManager::store_range`, `DiskCacheManager::finalize_incremental_range`,
+/// `CacheManager::store_full_object_as_range_new`, and the multipart-completion
+/// finalizer in `signed_put_handler` — and that last one *renames* each part out
+/// of `mpus_in_progress/` into `ranges/` **before** building its `RangeSpec`.
+/// Multipart parts are finalized by `finalize_incremental_part`, which
+/// deliberately builds no `RangeSpec` at all while the part is still staged.
+///
+/// So the path arm cannot fire for a freshly-constructed range. It is retained
+/// because a `RangeSpec` is also **deserialised from a persisted `.meta`**, which
+/// carries whatever string was written to disk by whatever version wrote it. That
+/// is the reachable case, and it is the one the path-only unit test covers — and
+/// since R12 that case is reached exclusively through the `None` fallback of
+/// [`is_staged_range_spec`], because any range this function classifies is recorded
+/// immediately and never re-derived.
+///
+/// This corrects the spec's original framing, which described the predicate
+/// disagreement as an active "opposite-direction leak" driving `write_cache_size`
+/// toward undershoot. On the current tree it is not reachable from a live write —
+/// unifying the predicate is consistency hardening plus legacy-data tolerance, not
+/// the repair of a running leak. The repair of the running leak is R5/R6.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 6.2, 12.2
+pub fn classify_new_range_as_staged(range_file_path: &str, is_write_cached: bool) -> bool {
+    is_write_cached || range_file_path.contains("mpus_in_progress/")
+}
+
+/// The single definition of "this **existing** range counts toward the write
+/// (staging) tier", per range rather than per object.
+///
+/// Takes the recorded membership rather than a `&RangeSpec` so that the handful of
+/// callers holding the parts separately — read-tier eviction's Step 5 carries a
+/// [`crate::cache::RangeEvictionCandidate`], not a `RangeSpec` — read the tier
+/// through the same rule rather than reimplementing the fallback. An inline
+/// `match staged { Some(s) => s, None => … }` at a call site is a second definition
+/// of that rule, which is what R12.4 forbids.
+///
+/// # The fallback is the migration
+///
+/// `staged == None` means the range predates the field, so the answer comes from
+/// [`classify_new_range_as_staged`] — reproducing exactly what the pre-R12 code
+/// returned for the same inputs. That is why the field is `Option<bool>`: see
+/// [`RangeSpec::staged`] for why a bare `bool` would drive `write_cache_size` to near
+/// zero fleet-wide on the first post-upgrade scan.
+///
+/// Recorded membership is **never** second-guessed: a `Some(false)` range under an
+/// `mpus_in_progress/` path stays unstaged, and a `Some(false)` range on a flagged
+/// object stays unstaged. That last case is the whole defect, so OR-ing the object
+/// flag in here would leave the fix inert while passing every migration test.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 12.3
+/// `pub(crate)` rather than `pub`, deliberately: its only caller outside this module is
+/// read-tier eviction's Step 5, and `pub` would hide it from the `dead_code` lint (see
+/// `pre-push-checklist.md` step 3). Prefer [`is_staged_range_spec`], which is the form
+/// `tests/` uses.
+pub(crate) fn is_staged_range_parts(
+    staged: Option<bool>,
+    range_file_path: &str,
+    object_is_write_cached: bool,
+) -> bool {
+    match staged {
+        Some(staged) => staged,
+        None => classify_new_range_as_staged(range_file_path, object_is_write_cached),
+    }
+}
+
+/// [`is_staged_range_parts`] for a caller holding the range itself, which is most of
+/// them.
+///
+/// Preferred over the parts form wherever a `&RangeSpec` is available: a caller
+/// holding the range cannot pair it with a different object's flag by accident, which
+/// the retired path-taking signature allowed.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 12.3
+pub fn is_staged_range_spec(range: &RangeSpec, object_is_write_cached: bool) -> bool {
+    is_staged_range_parts(range.staged, &range.file_path, object_is_write_cached)
 }
 
 /// Range specification without data (metadata only)
@@ -481,10 +618,47 @@ pub struct RangeSpec {
     pub created_at: SystemTime,
     pub last_accessed: SystemTime,
     pub access_count: u64,
+
+    /// Whether this range counts toward the write (staging) tier, recorded at the
+    /// moment it was credited. Read through
+    /// [`is_staged_range_spec`], never directly.
+    ///
+    /// `Option`, not `bool`, and the reason is the migration rather than
+    /// expressiveness. A bare `#[serde(default)] bool` would read `false` for every
+    /// range in every `.meta` written by an earlier release, so the first
+    /// post-upgrade Validation_Scan would compute `write_cache_size` ≈ 0 fleet-wide
+    /// and **persist it** — a silent, confident, wrong re-grounding indistinguishable
+    /// from a healthily drained tier, and the same failure class as the outage this
+    /// spec was opened for. `None` means "this range predates the field" and falls
+    /// back to the object flag, which reproduces today's answer exactly.
+    ///
+    /// # The `Option` is the guard, not the `#[serde(default)]`
+    ///
+    /// Measured 2026-08-27 while showing design test 16 failing first: **removing
+    /// `#[serde(default)]` from this field changes nothing.** Serde treats a missing
+    /// `Option<T>` field as `None` implicitly, so all fourteen tests still passed.
+    /// The attribute is kept because it is self-documenting and because the spec
+    /// specifies it, but it must not be mistaken for the thing that makes the
+    /// migration safe.
+    ///
+    /// What *is* load-bearing is the `Option` itself. Making the serde default yield
+    /// `Some(false)` — which is precisely what a bare `bool` does at the
+    /// deserialisation boundary — reds design test 16 at `left: Some(false)`. So a
+    /// future change that "simplifies" this to `#[serde(default)] bool`, keeping the
+    /// attribute and looking safer for it, is the dangerous one.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 12.1
+    #[serde(default)]
+    pub staged: Option<bool>,
 }
 
 impl RangeSpec {
-    /// Create a new RangeSpec with initial access tracking
+    /// Create a new RangeSpec with initial access tracking.
+    ///
+    /// Leaves `staged` as `None`. Every **live write path** must record membership
+    /// explicitly (R12.2) — use [`RangeSpec::new_staged`] there rather than this.
+    /// This constructor remains for the paths that reconstruct a range without
+    /// knowing its tier (recovery sweeps, tests, and read-path plumbing).
     pub fn new(
         start: u64,
         end: u64,
@@ -504,6 +678,36 @@ impl RangeSpec {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
+        }
+    }
+
+    /// Create a new RangeSpec with staging membership recorded explicitly.
+    ///
+    /// Every live write path uses this, so a range's tier is recorded once at the
+    /// only moment it is known for certain and is never re-derived from an object
+    /// flag that may since have gained ranges from a different tier.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+    pub fn new_staged(
+        start: u64,
+        end: u64,
+        file_path: String,
+        compression_algorithm: CompressionAlgorithm,
+        compressed_size: u64,
+        uncompressed_size: u64,
+        staged: bool,
+    ) -> Self {
+        Self {
+            staged: Some(staged),
+            ..Self::new(
+                start,
+                end,
+                file_path,
+                compression_algorithm,
+                compressed_size,
+                uncompressed_size,
+            )
         }
     }
 
@@ -592,6 +796,34 @@ impl NewCacheMetadata {
     /// Checks object-level expires_at against now.
     pub fn is_object_expired(&self) -> bool {
         SystemTime::now() > self.expires_at
+    }
+
+    /// Sum of `compressed_size` over the ranges that count toward the write
+    /// (staging) tier, classified through [`is_staged_range_spec`].
+    ///
+    /// This is the **per-range** figure, which is what any scan feeding
+    /// `SizeState::write_cache_size` must report, because the accumulator credits
+    /// and debits per range. Classifying at object granularity instead (all ranges
+    /// or none, from the object's flag alone) is what let the coordinated scan and
+    /// the accumulator report different figures for the same on-disk state.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 6.1, 6.2
+    pub fn staged_compressed_size(&self) -> u64 {
+        self.ranges
+            .iter()
+            .filter(|r| is_staged_range_spec(r, self.object_metadata.is_write_cached))
+            .map(|r| r.compressed_size)
+            .sum()
+    }
+
+    /// Whether any range of this object counts toward the write (staging) tier.
+    /// Used for **object counts** where `staged_compressed_size` gives bytes.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 6.1, 6.2
+    pub fn has_staged_range(&self) -> bool {
+        self.ranges
+            .iter()
+            .any(|r| is_staged_range_spec(r, self.object_metadata.is_write_cached))
     }
 
     /// Refresh the object-level TTL by setting `expires_at = now + ttl`.
@@ -751,6 +983,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         // Serialize
@@ -838,6 +1071,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         let json = serde_json::to_string(&range_spec).unwrap();
@@ -996,6 +1230,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         let score = range.lru_score();
@@ -1013,6 +1248,7 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(3600),
             last_accessed: now - std::time::Duration::from_secs(3600),
             access_count: 1,
+            staged: None,
         };
 
         assert!(range.lru_score() > older_range.lru_score());
@@ -1033,6 +1269,7 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(3600),
             last_accessed: now - std::time::Duration::from_secs(10),
             access_count: 100,
+            staged: None,
         };
 
         // Infrequently accessed, old range
@@ -1046,6 +1283,7 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(7200),
             last_accessed: now - std::time::Duration::from_secs(3600),
             access_count: 5,
+            staged: None,
         };
 
         // Hot range should have higher score (less likely to be evicted)
@@ -1065,6 +1303,7 @@ mod tests {
             created_at: now - std::time::Duration::from_secs(3600),
             last_accessed: now - std::time::Duration::from_secs(1800),
             access_count: 5,
+            staged: None,
         };
 
         let old_last_accessed = range.last_accessed;
@@ -1231,6 +1470,7 @@ mod tests {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         };
 
         // Serialize
@@ -1305,6 +1545,7 @@ mod tests {
             },
             write_cache_created_at: if is_write_cached { Some(now) } else { None },
             write_cache_last_accessed: if is_write_cached { Some(now) } else { None },
+            graduation_accounted: false,
         };
 
         // Serialize

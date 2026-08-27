@@ -218,9 +218,122 @@ Note the interaction with range reads: a request spanning retained ranges with a
 gap revalidates and refetches the missing bytes, and is counted in
 `cache.incomplete_range_fallbacks` rather than as a hit.
 
+## Write cache (staging tier) reclamation
+
+The write cache holds objects that have been uploaded through the proxy but not yet read.
+It is reclaimed differently from the read cache, and the differences follow from one
+property: **an object that has never been read cannot change its own eviction rank.** Its
+last-access time is its write time, so there is no frequency or recency score to compute —
+LRU and TinyLFU both degenerate to "oldest first" over a population where nothing has been
+accessed.
+
+| | Read cache | Write cache (staging) |
+|---|---|---|
+| Trigger | `eviction_trigger_percent` of `max_cache_size` | `eviction_trigger_percent` of the write cache allocation |
+| Target | `eviction_target_percent` of `max_cache_size` | `eviction_target_percent` of the allocation |
+| Order | LRU or TinyLFU per `eviction_algorithm` | oldest-staged-first; objects past `put_ttl` and still unread go first |
+| Candidate discovery | cache index | append-only record of staged objects |
+| Runs on the request path | no | no |
+
+### How candidates are found
+
+The proxy keeps a compact append-only record of the objects it has staged, one file per
+instance under `metadata/_write_ledger/`. Reclamation reads that instead of scanning the
+cache, so its cost is proportional to what it removes rather than to how much is cached.
+
+Every record is a **hint**. Before anything is deleted the candidate is re-checked against
+the object's authoritative metadata, and skipped if the object has since been read
+(graduated out of the staging tier), been replaced by a later upload, or already gone. An
+object whose metadata cannot be read is also skipped, rather than deleted on the strength
+of a failed read.
+
+One pass examines a bounded number of records, so a very long record set is worked through
+over several passes rather than in one. A pass removes only the records for objects it
+actually reclaimed; the rest are left for the next pass, including any appended by another
+instance while it was running.
+
+Because the record is only a hint, losing an entry is not a correctness problem: the object
+stays cached and stays correctly accounted, it is simply invisible to staging reclamation
+until the next full validation scan re-adds it. Note that a re-added entry is timestamped
+when it is re-added, so it is treated as recently written and reclaimed later than its true
+age would suggest. That same mechanism means **no migration step is needed when upgrading** —
+a deployment with existing staged objects starts with an empty record and the first
+validation scan populates it from the cache.
+
+`write_cache.ledger_entries` on `/metrics` reports the record's length. Read alongside
+`write_cache.staged_entries`: the two count the same population by different routes, so a
+persistent gap between them indicates entries being lost or reclamation not keeping up.
+
+### Coordination across instances
+
+Staging reclamation takes the same global eviction lock as read-cache eviction, so only one
+instance reclaims at a time, and it re-reads the staged total after acquiring the lock in
+case another instance has already brought the tier under its trigger.
+`eviction_coordination.staging_evictions_skipped_lock_held` counts passes skipped because
+the lock was held. This matters more than it might appear: the decision to reclaim is taken
+from shared state and the deletion lands on shared storage, so an instance acting on a
+private view of usage could delete data another instance had just written. See
+[SHARED_STORAGE.md](SHARED_STORAGE.md#distributed-eviction).
+
+## Recovery from an inflated write-cache figure
+
+Before 2.7.0, `cache.write_cache_size` (reported as `write_cache.resident_bytes`) could only
+grow: it was credited when an object was written through the cache but never reduced when
+that object was later read, overwritten, or removed. On a long-running deployment this
+figure could climb past the configured [`write_cache_percent`](CONFIGURATION.md#capacity-management)
+allocation even though almost nothing was genuinely staged, and once it did the proxy
+refused new write-through PUTs — reporting a full write cache while little or nothing was
+actually resident.
+
+**This is not a cache-wipe scenario.** No cached object needs to be removed to recover, and
+the fix does not discard anything. What is wrong is a number, not the data it was supposed
+to describe.
+
+### Automatic recovery
+
+Recovery happens on its own, with no operator action, in two stages that layer together:
+
+1. **Graduation now decrements the figure it should always have decremented.** Every object
+   read for the first time after upgrading releases its bytes from the write-cache
+   allocation as it graduates, exactly as [described above](CONFIGURATION.md#how-write-caching-works).
+   This alone starts correcting the figure for any object a client reads.
+2. **The first full validation scan re-grounds the figure from what is actually on disk.**
+   The periodic validation scan (see
+   [CONFIGURATION.md — Validation scan](CONFIGURATION.md#validation-scan)) now recomputes
+   `cache.write_cache_size` from the cache's own `.meta` files rather than leaving it
+   uncorrected, the same way it has always re-grounded the total cache size. Once this scan
+   completes, the figure drops to its true value regardless of read traffic.
+
+An operator who can wait for the next scheduled validation scan needs to do nothing at all.
+
+### Manual recovery, for an operator who cannot wait
+
+Deleting `size_tracking/validation.json` on the shared cache volume and restarting forces an
+immediate full validation scan instead of waiting for the next scheduled one. This is the
+same mechanism the automatic path uses, run on demand — it is not a special "repair" code
+path, and it does not touch `ranges/` or `metadata/`.
+
+Measured cost: **8.2 seconds for 1,780 cached objects.** Scale roughly linearly with object
+count for a rough estimate on a larger cache.
+
+One thing this manual path requires that the automatic path does not, established by running
+it on a live fleet:
+
+- **Every instance sharing the cache volume must be restarted, not just one.** Correcting
+  the shared `size_tracking/size_state.json` file does not reach a running instance's
+  in-memory write-cache counter — an instance restarts to pick up the corrected figure, it
+  does not observe it live. A proxy left running against the old, inflated figure continues
+  refusing new write-through PUTs after its siblings have recovered, until it is restarted
+  too. As of 2.7.0 this is an availability gap on the stale instance only, not a data-loss
+  risk: refusing a write-through PUT for lack of capacity no longer scans or deletes
+  anything on the shared volume (see [CHANGELOG.md](../CHANGELOG.md) 2.7.0), so a
+  staggered restart across the fleet is safe, just slower to fully take effect than
+  restarting every instance together.
+
 ## See Also
 
 - [CONFIGURATION.md — Eviction Configuration](CONFIGURATION.md#eviction-configuration) — thresholds and algorithm
+- [CONFIGURATION.md — Capacity Management](CONFIGURATION.md#capacity-management) — `write_cache_percent` and what it bounds
 - [SHARED_STORAGE.md](SHARED_STORAGE.md#distributed-eviction) — the distributed eviction lock
 - [CACHE_INTERNALS.md](CACHE_INTERNALS.md) — access tracking, which supplies the statistics eviction sorts on
 - [CACHE_READ_PATHS.md](CACHE_READ_PATHS.md) — what a partially-evicted object does to a range read

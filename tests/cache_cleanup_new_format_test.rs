@@ -193,7 +193,12 @@ async fn test_cache_size_calculation_new_format() -> Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let cache_manager = create_test_cache_manager(temp_dir.path().to_path_buf()).await;
 
-    let initial_size = cache_manager.get_cache_size_stats().await?.read_cache_size;
+    let initial_size = cache_manager
+        .get_cache_size_stats()
+        .await?
+        .sizes
+        .expect("get_cache_size_stats always populates CacheSizes")
+        .read_cache_size;
 
     // Store two entries
     let test_data_1 = vec![0u8; 1024]; // 1 KB
@@ -220,7 +225,12 @@ async fn test_cache_size_calculation_new_format() -> Result<()> {
         let _ = consolidator.run_consolidation_cycle().await;
     }
 
-    let size_after = cache_manager.get_cache_size_stats().await?.read_cache_size;
+    let size_after = cache_manager
+        .get_cache_size_stats()
+        .await?
+        .sizes
+        .expect("get_cache_size_stats always populates CacheSizes")
+        .read_cache_size;
     assert!(
         size_after > initial_size,
         "Cache size should increase after storing entries (initial={}, after={})",
@@ -236,7 +246,12 @@ async fn test_cache_size_calculation_new_format() -> Result<()> {
         let _ = consolidator.run_consolidation_cycle().await;
     }
 
-    let size_after_delete = cache_manager.get_cache_size_stats().await?.read_cache_size;
+    let size_after_delete = cache_manager
+        .get_cache_size_stats()
+        .await?
+        .sizes
+        .expect("get_cache_size_stats always populates CacheSizes")
+        .read_cache_size;
     assert!(
         size_after_delete < size_after,
         "Cache size should decrease after deletion (after_store={}, after_delete={})",

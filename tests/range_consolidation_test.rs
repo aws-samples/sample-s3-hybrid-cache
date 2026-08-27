@@ -90,6 +90,7 @@ async fn test_range_consolidation_small_gaps() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store each cached range
@@ -251,6 +252,7 @@ async fn test_range_consolidation_large_gaps() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store each cached range
@@ -373,6 +375,7 @@ async fn test_range_consolidation_mixed_gaps() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store each cached range
@@ -483,6 +486,7 @@ async fn test_range_consolidation_with_fetch_and_merge() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store each cached range

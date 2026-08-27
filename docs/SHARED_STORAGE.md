@@ -207,14 +207,22 @@ reducing how many instances can cold-miss the same key concurrently. The scan ca
 
 ## The validation scan
 
-A daily scan walks cached metadata and reconciles tracked size against actual disk usage.
+A daily scan reads every cached `.meta` file and reconciles tracked size against the sizes
+those files record. It does not stat the range (`.bin`) files, so a `.meta` that disagrees
+with what is on disk is not detected here — that is [orphan recovery](#orphan-recovery)'s
+job.
 
 **Cadence is not configurable.** It fires once per day at midnight local time plus up to
 one hour of random jitter, to avoid a thundering herd across instances.
 `validation_frequency` is parsed, range-validated, and logged at startup, but no code path
 reads it when scheduling the scan. Treat it as inert.
 
-The scan holds a global validation lock, so only one instance scans per cycle.
+The scan holds a global validation lock for its whole duration, so only one instance scans
+per cycle.
+
+**It deletes `.meta` files it cannot parse**, logging `Removed invalid metadata file during
+validation` for each one. An unparseable entry is unrecoverable, and leaving it would fail
+every later scan the same way, so this is deliberate self-heal rather than data loss.
 
 ### Full and rolling modes
 
@@ -224,7 +232,7 @@ The scan self-tunes between two modes based on how long the previous one took:
 whenever the previous scan finished inside the time budget.
 
 **Rolling mode** scans a subset of L1 directories per cycle, resuming from a persistent
-cursor, achieving full coverage over several days. Activated automatically when a full
+cursor, reaching full coverage over several cycles. Activated automatically when a full
 scan exceeds `validation_max_duration` (default 4h, validated 10m-23h).
 
 Mode selection:
@@ -237,7 +245,11 @@ Mode selection:
 | Rolling, extrapolated full time > budget | Rolling |
 | Rolling, extrapolated full time ≤ budget | Full |
 
-`validation_max_duration` is the only knob; the proxy adapts without manual mode switching.
+`validation_max_duration` is the only knob, and it selects the **next** cycle's mode rather
+than bounding the current one. Nothing aborts a scan in progress: a full scan runs to
+completion, then warns that it overran (`Full validation scan exceeded time budget`), and
+the following cycle switches to rolling. Crossing the threshold therefore costs one scan
+that runs for as long as it needs to, however far past the budget that is.
 
 ### Rolling scan internals
 
@@ -250,17 +262,24 @@ Mode selection:
   to 0.
 - **Rotation tracking.** When the cursor wraps past all 256 directories, a rotation
   completion is logged with elapsed time.
+- **Multi-bucket caches.** The cursor addresses 256 L1 index slots, and one slot covers
+  that index in *every* bucket. On a cache holding several buckets a cycle's recorded rate
+  therefore understates the work per slot, which makes batch sizing and the extrapolated
+  full-scan time optimistic.
 
 ### The correction is unconditional
 
+The size correction is always applied. There is no minimum drift below which reconciliation
+is skipped.
+
 `validation_threshold_warn` (default 5.0) and `validation_threshold_error` (default 20.0)
 are drift percentages that select a **log level only** — `warn!` above the first,
-`error!` above the second. Neither gates the correction, which is always applied. There is
-no minimum drift below which reconciliation is skipped.
+`error!` above the second — and they apply to **rolling scans only**. A full scan logs the
+drift it corrected unconditionally and consults neither field.
 
 Read `cache_size.last_validation_drift` in `/metrics` for the signed byte drift the last
-scan found. Persistent large drift on a multi-instance deployment is the expected symptom
-of the over-counting above, not a defect.
+full scan found; it reports `null` after a rolling cycle. Persistent large drift on a
+multi-instance deployment is the expected symptom of the over-counting above, not a defect.
 
 ### Monitoring
 
@@ -270,6 +289,9 @@ objects validated, scan rate, and cursor position at INFO:
 ```bash
 journalctl -u s3-proxy | grep -i validation
 ```
+
+In rolling mode the log is the only source of scan progress, since the `/metrics` fields
+above report `null`.
 
 ## Orphan recovery
 

@@ -128,8 +128,14 @@ impl EvictedRangesTracker {
 /// 2. Whether the range file exists
 /// 3. The entry's timestamp relative to current time
 ///
-/// This function implements the same logic as JournalConsolidator::validate_journal_entries_with_staleness()
-/// but as a pure function for property testing.
+/// This function models the range-file-existence and eviction-bypass branches of
+/// JournalConsolidator::validate_journal_entries_with_staleness() as a pure function for
+/// property testing. It does NOT model the object-level exemption for `TtlRefresh`,
+/// `AccessUpdate`, and `Graduation` entries (which validate against the `.meta`, not a
+/// range file) — task 45 in `.kiro/specs/write-cache-accounting-and-eviction/` found
+/// that gap the hard way when `Graduation` was missing from that exemption in
+/// production. This model covers only the staleness-timeout and bypass arithmetic
+/// below; it makes no claim about operation-type dispatch.
 ///
 /// **Validates: Requirements 4.1, 4.3**
 fn detect_staleness_with_eviction_bypass(

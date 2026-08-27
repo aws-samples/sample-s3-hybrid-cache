@@ -54,7 +54,6 @@ impl Arbitrary for ArbitraryJournalEntry {
         let instance_seed = u8::arbitrary(g) % 4;
         let cache_key_seed = u8::arbitrary(g) % 8;
         let metadata_version = (u8::arbitrary(g) % 10 + 1) as u64;
-        let metadata_written = bool::arbitrary(g);
 
         let now = SystemTime::now();
         let range_spec = RangeSpec {
@@ -67,6 +66,7 @@ impl Arbitrary for ArbitraryJournalEntry {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         let entry = JournalEntry {
@@ -81,7 +81,6 @@ impl Arbitrary for ArbitraryJournalEntry {
             object_ttl_secs: None,
             access_increment,
             object_metadata: None,
-            metadata_written,
         };
 
         ArbitraryJournalEntry(entry)

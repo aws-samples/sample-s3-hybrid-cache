@@ -155,6 +155,7 @@ async fn test_atomic_write_operations_with_sharded_paths() {
             write_cache_expires_at: None,
             write_cache_created_at: None,
             write_cache_last_accessed: None,
+            graduation_accounted: false,
         };
 
         // Store range using atomic operations

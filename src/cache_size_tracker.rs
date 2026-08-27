@@ -192,6 +192,19 @@ struct PreviousScanState {
 struct ScanFileResult {
     /// Size in bytes (for metadata files)
     size_bytes: u64,
+    /// The subset of `size_bytes` belonging to the write (staging) tier, classified
+    /// per range through `cache_types::is_staged_range_spec`.
+    ///
+    /// Carried alongside `size_bytes` rather than recomputed later so the two are
+    /// guaranteed to describe the same scan of the same file — including the deletion
+    /// branches, where both drop to 0 together. Summing this is what lets the full
+    /// Validation_Scan pass a real `write_cache_size` instead of `None`, which is the
+    /// only mechanism that can un-inflate an already-inflated figure.
+    ///
+    /// Invariant: `staged_bytes <= size_bytes`.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 6.1, 6.2
+    staged_bytes: u64,
     /// Whether GET cache entry was expired and deleted (active expiration)
     cache_expired: bool,
     /// Whether GET cache entry was skipped (actively being used)
@@ -872,6 +885,21 @@ impl CacheSizeTracker {
     /// and an error if it exceeds `validation_threshold_error`.
     ///
     /// See: Requirements 6.2, 6.3, 6.4
+    /// The proportional-correction formula on its own, without the
+    /// threshold logging. Used for the write-cache figure so a rolling scan applies
+    /// the same extrapolation to it that it applies to `total_size`, rather than
+    /// installing an unscaled partial sum as a whole-cache figure (Requirement 6.3).
+    ///
+    /// Kept as a separate helper rather than widening `apply_proportional_correction`'s
+    /// return tuple, which is `pub` and has existing unit-test call sites.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 6.3
+    fn proportional_correction(scanned: u64, dirs_scanned: usize, tracked: u64) -> u64 {
+        let expected = tracked as u128 * dirs_scanned as u128 / 256;
+        let discrepancy = scanned as i64 - expected as i64;
+        (tracked as i64 + discrepancy).max(0) as u64
+    }
+
     pub fn apply_proportional_correction(
         &self,
         scanned_size: u64,
@@ -1257,11 +1285,20 @@ impl CacheSizeTracker {
     async fn perform_full_validation(&self) -> Result<()> {
         let start = Instant::now();
 
-        // Scan metadata files using shared validator (returns size, cache_expired, cache_skipped, cache_errors, object_count)
-        let (scanned_size, cache_expired, cache_skipped, cache_errors, scanned_objects) =
-            self.scan_metadata_with_shared_validator().await?;
+        // Scan metadata files using shared validator (returns size, cache_expired, cache_skipped, cache_errors, object_count, staged_size)
+        let (
+            scanned_size,
+            cache_expired,
+            cache_skipped,
+            cache_errors,
+            scanned_objects,
+            scanned_staged_size,
+            staged_paths,
+        ) = self.scan_metadata_with_shared_validator().await?;
         let tracked_size = self.get_size().await; // Delegate to consolidator (Task 12.3)
+        let tracked_staged_size = self.get_write_cache_size().await;
         let drift = scanned_size as i64 - tracked_size as i64;
+        let staged_drift = scanned_staged_size as i64 - tracked_staged_size as i64;
 
         let duration = start.elapsed();
         let drift_sign = if drift >= 0 { "+" } else { "" };
@@ -1273,6 +1310,28 @@ impl CacheSizeTracker {
             cache_expired,
             format_duration_human(duration)
         );
+
+        // Requirement 6.5: log the write-cache drift being corrected, so recurring drift
+        // is visible without diffing state files. This is the line that makes an
+        // accounting leak observable in the logs — before this, `write_cache_size` was
+        // never corrected at all (the call below passed `None`), so a leak accumulated
+        // silently and indefinitely while `total_size` was reconciled every scan.
+        if staged_drift != 0 {
+            warn!(
+                "Cache validation: write-cache drift corrected: tracked {} -> scanned {} ({}{}), \
+                 recomputed from {} .meta files",
+                format_bytes_human(tracked_staged_size),
+                format_bytes_human(scanned_staged_size),
+                if staged_drift >= 0 { "+" } else { "-" },
+                format_bytes_human(staged_drift.unsigned_abs()),
+                scanned_objects
+            );
+        } else {
+            debug!(
+                "Cache validation: write-cache size already consistent at {}",
+                format_bytes_human(scanned_staged_size)
+            );
+        }
 
         // Always reconcile to scanned size after validation
         // The validation scan is expensive (once per day), so we trust its result
@@ -1286,9 +1345,24 @@ impl CacheSizeTracker {
         // Always update size state from validation — even when size drift is zero,
         // cached_objects may have drifted due to multi-instance double-counting.
         // The validation scan's .meta file count is the authoritative object count.
+        //
+        // Requirement 6.1: pass the recomputed write-cache figure rather than `None`.
+        // This is a full scan of every `.meta`, so `scanned_staged_size` is a
+        // whole-cache figure and safe to install as an absolute value. It is also the
+        // ONLY mechanism that can un-inflate an already-inflated `write_cache_size`:
+        // stopping the leaks (R1, R5) prevents further inflation but cannot undo what
+        // has already accumulated, which is why R5 and R6 must ship together.
         self.consolidator
-            .update_size_from_validation(scanned_size, None, Some(scanned_objects))
+            .update_size_from_validation(
+                scanned_size,
+                Some(scanned_staged_size),
+                Some(scanned_objects),
+            )
             .await;
+
+        // R2.7 / R6.6: give the Write_Ledger back any staged object it has lost track of.
+        // Also the in-place upgrade path — see the method doc.
+        self.reappend_missing_ledger_entries(&staged_paths).await;
 
         // Write validation metadata
         let files_scanned = scanned_objects;
@@ -1388,6 +1462,9 @@ impl CacheSizeTracker {
         let size_state = self.consolidator.get_size_state().await;
         let tracked_size = size_state.total_size;
         let tracked_objects = size_state.cached_objects;
+        // Read from the same Size_State snapshot as `tracked_size`, so both sides of the
+        // proportional correction describe one consistent view. Requirement 6.3.
+        let tracked_staged_size = size_state.write_cache_size;
 
         info!(
             "Rolling validation: starting scan at cursor={:02x}, estimated_dirs={}, cached_objects={}, budget={}",
@@ -1410,6 +1487,9 @@ impl CacheSizeTracker {
         // 7.2: Batch loop — process dirs in batches, check time after each batch
         let mut total_dirs_scanned: usize = 0;
         let mut total_size = 0u64;
+        // Staged (write-tier) subset of total_size across all batches — still a partial
+        // sum over the scanned L1 subset. Requirement 6.3.
+        let mut total_staged = 0u64;
         let mut total_objects = 0u64;
         let mut _total_cache_expired = 0u64;
         let mut _total_cache_skipped = 0u64;
@@ -1435,6 +1515,10 @@ impl CacheSizeTracker {
 
             // Scan selected L1 dirs in parallel using rayon (same pattern as scan_metadata_with_shared_validator)
             let batch_size = AtomicU64::new(0);
+            // Staged (write-tier) subset of batch_size. Requirement 6.3 — this is a
+            // PARTIAL sum and must never be installed as a whole-cache figure; it goes
+            // through the same proportional correction total_size does.
+            let batch_staged = AtomicU64::new(0);
             let batch_objects = AtomicU64::new(0);
             let batch_expired = AtomicU64::new(0);
             let batch_skipped = AtomicU64::new(0);
@@ -1461,6 +1545,7 @@ impl CacheSizeTracker {
                         }
                         let result = self.scan_metadata_file(&path, now_systime);
                         batch_size.fetch_add(result.size_bytes, Ordering::Relaxed);
+                        batch_staged.fetch_add(result.staged_bytes, Ordering::Relaxed);
                         batch_objects.fetch_add(1, Ordering::Relaxed);
                         if result.cache_expired {
                             batch_expired.fetch_add(1, Ordering::Relaxed);
@@ -1476,6 +1561,7 @@ impl CacheSizeTracker {
             });
 
             total_size += batch_size.load(Ordering::Relaxed);
+            total_staged += batch_staged.load(Ordering::Relaxed);
             total_objects += batch_objects.load(Ordering::Relaxed);
             _total_cache_expired += batch_expired.load(Ordering::Relaxed);
             _total_cache_skipped += batch_skipped.load(Ordering::Relaxed);
@@ -1514,9 +1600,25 @@ impl CacheSizeTracker {
                 tracked_objects,
             );
 
+            // Requirement 6.3: apply the SAME proportional correction to the write-cache
+            // figure. `total_staged` is a partial sum over `total_dirs_scanned` of 256 L1
+            // directories; installing it directly would report a fraction of the staged
+            // bytes as the whole-cache figure and drive `write_cache_size` toward a large
+            // undershoot — the direction that silently over-admits. The correction
+            // extrapolates the observed drift instead, exactly as it does for total_size.
+            let corrected_staged = Self::proportional_correction(
+                total_staged,
+                total_dirs_scanned.min(256),
+                tracked_staged_size,
+            );
+
             // Update size state via consolidator
             self.consolidator
-                .update_size_from_validation(corrected_size, None, Some(corrected_objects))
+                .update_size_from_validation(
+                    corrected_size,
+                    Some(corrected_staged),
+                    Some(corrected_objects),
+                )
                 .await;
         }
 
@@ -1636,12 +1738,132 @@ impl CacheSizeTracker {
         Ok(ValidationLock { file: lock_file })
     }
 
+    /// Re-append staged objects that no Write_Ledger knows about.
+    ///
+    /// # This is both the recovery path and the upgrade path
+    ///
+    /// A ledger append is best-effort: it happens after the `.meta` is written and after
+    /// the accounting credit, and a failure is logged rather than failing the upload,
+    /// because S3 already holds the object by that point. The cost of a lost append is
+    /// that the entry becomes invisible to staging eviction — never that it is served
+    /// wrongly, since the serve path does not consult the ledger. This is what repairs it.
+    ///
+    /// The same mechanism is what makes **upgrading in place require no migration step**
+    /// (R6.6). A deployment upgrading to 2.7.0 has staged objects on disk and an empty
+    /// ledger directory; every one of those objects is "missing from the ledger" by this
+    /// method's test, so the first full validation scan after the upgrade populates the
+    /// ledger from the authoritative `.meta` files. Nothing needs to be run by hand, and
+    /// the pre-upgrade state is not special-cased anywhere — the recovery path and the
+    /// cold-start path are the same code.
+    ///
+    /// Matching is by **cache key**, not by entry identity. A re-appended entry cannot
+    /// reconstruct the original append's timestamp, so it is stamped now; that makes it
+    /// look freshly written to the eviction watermark, which is the conservative direction
+    /// (it is ranked as fresh-unread rather than expired-unread, so it is evicted later
+    /// rather than sooner). Matching on identity instead would re-append a duplicate for
+    /// every object on every scan.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.7, 6.6
+    async fn reappend_missing_ledger_entries(&self, staged_paths: &[std::path::PathBuf]) {
+        if staged_paths.is_empty() {
+            return;
+        }
+
+        let ledger = self.consolidator.write_ledger().clone();
+        let known = match ledger.staged_keys().await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(
+                    "Validation scan: could not read the Write_Ledger to reconcile it ({}). \
+                     Skipping re-append; staging eviction may not see every staged object \
+                     until the next scan.",
+                    e
+                );
+                return;
+            }
+        };
+
+        let mut reappended = 0u64;
+        let mut ranges_appended = 0u64;
+
+        for path in staged_paths {
+            let content = match tokio::fs::read_to_string(path).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let metadata: crate::cache_types::NewCacheMetadata =
+                match serde_json::from_str(&content) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+            if known.contains(&metadata.cache_key) {
+                continue;
+            }
+            // Re-check the flag from the parsed metadata rather than trusting the caller's
+            // `staged_bytes > 0`: the two agree today, but this is the authoritative read
+            // and it costs nothing here.
+            if !metadata.object_metadata.is_write_cached {
+                continue;
+            }
+
+            for range in &metadata.ranges {
+                // Per-range membership, so a flagged object that has since gained a
+                // read-tier range does not re-append that range to the Write_Ledger.
+                // Doing so would give staging eviction a candidate whose bytes were
+                // never credited to `write_cache_size`, and freeing it would debit
+                // what nothing added.
+                // Spec: write-cache-accounting-and-eviction. Requirements: 12.3, 12.4
+                if !crate::cache_types::is_staged_range_spec(
+                    range,
+                    metadata.object_metadata.is_write_cached,
+                ) {
+                    continue;
+                }
+                self.consolidator
+                    .record_staged_range(
+                        &metadata.cache_key,
+                        range.start,
+                        range.end,
+                        range.compressed_size,
+                    )
+                    .await;
+                ranges_appended += 1;
+            }
+            reappended += 1;
+        }
+
+        if reappended > 0 {
+            info!(
+                "Validation scan: re-appended {} staged objects ({} ranges) to the Write_Ledger \
+                 that it had no record of. On a freshly upgraded deployment this is expected \
+                 and is the whole migration — no manual step is required.",
+                reappended, ranges_appended
+            );
+        }
+    }
+
     /// Scan metadata files using shared validator (replaces redundant parallel scanning)
     ///
     /// This method now uses the shared CacheValidator to avoid duplicating scanning logic.
     /// The coordinated initialization handles the initial scan, and this method is used
     /// only for periodic validation scans.
-    async fn scan_metadata_with_shared_validator(&self) -> Result<(u64, u64, u64, u64, u64)> {
+    /// Returns `(total_size, cache_expired, cache_skipped, cache_errors, files_scanned,
+    /// staged_size, staged_paths)`. `staged_size` is the write-tier subset of `total_size`
+    /// (Requirement 6.1) and is what the caller passes to
+    /// `update_size_from_validation` in place of the `None` it used to pass.
+    ///
+    /// `staged_paths` is the `.meta` path of every object the scan found still staged,
+    /// which the caller feeds to [`Self::reappend_missing_ledger_entries`] (R2.7 / R6.6).
+    /// Collected here rather than by a second walk because this scan is already the one
+    /// permitted pass over every `.meta` — walking again to find the same files would
+    /// reinstate the O(cache) cost Phase E exists to remove. The collection is bounded by
+    /// the staged set rather than the cache, so `Mutex` contention scales with
+    /// `write_cache_percent`, not with cache size.
+    #[allow(clippy::type_complexity)]
+    async fn scan_metadata_with_shared_validator(
+        &self,
+    ) -> Result<(u64, u64, u64, u64, u64, u64, Vec<std::path::PathBuf>)> {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1649,11 +1871,17 @@ impl CacheSizeTracker {
         let metadata_dir = self.cache_dir.join("metadata");
 
         if !metadata_dir.exists() {
-            return Ok((0, 0, 0, 0, 0));
+            return Ok((0, 0, 0, 0, 0, 0, Vec::new()));
         }
+
+        // Paths of `.meta` files found still staged, for the ledger re-append.
+        let staged_paths: std::sync::Mutex<Vec<std::path::PathBuf>> =
+            std::sync::Mutex::new(Vec::new());
 
         // Atomic counters for lock-free accumulation from parallel workers
         let total_size = AtomicU64::new(0);
+        // Staged (write-tier) subset of total_size. Requirement 6.1.
+        let staged_total = AtomicU64::new(0);
         let cache_expired = AtomicU64::new(0);
         let cache_skipped = AtomicU64::new(0);
         let cache_errors = AtomicU64::new(0);
@@ -1717,6 +1945,16 @@ impl CacheSizeTracker {
                     }
                     let result = self.scan_metadata_file(&path, now);
                     total_size.fetch_add(result.size_bytes, Ordering::Relaxed);
+                    staged_total.fetch_add(result.staged_bytes, Ordering::Relaxed);
+                    // Still staged: remember the path so the ledger re-append can check
+                    // whether any ledger knows about it (R2.7). `staged_bytes > 0` is the
+                    // same predicate that produced the figure above, so the two cannot
+                    // disagree about what "staged" means.
+                    if result.staged_bytes > 0 {
+                        if let Ok(mut paths) = staged_paths.lock() {
+                            paths.push(path.clone());
+                        }
+                    }
                     if result.cache_expired {
                         cache_expired.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1743,6 +1981,8 @@ impl CacheSizeTracker {
             cache_skipped.load(Ordering::Relaxed),
             cache_errors.load(Ordering::Relaxed),
             files_processed.load(Ordering::Relaxed),
+            staged_total.load(Ordering::Relaxed),
+            staged_paths.into_inner().unwrap_or_default(),
         ))
     }
 
@@ -1757,6 +1997,7 @@ impl CacheSizeTracker {
                 warn!("Failed to read metadata file {:?}: {}", path, e);
                 return ScanFileResult {
                     size_bytes: 0,
+                    staged_bytes: 0,
                     cache_expired: false,
                     cache_skipped: false,
                     cache_error: true,
@@ -1784,6 +2025,7 @@ impl CacheSizeTracker {
 
                 return ScanFileResult {
                     size_bytes: 0,
+                    staged_bytes: 0,
                     cache_expired: false,
                     cache_skipped: false,
                     cache_error: true,
@@ -1793,6 +2035,12 @@ impl CacheSizeTracker {
 
         // Calculate total size from all ranges
         let total_size: u64 = metadata.ranges.iter().map(|r| r.compressed_size).sum();
+        // The staged subset of that total, classified per range through the single
+        // shared predicate — the same one the accumulator's add and subtract sites use,
+        // so this scan and the accumulator cannot report different figures for
+        // identical on-disk state.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 6.1, 6.2
+        let staged_size: u64 = metadata.staged_compressed_size();
 
         // Check if write cache entry is expired (Requirements 5.3, 5.4)
         // Write cache expiration is always checked, regardless of actively_remove_cached_data
@@ -1813,6 +2061,7 @@ impl CacheSizeTracker {
                         warn!("Cache manager reference is no longer valid for write cache cleanup");
                         return ScanFileResult {
                             size_bytes: total_size,
+                            staged_bytes: staged_size,
                             cache_expired: false,
                             cache_skipped: false,
                             cache_error: true,
@@ -1823,6 +2072,7 @@ impl CacheSizeTracker {
                     // Cache manager not set, skip expiration
                     return ScanFileResult {
                         size_bytes: total_size,
+                        staged_bytes: staged_size,
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: false,
@@ -1847,6 +2097,7 @@ impl CacheSizeTracker {
                     debug!("Deleted expired write cache entry: {}", metadata.cache_key);
                     return ScanFileResult {
                         size_bytes: 0,
+                        staged_bytes: 0,
                         cache_expired: true,
                         cache_skipped: false,
                         cache_error: false,
@@ -1866,6 +2117,7 @@ impl CacheSizeTracker {
                     );
                     return ScanFileResult {
                         size_bytes: total_size,
+                        staged_bytes: staged_size,
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: true,
@@ -1889,6 +2141,7 @@ impl CacheSizeTracker {
                         warn!("Cache manager reference is no longer valid");
                         return ScanFileResult {
                             size_bytes: total_size,
+                            staged_bytes: staged_size,
                             cache_expired: false,
                             cache_skipped: false,
                             cache_error: true,
@@ -1899,6 +2152,7 @@ impl CacheSizeTracker {
                     // Cache manager not set, skip expiration
                     return ScanFileResult {
                         size_bytes: total_size,
+                        staged_bytes: staged_size,
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: false,
@@ -1927,6 +2181,7 @@ impl CacheSizeTracker {
                 );
                 return ScanFileResult {
                     size_bytes: total_size,
+                    staged_bytes: staged_size,
                     cache_expired: false,
                     cache_skipped: true,
                     cache_error: false,
@@ -1951,6 +2206,7 @@ impl CacheSizeTracker {
                     // Don't count size since we deleted it
                     return ScanFileResult {
                         size_bytes: 0,
+                        staged_bytes: 0,
                         cache_expired: true,
                         cache_skipped: false,
                         cache_error: false,
@@ -1963,6 +2219,7 @@ impl CacheSizeTracker {
                     );
                     return ScanFileResult {
                         size_bytes: total_size,
+                        staged_bytes: staged_size,
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: true,
@@ -1974,6 +2231,7 @@ impl CacheSizeTracker {
         // Entry not expired or active expiration disabled
         ScanFileResult {
             size_bytes: total_size,
+            staged_bytes: staged_size,
             cache_expired: false,
             cache_skipped: false,
             cache_error: false,

@@ -153,6 +153,7 @@ async fn test_cached_range_hit_logging() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     let mut disk_cache = disk_cache_manager.write().await;
@@ -264,6 +265,7 @@ async fn test_complete_cache_hit_metrics() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     let mut disk_cache = disk_cache_manager.write().await;

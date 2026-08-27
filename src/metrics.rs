@@ -29,6 +29,13 @@ fn ram_hit_rate_percent(fraction: f32) -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetrics {
     pub total_cache_size: u64,
+    /// Configured `cache.max_cache_size`, i.e. the figure `total_cache_size` is a
+    /// fraction of. 0 means no limit is configured.
+    ///
+    /// Exposed so utilisation is computable from `/metrics` alone. Without it a consumer
+    /// can see how full the cache is but not how full it is *allowed* to get, which also
+    /// made the denominator behind the `/health` cache percentage invisible.
+    pub max_cache_size_limit: u64,
     pub read_cache_size: u64,
     pub write_cache_size: u64,
     pub ram_cache_size: u64,
@@ -144,6 +151,15 @@ pub struct SignedPutMetrics {
     pub cache_failures_total: u64,
     pub average_cached_bytes: u64,
     pub average_streaming_duration_ms: u64,
+    /// Uploads not write-through cached, keyed by reason. A map rather than
+    /// fixed fields (mirrors the `bucket_traffic` precedent) because R8.1's
+    /// list of reasons is explicitly a minimum, not a closed set fixed at
+    /// compile time. Known reason keys as of this writing: `write_cache_disabled`,
+    /// `unknown_length`, `disk_safety`, `object_too_large`, `commit_failed`.
+    /// `capacity_refused` was retired in 2.7.0 and is never emitted — see
+    /// `docs/METRICS_REFERENCE.md` for the maintained list.
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.1
+    pub skipped_puts_total: HashMap<String, u64>,
 }
 
 /// Atomic metadata writes metrics
@@ -316,6 +332,11 @@ pub struct SystemMetrics {
     /// operator can confirm the feature is off from `/metrics` alone.
     /// Spec: inflight-memory-accounting. Requirements: 8.1-8.7
     pub inflight_memory: InflightMemoryMetrics,
+    /// Write-cache (staging tier) observability: Resident_Bytes vs the
+    /// Staging_Bound, Inflight_Bytes, and staged-entry count. Always present
+    /// (zeroed when write caching or the cache manager is not wired in).
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2
+    pub write_cache: WriteCacheMetrics,
 }
 
 /// In-flight buffered-byte ledger statistics.
@@ -362,6 +383,82 @@ pub struct InflightMemoryMetrics {
     /// Requirement: 8.7
     pub ram_cache_max_bytes: u64,
 }
+
+/// Write-cache (staging tier) observability metrics.
+///
+/// Exposed as `write_cache.{resident_bytes,staging_bound_bytes,inflight_bytes,
+/// over_bound,staged_entries,staging_evictions_total,
+/// staging_eviction_bytes_total,graduations_total}` in the `/metrics` JSON.
+///
+/// - `resident_bytes`: Resident_Bytes — staged bytes on the shared volume,
+///   read from the Journal_Consolidator's in-memory Size_State
+///   (`SizeState::write_cache_size`), the same fleet-wide figure
+///   `cache.write_cache_size` reports.
+/// - `staging_bound_bytes`: the configured Staging_Bound
+///   (`max_cache_size * write_cache_percent`), i.e.
+///   `CacheManager::get_write_cache_capacity()`.
+/// - `inflight_bytes`: Inflight_Bytes — this instance's current in-flight
+///   `WriteReservation` total (`WriteCacheManager::current_usage()`),
+///   per-instance and not shared.
+/// - `over_bound`: `resident_bytes > staging_bound_bytes`, derived and exposed
+///   explicitly so the condition needs no arithmetic to detect.
+/// - `staged_entries`: a live (approximate) count of currently staged
+///   (write-cached, ungraduated) entries.
+/// - `graduations_total`: cumulative entries that left the staging tier by being
+///   read (per-instance). Read it **with** `staged_entries`: a flat gauge alone
+///   cannot distinguish an idle proxy from a broken graduation path, and
+///   graduation is the mechanism by which the tier is supposed to drain. Together
+///   with `staging_evictions_total` it accounts for the two ways an entry leaves
+///   the tier — this one leaves the bytes on disk (they move to the read tier),
+///   the other reclaims them. Not the accounting authority: the authoritative
+///   decrement is applied to Size_State by the `Graduation` journal entry under
+///   the consolidation lock, so two proxies racing the same key can both count
+///   here while only one decrement lands.
+/// - `staging_evictions_total` / `staging_eviction_bytes_total`: cumulative
+///   objects evicted / bytes freed by staging (write-cache) eviction,
+///   per-instance (`WriteCacheManager::evict_write_cached_object`).
+///   Deliberately separate from `cache.evictions`, which reflects read-cache
+///   eviction only and reports 0 regardless of how much staging eviction has
+///   run — before this field existed, `cache.evictions: 0` was actively
+///   misleading evidence that the write tier had never evicted anything.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.4
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WriteCacheMetrics {
+    pub resident_bytes: u64,
+    pub staging_bound_bytes: u64,
+    pub inflight_bytes: u64,
+    pub over_bound: bool,
+    pub staged_entries: u64,
+    pub staging_evictions_total: u64,
+    pub staging_eviction_bytes_total: u64,
+    pub graduations_total: u64,
+    /// Write_Ledger length: entries across every instance's ledger file.
+    ///
+    /// Read alongside `staged_entries` (R8.3). The two measure the same population by
+    /// different routes — `staged_entries` is a per-instance in-memory gauge, this is a
+    /// count of records on shared storage — so a persistent gap between them is the
+    /// signal that compaction is not keeping up or that appends are being lost. Neither
+    /// is the accounting authority; `resident_bytes` is.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.6, 8.3
+    pub ledger_entries: u64,
+}
+
+/// Rate-limit interval for the Resident_Bytes-over-Staging_Bound WARN
+/// (Requirement 8.5). Mirrors the 60s window used by
+/// `InflightLedger::log_rejection_rate_limited` and
+/// `HttpProxy::shed_request`'s `CONCURRENCY_LAST_LOG` — one `warn!` per
+/// window rather than one per `/metrics` poll or per consolidation cycle.
+const OVER_BOUND_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Unix timestamp (seconds) of the last rate-limited `over_bound` WARN.
+/// Process-wide: `collect_write_cache_metrics` is called from every
+/// `/metrics` request, the dashboard's refresh, and OTLP export, so a
+/// per-call limiter would still spam if two of those overlap within the
+/// window.
+static LAST_OVER_BOUND_WARN_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Hedged upstream request statistics.
 ///
@@ -733,6 +830,16 @@ pub struct EvictionCoordinationStats {
     pub evictions_coordinated: u64,
     /// Number of evictions skipped because another instance holds the lock (Requirement 7.5)
     pub evictions_skipped_lock_held: u64,
+    /// Number of **staging** eviction passes skipped because another instance held the
+    /// global eviction lock.
+    ///
+    /// Counted separately from `evictions_skipped_lock_held` for the same reason
+    /// `staging_evictions_total` is separate from `cache.evictions`: the two tiers share
+    /// the lock but not the trigger, so folding them together makes it impossible to tell
+    /// whether the write tier is being starved of the lock by read-tier eviction.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 7.4
+    pub staging_evictions_skipped_lock_held: u64,
 }
 
 /// Internal signed PUT caching statistics tracking
@@ -746,6 +853,9 @@ pub struct SignedPutStats {
     cached_bytes: Vec<u64>,
     // Histogram data for streaming duration (in milliseconds)
     streaming_durations: Vec<u64>,
+    /// Skipped-PUT counts keyed by reason.
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.1
+    skipped_puts_by_reason: HashMap<String, u64>,
 }
 
 /// Internal connection keepalive statistics tracking
@@ -1017,6 +1127,93 @@ impl MetricsManager {
         }
     }
 
+    /// Collect write-cache (staging tier) observability metrics.
+    ///
+    /// `resident_bytes` is read from the Journal_Consolidator's in-memory
+    /// Size_State (`SizeState::write_cache_size`) rather than from a separate
+    /// walk, so it agrees with `cache.write_cache_size` and is fleet-wide.
+    /// `inflight_bytes` and `staged_entries` come from the per-instance
+    /// `WriteCacheManager` gauges. Returns all-zero when the cache manager is
+    /// not wired in (mirrors `collect_inflight_memory_metrics`'s disabled shape).
+    ///
+    /// Also emits the Requirement 8.5 rate-limited WARN when
+    /// `resident_bytes > staging_bound_bytes`. This is the natural single
+    /// point for that check: both figures are already computed together
+    /// here (rather than at the point Size_State's `write_cache_size` is
+    /// updated in `journal_consolidator.rs`, which knows the new resident
+    /// figure but not the Staging_Bound — that lives on `CacheManager`,
+    /// reached only via `get_write_cache_capacity()`), and this function
+    /// already runs on every `/metrics` poll, dashboard refresh, and OTLP
+    /// export cycle, so the condition is checked as often as an operator or
+    /// exporter would observe it.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.4, 8.5
+    async fn collect_write_cache_metrics(&self) -> WriteCacheMetrics {
+        let Some(cache_manager) = &self.cache_manager else {
+            return WriteCacheMetrics::default();
+        };
+
+        let resident_bytes = match cache_manager.get_journal_consolidator().await {
+            Some(consolidator) => consolidator.get_size_state().await.write_cache_size,
+            None => 0,
+        };
+        let staging_bound_bytes = cache_manager.get_write_cache_capacity();
+        let (inflight_bytes, staged_entries) = cache_manager.get_write_cache_manager_gauges().await;
+        let (staging_evictions_total, staging_eviction_bytes_total) =
+            cache_manager.get_write_cache_eviction_counters().await;
+        let graduations_total = cache_manager.get_write_cache_graduations_total().await;
+        let ledger_entries = match cache_manager.get_journal_consolidator().await {
+            Some(consolidator) => consolidator.write_ledger().count_entries().await,
+            None => 0,
+        };
+        let over_bound = resident_bytes > staging_bound_bytes;
+
+        if over_bound {
+            Self::log_over_bound_rate_limited(resident_bytes, staging_bound_bytes);
+        }
+
+        WriteCacheMetrics {
+            resident_bytes,
+            staging_bound_bytes,
+            inflight_bytes,
+            over_bound,
+            staged_entries,
+            staging_evictions_total,
+            staging_eviction_bytes_total,
+            graduations_total,
+            ledger_entries,
+        }
+    }
+
+    /// Rate-limited WARN naming both Resident_Bytes and the Staging_Bound
+    /// (Requirement 8.5): at most one `warn!` per
+    /// `OVER_BOUND_WARN_INTERVAL_SECS` (60s), mirroring the
+    /// `InflightLedger::log_rejection_rate_limited` / `CONCURRENCY_LAST_LOG`
+    /// discipline elsewhere in this codebase — an AtomicU64 storing the last
+    /// logged unix-second timestamp, checked-and-swapped to gate the line.
+    fn log_over_bound_rate_limited(resident_bytes: u64, staging_bound_bytes: u64) {
+        let now_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_OVER_BOUND_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if now_secs >= last + OVER_BOUND_WARN_INTERVAL_SECS
+            && LAST_OVER_BOUND_WARN_SECS
+                .compare_exchange(
+                    last,
+                    now_secs,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            warn!(
+                resident_bytes,
+                staging_bound_bytes, "Write cache Resident_Bytes exceeds the Staging_Bound"
+            );
+        }
+    }
+
     /// Collect hedging stats from the shared `HedgeMetrics` counters.
     /// Returns zeroes when hedge metrics have not been wired in.
     fn collect_hedging_metrics(&self) -> HedgingStats {
@@ -1177,6 +1374,7 @@ impl MetricsManager {
             download_bandwidth: crate::bandwidth_limiter::global_limiter().snapshot(),
             hedged_requests: self.collect_hedging_metrics(),
             inflight_memory: self.collect_inflight_memory_metrics(),
+            write_cache: self.collect_write_cache_metrics().await,
         };
 
         // Cache the result
@@ -1243,10 +1441,20 @@ impl MetricsManager {
             0.0
         };
 
+        // `None` only on the degraded path above, where `get_cache_size_stats` failed and
+        // we fell back to the stored statistics. Reported as zeros, which is what this
+        // endpoint has always done in that case — the WARN above is the signal, not these
+        // fields. `unwrap_or_default` is safe here precisely because it is unreachable on
+        // the success path: `get_cache_size_stats` always returns `Some`.
+        let sizes = stats.sizes.unwrap_or_default();
+
         Some(CacheMetrics {
-            total_cache_size: stats.total_cache_size,
-            read_cache_size: stats.read_cache_size,
-            write_cache_size: stats.write_cache_size,
+            total_cache_size: sizes.total_cache_size,
+            // Genuinely maintained on the stored statistics (set in the CacheManager
+            // constructor), so unlike the size figures this one is valid on both paths.
+            max_cache_size_limit: stats.max_cache_size_limit,
+            read_cache_size: sizes.read_cache_size,
+            write_cache_size: sizes.write_cache_size,
             ram_cache_size: stats.ram_cache_size,
             cache_hit_rate_percent: hit_rate,
             ram_cache_hit_rate_percent: ram_hit_rate_percent(stats.ram_cache_hit_rate),
@@ -1857,6 +2065,22 @@ impl MetricsManager {
         );
     }
 
+    /// Record a **staging** eviction pass skipped because another instance held the
+    /// global eviction lock (R7.4).
+    ///
+    /// Deliberately not folded into `record_eviction_skipped_lock_held` — see the field
+    /// doc on `EvictionCoordinationStats::staging_evictions_skipped_lock_held`.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 7.4
+    pub async fn record_staging_eviction_skipped_lock_held(&self) {
+        let mut stats = self.eviction_coordination_stats.write().await;
+        stats.staging_evictions_skipped_lock_held += 1;
+        debug!(
+            "Recorded staging eviction skipped (lock held) (total: {})",
+            stats.staging_evictions_skipped_lock_held
+        );
+    }
+
     /// Get eviction coordination statistics
     pub async fn get_eviction_coordination_stats(&self) -> EvictionCoordinationStats {
         self.eviction_coordination_stats.read().await.clone()
@@ -1887,6 +2111,7 @@ impl MetricsManager {
             cache_failures_total: stats.cache_failures_total,
             average_cached_bytes,
             average_streaming_duration_ms,
+            skipped_puts_total: stats.skipped_puts_by_reason.clone(),
         })
     }
 
@@ -1946,6 +2171,35 @@ impl MetricsManager {
             stats.cache_failures_total
         );
     }
+
+    /// Record an upload that was not write-through cached, keyed by reason.
+    ///
+    /// Covers the otherwise-silent skip sites — caching disabled by rule
+    /// (`write_cache_disabled`), decoded length unknown (`unknown_length`),
+    /// no room on the cache volume (`disk_safety`), object too large
+    /// (`object_too_large`), and post-S3 commit failure (`commit_failed`) —
+    /// so the fleet reports something other than all zeros when write-through
+    /// caching has stopped. Callers keep their existing `debug!` lines; this is
+    /// purely additive observability.
+    ///
+    /// # Arguments
+    /// * `reason` - A stable reason key (see `docs/METRICS_REFERENCE.md` for
+    ///   the maintained list of keys)
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.1
+    pub async fn record_skipped_put(&self, reason: &str) {
+        let mut stats = self.signed_put_stats.write().await;
+        let count = stats
+            .skipped_puts_by_reason
+            .entry(reason.to_string())
+            .or_insert(0);
+        *count += 1;
+        debug!(
+            "Recorded skipped PUT: reason={} (total for this reason: {})",
+            reason, count
+        );
+    }
+
     /// Record cache bypass with reason
     /// Requirements: 5.5, 13.4
     ///
@@ -3307,6 +3561,143 @@ impl MetricsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `CacheManager` with shared storage wired up just far enough
+    /// for `collect_write_cache_metrics` to read a real Journal_Consolidator
+    /// (so `get_journal_consolidator()` returns `Some` and
+    /// `get_write_cache_capacity()` reflects `write_cache_percent`).
+    ///
+    /// Deliberately calls `create_configured_disk_cache_manager()` plus a
+    /// direct `consolidator.initialize()` rather than the full
+    /// `CacheManager::initialize()` coordinated path: the latter also starts
+    /// `CacheSizeTracker`'s background validation task, which — because no
+    /// `validation.json` exists yet in a fresh temp dir — runs an immediate
+    /// filesystem-scan validation that calls `update_size_from_validation`
+    /// and overwrites `write_cache_size` back to the scanned (zero) figure,
+    /// racing with this test's own `atomic_update_size_delta` calls. Skipping
+    /// it keeps the test deterministic without weakening what's under test:
+    /// `collect_write_cache_metrics` reads through
+    /// `get_journal_consolidator()` and `get_write_cache_capacity()`, neither
+    /// of which depends on `CacheSizeTracker` or `WriteCacheManager` being
+    /// initialized.
+    ///
+    /// Returns the manager plus the temp dir it owns (kept alive for the
+    /// caller's duration).
+    async fn build_cache_manager_with_write_cache(
+        max_cache_size: u64,
+        write_cache_percent: f32,
+    ) -> (Arc<CacheManager>, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_manager = Arc::new(CacheManager::new_with_shared_storage(
+            temp_dir.path().to_path_buf(),
+            false, // RAM cache disabled — irrelevant to write_cache metrics
+            0,
+            max_cache_size,
+            crate::cache::CacheEvictionAlgorithm::LRU,
+            1024,
+            false,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            write_cache_percent,
+            true, // write cache enabled
+            Duration::from_secs(86400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            Duration::from_secs(60),
+            1_048_576,
+            false,
+            Duration::from_secs(10),
+            4,
+            Duration::from_secs(5),
+        ));
+
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager
+            .get_journal_consolidator()
+            .await
+            .expect("consolidator set by create_configured_disk_cache_manager")
+            .initialize()
+            .await
+            .unwrap();
+
+        (cache_manager, temp_dir)
+    }
+
+    /// `collect_write_cache_metrics` must read `resident_bytes` from
+    /// Size_State, `staging_bound_bytes` from the configured
+    /// Staging_Bound, and derive `over_bound` from the two — plus surface
+    /// the staging-eviction counters, initially zero.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.4
+    #[tokio::test]
+    async fn test_collect_write_cache_metrics_reports_bound_and_eviction_counters() {
+        let (cache_manager, _temp_dir) =
+            build_cache_manager_with_write_cache(1_000_000, 10.0).await;
+
+        let mut metrics_manager = MetricsManager::new();
+        metrics_manager.set_cache_manager(cache_manager.clone());
+
+        let metrics = metrics_manager.collect_metrics().await;
+
+        // Staging_Bound = 10% of 1_000_000 = 100_000.
+        assert_eq!(metrics.write_cache.staging_bound_bytes, 100_000);
+        // Nothing staged yet: resident bytes and eviction counters start at zero.
+        assert_eq!(metrics.write_cache.resident_bytes, 0);
+        assert!(!metrics.write_cache.over_bound);
+        assert_eq!(metrics.write_cache.staging_evictions_total, 0);
+        assert_eq!(metrics.write_cache.staging_eviction_bytes_total, 0);
+
+        // Push Resident_Bytes over the Staging_Bound directly through the
+        // consolidator (the same component `resident_bytes` is read from),
+        // and confirm `over_bound` flips without anything else changing.
+        let consolidator = cache_manager.get_journal_consolidator().await.unwrap();
+        consolidator
+            .atomic_update_size_delta(150_000, 150_000)
+            .await
+            .unwrap();
+
+        let metrics = metrics_manager.collect_metrics().await;
+        assert_eq!(metrics.write_cache.resident_bytes, 150_000);
+        assert_eq!(metrics.write_cache.staging_bound_bytes, 100_000);
+        assert!(metrics.write_cache.over_bound);
+    }
+
+    /// The `over_bound` WARN (Requirement 8.5) must be rate-limited: calling
+    /// `collect_write_cache_metrics` repeatedly while Resident_Bytes stays
+    /// over the Staging_Bound must not panic, error, or otherwise fail — the
+    /// rate limiter's job is to suppress log volume, not to change the
+    /// returned metrics. This exercises the code path directly; the log
+    /// suppression itself is structurally identical to
+    /// `InflightLedger::log_rejection_rate_limited`, which is not
+    /// separately log-capture-tested either.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.5
+    #[tokio::test]
+    async fn test_collect_write_cache_metrics_over_bound_repeated_calls_stable() {
+        let (cache_manager, _temp_dir) = build_cache_manager_with_write_cache(1_000, 10.0).await;
+
+        let mut metrics_manager = MetricsManager::new();
+        metrics_manager.set_cache_manager(cache_manager.clone());
+
+        let consolidator = cache_manager.get_journal_consolidator().await.unwrap();
+        consolidator
+            .atomic_update_size_delta(500, 500)
+            .await
+            .unwrap();
+
+        // Staging_Bound = 10% of 1_000 = 100; resident 500 is over it on every call.
+        for _ in 0..5 {
+            let metrics = metrics_manager.collect_metrics().await;
+            assert!(metrics.write_cache.over_bound);
+            assert_eq!(metrics.write_cache.resident_bytes, 500);
+            assert_eq!(metrics.write_cache.staging_bound_bytes, 100);
+        }
+    }
 
     #[tokio::test]
     async fn test_signed_put_metrics_recording() {

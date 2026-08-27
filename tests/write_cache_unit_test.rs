@@ -6,6 +6,8 @@
 //! - PUT_TTL is used for expiration
 //! - PUT-cached objects are not in RAM cache
 
+mod common;
+
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::{CacheMetadata, UploadState};
 use s3_proxy::config::SharedStorageConfig;
@@ -66,16 +68,16 @@ async fn test_put_storage_creates_correct_metadata_and_range_files() {
     };
 
     // Store as write cache entry
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata.clone(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify metadata using CacheManager API
     let stored_metadata = cache_manager
@@ -165,16 +167,16 @@ async fn test_upload_state_is_complete() {
     };
 
     // Store as write cache entry
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata,
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify upload_state is Complete
     let stored_metadata = cache_manager
@@ -246,16 +248,16 @@ async fn test_put_ttl_is_used_for_expiration() {
     let _before_store = SystemTime::now();
 
     // Store as write cache entry
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata,
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     let _after_store = SystemTime::now();
 
@@ -352,16 +354,16 @@ async fn test_put_cached_objects_not_in_ram_cache() {
     };
 
     // Store as write cache entry
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata,
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify object is in disk cache
     let disk_metadata = cache_manager
@@ -439,16 +441,16 @@ async fn test_put_storage_with_headers() {
     };
 
     // Store with headers
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            headers.clone(),
-            metadata.clone(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        headers.clone(),
+        metadata.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify metadata includes content-type
     let stored_metadata = cache_manager
@@ -515,16 +517,16 @@ async fn test_multiple_put_operations_same_key() {
         last_accessed: SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data_1,
-            HashMap::new(),
-            metadata_1,
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data_1,
+        HashMap::new(),
+        metadata_1,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify first version is stored
     let stored_metadata_1 = cache_manager
@@ -546,16 +548,16 @@ async fn test_multiple_put_operations_same_key() {
         last_accessed: SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data_2,
-            HashMap::new(),
-            metadata_2,
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data_2,
+        HashMap::new(),
+        metadata_2,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify second version replaced the first
     let stored_metadata_2 = cache_manager

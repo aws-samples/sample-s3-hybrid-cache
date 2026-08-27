@@ -233,6 +233,7 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
             created_at: std::time::SystemTime::now(),
             last_accessed: std::time::SystemTime::now(),
             access_count: 0,
+            staged: None,
         }],
         ..Default::default()
     };

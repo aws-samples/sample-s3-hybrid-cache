@@ -1,6 +1,31 @@
+mod common;
+
 use s3_proxy::{cache::CacheManager, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tempfile::TempDir;
+
+/// Recursively find `.bin` range files under `ranges_dir` belonging to `cache_key`.
+/// Range files are sharded (`ranges/{bucket}/{XX}/{YYY}/{object}_{start}-{end}.bin`,
+/// see `get_sharded_path` in `disk_cache.rs`), so the bucket segment of the key lands
+/// in a *directory* component and only the object-key tail appears in the filename
+/// itself — a flat `read_dir` or a filename-only substring match on the full
+/// percent-encoded key both miss every file the production write-through path
+/// creates. Matching against the full path (parent directories included) is what
+/// makes this correct for a multi-segment key.
+fn find_range_files_for_key(ranges_dir: &std::path::Path, cache_key: &str) -> Vec<PathBuf> {
+    // The object-key tail is what actually appears in the filename; check the full
+    // path (not just the filename) so the bucket segment, which lives in a
+    // directory component, still discriminates between keys sharing an object name.
+    let object_tail = cache_key.rsplit('/').next().unwrap_or(cache_key);
+    walkdir::WalkDir::new(ranges_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(object_tail))
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
 
 /// Helper function to create test metadata
 #[allow(dead_code)]
@@ -46,15 +71,15 @@ async fn test_put_invalidates_existing_complete_cache() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            initial_data,
-            initial_headers.clone(),
-            initial_metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        initial_data,
+        initial_headers.clone(),
+        initial_metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Verify initial data is cached
     let metadata_file_path = cache_manager.get_new_metadata_file_path(&cache_key);
@@ -89,15 +114,15 @@ async fn test_put_invalidates_existing_complete_cache() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            new_data,
-            new_headers,
-            new_metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        new_data,
+        new_headers,
+        new_metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Verify metadata file still exists but with new content
     assert!(
@@ -177,15 +202,15 @@ async fn test_put_invalidates_in_progress_multipart() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            put_data,
-            put_headers,
-            put_metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        put_data,
+        put_headers,
+        put_metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Verify metadata file now contains the PUT data, not the multipart
     assert!(
@@ -238,26 +263,29 @@ async fn test_put_deletes_range_files_on_conflict() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            initial_data,
-            initial_headers.clone(),
-            initial_metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        initial_data,
+        initial_headers.clone(),
+        initial_metadata,
+        HashMap::new(),
+    )
+    .await?;
 
-    // Verify range file was created
+    // Verify range file was created. The two write-through storage paths use
+    // DIFFERENT directory layouts, which is a real finding surfaced by migrating
+    // this fixture off the retired `store_write_cache_entry` (task 61):
+    //   - `store_write_cache_entry` -> `store_full_object_as_range_new` ->
+    //     `CacheManager::get_new_range_file_path` -> FLAT `ranges/{key}_{s}-{e}.bin`
+    //   - `common::put_through_write_cache` -> `store_put_as_write_cached_range` ->
+    //     `WriteCacheRangeSink` -> `DiskCacheManager::get_new_range_file_path` ->
+    //     SHARDED `ranges/{bucket}/{XX}/{YYY}/{key}_{s}-{e}.bin`
+    // (`get_sharded_path` in disk_cache.rs). This fixture originally assumed the
+    // flat layout and a plain `read_dir` found nothing under the sharded one even
+    // though the file was created correctly, so the walk must be recursive.
     let ranges_dir = temp_dir.path().join("ranges");
-    let range_files_before: Vec<_> = std::fs::read_dir(&ranges_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .contains(&cache_key.replace("/", "%2F"))
-        })
-        .collect();
+    let range_files_before: Vec<_> = find_range_files_for_key(&ranges_dir, &cache_key);
 
     assert!(
         !range_files_before.is_empty(),
@@ -280,25 +308,18 @@ async fn test_put_deletes_range_files_on_conflict() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            new_data,
-            new_headers,
-            new_metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        new_data,
+        new_headers,
+        new_metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Verify old range files were deleted and new ones created
-    let range_files_after: Vec<_> = std::fs::read_dir(&ranges_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .contains(&cache_key.replace("/", "%2F"))
-        })
-        .collect();
+    let range_files_after: Vec<_> = find_range_files_for_key(&ranges_dir, &cache_key);
 
     // Should have new range files (not the old ones)
     assert!(
@@ -309,8 +330,14 @@ async fn test_put_deletes_range_files_on_conflict() -> Result<()> {
     // The old range files should have been deleted
     // We can verify this by checking that the file names are different
     // (since the new data has different length, the range spec will be different)
-    let old_range_names: Vec<_> = range_files_before.iter().map(|e| e.file_name()).collect();
-    let new_range_names: Vec<_> = range_files_after.iter().map(|e| e.file_name()).collect();
+    let old_range_names: Vec<_> = range_files_before
+        .iter()
+        .map(|p| p.file_name().unwrap().to_owned())
+        .collect();
+    let new_range_names: Vec<_> = range_files_after
+        .iter()
+        .map(|p| p.file_name().unwrap().to_owned())
+        .collect();
 
     // Since the data lengths are different, the range specs should be different
     assert_ne!(
@@ -347,15 +374,15 @@ async fn test_multipart_initiation_invalidates_put_cache() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            put_data,
-            put_headers,
-            put_metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        put_data,
+        put_headers,
+        put_metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Verify PUT data is cached
     let metadata_file_path = cache_manager.get_new_metadata_file_path(&cache_key);

@@ -104,6 +104,7 @@ fn prop_ttl_refresh_uses_resolved_ttl(input: ArbitraryTtlRefreshInput) -> TestRe
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         let metadata = NewCacheMetadata {

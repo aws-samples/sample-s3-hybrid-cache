@@ -239,23 +239,38 @@ async fn test_cache_state_after_bypass_operations() -> Result<(), Box<dyn std::e
         std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
 
-    // Get initial cache statistics
-    let stats_before = cache_manager.get_statistics();
-    let initial_read_cache_size = stats_before.read_cache_size;
-    let initial_write_cache_size = stats_before.write_cache_size;
+    // Get initial cache sizes.
+    //
+    // MUST come from `get_cache_size_stats()`, not `get_statistics()`. Until 2026-08-26
+    // this read the size fields off the stored statistics, where they are never written
+    // and were always 0 — so "size did not change after the bypass" compared 0 against 0
+    // and could not have failed whatever the proxy did. Same class of vacuous assertion as
+    // the production defects in tasks 62 and 65, which is why those figures now sit behind
+    // an `Option` a caller has to acknowledge.
+    let sizes_before = cache_manager
+        .get_cache_size_stats()
+        .await
+        .unwrap()
+        .sizes
+        .expect("get_cache_size_stats always populates CacheSizes");
 
     // Simulate various bypass operations
     // (In a real test, these would be actual HTTP requests)
 
     // After bypass operations, verify cache size hasn't changed
-    let stats_after = cache_manager.get_statistics();
+    let sizes_after = cache_manager
+        .get_cache_size_stats()
+        .await
+        .unwrap()
+        .sizes
+        .expect("get_cache_size_stats always populates CacheSizes");
 
     assert_eq!(
-        stats_after.read_cache_size, initial_read_cache_size,
+        sizes_after.read_cache_size, sizes_before.read_cache_size,
         "Read cache size should not change after bypass operations"
     );
     assert_eq!(
-        stats_after.write_cache_size, initial_write_cache_size,
+        sizes_after.write_cache_size, sizes_before.write_cache_size,
         "Write cache size should not change after bypass operations"
     );
 

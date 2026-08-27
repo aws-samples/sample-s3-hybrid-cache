@@ -247,6 +247,8 @@ The proxy intercepts S3 traffic by routing client requests to the proxy. Choose 
 - **Option C (Hosts File)** — edit `/etc/hosts`. Rarely the easiest choice anymore; prefer Option A unless the client cannot set `HTTP_PROXY`.
 - **Option D (Layer 4 Load Balancer)** — front a proxy fleet with a TCP load balancer. Centralised failover and health checking with a single stable endpoint.
 
+Those four cover distributing clients across a fleet. If you additionally want requests for the same object and byte range to converge on one instance, that needs a Layer 7 router reading each request; see [Request-Aware Routing](REQUEST_AWARE_ROUTING.md) and the tradeoff in [Layer 4 or Layer 7?](#layer-4-or-layer-7) below.
+
 #### Option A: HTTP_PROXY (Single-Instance / No DNS Changes)
 
 Route S3 traffic through the proxy using the `HTTP_PROXY` environment variable. The client sends requests with absolute URIs (`GET http://s3.amazonaws.com/bucket/key`), and the proxy extracts the target host from the URI and processes the request through the caching pipeline.
@@ -701,9 +703,11 @@ Option B (DNS multi-value routing with the AWS CRT transfer client) and Option D
 
 Use Option B when you want to avoid load balancer infrastructure and all clients use the AWS CRT. Use Option D when you need a single stable endpoint, server-side health checking, or support for clients that don't do DNS-based failover.
 
-##### Why Layer 4, Not Layer 7
+##### Layer 4 or Layer 7?
 
-L7 (HTTP) load balancers like AWS ALB, nginx in HTTP mode, or Envoy in HTTP mode work functionally in Patterns 1 and 3, but they add per-request HTTP parsing and re-serialisation overhead that's unnecessary — the proxy already handles HTTP semantics, caching decisions, and range optimisation. L7 load balancers also commonly impose idle timeouts and request/response size limits that can interfere with large streaming transfers. Use a pure TCP (L4) load balancer for best throughput and lowest latency.
+Default to L4. The proxy already terminates and interprets HTTP itself — caching decisions, range handling, conditional requests — so an L7 load balancer redoes that work on every request for no gain, and inserts its own HTTP behaviour between client and proxy. An L4 load balancer forwards bytes and stays out of the way.
+
+Choose L7 only if you want the router to decide *per request* — sending every read of one object and byte range to the same instance, which L4 cannot do because it never sees the request. See [Request-Aware Routing](REQUEST_AWARE_ROUTING.md).
 
 #### S3 PrivateLink (Interface VPC Endpoints)
 

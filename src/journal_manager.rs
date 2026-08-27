@@ -36,14 +36,6 @@ pub struct JournalEntry {
     /// Contains response_headers needed for serving cached responses with correct headers
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<crate::cache_types::ObjectMetadata>,
-    /// Whether the metadata was already written to .meta file before this journal entry was created.
-    /// - `true`: Range was written to .meta immediately (hybrid mode success) - consolidation should NOT count size
-    /// - `false`: Range was NOT written to .meta (journal-only mode) - consolidation SHOULD count size
-    ///
-    /// This flag solves the size tracking problem where HybridMetadataWriter writes to .meta immediately,
-    /// causing consolidation to see "range already exists" and calculate size_delta = 0.
-    #[serde(default)]
-    pub metadata_written: bool,
 }
 
 /// Types of journal operations
@@ -59,6 +51,34 @@ pub enum JournalOperation {
     TtlRefresh,
     /// Update access count and last_accessed timestamp (cache-hit operation)
     AccessUpdate,
+    /// An entry graduated out of the write (staging) tier on its first read.
+    ///
+    /// Carries no range mutation — the `.meta` transition was already performed
+    /// synchronously by `CacheManager::refresh_write_cache_ttl` (it has to be, so a
+    /// `get_ttl: 0` object is correctly expired on that same GET). What this entry
+    /// carries is the **accounting**: `range_spec.compressed_size` holds the entry's
+    /// staged compressed size, which the consolidator subtracts from
+    /// `SizeState::write_cache_size` while leaving `total_size` unchanged — the bytes
+    /// are still on disk, they have simply moved from the write tier to the read tier.
+    ///
+    /// It exists as a journal entry rather than a direct accumulator debit because the
+    /// decrement must be **exactly once fleet-wide** (Requirement 1.2) and the
+    /// accumulator is per-instance. Consolidation applies it under the per-key metadata
+    /// lock and records `ObjectMetadata::graduation_accounted`, so concurrent
+    /// graduations on two proxies collapse to one decrement.
+    ///
+    /// # Mixed-version fleets
+    ///
+    /// `JournalOperation` is externally tagged, so an instance running a release without
+    /// this variant fails to deserialise a line containing it. Every parse site treats a
+    /// malformed line as skippable (`debug!` and continue) rather than fatal, so
+    /// consolidation degrades to "the entry is ignored" rather than breaking — but a
+    /// graduation consolidated only by an old instance is silently lost, and its bytes
+    /// stay in `write_cache_size` until the next full Validation_Scan re-grounds it.
+    /// Acceptable, and self-healing, but worth knowing during a rolling upgrade.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 1.2, 1.3
+    Graduation,
 }
 
 /// Journal manager for write-ahead logging of metadata operations
@@ -916,6 +936,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         }
     }
 
@@ -934,7 +955,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
 
         // Test serialization
@@ -963,7 +983,6 @@ mod tests {
             object_ttl_secs: None,
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
 
         // Test serialization
@@ -993,7 +1012,6 @@ mod tests {
             object_ttl_secs: None,
             access_increment: Some(5),
             object_metadata: None,
-            metadata_written: false,
         };
 
         // Test serialization
@@ -1028,7 +1046,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
 
         // Test append
@@ -1090,7 +1107,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
 
         let entry2 = JournalEntry {
@@ -1105,7 +1121,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
 
         journal_manager
@@ -1186,6 +1201,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         let entry = JournalEntry {
@@ -1203,7 +1219,6 @@ mod tests {
             },
             access_increment: final_increment,
             object_metadata: None,
-            metadata_written: false,
         };
 
         // Serialize to JSON

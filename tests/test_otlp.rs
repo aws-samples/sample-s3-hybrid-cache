@@ -25,6 +25,7 @@ fn test_system_metrics() -> SystemMetrics {
         uptime_seconds: 120,
         cache: Some(CacheMetrics {
             total_cache_size: 1_000_000,
+            max_cache_size_limit: 10_000_000,
             read_cache_size: 800_000,
             write_cache_size: 200_000,
             ram_cache_size: 50_000,
@@ -158,6 +159,7 @@ fn test_system_metrics() -> SystemMetrics {
             suppressed: 0,
         },
         inflight_memory: s3_proxy::metrics::InflightMemoryMetrics::default(),
+        write_cache: s3_proxy::metrics::WriteCacheMetrics::default(),
     }
 }
 
@@ -320,6 +322,7 @@ async fn export_metrics_with_minimal_metrics_succeeds() {
             suppressed: 0,
         },
         inflight_memory: s3_proxy::metrics::InflightMemoryMetrics::default(),
+        write_cache: s3_proxy::metrics::WriteCacheMetrics::default(),
     };
 
     let result = exporter.export_metrics(&metrics).await;

@@ -1106,9 +1106,37 @@ impl CacheInitializationCoordinator {
                 total_objects += 1;
                 total_size += cache_result.compressed_size;
 
-                if cache_result.is_write_cached {
+                // Classify through the single shared staged-range predicate so this scan
+                // reports the same figure the accumulator would for the same on-disk
+                // state, and do it PER RANGE where the ranges are available — the
+                // accumulator credits per range, so classifying at object granularity
+                // (all ranges or none, from the flag alone) is what let the two disagree.
+                //
+                // **`metadata` being `Some` does not mean it was fully parsed.** There are
+                // two producers of these results and they retain different amounts:
+                // `process_metadata_file_lazy` builds a MINIMAL `NewCacheMetadata` that
+                // copies `is_write_cached` but carries **no ranges**, putting the summed
+                // range bytes in `compressed_size` instead. So a range-based predicate
+                // alone reports such an object as unstaged, which is wrong and is exactly
+                // the "find every producer, not the first one" trap in
+                // `cache-tier-verification.md`. Branch on whether ranges are actually
+                // present, and fall back to the flag plus `compressed_size` when they are
+                // not.
+                // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
+                let (is_staged, staged_bytes) = match cache_result.metadata.as_ref() {
+                    Some(m) if !m.ranges.is_empty() => {
+                        (m.has_staged_range(), m.staged_compressed_size())
+                    }
+                    _ if cache_result.is_write_cached => (true, cache_result.compressed_size),
+                    _ => (false, 0),
+                };
+
+                if is_staged {
                     write_cached_objects += 1;
-                    write_cached_size += cache_result.compressed_size;
+                    write_cached_size += staged_bytes;
+                    // A partially-staged object contributes its unstaged remainder to
+                    // the read tier, so the two subtotals still sum to total_size.
+                    read_cached_size += cache_result.compressed_size.saturating_sub(staged_bytes);
                 } else {
                     read_cached_objects += 1;
                     read_cached_size += cache_result.compressed_size;
@@ -1521,27 +1549,45 @@ impl CacheInitializationCoordinator {
     ) -> Result<SubsystemResults> {
         let mut results = SubsystemResults::empty();
 
-        // Initialize WriteCacheManager if enabled with graceful error handling
+        // Report the scan's staged findings, but do NOT seed the admission counter.
+        //
+        // Task 27 removed `initialize_from_scan_results` and its wrapper
+        // `initialize_write_cache_manager_safe` rather than repointing them, because
+        // **seeding an admission counter from persisted state is the defect**, not a
+        // detail of which figure it was seeded from. A repointed version preserves the
+        // bug in a new shape.
+        //
+        // What went wrong is worth stating, because it is what makes "removed, not
+        // repointed" the right call. `WriteCacheManager::current_size` counts bytes
+        // **in flight** — reservations held by uploads currently streaming — released by
+        // `WriteReservation::drop`. Seeding it from a scan of what is **resident** on disk
+        // conflates two different quantities, and because nothing ever released the seeded
+        // portion, the figure was pinned rather than tracked: on the fleet it started at
+        // 157.61% of the bound at every startup and stayed there, refusing every
+        // write-through PUT for months.
+        //
+        // Inflight_Bytes now starts at zero on every start, which is simply correct — a
+        // fresh process has no uploads in flight. Residency is read live from Size_State
+        // by `CacheManager::get_staging_resident_bytes` (R7.1), which is shared across the
+        // fleet and cannot be pinned by a local seed.
+        //
+        // Spec: write-cache-accounting-and-eviction. Requirements: 3.3, 7.2
         if self.write_cache_enabled {
-            if let Some(manager) = write_cache_manager {
-                match self
-                    .initialize_write_cache_manager_safe(manager, scan_results)
-                    .await
-                {
-                    Ok(usage) => {
-                        results.write_cache_initialized = true;
-                        results.write_cache_usage = usage;
-                    }
-                    Err(e) => {
-                        error!(
-                            "Write cache capacity tracking: Initialization failed: {}. \
-                            Continuing without write cache capacity tracking.",
-                            e
-                        );
-                        results.write_cache_initialized = false;
-                        results.write_cache_usage = 0;
-                    }
-                }
+            if write_cache_manager.is_some() {
+                info!(
+                    "Write cache: scan found {} staged objects ({} total), {} staged on disk \
+                     ({:.1}% of the cache). In-flight bytes start at 0; staged residency is \
+                     read from shared size state, not seeded from this scan.",
+                    scan_results.write_cached_objects,
+                    scan_results.total_objects,
+                    scan_results.format_write_cached_size(),
+                    scan_results.write_cache_percentage(),
+                );
+                results.write_cache_initialized = true;
+                // Deliberately the live in-flight figure (zero at startup), not the
+                // scan's resident figure. Reporting the scan figure here is what made the
+                // startup summary read as though the tier were already full.
+                results.write_cache_usage = 0;
             } else {
                 warn!("Write cache capacity tracking: Manager not provided despite being enabled");
             }
@@ -1574,54 +1620,6 @@ impl CacheInitializationCoordinator {
         }
 
         Ok(results)
-    }
-
-    /// Safely initialize WriteCacheManager with error recovery
-    ///
-    /// This method implements graceful error handling for write cache manager
-    /// initialization, ensuring that failures don't prevent proxy startup.
-    ///
-    /// # Requirements
-    /// - Requirement 7.3: Handle subsystem initialization failures gracefully
-    /// - Requirement 7.5: Include error counts in completion summary
-    async fn initialize_write_cache_manager_safe(
-        &self,
-        manager: &mut WriteCacheManager,
-        scan_results: &ObjectsScanResults,
-    ) -> Result<u64> {
-        info!("Write cache capacity tracking: Initializing from scan results");
-        info!(
-            "Write cache capacity tracking: Found {} write-cached objects ({} total)",
-            scan_results.write_cached_objects, scan_results.total_objects
-        );
-        info!(
-            "Write cache capacity tracking: Write cache usage: {} ({:.1}% of total cache)",
-            scan_results.format_write_cached_size(),
-            scan_results.write_cache_percentage()
-        );
-
-        // Initialize manager with scan data using the new streamlined method
-        manager.initialize_from_scan_results(
-            scan_results.write_cached_size,
-            scan_results.write_cached_objects,
-        );
-
-        let current_usage = manager.current_usage();
-        let max_capacity = manager.max_size();
-        let usage_percent = if max_capacity > 0 {
-            (current_usage as f64 / max_capacity as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        info!(
-            "Write cache capacity tracking: Initialized with {} / {} ({:.1}% capacity)",
-            format_bytes_human(current_usage),
-            format_bytes_human(max_capacity),
-            usage_percent
-        );
-
-        Ok(current_usage)
     }
 
     /// Safely initialize CacheSizeTracker with error recovery
@@ -2225,70 +2223,55 @@ impl CacheInitializationCoordinator {
         let manager_size = manager.current_usage();
         let tracker_size = tracker.get_write_cache_size().await;
 
+        // RETIRED as of 2.7.0 — these two figures measure different quantities and
+        // comparing them can now only produce a false alarm.
+        //
+        // The comparison was valid while `WriteCacheManager::current_size` was seeded from
+        // a scan of resident staged bytes, because both sides were then attempting to
+        // report the same thing. Task 27 removed that seeding, because seeding an
+        // admission counter from persisted state was itself the defect behind the fleet's
+        // months-long write-caching outage. So today:
+        //
+        //   manager_size  = Inflight_Bytes — bytes held by uploads currently streaming on
+        //                   THIS instance, released on `WriteReservation::drop`. Zero on a
+        //                   freshly started process, by design (R7.2).
+        //   tracker_size  = Resident_Bytes — staged bytes on the SHARED volume, from
+        //                   Size_State, fleet-wide (R7.1).
+        //
+        // Cross-validating those would report a discrepancy equal to the entire staged set
+        // on every startup, and the old thresholds would escalate it to `error!` above 20%.
+        // That is a permanent false alarm on any deployment with staged data, pointing an
+        // operator at a corruption that does not exist.
+        //
+        // Retired rather than re-thresholded, because no threshold makes an in-flight
+        // figure comparable to a residency figure — there is no correct expected
+        // relationship between them at all. The accounting invariant that DOES matter,
+        // `write_cache_size <= total_size`, is enforced where it belongs, by the clamp in
+        // `JournalConsolidator::update_size_from_validation` (R6.4).
+        //
+        // Both figures are still reported, so the information is not lost, and
+        // `/metrics` exposes them separately as `write_cache.inflight_bytes` and
+        // `write_cache.resident_bytes`.
+        //
+        // Spec: write-cache-accounting-and-eviction. Requirements: 3.3, 7.1, 7.2
         info!(
-            "Cache initialization: Cross-validation - WriteCacheManager: {}, CacheSizeTracker: {}",
+            "Cache initialization: write cache figures — Inflight_Bytes (this instance): {}, \
+             Resident_Bytes (shared, fleet-wide): {}. Not cross-validated: these measure \
+             different quantities and are expected to differ.",
             format_bytes_human(manager_size),
             format_bytes_human(tracker_size)
         );
 
-        // Calculate discrepancy percentage
-        let size_discrepancy_percent = if manager_size == 0 && tracker_size == 0 {
-            0.0
-        } else {
-            let max_size = manager_size.max(tracker_size) as f64;
-            let diff = (manager_size as i64 - tracker_size as i64).abs() as f64;
-            (diff / max_size) * 100.0
-        };
-
-        let mut validation_warnings = Vec::new();
-        let mut write_cache_consistent = true;
-
-        // Apply threshold-based logging and validation
-        if size_discrepancy_percent > 20.0 {
-            // Error threshold exceeded
-            let error_msg = format!(
-                "Write cache size discrepancy exceeds error threshold (20%): {:.1}% difference. \
-                WriteCacheManager: {}, CacheSizeTracker: {}. Consider running cache validation.",
-                size_discrepancy_percent,
-                format_bytes_human(manager_size),
-                format_bytes_human(tracker_size)
-            );
-            error!("Cache initialization: {}", error_msg);
-            validation_warnings.push(error_msg);
-            write_cache_consistent = false;
-        } else if size_discrepancy_percent > 5.0 {
-            // Warning threshold exceeded
-            let warning_msg = format!(
-                "Write cache size discrepancy exceeds warning threshold (5%): {:.1}% difference. \
-                WriteCacheManager: {}, CacheSizeTracker: {}",
-                size_discrepancy_percent,
-                format_bytes_human(manager_size),
-                format_bytes_human(tracker_size)
-            );
-            warn!("Cache initialization: {}", warning_msg);
-            validation_warnings.push(warning_msg);
-            write_cache_consistent = false;
-        } else {
-            // Validation passed
-            debug!(
-                "Cache initialization: Cross-validation successful - write cache sizes consistent \
-                ({:.1}% difference within acceptable range)",
-                size_discrepancy_percent
-            );
-        }
-
+        // `size_discrepancy_percent` is reported as 0.0 and `write_cache_consistent` as
+        // true, because there is no longer any discrepancy being measured. Both figures
+        // are still carried in the result so a caller that wants them keeps them.
         let results = ValidationResults {
-            write_cache_consistent,
-            size_discrepancy_percent,
-            validation_warnings,
+            write_cache_consistent: true,
+            size_discrepancy_percent: 0.0,
+            validation_warnings: Vec::new(),
             write_cache_manager_size: Some(manager_size),
             size_tracker_write_cache_size: Some(tracker_size),
         };
-
-        info!(
-            "Cache initialization: Cross-validation completed - {}",
-            results.summary_string()
-        );
 
         Ok(results)
     }
@@ -3512,6 +3495,7 @@ mod tests {
                 created_at: SystemTime::now(),
                 last_accessed: SystemTime::now(),
                 access_count: 1,
+                staged: None,
             }],
             created_at: SystemTime::now(),
             expires_at: SystemTime::now() + Duration::from_secs(3600),
@@ -3613,8 +3597,9 @@ mod tests {
             CacheEvictionAlgorithm::LRU,
             config.write_cache_max_object_size,
         );
-        // Initialize write cache manager with 512 bytes to match consolidator
-        write_cache_manager.initialize_from_scan_results(512, 1);
+        // No seeding: `initialize_from_scan_results` was removed in task 27 because
+        // seeding an admission counter from persisted state was the defect. In-flight
+        // bytes therefore start at 0, which is what this test now exercises.
 
         // Create consolidator and set write cache size
         let journal_manager = Arc::new(JournalManager::new(
@@ -3663,12 +3648,30 @@ mod tests {
         assert!(results.write_cache_consistent);
         assert_eq!(results.size_discrepancy_percent, 0.0);
         assert!(results.validation_warnings.is_empty());
-        assert_eq!(results.write_cache_manager_size, Some(512));
+        // Was `Some(512)` when the manager's counter was seeded from the scan's resident
+        // figure. Task 27 removed that seeding — Inflight_Bytes starts at zero on every
+        // start, because a fresh process has no uploads in flight — so 0 is the correct
+        // value here and 512 would now indicate the seeding had come back.
+        assert_eq!(results.write_cache_manager_size, Some(0));
         assert_eq!(results.size_tracker_write_cache_size, Some(512));
     }
 
+    /// The write-cache cross-validation is RETIRED (task 27), and this asserts the
+    /// retirement rather than the thresholds it replaced.
+    ///
+    /// It replaces `test_cross_validate_subsystems_warning_threshold` and
+    /// `..._error_threshold`, which asserted a 5% warning and a 20% `error!` escalation on
+    /// the difference between `WriteCacheManager::current_usage()` and the tracker's
+    /// `write_cache_size`. Those two figures measure different quantities now —
+    /// Inflight_Bytes on this instance versus Resident_Bytes across the fleet — so any
+    /// deployment with staged data would trip the error threshold on **every startup**.
+    ///
+    /// The fixture makes that concrete: the manager holds nothing in flight while the
+    /// tracker reports 1000 staged bytes, which is a 100% difference under the old
+    /// arithmetic and therefore the loudest possible false alarm. It must now be reported
+    /// as consistent, with both figures still carried for observability.
     #[tokio::test]
-    async fn test_cross_validate_subsystems_warning_threshold() {
+    async fn cross_validation_of_inflight_against_resident_is_retired() {
         use crate::cache::CacheEvictionAlgorithm;
         use crate::cache_size_tracker::{CacheSizeConfig, CacheSizeTracker};
         use crate::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
@@ -3680,29 +3683,24 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let cache_dir = temp_dir.path().to_path_buf();
         let config = create_test_cache_config();
-
-        // Create required directories
         std::fs::create_dir_all(cache_dir.join("metadata/_journals")).unwrap();
         std::fs::create_dir_all(cache_dir.join("size_tracking")).unwrap();
         std::fs::create_dir_all(cache_dir.join("locks")).unwrap();
-
         let coordinator =
             CacheInitializationCoordinator::new(cache_dir.clone(), true, config.clone());
 
-        // Create write cache manager with 1000 bytes
         let write_cache_manager = WriteCacheManager::new(
             cache_dir.clone(),
-            1024 * 1024, // 1MB total cache
-            50.0,        // 50% for write cache
+            1024 * 1024,
+            50.0,
             config.put_ttl,
             config.incomplete_upload_ttl,
             CacheEvictionAlgorithm::LRU,
             config.write_cache_max_object_size,
         );
-        // Initialize write cache manager with 1000 bytes
-        write_cache_manager.initialize_from_scan_results(1000, 1);
+        // Nothing in flight — the correct state for a freshly started process (R7.2).
+        assert_eq!(write_cache_manager.current_usage(), 0);
 
-        // Create consolidator and set write cache size to 900 (10% difference)
         let journal_manager = Arc::new(JournalManager::new(
             cache_dir.clone(),
             "test-instance".to_string(),
@@ -3712,23 +3710,22 @@ mod tests {
             Duration::from_secs(30),
             3,
         ));
-        let consolidation_config = ConsolidationConfig::default();
         let consolidator = Arc::new(JournalConsolidator::new(
             cache_dir.clone(),
             journal_manager,
             lock_manager,
-            consolidation_config,
+            ConsolidationConfig::default(),
         ));
         consolidator.initialize().await.unwrap();
+        // 1000 resident staged bytes on the shared volume.
         consolidator
-            .update_size_from_validation(900, Some(900), None)
+            .update_size_from_validation(1000, Some(1000), None)
             .await;
 
-        // Create size tracker with consolidator reference
         let size_config = CacheSizeConfig {
             checkpoint_interval: Duration::from_secs(300),
             validation_time_of_day: "00:00".to_string(),
-            validation_enabled: true,
+            validation_enabled: false,
             incomplete_upload_ttl: Duration::from_secs(86400),
             validation_max_duration: Duration::from_secs(4 * 3600),
             ..Default::default()
@@ -3744,100 +3741,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(results.was_performed());
-        assert!(!results.write_cache_consistent); // Should be inconsistent due to warning threshold
-        assert_eq!(results.size_discrepancy_percent, 10.0);
-        assert_eq!(results.validation_warnings.len(), 1);
-        assert!(results.validation_warnings[0].contains("warning threshold"));
-        assert_eq!(results.write_cache_manager_size, Some(1000));
-        assert_eq!(results.size_tracker_write_cache_size, Some(900));
-    }
-
-    #[tokio::test]
-    async fn test_cross_validate_subsystems_error_threshold() {
-        use crate::cache::CacheEvictionAlgorithm;
-        use crate::cache_size_tracker::{CacheSizeConfig, CacheSizeTracker};
-        use crate::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
-        use crate::journal_manager::JournalManager;
-        use crate::metadata_lock_manager::MetadataLockManager;
-        use crate::write_cache_manager::WriteCacheManager;
-        use std::sync::Arc;
-
-        let temp_dir = TempDir::new().unwrap();
-        let cache_dir = temp_dir.path().to_path_buf();
-        let config = create_test_cache_config();
-
-        // Create required directories
-        std::fs::create_dir_all(cache_dir.join("metadata/_journals")).unwrap();
-        std::fs::create_dir_all(cache_dir.join("size_tracking")).unwrap();
-        std::fs::create_dir_all(cache_dir.join("locks")).unwrap();
-
-        let coordinator =
-            CacheInitializationCoordinator::new(cache_dir.clone(), true, config.clone());
-
-        // Create write cache manager with 1000 bytes
-        let write_cache_manager = WriteCacheManager::new(
-            cache_dir.clone(),
-            1024 * 1024, // 1MB total cache
-            50.0,        // 50% for write cache
-            config.put_ttl,
-            config.incomplete_upload_ttl,
-            CacheEvictionAlgorithm::LRU,
-            config.write_cache_max_object_size,
+        assert!(
+            results.write_cache_consistent,
+            "0 in-flight against 1000 resident is the expected steady state, not an \
+             inconsistency; reinstating the comparison makes this a permanent startup alarm"
         );
-        // Initialize write cache manager with 1000 bytes
-        write_cache_manager.initialize_from_scan_results(1000, 1);
-
-        // Create consolidator and set write cache size to 750 (25% difference)
-        let journal_manager = Arc::new(JournalManager::new(
-            cache_dir.clone(),
-            "test-instance".to_string(),
-        ));
-        let lock_manager = Arc::new(MetadataLockManager::new(
-            cache_dir.join("locks"),
-            Duration::from_secs(30),
-            3,
-        ));
-        let consolidation_config = ConsolidationConfig::default();
-        let consolidator = Arc::new(JournalConsolidator::new(
-            cache_dir.clone(),
-            journal_manager,
-            lock_manager,
-            consolidation_config,
-        ));
-        consolidator.initialize().await.unwrap();
-        consolidator
-            .update_size_from_validation(750, Some(750), None)
-            .await;
-
-        // Create size tracker with consolidator reference
-        let size_config = CacheSizeConfig {
-            checkpoint_interval: Duration::from_secs(300),
-            validation_time_of_day: "00:00".to_string(),
-            validation_enabled: true,
-            incomplete_upload_ttl: Duration::from_secs(86400),
-            validation_max_duration: Duration::from_secs(4 * 3600),
-            ..Default::default()
-        };
-        let size_tracker = Arc::new(
-            CacheSizeTracker::new(cache_dir, size_config, false, consolidator)
-                .await
-                .unwrap(),
+        assert_eq!(results.size_discrepancy_percent, 0.0);
+        assert!(
+            results.validation_warnings.is_empty(),
+            "no warning may be raised for two figures that are not comparable"
         );
-
-        let results = coordinator
-            .cross_validate_subsystems(Some(&write_cache_manager), Some(&size_tracker))
-            .await
-            .unwrap();
-
-        assert!(results.was_performed());
-        assert!(!results.write_cache_consistent); // Should be inconsistent due to error threshold
-        assert_eq!(results.size_discrepancy_percent, 25.0);
-        assert_eq!(results.validation_warnings.len(), 1);
-        assert!(results.validation_warnings[0].contains("error threshold"));
-        assert!(results.validation_warnings[0].contains("Consider running cache validation"));
-        assert_eq!(results.write_cache_manager_size, Some(1000));
-        assert_eq!(results.size_tracker_write_cache_size, Some(750));
+        // Both figures are still reported — retiring the comparison must not lose the data.
+        assert_eq!(results.write_cache_manager_size, Some(0));
+        assert_eq!(results.size_tracker_write_cache_size, Some(1000));
     }
 
     #[tokio::test]

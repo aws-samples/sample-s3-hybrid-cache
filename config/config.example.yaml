@@ -132,7 +132,14 @@ cache:
   
   # Percentage of total disk cache reserved for write cache (default: 10%)
   # Valid range: 1.0 to 50.0
-  # Write cache is limited to this percentage to prevent starving read cache
+  # This is a reclamation target, not an admission limit: an upload is cached even when
+  # the allocation is full, and the excess is reclaimed in the background (oldest staged
+  # first, entries whose put_ttl expired unread first of all) between
+  # eviction_trigger_percent and eviction_target_percent of the allocation. Raise this if
+  # a larger unread working set is intended, rather than letting reclamation churn.
+  # Only available disk space declines to cache at all: an upload is skipped when caching
+  # it would take the cache past max_cache_size, or when the volume has under 1 GiB free
+  # beyond the object's own size. The upload itself always proceeds to S3 regardless.
   write_cache_percent: 10.0
   
   # Maximum object size for write caching (default: 256MB)

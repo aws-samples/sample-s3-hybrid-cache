@@ -655,7 +655,13 @@ impl OrphanedRangeRecovery {
             )));
         }
 
-        // Create a basic RangeSpec - we'll fill in more details during validation
+        // Create a basic RangeSpec - we'll fill in more details during validation.
+        //
+        // `staged: None` is the correct answer here rather than an omission: this range
+        // is reconstructed from a `.bin` filename found on disk, so its tier is
+        // genuinely unknown. `None` routes it to the object-flag fallback, which is the
+        // same answer this sweep produced before per-range membership existed.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.1
         let now = SystemTime::now();
 
         Ok(RangeSpec {
@@ -668,6 +674,7 @@ impl OrphanedRangeRecovery {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         })
     }
 

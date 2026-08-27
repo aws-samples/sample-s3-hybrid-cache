@@ -289,6 +289,18 @@ fn prop_crash_recovery_validation_correction(
         let correct_size = correct_size as u64;
         let write_cache_size = write_cache_size as u64;
 
+        // The write-cache figure is a SUBSET of the total, and
+        // `update_size_from_validation` clamps it to the total with a WARN rather than
+        // storing an impossible state (write-cache-accounting-and-eviction R6.4). The
+        // generator freely produces `write_cache_size > correct_size` (e.g. `(0, 0, 1)`),
+        // so the expected value is the clamped one.
+        //
+        // Asserting `.min()` rather than constraining the generator is deliberate: it
+        // keeps the inputs unconstrained, so the ordinary case is still covered, AND makes
+        // this property cover the clamp itself — which nothing else exercises with random
+        // inputs.
+        let expected_write_cache_size = write_cache_size.min(correct_size);
+
         // Update size from validation (simulating what CacheSizeTracker does after a scan)
         consolidator
             .update_size_from_validation(correct_size, Some(write_cache_size), None)
@@ -304,10 +316,15 @@ fn prop_crash_recovery_validation_correction(
             ));
         }
 
-        if size_state.write_cache_size != write_cache_size {
+        if size_state.write_cache_size != expected_write_cache_size {
             return TestResult::error(format!(
-                "Write cache size not corrected: actual={}, expected={}",
-                size_state.write_cache_size, write_cache_size
+                "Write cache size not corrected: actual={}, expected={} \
+                 (requested={}, total={}; the figure is clamped to the total it is a \
+                 subset of)",
+                size_state.write_cache_size,
+                expected_write_cache_size,
+                write_cache_size,
+                correct_size
             ));
         }
 

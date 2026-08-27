@@ -3511,7 +3511,21 @@ impl HttpProxy {
                                 // Synchronous write-cache TTL transition BEFORE freshness check.
                                 // Ensures get_ttl=0 objects are correctly expired on first GET
                                 // (write-cache-get-ttl-revalidation bugfix).
-                                let _ = cache_manager.refresh_write_cache_ttl(&cache_key).await;
+                                //
+                                // The result is no longer discarded: graduation now carries the
+                                // `write_cache_size` decrement, so a silent failure here is a
+                                // silent accounting leak. Only `Err` is logged — `Ok(false)` is
+                                // the overwhelmingly common "not write-cached" case and firing on
+                                // it would log on every cached GET.
+                                // Spec: write-cache-accounting-and-eviction. Requirements: 1.7
+                                if let Err(e) =
+                                    cache_manager.refresh_write_cache_ttl(&cache_key).await
+                                {
+                                    warn!(
+                                        "Write-cache graduation failed (full object path): cache_key={}, error={}",
+                                        cache_key, e
+                                    );
+                                }
 
                                 let disk_cache = range_handler.get_disk_cache_manager();
                                 let disk_cache_guard = disk_cache.read().await;
@@ -4163,6 +4177,13 @@ impl HttpProxy {
                     "Write caching disabled for bucket/prefix, forwarding signed PUT request directly to S3 without caching: path={}, source={:?}",
                     path, resolved_settings.source
                 );
+                if let Some(metrics_mgr) = &metrics_manager {
+                    metrics_mgr
+                        .read()
+                        .await
+                        .record_skipped_put("write_cache_disabled")
+                        .await;
+                }
 
                 // Forward request to S3 and invalidate cache on success
                 let response = Self::forward_signed_request_streaming(
@@ -4219,9 +4240,36 @@ impl HttpProxy {
                     }
                 };
 
-            // Get current cache usage and max capacity for capacity checking
-            let cache_stats = cache_manager.get_statistics();
-            let current_cache_usage = cache_stats.read_cache_size + cache_stats.write_cache_size;
+            // Get current cache usage and max capacity for capacity checking.
+            //
+            // MUST be `get_cache_size_stats()`, not `get_statistics()`. The latter returns
+            // the STORED statistics, in which the size fields are never written — this
+            // read was `read_cache_size + write_cache_size` off that copy and therefore
+            // evaluated to 0 on every deployment, so `check_cache_capacity` always saw the
+            // full configured maximum as available and Requirement 2.2's bypass could only
+            // fire for an object larger than the entire cache. Third occurrence of that
+            // trap; `CacheCounters` now makes it a compile error.
+            //
+            // Reads `total_cache_size` directly rather than re-summing two components:
+            // since task 63 the components are disjoint and the total IS their sum, and
+            // re-deriving it by hand is what got the arithmetic wrong here originally.
+            //
+            // Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+            let current_cache_usage = match cache_manager.get_cache_size_stats().await {
+                Ok(stats) => stats.sizes.map(|s| s.total_cache_size).unwrap_or(0),
+                Err(e) => {
+                    // Fail OPEN, deliberately: an unreadable cache size must not start
+                    // refusing to cache. Logged so a persistent failure is visible rather
+                    // than silently restoring the old always-zero behaviour.
+                    warn!(
+                        "Failed to read cache size for PUT capacity check, treating cache \
+                         as empty for this request (write-through may admit past the \
+                         configured maximum until this recovers): {}",
+                        e
+                    );
+                    0
+                }
+            };
             let max_cache_capacity = config.cache.max_cache_size;
 
             // Create SignedPutHandler
@@ -4356,6 +4404,13 @@ impl HttpProxy {
                 "Write caching disabled for bucket/prefix, streaming unsigned PUT verbatim: path={}, source={:?}",
                 path, resolved_settings.source
             );
+            if let Some(metrics_mgr) = &metrics_manager {
+                metrics_mgr
+                    .read()
+                    .await
+                    .record_skipped_put("write_cache_disabled")
+                    .await;
+            }
             let response = crate::signed_request_proxy::forward_signed_request_streaming_verbatim(
                 req,
                 &host,
@@ -4391,8 +4446,22 @@ impl HttpProxy {
         // SignedPutHandler's streaming cache pipeline does not depend on an
         // Authorization header. It preserves the inbound request line, headers, body,
         // and presigned query verbatim while its bounded tee writes the object cache.
-        let cache_stats = cache_manager.get_statistics();
-        let current_cache_usage = cache_stats.read_cache_size + cache_stats.write_cache_size;
+        // See the sibling capacity check on the signed-PUT path above for why this must
+        // read `get_cache_size_stats()` and `total_cache_size` rather than summing the
+        // stored copy's size fields, which are never written and read as 0.
+        //
+        // Spec: write-cache-accounting-and-eviction. Requirements: 8.3
+        let current_cache_usage = match cache_manager.get_cache_size_stats().await {
+            Ok(stats) => stats.sizes.map(|s| s.total_cache_size).unwrap_or(0),
+            Err(e) => {
+                warn!(
+                    "Failed to read cache size for presigned PUT capacity check, treating \
+                     cache as empty for this request: {}",
+                    e
+                );
+                0
+            }
+        };
         let compression_handler = cache_manager.get_compression_handler();
         let mut put_handler = crate::signed_put_handler::SignedPutHandler::new(
             config.cache.cache_dir.clone(),
@@ -6797,7 +6866,18 @@ impl HttpProxy {
                             // Synchronous write-cache TTL transition BEFORE freshness check.
                             // Ensures get_ttl=0 objects are correctly expired on first GET
                             // (write-cache-get-ttl-revalidation bugfix).
-                            let _ = cache_manager.refresh_write_cache_ttl(&cache_key).await;
+                            //
+                            // See the full-object call site for why the result is now checked:
+                            // graduation carries the `write_cache_size` decrement, so a silent
+                            // failure is a silent accounting leak.
+                            // Spec: write-cache-accounting-and-eviction. Requirements: 1.7
+                            if let Err(e) = cache_manager.refresh_write_cache_ttl(&cache_key).await
+                            {
+                                warn!(
+                                    "Write-cache graduation failed (range path): cache_key={}, error={}",
+                                    cache_key, e
+                                );
+                            }
 
                             let disk_cache = range_handler.get_disk_cache_manager();
                             let disk_cache_guard = disk_cache.read().await;

@@ -379,7 +379,7 @@ This keeps frequently accessed objects in cache while allowing rarely-read uploa
 
 #### Capacity Management
 
-Write cache is limited to a percentage of total disk cache:
+The write cache is allocated a percentage of the total disk cache:
 
 ```yaml
 cache:
@@ -387,9 +387,14 @@ cache:
 ```
 
 **Eviction behavior**:
-- When write cache is full, oldest write-cached objects are evicted first
-- Uses the same eviction algorithm as read cache (LRU or TinyLFU)
-- If eviction cannot free enough space, the PUT bypasses caching
+- The allocation is a reclamation target, not an admission limit — an upload is cached even
+  when it is already full, and the excess is reclaimed in the background
+- Reclamation order is oldest-staged-first, with entries whose `put_ttl` elapsed unread
+  taken first. An object never read has no recency or frequency score to compute, so the
+  read cache's LRU/TinyLFU choice does not apply here
+- Reclamation runs from the background maintenance cycle, never on the request path
+- Staged bytes also leave the allocation without any reclamation, by being read for the
+  first time — the normal case for a read-after-write workload
 - S3 operation always succeeds regardless of caching outcome
 
 #### Disk-Only Storage
@@ -402,8 +407,11 @@ Write-cached objects are stored only on disk, not in RAM cache:
 #### Limitations
 
 - Single PUT size limit: 256MB per object (configurable via `write_cache_max_object_size`)
-- Space limit: 10% of total cache for write operations (configurable via `write_cache_percent`)
-- Objects larger than limit bypass caching automatically
+- Objects larger than that limit bypass caching automatically
+- Caching is also declined when it would take the cache past `max_cache_size`, or when the
+  cache volume has under 1 GiB free beyond the object's own size — reported as
+  `disk_safety` in `signed_put.skipped_puts_total`. This is the only capacity-shaped
+  refusal; `write_cache_percent` does not decline anything (see above)
 - POST object upload is not write-through cached — see below
 
 #### POST object upload is not write-through cached

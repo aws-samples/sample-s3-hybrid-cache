@@ -23,6 +23,16 @@ use tracing::{debug, info, warn};
 /// Maximum concurrent cache keys processed in a single consolidation cycle
 const KEY_CONCURRENCY_LIMIT: usize = 32;
 
+/// Minimum seconds between Write_Ledger compaction passes.
+///
+/// Compaction is O(staged) with one `.meta` read per candidate, so it must not run on the
+/// 5-second consolidation interval — that would reinstate a periodic full scan of the
+/// staged set, which is the cost Phase B removed from the request path rather than a cost
+/// worth moving elsewhere. 5 minutes bounds it to a negligible share of shared-storage
+/// I/O while still keeping the ledger proportional to what is actually staged, and most
+/// retirement happens opportunistically inside `evict_staging_tier` anyway.
+const LEDGER_COMPACTION_INTERVAL_SECS: u64 = 300;
+
 /// Result of journal discovery, including per-file entry counts for optimized cleanup.
 ///
 /// During discovery, every journal file is read and parsed to build the key index.
@@ -67,9 +77,33 @@ pub struct SizeState {
     /// Total cache size in bytes (read cache + write cache)
     pub total_size: u64,
 
-    /// Write cache size in bytes (subset of total_size)
-    /// Tracked separately for dashboard display
-    /// Write cache = mpus_in_progress/ directory contents
+    /// Write (staging) cache size in bytes — a **subset** of `total_size`, not an
+    /// addition to it, so `read_cache_size` is `total_size - write_cache_size`.
+    ///
+    /// Counts the compressed bytes of every range classified as staged by
+    /// `cache_types::is_staged_range_spec`: a range that recorded itself staged when it
+    /// was credited or — for a range written before membership was recorded — one
+    /// belonging to an object flagged `is_write_cached`, or a range file under
+    /// `mpus_in_progress/`. In practice
+    /// essentially all of it is the former — completed `PutObject` and
+    /// `CompleteMultipartUpload` bodies that have been written through to the cache and
+    /// **not yet read**. An entry leaves this figure by graduating (its first GET clears
+    /// the flag) or by being evicted.
+    ///
+    /// The previous comment here said "Write cache = mpus_in_progress/ directory
+    /// contents", which described neither what is counted nor where it lives: staged
+    /// range files sit under `ranges/` like every other range, because multipart parts
+    /// are renamed out of `mpus_in_progress/` into `ranges/` at completion, and
+    /// single-part write-through bodies never go near that directory. Reading it
+    /// literally suggests the figure tracks in-progress upload scratch space, which
+    /// would make an inflated value look harmless.
+    ///
+    /// Maintained by the Journal_Consolidator alone: credited and debited via
+    /// `SizeAccumulator::{add_write_cache, subtract_write_cache}` folded in under the
+    /// global lock, and re-grounded absolutely by a full Validation_Scan. No other
+    /// component may write it.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 9.5
     pub write_cache_size: u64,
 
     /// Number of distinct cached objects (unique cache keys with at least one range on disk).
@@ -271,9 +305,16 @@ pub struct SizeAccumulator {
     size_tracking_dir: PathBuf,
     /// Monotonic sequence counter for unique delta file names
     flush_sequence: AtomicU64,
-    /// Dedup set: tracks (cache_key_hash, range_start, range_end) written since last flush.
-    /// Prevents double-counting when stampede causes multiple writes of the same range.
-    /// Cleared on flush (every ~5 seconds). Memory: ~24 bytes per entry.
+    /// Dedup set: tracks `(cache_key_hash, range_start, range_end)` currently counted
+    /// in `delta`. Prevents double-counting when a stampede causes multiple writes of
+    /// the same range. Memory: ~24 bytes per entry.
+    ///
+    /// **Not** cleared on flush, despite what this comment said until 2026-08-25 —
+    /// `flush` deliberately keeps it (see the comment there) and only [`Self::reset`],
+    /// on a validation scan, empties it. That distinction matters: an entry suppresses
+    /// re-credits for as long as it survives, which is why a removal should go through
+    /// [`Self::subtract_range`] rather than [`Self::subtract`] wherever the range's
+    /// identity is known.
     recent_ranges: Mutex<HashSet<(u64, u64, u64)>>,
 }
 
@@ -337,6 +378,11 @@ impl SizeAccumulator {
     }
 
     /// Decrement the total size delta. Called after range eviction.
+    ///
+    /// Leaves `recent_ranges` untouched, so a range removed through this method stays
+    /// deduplicated and a later re-add of the same `(key, start, end)` credits
+    /// nothing. Prefer [`Self::subtract_range`] wherever the range's identity is
+    /// known — see its doc for why the difference matters.
     pub fn subtract(&self, compressed_size: u64) {
         self.delta
             .fetch_sub(compressed_size as i64, Ordering::Relaxed);
@@ -344,6 +390,53 @@ impl SizeAccumulator {
             "SIZE_ACCUM subtract: -{} bytes, instance={}",
             compressed_size, self.instance_id
         );
+    }
+
+    /// Decrement the total size delta **and** clear the range's dedup entry, so the
+    /// same `(cache_key, start, end)` can be credited again if it is re-cached.
+    ///
+    /// The mirror of [`Self::add_range`], and the asymmetry it exists to close is not
+    /// hypothetical. `add_range` credits only when it can insert into `recent_ranges`;
+    /// `subtract` debits unconditionally and leaves the entry in place. So
+    /// delete-then-rewrite of one range — a re-PUT of the same key, or an eviction
+    /// followed by a re-cache — debits once and then credits **nothing**, leaving the
+    /// total short by one copy of the bytes. Measured on 2026-08-25 while adding the
+    /// re-PUT debit: the total went to 0 for an object the disk still held, where
+    /// before the debit existed it had read one copy by accident of the dedup.
+    ///
+    /// Note the dedup set is cleared only by [`Self::reset`] on a validation scan, not
+    /// on flush (the field's own doc comment says otherwise and is wrong — see
+    /// `flush`), so without this an entry can suppress credits for up to a full
+    /// validation interval.
+    ///
+    /// Returns `true` if a dedup entry was actually removed. `false` means the range
+    /// was not currently counted, which is worth logging but not an error: a
+    /// validation scan may have reset the set since the range was added.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+    pub fn subtract_range(
+        &self,
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        compressed_size: u64,
+    ) -> bool {
+        let key_hash = blake3::hash(cache_key.as_bytes());
+        let key_u64 = u64::from_le_bytes(key_hash.as_bytes()[..8].try_into().unwrap());
+        let range_id = (key_u64, start, end);
+
+        let was_tracked = {
+            let mut recent = self.recent_ranges.lock().unwrap();
+            recent.remove(&range_id)
+        };
+
+        self.delta
+            .fetch_sub(compressed_size as i64, Ordering::Relaxed);
+        debug!(
+            "SIZE_ACCUM subtract_range: -{} bytes, range={}-{}, was_tracked={}, instance={}",
+            compressed_size, start, end, was_tracked, self.instance_id
+        );
+        was_tracked
     }
 
     /// Decrement the write-cache size delta. Called after write-cached range eviction.
@@ -488,6 +581,23 @@ pub struct JournalConsolidator {
     size_accumulator: Arc<SizeAccumulator>,
     /// Guard to prevent concurrent eviction spawns
     eviction_in_progress: Arc<AtomicBool>,
+    /// Append-only record of staged (write-cached, un-graduated) ranges, so staging
+    /// eviction can find candidates without walking `metadata/`.
+    ///
+    /// Owned here for the same reason [`SizeAccumulator`] is: both are per-instance
+    /// staging-tier bookkeeping that must exist exactly once per process, and the
+    /// consolidator is already that singleton (see `CacheManager::JournalComponents`).
+    /// Holding them together also means the two things that must happen for every staged
+    /// write — credit the accumulator, append the ledger — are reachable from one handle,
+    /// which is what makes the pairing checkable.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.1
+    write_ledger: Arc<crate::write_ledger::WriteLedger>,
+    /// Unix seconds of the last Write_Ledger compaction, so compaction runs on its own
+    /// interval rather than on every 5-second consolidation cycle. Compaction is
+    /// O(ledger) and verifies each entry against its `.meta`, which is far too much work
+    /// to repeat every cycle. Requirement 2.6.
+    last_ledger_compaction_secs: Arc<AtomicU64>,
 }
 
 /// Get unique instance ID for this process (hostname:pid)
@@ -509,7 +619,13 @@ impl JournalConsolidator {
     ) -> Self {
         let size_state_path = cache_dir.join("size_tracking").join("size_state.json");
         let instance_id = get_instance_id();
-        let size_accumulator = Arc::new(SizeAccumulator::new(&cache_dir, instance_id));
+        let size_accumulator = Arc::new(SizeAccumulator::new(&cache_dir, instance_id.clone()));
+        // Same instance identity as the journal and the accumulator, so an instance's
+        // files sort together and dead-instance cleanup can match them by name.
+        let write_ledger = Arc::new(crate::write_ledger::WriteLedger::new(
+            cache_dir.clone(),
+            instance_id,
+        ));
         Self {
             cache_dir,
             journal_manager,
@@ -521,6 +637,8 @@ impl JournalConsolidator {
             consolidation_lock_file: Mutex::new(None),
             size_accumulator,
             eviction_in_progress: Arc::new(AtomicBool::new(false)),
+            write_ledger,
+            last_ledger_compaction_secs: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -540,6 +658,63 @@ impl JournalConsolidator {
     /// Get reference to the size accumulator (for store_range and eviction to call)
     pub fn size_accumulator(&self) -> &Arc<SizeAccumulator> {
         &self.size_accumulator
+    }
+
+    /// The Write_Ledger for this instance.
+    ///
+    /// Callers that credit `SizeAccumulator::add_write_cache` for a staged range with a
+    /// `.meta` should also append here — see
+    /// [`Self::record_staged_range`], which does both halves and is the
+    /// preferred entry point.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.1
+    pub fn write_ledger(&self) -> &Arc<crate::write_ledger::WriteLedger> {
+        &self.write_ledger
+    }
+
+    /// Append a staged range to the Write_Ledger, best-effort.
+    ///
+    /// Separate from the accumulator credit rather than folded into it, because the two
+    /// have different failure semantics: a lost credit is an accounting error that
+    /// persists until the next Validation_Scan re-grounds the figure, whereas a lost
+    /// ledger append only makes the entry invisible to staging eviction until the same
+    /// scan re-appends it (R2.7). Neither may fail the upload — S3 already holds the
+    /// object by this point — so this returns nothing and logs at WARN.
+    ///
+    /// # Which ranges belong here
+    ///
+    /// Staged ranges that have a `.meta`, i.e. the ones
+    /// `WriteCacheManager::evict_write_cached_object` can actually evict. That is
+    /// single-part write-through PUTs and completed multipart uploads.
+    ///
+    /// Deliberately **not** in-progress multipart parts under `mpus_in_progress/`, even
+    /// though `classify_new_range_as_staged` classifies them as staged and they do credit
+    /// `add_write_cache`. They have a tracker rather than a `.meta` with ranges, so the
+    /// staging evictor cannot act on them and every such entry would verify as
+    /// `MetadataAbsent` — pure noise in the ledger. Incomplete uploads are reclaimed by
+    /// `WriteCacheManager::evict_incomplete_uploads` on `incomplete_upload_ttl`, which is
+    /// a separate mechanism that already owns them.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.1, 2.7
+    pub async fn record_staged_range(
+        &self,
+        cache_key: &str,
+        range_start: u64,
+        range_end: u64,
+        compressed_size: u64,
+    ) {
+        if let Err(e) = self
+            .write_ledger
+            .append_staged_range(cache_key, range_start, range_end, compressed_size)
+            .await
+        {
+            warn!(
+                "Failed to append Write_Ledger entry: cache_key={}, range={}-{}, size={}, error={}. \
+                 The entry stays cached and correctly accounted, but is invisible to staging \
+                 eviction until the next full validation scan re-appends it.",
+                cache_key, range_start, range_end, compressed_size, e
+            );
+        }
     }
 
     /// Quick check for pending journal files without reading their contents.
@@ -774,7 +949,13 @@ impl JournalConsolidator {
         for (cache_key, range_start, range_end, size, bin_file_path) in evicted_ranges {
             let now = std::time::SystemTime::now();
 
-            // Create a RangeSpec with the size information needed for size tracking
+            // Create a RangeSpec with the size information needed for size tracking.
+            //
+            // `staged: None` is deliberate and is NOT an R12.2 violation: a Remove
+            // entry's `RangeSpec` is a carrier for the extent and size, and the Remove
+            // arm of `consolidate_key` strips a matching range from the `.meta` rather
+            // than writing this one into it. Nothing persists it, so there is no
+            // membership to record.
             let range_spec = RangeSpec {
                 start: range_start,
                 end: range_end,
@@ -785,6 +966,7 @@ impl JournalConsolidator {
                 created_at: now,
                 last_accessed: now,
                 access_count: 0,
+                staged: None,
             };
 
             let journal_entry = JournalEntry {
@@ -799,7 +981,6 @@ impl JournalConsolidator {
                 object_ttl_secs: None,
                 access_increment: None,
                 object_metadata: None,
-                metadata_written: false, // Not relevant for Remove operations
             };
 
             grouped.entry(cache_key).or_default().push(journal_entry);
@@ -834,6 +1015,85 @@ impl JournalConsolidator {
         }
     }
 
+    /// Append a `Graduation` journal entry recording that an entry left the write
+    /// (staging) tier on its first read, so the decrement is applied exactly once
+    /// fleet-wide under the consolidation lock.
+    ///
+    /// `staged_compressed_size` is the sum of `compressed_size` over the entry's staged
+    /// ranges — the same figure the add sites credited, so the debit is symmetric.
+    /// Passing an uncompressed or on-disk `len()` figure instead would drift silently.
+    ///
+    /// Deliberately does **not** touch the size accumulator. That is the difference
+    /// between this and every other accounting site in this file: the accumulator is
+    /// per-instance, and two proxies can graduate the same key concurrently, so a local
+    /// debit would double-count (Requirement 1.2). The decrement is applied by
+    /// `consolidate_key` instead — see `JournalOperation::Graduation`.
+    ///
+    /// Returns `true` when the entry was appended. A `false` means the graduation's
+    /// accounting was lost and the entry's bytes stay in `write_cache_size` until the
+    /// next full Validation_Scan; the caller surfaces that (Requirement 1.7).
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 1.2, 1.3
+    pub async fn write_graduation_journal_entry(
+        &self,
+        cache_key: &str,
+        staged_compressed_size: u64,
+    ) -> bool {
+        let now = std::time::SystemTime::now();
+        let journal_entry = JournalEntry {
+            timestamp: now,
+            instance_id: get_instance_id(),
+            cache_key: cache_key.to_string(),
+            // A Graduation entry mutates no range. The `RangeSpec` is a carrier for
+            // `compressed_size`; `start`/`end` are 0 and are never matched against
+            // `metadata.ranges`, unlike Add/Remove/Update/AccessUpdate. `staged: None`
+            // follows from that and is not an R12.2 violation — nothing persists this
+            // range, so it has no membership to record.
+            range_spec: RangeSpec {
+                start: 0,
+                end: 0,
+                file_path: String::new(),
+                compression_algorithm: crate::compression::CompressionAlgorithm::Lz4,
+                compressed_size: staged_compressed_size,
+                uncompressed_size: staged_compressed_size,
+                created_at: now,
+                last_accessed: now,
+                access_count: 0,
+                staged: None,
+            },
+            operation: JournalOperation::Graduation,
+            range_file_path: String::new(),
+            metadata_version: 0,
+            new_ttl_secs: None,
+            object_ttl_secs: None,
+            access_increment: None,
+            object_metadata: None,
+            // The `.meta` transition was already written synchronously by
+            // `refresh_write_cache_ttl` before this entry was appended.
+        };
+
+        match self
+            .journal_manager
+            .append_range_entry(cache_key, journal_entry)
+            .await
+        {
+            Ok(()) => {
+                debug!(
+                    "Wrote graduation journal entry: cache_key={}, staged_compressed_size={}",
+                    cache_key, staged_compressed_size
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to write graduation journal entry: cache_key={}, staged_compressed_size={}, error={}",
+                    cache_key, staged_compressed_size, e
+                );
+                false
+            }
+        }
+    }
+
     /// Write Add journal entries for multipart upload completion
     ///
     /// This is called after CompleteMultipartUpload to create journal entries for size tracking.
@@ -859,7 +1119,20 @@ impl JournalConsolidator {
         let mut error_count = 0;
         let now = std::time::SystemTime::now();
 
-        for range_spec in ranges {
+        for mut range_spec in ranges {
+            // Classify ONCE, before the entry is built, and record it on the range
+            // that goes into the journal — consolidation appends that `RangeSpec`
+            // verbatim into the `.meta`, so this is the only point at which the
+            // persisted range can be given its tier. Deriving it again at the credit
+            // gate below would be a second definition site, which is what R12.4
+            // forbids.
+            // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+            let counts_as_staged = crate::cache_types::classify_new_range_as_staged(
+                &range_spec.file_path,
+                object_metadata.is_write_cached,
+            );
+            range_spec.staged = Some(counts_as_staged);
+
             let journal_entry = JournalEntry {
                 timestamp: now,
                 instance_id: instance_id.clone(),
@@ -872,9 +1145,7 @@ impl JournalConsolidator {
                 object_ttl_secs: None, // Multipart completion writes metadata directly with correct TTL
                 access_increment: None,
                 object_metadata: Some(object_metadata.clone()),
-                // Multipart completion writes metadata directly, so metadata_written: true
                 // This prevents double-counting when consolidation processes these entries
-                metadata_written: true,
             };
 
             match self
@@ -884,15 +1155,45 @@ impl JournalConsolidator {
             {
                 Ok(()) => {
                     success_count += 1;
-                    // Track size via accumulator for each successfully written range
+                    // Track size via accumulator for each successfully written range.
                     // **Validates: Requirements 1.5, 5.2, 5.3**
-                    self.size_accumulator.add(range_spec.compressed_size);
-                    // MPU completion ranges go under mpus_in_progress or are write-cached
-                    if range_spec.file_path.contains("mpus_in_progress/")
-                        || object_metadata.is_write_cached
-                    {
+                    //
+                    // Uses `add_range`'s (cache_key, start, end) dedup, not the plain
+                    // `add` this used before — `add` is unconditional and re-credits the
+                    // same bytes whenever a full object is re-cached through this path
+                    // (CompleteMultipartUpload or a GET-miss full-object re-store both
+                    // funnel through here with an identical range on re-cache). `add_range`
+                    // returns `false` for a duplicate (cache_key, start, end), so a re-cache
+                    // credits nothing a second time, matching the other three credit sites
+                    // (`disk_cache::store_range`, `disk_cache::commit_incremental_range`,
+                    // `CacheManager::credit_staged_range`).
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
+                    let credited = self.size_accumulator.add_range(
+                        cache_key,
+                        range_spec.start,
+                        range_spec.end,
+                        range_spec.compressed_size,
+                    );
+                    // MPU completion ranges go under mpus_in_progress or are write-cached.
+                    // Reuses the membership recorded on the range above rather than
+                    // re-deriving it, so the credit and the persisted flag cannot
+                    // disagree. Requirements: 12.2, 12.4
+                    if credited && counts_as_staged {
                         self.size_accumulator
                             .add_write_cache(range_spec.compressed_size);
+                        // Paired with the credit, exactly as in
+                        // `CacheManager::credit_staged_range`. Gated on `credited` for
+                        // the same reason the write-cache credit is: a duplicate range
+                        // was already recorded by whoever credited it first, and a second
+                        // ledger entry for it would only add a candidate that verifies as
+                        // superseded. Requirements: 2.1
+                        self.record_staged_range(
+                            cache_key,
+                            range_spec.start,
+                            range_spec.end,
+                            range_spec.compressed_size,
+                        )
+                        .await;
                     }
                 }
                 Err(e) => {
@@ -1330,7 +1631,21 @@ impl JournalConsolidator {
     ///
     /// # Arguments
     /// * `scanned_size` - The actual cache size calculated from filesystem scan
-    /// * `write_cache_size` - The actual write cache size from filesystem scan (optional)
+    /// * `write_cache_size` - The actual write cache size from filesystem scan (optional).
+    ///   Both Validation_Scan callers now supply a real figure (Requirement 6.1); `None`
+    ///   remains accepted so a caller that cannot compute a whole-cache figure leaves the
+    ///   existing value alone rather than installing a partial sum.
+    /// * `cached_objects` - Authoritative object count from the scan (optional)
+    ///
+    /// # Subset invariant (Requirement 6.4)
+    ///
+    /// `write_cache_size` is a **subset** of `total_size` — the staged bytes are part of
+    /// the cache, not additional to it. A figure exceeding `total_size` is therefore
+    /// impossible for consistent inputs and indicates a scan that computed the two
+    /// figures from different views (or a caller passing an unscaled partial sum). It is
+    /// clamped with a WARN rather than accepted, because accepting it would make
+    /// `read_cache_size = total_size - write_cache_size` underflow at every reporting
+    /// site downstream.
     pub async fn update_size_from_validation(
         &self,
         scanned_size: u64,
@@ -1347,20 +1662,41 @@ impl JournalConsolidator {
         };
 
         let old_size = state.total_size;
+        let old_write_cache_size = state.write_cache_size;
         state.total_size = scanned_size;
         if let Some(wc_size) = write_cache_size {
-            state.write_cache_size = wc_size;
+            // Requirement 6.4: enforce the subset invariant. Clamp with a WARN rather
+            // than trusting the input — see the doc comment for why accepting it would
+            // underflow every read-cache figure derived from the difference.
+            if wc_size > scanned_size {
+                warn!(
+                    "Validation write_cache_size {} exceeds total_size {} — clamping to \
+                     total_size. The two figures were computed from inconsistent views; \
+                     suspect a partial scan being installed as a whole-cache figure.",
+                    wc_size, scanned_size
+                );
+                state.write_cache_size = scanned_size;
+            } else {
+                state.write_cache_size = wc_size;
+            }
         }
         if let Some(objects) = cached_objects {
             state.cached_objects = objects;
         }
         state.last_updated_by = get_instance_id();
 
+        // Requirement 6.5: log the write-cache drift corrected alongside the total, so
+        // recurring drift in either figure is visible without diffing state files.
         info!(
-            "Updated size state from validation: old_size={}, new_size={}, drift={}, cached_objects={}",
+            "Updated size state from validation: old_size={}, new_size={}, drift={}, \
+             old_write_cache_size={}, new_write_cache_size={}, write_cache_drift={}, \
+             cached_objects={}",
             old_size,
             scanned_size,
             scanned_size as i64 - old_size as i64,
+            old_write_cache_size,
+            state.write_cache_size,
+            state.write_cache_size as i64 - old_write_cache_size as i64,
             state.cached_objects
         );
 
@@ -1829,6 +2165,138 @@ impl JournalConsolidator {
         Ok(())
     }
 
+    /// Nudge a staging eviction pass at the end of a consolidation cycle.
+    ///
+    /// # Why the consolidation cycle and not the upload path
+    ///
+    /// R3.2 forbids staging eviction on the request path, and the old inline sweep is
+    /// what made a refused PUT cost 7-9 seconds. Driving it from here instead has two
+    /// further advantages that a post-upload hook would not:
+    ///
+    /// - **A tier that stops receiving uploads still drains.** Residency falls only by
+    ///   graduation or eviction, so a write-heavy burst followed by silence would
+    ///   otherwise leave the tier over its bound indefinitely.
+    /// - **No `Arc<CacheManager>` on the request path.** The nudge needs an owned handle
+    ///   to spawn with; the consolidator already holds a `Weak` for exactly this purpose.
+    ///
+    /// All the real decisions — is the tier over its trigger, is the lock free, which
+    /// candidates — live in `CacheManager::evict_staging_tier`. This is only the wake-up.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 3.1, 3.2
+    async fn maybe_trigger_staging_eviction(&self) {
+        let cache_manager = {
+            let guard = match self.cache_manager.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(
+                        "Failed to acquire cache_manager lock for staging eviction: {}",
+                        e
+                    );
+                    return;
+                }
+            };
+            match guard.as_ref().and_then(|weak| weak.upgrade()) {
+                Some(cm) => cm,
+                None => return,
+            }
+        };
+        cache_manager.nudge_staging_eviction();
+    }
+
+    /// Compact the Write_Ledger, dropping entries that can never become evictable.
+    ///
+    /// Keeps the ledger proportional to the currently staged set (R2.6) rather than to
+    /// everything ever staged. An entry is dropped when its `.meta` says it graduated,
+    /// was superseded by a later write, or is gone — and kept when it is still evictable,
+    /// or when the `.meta` could not be read, since one failed read on shared storage is
+    /// not evidence an object no longer exists.
+    ///
+    /// Most compaction actually happens inside `evict_staging_tier`, which retires the
+    /// terminal entries it walks past. This pass exists for the case that never evicts:
+    /// a tier comfortably under its bound whose entries all graduate normally, where
+    /// nothing would otherwise ever revisit them.
+    ///
+    /// # Interval-gated deliberately
+    ///
+    /// This is O(staged) work with one `.meta` read per candidate, so running it on every
+    /// 5-second consolidation cycle would put a full staged-set scan on a 5-second loop —
+    /// the same class of cost as the `metadata/` walk Phase B removed, just moved off the
+    /// request path. [`LEDGER_COMPACTION_INTERVAL_SECS`] bounds it instead.
+    ///
+    /// Called from `run_consolidation_cycle` while the global consolidation lock is held,
+    /// which is what makes it safe for this to rewrite *other* instances' ledger files.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 2.6
+    async fn maybe_compact_write_ledger(&self) {
+        use crate::write_ledger::StagedCandidateVerdict;
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = self.last_ledger_compaction_secs.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(last) < LEDGER_COMPACTION_INTERVAL_SECS {
+            return;
+        }
+        // CAS so two overlapping cycles in this process cannot both compact.
+        if self
+            .last_ledger_compaction_secs
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let entries = match self.write_ledger.read_merged_oldest_first(0).await {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Write-ledger compaction: failed to read ledger: {}", e);
+                return;
+            }
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        let candidates = crate::write_ledger::WriteLedger::group_by_key(entries);
+        // Named as removals rather than as a retain set, so an entry appended after the
+        // read above is not deleted for the sole reason that this pass did not see it.
+        // The read here is unbounded (`cap = 0`), so this pass never had the
+        // beyond-the-cap exposure the eviction pass did — but it has the same
+        // read-then-rewrite window, and it is a long one: there is a `.meta` read per
+        // candidate between the read and the rewrite. Task 77.
+        let mut retire: HashSet<(String, u64, u64, SystemTime, String)> = HashSet::new();
+        let mut dropped_by_reason: HashMap<&'static str, u64> = HashMap::new();
+
+        for candidate in &candidates {
+            match crate::write_ledger::verify_staged_candidate(&self.cache_dir, candidate).await {
+                StagedCandidateVerdict::Evictable | StagedCandidateVerdict::Unreadable => {
+                    // Still staged, or its `.meta` could not be read — one failed read
+                    // on shared storage is not evidence an object is gone. Keep it by
+                    // not naming it.
+                }
+                verdict => {
+                    retire.extend(candidate.identities.iter().cloned());
+                    *dropped_by_reason.entry(verdict.reason()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        match self.write_ledger.retire_identities(&retire).await {
+            Ok(stats) if stats.entries_dropped() > 0 => {
+                info!(
+                    "Write-ledger compaction: dropped {} entries across {} objects, {} retained, reasons={:?}",
+                    stats.entries_dropped(),
+                    dropped_by_reason.values().sum::<u64>(),
+                    stats.entries_after,
+                    dropped_by_reason
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Write-ledger compaction failed: {}", e),
+        }
+    }
+
     /// Check if eviction is needed and trigger it via CacheManager
     ///
     /// Called at the end of each consolidation cycle.
@@ -2095,7 +2563,10 @@ impl JournalConsolidator {
         // Accumulate results across all cache keys
         let mut total_entries_consolidated = 0;
         let mut _total_size_delta: i64 = 0; // Kept for debugging, not used for size tracking
-        let mut _total_write_cache_delta: i64 = 0; // Kept for debugging, not used for size tracking
+                                            // NO LONGER debug-only: `consolidate_key` now produces a real, negative
+                                            // write-cache delta for graduations (and nothing else). Applied to Size_State
+                                            // after the key loop below. Requirements 1.1, 1.3
+        let mut total_write_cache_delta: i64 = 0;
         let mut all_consolidated_entries = Vec::new();
         let mut new_objects_count: u64 = 0;
         let mut keys_processed = 0;
@@ -2150,7 +2621,7 @@ impl JournalConsolidator {
                             }
                             total_entries_consolidated += result.entries_consolidated;
                             _total_size_delta += result.size_delta;
-                            _total_write_cache_delta += result.write_cache_delta;
+                            total_write_cache_delta += result.write_cache_delta;
                             all_consolidated_entries.extend(result.consolidated_entries);
                             keys_processed += 1;
                             if result.is_new_object {
@@ -2196,10 +2667,40 @@ impl JournalConsolidator {
         }
 
         // NOTE: Size tracking is now handled by the accumulator-based approach above.
-        // Journal-derived size deltas (total_size_delta, total_write_cache_delta) are
-        // no longer used for size state updates - they are kept for logging/debugging only.
-        // The accumulator tracks size at write/eviction time, eliminating the gap between
-        // "when data is written" and "when size is counted".
+        // The journal-derived TOTAL size delta (`_total_size_delta`) is no longer used for
+        // size state updates — it is kept for logging/debugging only. The accumulator
+        // tracks size at write/eviction time, eliminating the gap between "when data is
+        // written" and "when size is counted".
+        //
+        // The journal-derived WRITE-CACHE delta is the exception, and it is real. It is
+        // produced only by `Graduation` entries, which cannot use the accumulator because
+        // the accumulator is per-instance and the graduation decrement must be exactly
+        // once fleet-wide (Requirement 1.2). Applying it here — after the key loop, so
+        // every key's `graduation_accounted` token has been written under its own metadata
+        // lock — keeps `write_cache_size` the consolidator's exclusive property.
+        //
+        // `size_delta` is passed as 0: a graduation moves bytes between tiers without
+        // changing how many are on disk. Requirements 1.1, 1.3
+        if total_write_cache_delta != 0 {
+            match self
+                .atomic_update_size_delta(0, total_write_cache_delta)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        "Applied graduation accounting: write_cache_delta={:+} bytes across {} keys",
+                        total_write_cache_delta, keys_processed
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to apply graduation write-cache delta {:+} to size state: {}. \
+                         The decrement is lost; the next full validation scan re-grounds it.",
+                        total_write_cache_delta, e
+                    );
+                }
+            }
+        }
 
         // Clean up ONLY the entries that were successfully consolidated
         // Entries that failed validation (range file not visible) are preserved
@@ -2227,6 +2728,16 @@ impl JournalConsolidator {
         let current_size = self.get_current_size().await;
         let (eviction_triggered, bytes_evicted) =
             self.maybe_trigger_eviction(Some(current_size)).await;
+
+        // Staging tier, on the same schedule and for the same reason: residency falls
+        // only by graduation or eviction, so a tier left over its bound by a write burst
+        // must be drained by a background pass rather than by the next upload.
+        // Requirements 3.1, 3.2
+        self.maybe_trigger_staging_eviction().await;
+
+        // Keep the Write_Ledger proportional to the staged set. Interval-gated inside,
+        // so this is a cheap no-op on most cycles. Requirement 2.6
+        self.maybe_compact_write_ledger().await;
 
         // Log summary if there was activity
         if total_entries_consolidated > 0 || eviction_triggered || accumulator_size_delta != 0 {
@@ -2410,13 +2921,26 @@ impl JournalConsolidator {
         // only entries that affect size tracking (Add entries that weren't skipped, Remove entries)
         // NOTE: size_affecting_entries is no longer used for size tracking - size is now tracked
         // at write/eviction time via the in-memory accumulator (see SizeAccumulator).
-        let (entries_consolidated, _size_affecting_entries) =
+        let (entries_consolidated, _size_affecting_entries, graduated_bytes) =
             self.apply_journal_entries(&mut metadata, &valid_entries);
 
         // Size tracking is handled by the accumulator at write/eviction time, not during consolidation.
         // Journal entries are processed only for metadata updates via apply_journal_entries() above.
         let size_delta: i64 = 0;
-        let write_cache_delta: i64 = 0;
+        // ...with ONE exception, deliberately revived: graduation.
+        //
+        // Every other size change is credited or debited by `SizeAccumulator` at the
+        // moment the bytes are written or deleted, which is why the journal-derived
+        // deltas were retired. Graduation cannot use that mechanism, because the
+        // accumulator is per-instance and the decrement must be exactly once fleet-wide
+        // (Requirement 1.2) — two proxies can graduate the same key concurrently. Here we
+        // are inside the per-key metadata lock, `graduation_accounted` has just been set
+        // for the entries that were charged, and duplicates were skipped. So this is the
+        // one place a correct, non-duplicable write-cache decrement can be produced.
+        //
+        // `size_delta` stays 0: the bytes are still on disk, they have only changed tier.
+        // Requirements 1.1, 1.3
+        let write_cache_delta: i64 = -(graduated_bytes as i64);
 
         debug!(
             "Journal entries applied for metadata updates: cache_key={}, entries_consolidated={}, total_valid={}",
@@ -2687,50 +3211,6 @@ impl JournalConsolidator {
         Ok(all_entries)
     }
 
-    /// Validate journal entries by checking if referenced range files exist
-    pub async fn validate_journal_entries(&self, entries: &[JournalEntry]) -> Vec<JournalEntry> {
-        let mut valid_entries = Vec::new();
-
-        for entry in entries {
-            // Check if the range file exists
-            let range_file_path = match self
-                .get_range_file_path(&entry.cache_key, &entry.range_spec)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(
-                        "Skipping journal entry with malformed cache key in validate_journal_entries: cache_key={}, error={}",
-                        entry.cache_key, e
-                    );
-                    continue;
-                }
-            };
-
-            if range_file_path.exists() {
-                valid_entries.push(entry.clone());
-                debug!(
-                    "Journal entry validated: cache_key={}, range={}-{}, file={:?}",
-                    entry.cache_key, entry.range_spec.start, entry.range_spec.end, range_file_path
-                );
-            } else {
-                // Range file may not exist yet (still streaming) or was evicted
-                // This is expected during concurrent writes - skip silently
-                debug!(
-                    "Journal entry references non-existent range file: cache_key={}, range={}-{}, file={:?}",
-                    entry.cache_key, entry.range_spec.start, entry.range_spec.end, range_file_path
-                );
-            }
-        }
-
-        debug!(
-            "Validated {} out of {} journal entries",
-            valid_entries.len(),
-            entries.len()
-        );
-
-        valid_entries
-    }
-
     /// Validate journal entries, categorizing them based on range file existence and age
     ///
     /// Returns two lists:
@@ -2793,12 +3273,27 @@ impl JournalConsolidator {
                 continue;
             }
 
-            // TtlRefresh and AccessUpdate are object-level operations that don't target
-            // a specific range file. They update object metadata (expires_at, access_count).
-            // Validate by checking the metadata file exists instead of a range file.
+            // TtlRefresh, AccessUpdate and Graduation are object-level operations that
+            // don't target a specific range file. They update object metadata
+            // (expires_at, access_count, graduation_accounted). Validate by checking the
+            // metadata file exists instead of a range file.
+            //
+            // Graduation was missing from this list, and the omission silently disabled
+            // the entire write-cache decrement (Requirement 1.1). Its `RangeSpec` is a
+            // carrier for `compressed_size` with `start`/`end` both 0, so the range-file
+            // check below builds `..._0-0.bin`, which never exists. The entry was
+            // therefore classified "pending" on every cycle — landing in neither
+            // `valid_entries` nor `stale_entries` — and then silently dropped as stale
+            // once it aged past `stale_entry_timeout_secs`, losing the accounting for
+            // good. One missing match arm produced all three observed symptoms at once:
+            // the `graduation_accounted` token was never persisted, the write-cache delta
+            // was always 0, and the entry sat in the journal file across thousands of
+            // cycles. Do not remove Graduation from this list.
             if matches!(
                 entry.operation,
-                JournalOperation::TtlRefresh | JournalOperation::AccessUpdate
+                JournalOperation::TtlRefresh
+                    | JournalOperation::AccessUpdate
+                    | JournalOperation::Graduation
             ) {
                 let metadata_base_dir = self.cache_dir.join("metadata");
                 let metadata_path = crate::disk_cache::get_sharded_path(
@@ -2913,14 +3408,24 @@ impl JournalConsolidator {
         let mut conflicts_resolved = 0;
 
         // Group journal entries by range (start, end), but only for operations that
-        // carry full range data (Add, Update, Remove). TtlRefresh and AccessUpdate
-        // are incremental updates that should not replace existing ranges.
+        // carry full range data (Add, Update, Remove). TtlRefresh, AccessUpdate and
+        // Graduation are object-level updates that should not replace existing ranges.
         let mut journal_ranges: HashMap<(u64, u64), &JournalEntry> = HashMap::new();
         for entry in journal_entries {
-            // Skip TtlRefresh and AccessUpdate - they don't carry full range data
-            // and should not participate in conflict resolution
+            // Skip TtlRefresh, AccessUpdate and Graduation - they don't carry full range
+            // data and must not participate in conflict resolution.
+            //
+            // Graduation matters here specifically because its `RangeSpec` is a carrier
+            // for `compressed_size` with `start`/`end` both 0 and an empty `file_path`.
+            // For a 1-byte object — whose real whole-object range IS (0, 0) — the entry
+            // would collide with that range, win on timestamp (the graduation happens
+            // after the PUT), and overwrite a valid range with the carrier, losing
+            // `file_path` and the true compressed size. Harmless before the validation
+            // fix above only because graduation entries never reached this function.
             match entry.operation {
-                JournalOperation::TtlRefresh | JournalOperation::AccessUpdate => continue,
+                JournalOperation::TtlRefresh
+                | JournalOperation::AccessUpdate
+                | JournalOperation::Graduation => continue,
                 _ => {}
             }
 
@@ -2980,10 +3485,13 @@ impl JournalConsolidator {
         &self,
         metadata: &mut NewCacheMetadata,
         entries: &[JournalEntry],
-    ) -> (usize, Vec<JournalEntry>) {
+    ) -> (usize, Vec<JournalEntry>, u64) {
         let mut entries_applied = 0;
         // Track entries that affect size: Add entries that were actually applied, and all Remove entries
         let mut size_affecting_entries = Vec::new();
+        // Staged bytes to debit from `write_cache_size` for graduations applied here.
+        // Requirement 1.1, 1.2 — see the `Graduation` arm below.
+        let mut graduated_bytes: u64 = 0;
 
         // Note: Object-level expires_at is set to ~100 years, so no need to extend it
         // Individual range TTLs are what matter for cache validity
@@ -3027,17 +3535,73 @@ impl JournalConsolidator {
                     }
                 }
                 JournalOperation::Remove => {
-                    // Remove range from metadata
+                    // Remove range from metadata — but ONLY if the range currently in
+                    // metadata is the one this entry refers to, not a NEWER range that
+                    // happens to sit at the same offsets.
+                    //
+                    // Without the timestamp guard this arm strips by `(start, end)`
+                    // alone, which is wrong whenever a range is removed and then
+                    // immediately republished at the same offsets. That is exactly what a
+                    // re-PUT of the same key at the same length does:
+                    //
+                    //   T1  remove_range_files    deletes ranges/…_0-N.bin
+                    //   T2  debit_removed_ranges  writes this Remove entry {0, N}
+                    //   T3  sink.finalize()       republishes ranges/…_0-N.bin
+                    //   T4  store_new_metadata    .meta written directly, ranges=[{0, N}]
+                    //   T5  (one cycle later)     this arm strips the T4 range
+                    //
+                    // The `.meta` was correct when written at T4; consolidation then
+                    // emptied `ranges`, so the next GET for the key missed and the
+                    // republished `.bin` was orphaned. Read-after-write still held inside
+                    // the consolidation interval, so it presented as an INTERMITTENT
+                    // post-overwrite cache miss — which is why nothing caught it.
+                    //
+                    // `RangeSpec::new` stamps `created_at` at publish time
+                    // (`cache_types.rs`), and the republish necessarily happens after the
+                    // Remove entry is written, so `created_at > entry.timestamp` is a
+                    // reliable discriminator. This is the same comparison
+                    // `resolve_conflicts` already makes against `created_at`, so the
+                    // cross-instance clock assumption is not a new one.
+                    //
+                    // Both failure directions are benign, and the asymmetry favours the
+                    // re-PUT case deliberately. If the clock is too coarse to separate T2
+                    // from T3 we keep the range — correct for a republish. For an
+                    // eviction, whose Remove always post-dates the range by much more
+                    // than clock granularity, we still strip; and were it ever skipped,
+                    // the metadata would reference a missing `.bin`, which the read path
+                    // already repairs.
+                    //
+                    // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
                     let original_len = metadata.ranges.len();
+                    let mut superseded_by_newer = false;
                     metadata.ranges.retain(|r| {
-                        !(r.start == entry.range_spec.start && r.end == entry.range_spec.end)
+                        let same_extent =
+                            r.start == entry.range_spec.start && r.end == entry.range_spec.end;
+                        if !same_extent {
+                            return true;
+                        }
+                        if r.created_at > entry.timestamp {
+                            // Republished after this removal was recorded — keep it.
+                            superseded_by_newer = true;
+                            return true;
+                        }
+                        false
                     });
 
                     entries_applied += 1;
-                    // Always count Remove entries for size tracking (file was deleted)
+                    // Always count Remove entries for size tracking (file was deleted).
+                    // Note this is unconditional even when the range was kept above: the
+                    // bytes this entry refers to WERE deleted from disk, and the debit was
+                    // already applied at the removal site. The republished range is a
+                    // different copy with its own credit.
                     size_affecting_entries.push(entry.clone());
 
-                    if metadata.ranges.len() < original_len {
+                    if superseded_by_newer {
+                        debug!(
+                            "REMOVE journal entry NOT applied (range republished after the removal was recorded): cache_key={}, range={}-{}",
+                            entry.cache_key, entry.range_spec.start, entry.range_spec.end
+                        );
+                    } else if metadata.ranges.len() < original_len {
                         debug!(
                             "Applied REMOVE journal entry: cache_key={}, range={}-{}",
                             entry.cache_key, entry.range_spec.start, entry.range_spec.end
@@ -3069,6 +3633,40 @@ impl JournalConsolidator {
                         debug!(
                             "TTL_REFRESH skipped - no new_ttl_secs: cache_key={}, range={}-{}",
                             entry.cache_key, entry.range_spec.start, entry.range_spec.end
+                        );
+                    }
+                }
+                JournalOperation::Graduation => {
+                    // The entry left the write (staging) tier on its first read. The
+                    // `.meta` transition (clearing `is_write_cached`, recomputing
+                    // `expires_at`) was already written synchronously by
+                    // `refresh_write_cache_ttl`; all that is applied here is the
+                    // accounting, and the ONLY reason it is applied here rather than at
+                    // the call site is that this runs under the per-key metadata lock,
+                    // which is what makes the decrement exactly-once fleet-wide.
+                    //
+                    // `graduation_accounted` is the token. Two proxies can both observe
+                    // the flag set and both append a Graduation entry; both entries
+                    // arrive here, the first is charged and sets the token, the rest are
+                    // skipped. Because this is the only writer of the token and it is
+                    // serialised by the lock, that holds across cycles too.
+                    //
+                    // No range is touched and no `size_delta` is produced: the bytes are
+                    // still on disk, they have only moved from the write tier to the read
+                    // tier. Requirements 1.1, 1.2, 1.3
+                    if metadata.object_metadata.graduation_accounted {
+                        debug!(
+                            "GRADUATION journal entry skipped (already accounted): cache_key={}, staged_compressed_size={}",
+                            entry.cache_key, entry.range_spec.compressed_size
+                        );
+                    } else {
+                        metadata.object_metadata.graduation_accounted = true;
+                        graduated_bytes =
+                            graduated_bytes.saturating_add(entry.range_spec.compressed_size);
+                        entries_applied += 1;
+                        debug!(
+                            "Applied GRADUATION journal entry: cache_key={}, staged_compressed_size={}",
+                            entry.cache_key, entry.range_spec.compressed_size
                         );
                     }
                 }
@@ -3111,14 +3709,15 @@ impl JournalConsolidator {
         }
 
         debug!(
-            "Applied {} journal entries to metadata: cache_key={}, total_ranges={}, size_affecting={}",
+            "Applied {} journal entries to metadata: cache_key={}, total_ranges={}, size_affecting={}, graduated_bytes={}",
             entries_applied,
             metadata.cache_key,
             metadata.ranges.len(),
-            size_affecting_entries.len()
+            size_affecting_entries.len(),
+            graduated_bytes
         );
 
-        (entries_applied, size_affecting_entries)
+        (entries_applied, size_affecting_entries, graduated_bytes)
     }
 
     /// Load existing metadata or create new metadata structure, using object_metadata from journal entries
@@ -3865,7 +4464,639 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         }
+    }
+
+    /// Build a consolidator over a temp dir, for the graduation-accounting tests below.
+    fn graduation_test_consolidator(temp_dir: &TempDir) -> JournalConsolidator {
+        JournalConsolidator::new(
+            temp_dir.path().to_path_buf(),
+            Arc::new(JournalManager::new(
+                temp_dir.path().to_path_buf(),
+                "test-instance".to_string(),
+            )),
+            Arc::new(MetadataLockManager::new(
+                temp_dir.path().to_path_buf(),
+                Duration::from_secs(30),
+                3,
+            )),
+            ConsolidationConfig::default(),
+        )
+    }
+
+    /// A `Graduation` entry carrying `staged_compressed_size`, as
+    /// `write_graduation_journal_entry` builds it.
+    fn graduation_entry(
+        cache_key: &str,
+        staged_compressed_size: u64,
+        instance: &str,
+    ) -> JournalEntry {
+        let now = SystemTime::now();
+        JournalEntry {
+            timestamp: now,
+            instance_id: instance.to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec: RangeSpec {
+                start: 0,
+                end: 0,
+                file_path: String::new(),
+                compression_algorithm: CompressionAlgorithm::Lz4,
+                compressed_size: staged_compressed_size,
+                uncompressed_size: staged_compressed_size,
+                created_at: now,
+                last_accessed: now,
+                access_count: 0,
+                staged: None,
+            },
+            operation: JournalOperation::Graduation,
+            range_file_path: String::new(),
+            metadata_version: 0,
+            new_ttl_secs: None,
+            object_ttl_secs: None,
+            access_increment: None,
+            object_metadata: None,
+        }
+    }
+
+    /// Metadata for an entry that has already had its `.meta` transition written by
+    /// `refresh_write_cache_ttl` — flag cleared, token not yet set. This is the state
+    /// consolidation actually sees, and getting it wrong is how a test of this arm
+    /// would pass vacuously: if `graduation_accounted` started as `true`, every
+    /// assertion below would hold for a decrement that never happened.
+    fn graduated_but_unaccounted_metadata(cache_key: &str, compressed: u64) -> NewCacheMetadata {
+        let now = SystemTime::now();
+        NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                is_write_cached: false,
+                graduation_accounted: false,
+                content_length: compressed,
+                ..Default::default()
+            },
+            ranges: vec![create_test_range_spec(0, compressed - 1)],
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            ..Default::default()
+        }
+    }
+
+    /// Task 49: `write_multipart_journal_entries` must credit through `add_range`'s
+    /// (cache_key, start, end) dedup, not the plain unconditional `add`. A fresh range
+    /// credits once; re-presenting the identical (cache_key, start, end) — exactly what
+    /// happens when a full object is re-cached via CompleteMultipartUpload or the
+    /// GET-miss `store_full_object_as_range_new` path — must NOT credit a second time.
+    ///
+    /// Shown failing first: reverting the fix (using `size_accumulator.add(...)`
+    /// unconditionally) makes the second assertion fail with the deltas doubled.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+    #[tokio::test]
+    async fn write_multipart_journal_entries_does_not_double_credit_a_repeated_range() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/multipart-double-credit.bin";
+        let range_spec = create_test_range_spec(0, 4095);
+        let object_metadata = ObjectMetadata {
+            is_write_cached: true,
+            ..Default::default()
+        };
+
+        // First credit: a fresh (cache_key, start, end) must be counted on both
+        // channels, since `is_write_cached: true` makes it a staged range.
+        consolidator
+            .write_multipart_journal_entries(
+                cache_key,
+                vec![range_spec.clone()],
+                object_metadata.clone(),
+            )
+            .await;
+
+        let total_after_first = consolidator.size_accumulator().current_delta();
+        let write_cache_after_first = consolidator.size_accumulator().current_write_cache_delta();
+        assert_eq!(
+            total_after_first, 4096,
+            "first credit of a fresh range must move total_size delta"
+        );
+        assert_eq!(
+            write_cache_after_first, 4096,
+            "first credit of a fresh staged range must move write_cache_size delta"
+        );
+
+        // Second credit: identical (cache_key, start, end) — e.g. a re-cache of the
+        // same full object. `add_range`'s dedup must reject it, so neither channel
+        // moves again.
+        consolidator
+            .write_multipart_journal_entries(cache_key, vec![range_spec], object_metadata)
+            .await;
+
+        let total_after_second = consolidator.size_accumulator().current_delta();
+        let write_cache_after_second = consolidator.size_accumulator().current_write_cache_delta();
+        assert_eq!(
+            total_after_second, 4096,
+            "re-presenting the identical range must not double-credit total_size (got {total_after_second})"
+        );
+        assert_eq!(
+            write_cache_after_second, 4096,
+            "re-presenting the identical range must not double-credit write_cache_size (got {write_cache_after_second})"
+        );
+    }
+
+    /// R1.1: a graduation debits `write_cache_size` by the entry's staged compressed
+    /// size and leaves `total_size` alone — the bytes are still on disk, they have only
+    /// changed tier. `apply_journal_entries` reports the debit; `consolidate_key`
+    /// negates it into `write_cache_delta` while holding `size_delta` at 0.
+    #[tokio::test]
+    async fn graduation_entry_reports_its_staged_bytes_and_sets_the_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/graduated-object";
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 4096);
+        assert!(
+            !metadata.object_metadata.graduation_accounted,
+            "precondition: the token must start clear, or this test proves nothing"
+        );
+
+        let entries = vec![graduation_entry(cache_key, 4096, "instance-a")];
+        let (applied, size_affecting, graduated_bytes) =
+            consolidator.apply_journal_entries(&mut metadata, &entries);
+
+        assert_eq!(applied, 1);
+        assert_eq!(graduated_bytes, 4096);
+        assert!(
+            metadata.object_metadata.graduation_accounted,
+            "the token must be set, or a later duplicate entry would debit again"
+        );
+        assert!(
+            size_affecting.is_empty(),
+            "a graduation must not appear as size-affecting: total_size does not move"
+        );
+        assert_eq!(
+            metadata.ranges.len(),
+            1,
+            "R1.4: graduation must not touch range files or their metadata entries"
+        );
+    }
+
+    /// R1.2, the property this whole mechanism exists for: **exactly once fleet-wide.**
+    ///
+    /// Two proxies can both observe `is_write_cached` set and both clear it — the
+    /// metadata transition is harmlessly idempotent — and both will then append a
+    /// `Graduation` entry. Consolidation for a key processes entries from every
+    /// instance's journal under that key's metadata lock, so both entries arrive here
+    /// together. Exactly one may be charged.
+    ///
+    /// This is the assertion that a per-instance accumulator debit could not satisfy,
+    /// and it is why the decrement goes through the journal rather than through
+    /// `subtract_write_cache` at the call site.
+    #[tokio::test]
+    async fn concurrent_graduations_of_one_key_debit_exactly_once() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/raced-object";
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 4096);
+
+        // Two different instances, same key, same size — the real race.
+        let entries = vec![
+            graduation_entry(cache_key, 4096, "instance-a"),
+            graduation_entry(cache_key, 4096, "instance-b"),
+        ];
+        let (applied, _size_affecting, graduated_bytes) =
+            consolidator.apply_journal_entries(&mut metadata, &entries);
+
+        assert_eq!(
+            graduated_bytes, 4096,
+            "two entries for one key must debit 4096 once, not 8192 — an 8192 debit \
+             drives write_cache_size toward undershoot, which silently over-admits"
+        );
+        assert_eq!(applied, 1, "only one of the two entries is charged");
+        assert!(metadata.object_metadata.graduation_accounted);
+    }
+
+    /// The cross-cycle half of R1.2. The two entries above arrived together; entries can
+    /// also arrive in separate consolidation cycles. The token is persisted in the
+    /// `.meta`, so a second cycle sees it already set and charges nothing.
+    #[tokio::test]
+    async fn a_graduation_arriving_after_the_token_is_set_debits_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/late-entry";
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 4096);
+
+        // Cycle 1
+        let (_, _, first) = consolidator
+            .apply_journal_entries(&mut metadata, &[graduation_entry(cache_key, 4096, "a")]);
+        assert_eq!(first, 4096);
+
+        // Cycle 2 — a duplicate from another instance, against the same persisted .meta
+        let (applied, _, second) = consolidator
+            .apply_journal_entries(&mut metadata, &[graduation_entry(cache_key, 4096, "b")]);
+        assert_eq!(
+            second, 0,
+            "the persisted token must suppress a cross-cycle duplicate"
+        );
+        assert_eq!(applied, 0);
+    }
+
+    /// The token survives a `.meta` round-trip. It is `#[serde(default)]`, so a
+    /// serialisation gap would silently reset it to `false` on every read and re-open the
+    /// double-debit window — with no compile error and no test failure anywhere else.
+    #[test]
+    fn the_graduation_token_survives_serialisation() {
+        let mut metadata = graduated_but_unaccounted_metadata("test-bucket/obj", 4096);
+        metadata.object_metadata.graduation_accounted = true;
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let restored: NewCacheMetadata = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            restored.object_metadata.graduation_accounted,
+            "the token must persist, or every consolidation cycle re-debits"
+        );
+    }
+
+    /// Backward compatibility: a `.meta` written before this field existed must read as
+    /// `false`. That is correct rather than merely convenient — no `Graduation` entry
+    /// exists for an entry that graduated under an older release, so nothing debits it,
+    /// and its already-lost bytes are re-grounded by the full Validation_Scan (R6).
+    #[test]
+    fn a_meta_predating_the_token_reads_as_unaccounted() {
+        let json =
+            serde_json::to_string(&graduated_but_unaccounted_metadata("test-bucket/obj", 4096))
+                .unwrap();
+        // Strip the field the way an older writer would have: never emit it at all.
+        let legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut legacy = legacy;
+        legacy["object_metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("graduation_accounted");
+        assert!(
+            legacy["object_metadata"]
+                .get("graduation_accounted")
+                .is_none(),
+            "precondition: the field really is absent from the legacy shape"
+        );
+
+        let restored: NewCacheMetadata = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.object_metadata.graduation_accounted);
+    }
+
+    /// R1.5: an entry that expires without ever being read must not graduate. Graduation
+    /// is triggered only from the read paths, so the structural guard is that a
+    /// `Graduation` entry is the *only* thing that can move the token — nothing in the
+    /// other four operations may set it. A `Remove` for an unread expired entry must
+    /// leave it clear, so the entry is reclaimed by eviction (which decrements via the
+    /// accumulator) rather than being charged as a graduation as well.
+    #[tokio::test]
+    async fn a_remove_entry_does_not_account_a_graduation() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/expired-unread";
+        let now = SystemTime::now();
+        let mut metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                // Still staged: never read, so never graduated.
+                is_write_cached: true,
+                graduation_accounted: false,
+                content_length: 4096,
+                ..Default::default()
+            },
+            ranges: vec![create_test_range_spec(0, 4095)],
+            created_at: now,
+            expires_at: now,
+            ..Default::default()
+        };
+        // `create_test_range_spec` stamps `created_at` at call time, which is AFTER the
+        // `now` the Remove entry below is stamped with — so as written the fixture had the
+        // range being cached after its own eviction was recorded. Harmless while the
+        // `Remove` arm matched on `(start, end)` alone; with the republish guard in place
+        // it made the range look republished and the arm correctly declined to strip it.
+        // Backdate it to what an eviction actually looks like: the range was cached, then
+        // removed later.
+        metadata.ranges[0].created_at = now - Duration::from_secs(600);
+
+        let range_spec = create_test_range_spec(0, 4095);
+        let remove = JournalEntry {
+            timestamp: now,
+            instance_id: "instance-a".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec: range_spec.clone(),
+            operation: JournalOperation::Remove,
+            range_file_path: range_spec.file_path.clone(),
+            metadata_version: 0,
+            new_ttl_secs: None,
+            object_ttl_secs: None,
+            access_increment: None,
+            object_metadata: None,
+        };
+
+        let (_applied, size_affecting, graduated_bytes) =
+            consolidator.apply_journal_entries(&mut metadata, &[remove]);
+
+        assert_eq!(
+            graduated_bytes, 0,
+            "eviction of an unread entry is not a graduation and must not be charged as one"
+        );
+        assert!(
+            !metadata.object_metadata.graduation_accounted,
+            "only a Graduation entry may set the token"
+        );
+        assert_eq!(
+            size_affecting.len(),
+            1,
+            "a Remove IS size-affecting, unlike a graduation"
+        );
+        assert!(metadata.ranges.is_empty(), "the Remove pruned the range");
+    }
+
+    /// A `Remove` entry for `(start, end)` stamped `timestamp`, as
+    /// `write_eviction_journal_entries` builds it.
+    fn remove_entry_at(
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        timestamp: SystemTime,
+    ) -> JournalEntry {
+        let mut range_spec = create_test_range_spec(start, end);
+        range_spec.created_at = timestamp;
+        JournalEntry {
+            timestamp,
+            instance_id: "instance-a".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec: range_spec.clone(),
+            operation: JournalOperation::Remove,
+            range_file_path: range_spec.file_path.clone(),
+            metadata_version: 0,
+            new_ttl_secs: None,
+            object_ttl_secs: None,
+            access_increment: None,
+            object_metadata: None,
+        }
+    }
+
+    /// **The red side for the re-PUT / `Remove`-collision defect.**
+    ///
+    /// A re-PUT of the same key at the same length removes the old `.bin` (writing a
+    /// `Remove` journal entry for its offsets), then republishes a new `.bin` at the
+    /// SAME offsets and writes the `.meta` directly. One consolidation cycle later this
+    /// arm used to strip the freshly-published range, because it matched on
+    /// `(start, end)` with no timestamp comparison — emptying `ranges` on a `.meta` that
+    /// was correct when written.
+    ///
+    /// The symptom is an INTERMITTENT post-overwrite cache miss: read-after-write holds
+    /// until the cycle runs, so it only appears once consolidation catches up. That is
+    /// why the accounting tests never saw it — they assert accumulator deltas and never
+    /// run this function.
+    #[tokio::test]
+    async fn a_remove_does_not_strip_a_range_republished_after_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let cache_key = "test-bucket/re-put-same-length";
+
+        // The Remove was recorded BEFORE the republish.
+        let removal_time = SystemTime::now() - Duration::from_secs(5);
+        let remove = remove_entry_at(cache_key, 0, 65535, removal_time);
+
+        // The .meta as the re-PUT wrote it: a range published AFTER the removal, at the
+        // identical offsets. `RangeSpec::new` stamps created_at at publish time, which is
+        // what makes the two distinguishable.
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 65536);
+        metadata.ranges = vec![create_test_range_spec(0, 65535)];
+        assert!(
+            metadata.ranges[0].created_at > removal_time,
+            "precondition: the republished range must post-date the removal, or this \
+             test proves nothing about the guard"
+        );
+        let published_path = metadata.ranges[0].file_path.clone();
+
+        let (applied, _size_affecting, _graduated) =
+            consolidator.apply_journal_entries(&mut metadata, &[remove]);
+
+        assert_eq!(
+            metadata.ranges.len(),
+            1,
+            "the republished range must survive: stripping it empties `ranges` on a .meta \
+             that was correct when written, so the next GET misses and the published .bin \
+             is orphaned"
+        );
+        assert_eq!(
+            metadata.ranges[0].file_path, published_path,
+            "the surviving range must be the republished one, not the removed one"
+        );
+        assert_eq!(
+            applied, 1,
+            "the entry is still retired from the journal — it must not be retained for \
+             retry, or it would strip the range on some later cycle instead"
+        );
+    }
+
+    /// The other side of the same guard: a genuine eviction MUST still strip. Without
+    /// this, the fix above would be indistinguishable from deleting the `Remove` arm,
+    /// and metadata would keep referencing `.bin` files that are gone.
+    #[tokio::test]
+    async fn a_remove_still_strips_a_range_older_than_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let cache_key = "test-bucket/evicted";
+
+        // The eviction case: the range was created long before the Remove was recorded.
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 65536);
+        metadata.ranges = vec![create_test_range_spec(0, 65535)];
+        metadata.ranges[0].created_at = SystemTime::now() - Duration::from_secs(600);
+
+        let remove = remove_entry_at(cache_key, 0, 65535, SystemTime::now());
+
+        let (applied, size_affecting, _graduated) =
+            consolidator.apply_journal_entries(&mut metadata, &[remove]);
+
+        assert!(
+            metadata.ranges.is_empty(),
+            "an eviction's Remove must still strip the range it deleted, or metadata \
+             keeps pointing at a .bin that is gone"
+        );
+        assert_eq!(applied, 1);
+        assert_eq!(
+            size_affecting.len(),
+            1,
+            "a Remove stays size-affecting regardless of the guard"
+        );
+    }
+
+    /// Write `metadata` to the sharded `.meta` path the consolidator will look for.
+    /// `refresh_write_cache_ttl` does this synchronously before appending the Graduation
+    /// entry, so this reproduces the on-disk state consolidation actually sees.
+    async fn seed_meta_on_disk(consolidator: &JournalConsolidator, metadata: &NewCacheMetadata) {
+        let path = consolidator
+            .get_metadata_file_path(&metadata.cache_key)
+            .unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, serde_json::to_string(metadata).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// **The red side for the defect that disabled graduation accounting entirely.**
+    ///
+    /// A `Graduation` entry must survive `validate_journal_entries_with_staleness`. It was
+    /// absent from that function's object-level exemption list, so it fell through to the
+    /// range-file check — which builds `..._0-0.bin` from the carrier `RangeSpec`, a file
+    /// that never exists for any graduation.
+    ///
+    /// The four tests above cannot catch this: they all call `apply_journal_entries`
+    /// directly, so they never traverse the gate that was dropping the entry. That is
+    /// precisely why the defect shipped, and it is why this test enters one stage earlier.
+    #[tokio::test]
+    async fn a_graduation_entry_validates_against_the_meta_not_a_range_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/graduated-object";
+        let metadata = graduated_but_unaccounted_metadata(cache_key, 4096);
+        seed_meta_on_disk(&consolidator, &metadata).await;
+
+        let entry = graduation_entry(cache_key, 4096, "instance-a");
+
+        // Precondition, and the whole point: the range file the old code looked for does
+        // NOT exist. Without this assertion the test could pass because some unrelated
+        // fixture happened to create it.
+        let bogus_range_file = consolidator
+            .get_range_file_path(cache_key, &entry.range_spec)
+            .unwrap();
+        assert!(
+            !bogus_range_file.exists(),
+            "precondition: no _0-0.bin may exist, or this test proves nothing about the gate"
+        );
+
+        let (valid, stale) = consolidator
+            .validate_journal_entries_with_staleness(std::slice::from_ref(&entry))
+            .await;
+
+        assert_eq!(
+            valid.len(),
+            1,
+            "a Graduation entry must validate against the .meta. Landing in neither list \
+             is the defect: the entry is retained, re-read every cycle, and then dropped \
+             as stale after stale_entry_timeout_secs with its accounting lost"
+        );
+        assert!(
+            stale.is_empty(),
+            "a fresh entry whose .meta exists is not stale"
+        );
+    }
+
+    /// The end-to-end statement of the same fix, through `consolidate_object`, asserting
+    /// all three observed fleet symptoms together — which is what the fleet evidence
+    /// demanded, since a partial explanation of any one of them was misleading.
+    ///
+    /// On the fleet the `Graduation` entry sat in the journal across ~2900 consolidation
+    /// cycles while `graduation_accounted` stayed `false` and `write_cache_size` never
+    /// moved. One missing match arm caused all three.
+    #[tokio::test]
+    async fn consolidating_a_graduation_debits_the_write_tier_and_retires_the_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/graduated-object";
+        let staged = 4096u64;
+        seed_meta_on_disk(
+            &consolidator,
+            &graduated_but_unaccounted_metadata(cache_key, staged),
+        )
+        .await;
+
+        // Use the real producer, so the test covers the writer/reader pair rather than a
+        // hand-built entry that could drift from what the writer actually emits.
+        assert!(
+            consolidator
+                .write_graduation_journal_entry(cache_key, staged)
+                .await,
+            "precondition: the journal entry must be appended"
+        );
+
+        let result = consolidator.consolidate_object(cache_key).await.unwrap();
+
+        // Symptom 1: the write-cache delta was always 0.
+        assert_eq!(
+            result.write_cache_delta,
+            -(staged as i64),
+            "the graduation must debit write_cache_size by the staged compressed size"
+        );
+        assert_eq!(
+            result.size_delta, 0,
+            "R1.3: total_size must not move — the bytes are still on disk, only the tier changed"
+        );
+
+        // Symptom 2: the token was never persisted. Read it back off disk rather than
+        // from the in-memory struct, because the fleet's evidence was a `.meta` file.
+        let persisted: NewCacheMetadata = serde_json::from_str(
+            &tokio::fs::read_to_string(consolidator.get_metadata_file_path(cache_key).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted.object_metadata.graduation_accounted,
+            "the token must be persisted, or the next cycle debits the same bytes again"
+        );
+
+        // Symptom 3: the entry never left the journal.
+        assert_eq!(
+            result.consolidated_entries.len(),
+            1,
+            "the entry must be returned for journal cleanup, not retained for retry"
+        );
+        assert_eq!(result.entries_consolidated, 1);
+    }
+
+    /// A graduation must not disturb the object's ranges. The carrier `RangeSpec` is
+    /// `(0, 0)` with an empty `file_path`, which for a **1-byte object** collides with its
+    /// real whole-object range — also `(0, 0)`. `resolve_conflicts` picks the newer of the
+    /// two by timestamp, and a graduation always post-dates the PUT, so it would have
+    /// overwritten a valid range with the carrier and lost both `file_path` and the true
+    /// compressed size.
+    ///
+    /// Latent until the validation fix above, because graduation entries never reached
+    /// `resolve_conflicts` before it. 1 byte is the only size that triggers it, so a
+    /// fixture at any other size passes whatever the code does.
+    #[tokio::test]
+    async fn a_graduation_does_not_overwrite_the_range_of_a_one_byte_object() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+
+        let cache_key = "test-bucket/one-byte-object";
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 1);
+        let real_range = metadata.ranges[0].clone();
+        assert_eq!(
+            (real_range.start, real_range.end),
+            (0, 0),
+            "precondition: the collision only exists because a 1-byte range IS (0, 0)"
+        );
+        assert!(
+            !real_range.file_path.is_empty(),
+            "precondition: the real range has a file_path the carrier would erase"
+        );
+
+        let entry = graduation_entry(cache_key, 1, "instance-a");
+        consolidator
+            .resolve_conflicts(&mut metadata, std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            metadata.ranges[0].file_path, real_range.file_path,
+            "the graduation carrier must not replace the real range: an empty file_path \
+             orphans the .bin and makes the range unreadable"
+        );
+        assert_eq!(metadata.ranges.len(), 1);
     }
 
     #[tokio::test]
@@ -3954,67 +5185,6 @@ mod tests {
         assert!(cache_keys.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_validate_journal_entries() {
-        let temp_dir = TempDir::new().unwrap();
-        let journal_manager = Arc::new(JournalManager::new(
-            temp_dir.path().to_path_buf(),
-            "test-instance".to_string(),
-        ));
-        let lock_manager = Arc::new(MetadataLockManager::new(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(30),
-            3,
-        ));
-
-        let consolidator = JournalConsolidator::new(
-            temp_dir.path().to_path_buf(),
-            journal_manager,
-            lock_manager,
-            ConsolidationConfig::default(),
-        );
-
-        let cache_key = "test-bucket/test-object";
-        let range_spec = create_test_range_spec(0, 8388607);
-
-        // Create a journal entry
-        let entry = JournalEntry {
-            timestamp: SystemTime::now(),
-            instance_id: "test-instance".to_string(),
-            cache_key: cache_key.to_string(),
-            range_spec: range_spec.clone(),
-            operation: JournalOperation::Add,
-            range_file_path: "test_range_0-8388607.bin".to_string(),
-            metadata_version: 1,
-            new_ttl_secs: None,
-            object_ttl_secs: Some(3600),
-            access_increment: None,
-            object_metadata: None,
-            metadata_written: false,
-        };
-
-        // Without creating the range file, validation should filter it out
-        let valid_entries = consolidator
-            .validate_journal_entries(std::slice::from_ref(&entry))
-            .await;
-        assert_eq!(valid_entries.len(), 0);
-
-        // Create the range file
-        let range_file_path = consolidator
-            .get_range_file_path(cache_key, &range_spec)
-            .unwrap();
-        if let Some(parent) = range_file_path.parent() {
-            tokio::fs::create_dir_all(parent).await.unwrap();
-        }
-        tokio::fs::write(&range_file_path, b"test data")
-            .await
-            .unwrap();
-
-        // Now validation should pass
-        let valid_entries = consolidator.validate_journal_entries(&[entry]).await;
-        assert_eq!(valid_entries.len(), 1);
-    }
-
     // Property-based tests using quickcheck
     use quickcheck::TestResult;
     use quickcheck_macros::quickcheck;
@@ -4066,6 +5236,7 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
+                staged: None,
             };
 
             let mut metadata = NewCacheMetadata {
@@ -4097,7 +5268,6 @@ mod tests {
                     object_ttl_secs: None,
                     access_increment: None,
                     object_metadata: None,
-                    metadata_written: false,
                 });
             }
 
@@ -4105,7 +5275,7 @@ mod tests {
             // (entries are already in reverse timestamp order)
 
             // Apply entries - consolidator should sort by timestamp
-            let (entries_applied, _applied_entries) =
+            let (entries_applied, _applied_entries, _graduated_bytes) =
                 consolidator.apply_journal_entries(&mut metadata, &entries);
 
             // Property 1: All entries should be applied
@@ -4186,6 +5356,7 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
+                staged: None,
             };
 
             let range2 = RangeSpec {
@@ -4198,6 +5369,7 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 5,
+                staged: None,
             };
 
             let range3 = RangeSpec {
@@ -4210,6 +5382,7 @@ mod tests {
                 created_at: now,
                 last_accessed: now,
                 access_count: 1,
+                staged: None,
             };
 
             // Create metadata with range2 (for TTL refresh and access update tests)
@@ -4240,7 +5413,6 @@ mod tests {
                     object_ttl_secs: Some(3600),
                     access_increment: None,
                     object_metadata: None,
-                    metadata_written: false,
                 },
                 // TtlRefresh operation - refresh TTL for range2
                 JournalEntry {
@@ -4255,7 +5427,6 @@ mod tests {
                     object_ttl_secs: None,
                     access_increment: None,
                     object_metadata: None,
-                    metadata_written: false,
                 },
                 // AccessUpdate operation - update access count for range2
                 JournalEntry {
@@ -4270,7 +5441,6 @@ mod tests {
                     object_ttl_secs: None,
                     access_increment: Some(access_increment as u64),
                     object_metadata: None,
-                    metadata_written: false,
                 },
                 // Add operation - add range3
                 JournalEntry {
@@ -4285,12 +5455,11 @@ mod tests {
                     object_ttl_secs: Some(3600),
                     access_increment: None,
                     object_metadata: None,
-                    metadata_written: false,
                 },
             ];
 
             // Apply all entries
-            let (entries_applied, _applied_entries) =
+            let (entries_applied, _applied_entries, _graduated_bytes) =
                 consolidator.apply_journal_entries(&mut metadata, &entries);
 
             // Property 1: All 4 entries should be applied
@@ -4514,6 +5683,169 @@ mod tests {
 
         // Should reflect new size from disk
         assert_eq!(consolidator.get_current_size().await, 1024 * 1024 * 100);
+    }
+
+    /// Design tests 7 and 8: the Validation_Scan re-grounds an inflated
+    /// `write_cache_size`, and the subset invariant is clamped rather than trusted.
+    ///
+    /// These are the only mechanism that un-inflates a figure that is already inflated
+    /// (R6). Graduation and eviction stop the leak; nothing else corrects the residue,
+    /// which is why `T42c` returning to green at checkpoint 2 was attributed here rather
+    /// than to R5.
+    mod validation_regrounds_write_cache_size {
+        use super::*;
+
+        /// The live fleet figure this spec was opened for: 157.61% of a 10 GiB
+        /// allocation, seeded from `size_state.json` at every startup on all three
+        /// proxies.
+        const INFLATED: u64 = 16_922_745_347;
+
+        fn consolidator(dir: &std::path::Path) -> JournalConsolidator {
+            JournalConsolidator::new(
+                dir.to_path_buf(),
+                Arc::new(JournalManager::new(
+                    dir.to_path_buf(),
+                    "test-instance".to_string(),
+                )),
+                Arc::new(MetadataLockManager::new(
+                    dir.to_path_buf(),
+                    Duration::from_secs(30),
+                    3,
+                )),
+                ConsolidationConfig::default(),
+            )
+        }
+
+        /// Design test 7. Shown failing first by reverting the caller to pass `None`,
+        /// which is what the pre-R6 tree did: the inflated figure then survives the scan
+        /// untouched, and the second assertion reports 16,922,745,347 where 0 is
+        /// expected.
+        ///
+        /// The scanned figure is 0 rather than merely smaller, because that is the state
+        /// the fleet was actually in — 1,779 `.meta` files parsed, none flagged
+        /// `is_write_cached`, and the validation scan computing `write_cache_size: 0`
+        /// beside `size_state.json`'s 16.9 GB. The right answer was being computed and
+        /// discarded.
+        #[tokio::test]
+        async fn a_scan_replaces_an_inflated_figure_with_the_scanned_one() {
+            let temp = TempDir::new().unwrap();
+            let consolidator = consolidator(temp.path());
+
+            // The pre-fix fleet state: a large, real cache with an impossible staged
+            // figure attached to it.
+            consolidator
+                .persist_size_state(&SizeState {
+                    total_size: 19_748_298_884,
+                    write_cache_size: INFLATED,
+                    cached_objects: 1_779,
+                    consolidation_count: 0,
+                    last_updated_by: "test".to_string(),
+                    last_consolidation: SystemTime::now(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                consolidator.get_write_cache_size().await,
+                INFLATED,
+                "precondition: the inflated figure must be installed, or this test \
+                 asserts re-grounding of something that was never wrong"
+            );
+
+            consolidator
+                .update_size_from_validation(19_748_298_884, Some(0), Some(1_779))
+                .await;
+
+            assert_eq!(
+                consolidator.get_write_cache_size().await,
+                0,
+                "R6.1: the scan's staged figure must replace the tracked one"
+            );
+            assert_eq!(
+                consolidator.get_current_size().await,
+                19_748_298_884,
+                "re-grounding the staged figure must not disturb the total"
+            );
+        }
+
+        /// Design test 8. The subset invariant: `write_cache_size` is part of
+        /// `total_size`, never additional to it, so a figure exceeding the total is
+        /// impossible for consistent inputs.
+        ///
+        /// Clamped rather than accepted because `read_cache_size` is derived as
+        /// `total_size - write_cache_size` at every reporting site, and an unclamped
+        /// value underflows all of them.
+        ///
+        /// Shown failing first by replacing the clamp with `state.write_cache_size =
+        /// wc_size`, which reports the full 16.9 GB against a 1,000-byte total.
+        #[tokio::test]
+        async fn a_figure_exceeding_the_total_is_clamped_to_it() {
+            let temp = TempDir::new().unwrap();
+            let consolidator = consolidator(temp.path());
+
+            consolidator
+                .update_size_from_validation(1_000, Some(INFLATED), None)
+                .await;
+
+            assert_eq!(
+                consolidator.get_write_cache_size().await,
+                1_000,
+                "R6.4: a staged figure above the total must be clamped to the total"
+            );
+            assert_eq!(consolidator.get_current_size().await, 1_000);
+        }
+
+        /// The boundary, pinned separately: equal is legal. A whole cache consisting of
+        /// nothing but staged bytes is a real state — a fresh volume that has taken
+        /// writes and served no reads — so a `>=` clamp would corrupt it, and no other
+        /// assertion here distinguishes `>` from `>=`.
+        #[tokio::test]
+        async fn a_figure_equal_to_the_total_is_left_alone() {
+            let temp = TempDir::new().unwrap();
+            let consolidator = consolidator(temp.path());
+
+            consolidator
+                .update_size_from_validation(4_096, Some(4_096), None)
+                .await;
+
+            assert_eq!(
+                consolidator.get_write_cache_size().await,
+                4_096,
+                "an all-staged cache is legal: the invariant is subset, not strict subset"
+            );
+        }
+
+        /// `None` must leave the existing figure alone rather than zeroing it, so a
+        /// caller that cannot compute a whole-cache staged figure does not install a
+        /// partial sum as one. This is the behaviour the rolling scan relies on, and it
+        /// is the reason `None` is still accepted after R6.1 gave both full-scan callers
+        /// a real figure.
+        #[tokio::test]
+        async fn none_preserves_the_existing_figure() {
+            let temp = TempDir::new().unwrap();
+            let consolidator = consolidator(temp.path());
+
+            consolidator
+                .persist_size_state(&SizeState {
+                    total_size: 8_192,
+                    write_cache_size: 4_096,
+                    cached_objects: 2,
+                    consolidation_count: 0,
+                    last_updated_by: "test".to_string(),
+                    last_consolidation: SystemTime::now(),
+                })
+                .await
+                .unwrap();
+
+            consolidator
+                .update_size_from_validation(8_192, None, Some(2))
+                .await;
+
+            assert_eq!(
+                consolidator.get_write_cache_size().await,
+                4_096,
+                "None means 'not measured', not 'measured as zero'"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4803,6 +6135,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         // Create the range file so validation passes
@@ -4835,7 +6168,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -4905,6 +6237,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         // Create the range file
@@ -4937,7 +6270,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -5062,6 +6394,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         // Create the range file
@@ -5094,7 +6427,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -6059,6 +7391,7 @@ mod tests {
                         created_at: base_time,
                         last_accessed: base_time,
                         access_count: 1,
+                        staged: None,
                     },
                     operation: JournalOperation::Add,
                     range_file_path: format!("range_{}.bin", i),
@@ -6067,7 +7400,6 @@ mod tests {
                     object_ttl_secs: Some(3600),
                     access_increment: None,
                     object_metadata: None,
-                    metadata_written: false,
                 }
             })
             .collect();
@@ -6305,6 +7637,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         // Create range file
@@ -6334,7 +7667,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -6411,6 +7743,7 @@ mod tests {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         };
 
         let range_file_path = consolidator
@@ -6437,7 +7770,6 @@ mod tests {
             object_ttl_secs: Some(3600),
             access_increment: None,
             object_metadata: None,
-            metadata_written: false,
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -6473,5 +7805,134 @@ mod tests {
         };
         assert_eq!(result.keys_skipped, 2);
         assert_eq!(result.keys_processed, 5);
+    }
+}
+
+/// Tests for [`SizeAccumulator::subtract_range`] and the dedup asymmetry it closes.
+///
+/// `add_range` credits only when it can insert into `recent_ranges`, so a range that
+/// is already tracked is credited **nothing**. `subtract` debits unconditionally and
+/// leaves the entry in place. Delete-then-rewrite of the same range therefore debits
+/// once and re-credits zero, leaving the figure short by one copy of bytes that are
+/// still on disk.
+///
+/// This was found on 2026-08-25 while adding the re-PUT debit
+/// (`CacheManager::debit_removed_ranges`), and it is worth knowing that adding that
+/// debit *without* this method made the total read `0` for an object the disk still
+/// held — an undershoot swapped in for the overshoot it was fixing. Undershoot is the
+/// worse direction: it silently over-admits instead of refusing.
+///
+/// The field's own doc comment claimed the set was "Cleared on flush", which would
+/// have bounded the damage to one flush interval. It is not — only `reset()`, on a
+/// validation scan, empties it. That comment is now corrected, and this module is what
+/// keeps the distinction from being re-collapsed.
+///
+/// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
+#[cfg(test)]
+mod subtract_range_tests {
+    use super::*;
+
+    const KEY: &str = "test-bucket/object.bin";
+    const SIZE: u64 = 4096;
+
+    fn accumulator() -> (tempfile::TempDir, SizeAccumulator) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let acc = SizeAccumulator::new(temp.path(), "test-instance".to_string());
+        (temp, acc)
+    }
+
+    /// The property the re-PUT debit depends on: a range removed through
+    /// `subtract_range` can be credited again.
+    #[test]
+    fn subtract_range_releases_the_dedup_entry_so_a_re_add_counts() {
+        let (_temp, acc) = accumulator();
+
+        assert!(acc.add_range(KEY, 0, SIZE - 1, SIZE));
+        acc.subtract_range(KEY, 0, SIZE - 1, SIZE);
+        assert_eq!(
+            acc.current_delta(),
+            0,
+            "the debit should net the credit out"
+        );
+
+        assert!(
+            acc.add_range(KEY, 0, SIZE - 1, SIZE),
+            "the range's dedup entry must have been released, so this is a fresh credit"
+        );
+        assert_eq!(
+            acc.current_delta(),
+            SIZE as i64,
+            "one copy of the bytes is on disk, so the delta must show one copy"
+        );
+    }
+
+    /// The two-sided contrast, and the reason `subtract` is not interchangeable with
+    /// `subtract_range`. This asserts the *trap*, not desired behaviour: if someone
+    /// swaps a `subtract_range` call site back to `subtract`, the accompanying re-add
+    /// silently credits nothing, and this test is what says so out loud.
+    #[test]
+    fn plain_subtract_leaves_the_dedup_entry_so_a_re_add_is_suppressed() {
+        let (_temp, acc) = accumulator();
+
+        assert!(acc.add_range(KEY, 0, SIZE - 1, SIZE));
+        acc.subtract(SIZE);
+        assert_eq!(acc.current_delta(), 0);
+
+        assert!(
+            !acc.add_range(KEY, 0, SIZE - 1, SIZE),
+            "plain subtract leaves the dedup entry, so add_range reports a duplicate"
+        );
+        assert_eq!(
+            acc.current_delta(),
+            0,
+            "and credits nothing — the delta is now short by one copy of bytes that \
+             are on disk. This is why a removal with a known range identity must use \
+             subtract_range."
+        );
+    }
+
+    /// The return value distinguishes "this range was counted and is no longer" from
+    /// "it was not counted", which a caller may want to log. A validation scan's
+    /// `reset()` between the add and the subtract produces the second case, so it is
+    /// not an error.
+    #[test]
+    fn subtract_range_reports_whether_a_dedup_entry_was_present() {
+        let (_temp, acc) = accumulator();
+
+        acc.add_range(KEY, 0, SIZE - 1, SIZE);
+        assert!(
+            acc.subtract_range(KEY, 0, SIZE - 1, SIZE),
+            "the range was tracked, so its entry was removed"
+        );
+        assert!(
+            !acc.subtract_range(KEY, 0, SIZE - 1, SIZE),
+            "second call finds no entry to remove"
+        );
+    }
+
+    /// Range identity is per `(key, start, end)`, so removing one range must not
+    /// release another's entry — including a different range of the same object.
+    #[test]
+    fn subtract_range_releases_only_the_named_range() {
+        let (_temp, acc) = accumulator();
+
+        acc.add_range(KEY, 0, SIZE - 1, SIZE);
+        acc.add_range(KEY, SIZE, (2 * SIZE) - 1, SIZE);
+        acc.add_range("test-bucket/other.bin", 0, SIZE - 1, SIZE);
+
+        acc.subtract_range(KEY, 0, SIZE - 1, SIZE);
+
+        assert!(
+            !acc.add_range(KEY, SIZE, (2 * SIZE) - 1, SIZE),
+            "the second range of the same object must still be deduplicated"
+        );
+        assert!(
+            !acc.add_range("test-bucket/other.bin", 0, SIZE - 1, SIZE),
+            "a different object's identical range must still be deduplicated"
+        );
+        assert!(
+            acc.add_range(KEY, 0, SIZE - 1, SIZE),
+            "only the named range was released"
+        );
     }
 }

@@ -5,6 +5,191 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-08-27
+
+**Upgrade impact:** cache size reporting is now accurate and self-consistent, and several
+figures change value as a result. No cached object is removed, no cache wipe is needed, and
+no configuration change is required.
+
+- `write_cache.resident_bytes` and `cache.write_cache_size` now reflect what is actually
+  staged. Both drop, often substantially, once a full validation scan runs, and from then on
+  they track uploads, overwrites and removals as they happen. Deployments that overwrite the
+  same keys frequently see the largest drop.
+- `cache.total_cache_size` is now the bytes held on the shared cache volume, and reads
+  identically on every instance sharing that volume. `cache.read_cache_size` is now the
+  non-staged remainder of it, so `total = read + write_cache` holds exactly.
+  `cache.ram_cache_size` is reported separately and is deliberately outside that sum.
+- Absolute-threshold alarms on any of those fields need rebaselining. A dashboard that
+  stacked the four cache gauges, or added `read_cache_size` to `write_cache_size` to get a
+  total, was double-counting and should be corrected.
+- On a cache at or near its configured `cache.max_cache_size`, signed and presigned PUTs now
+  bypass write-through caching, so a read of a just-uploaded object may be a cache miss where
+  it was previously a hit. Uploads themselves are unaffected: the body still streams to S3 and
+  S3's response is returned unchanged. A cache with headroom behaves as before.
+- The `/health` cache component can now report `Degraded` on a genuinely full cache. HTTP
+  status codes are unchanged (`Degraded` returns 200), so load balancer health checks are
+  unaffected.
+- Cached range metadata gains one optional field recording write-cache membership per range.
+  Existing cache files stay readable, older releases ignore the field, and data already on
+  the volume keeps the previous behaviour until it is next written.
+
+### Added
+
+- **`cache.max_cache_size_limit`** in `/metrics` and as an OTLP gauge: the configured
+  `cache.max_cache_size`, so cache utilisation is computable from `/metrics` alone and the
+  denominator behind the `/health` cache percentage is visible. `0` means no limit is
+  configured. Documented in [METRICS_REFERENCE.md](docs/METRICS_REFERENCE.md#cache) and
+  [OTLP_METRICS.md](docs/OTLP_METRICS.md).
+- **`write_cache.graduations_total`** in `/metrics`: how many objects have left the staging
+  tier by being read. Read together with `staged_entries` it shows the tier draining, which a
+  gauge alone cannot distinguish from an idle proxy. Documented in
+  [METRICS_REFERENCE.md](docs/METRICS_REFERENCE.md#write_cache).
+- **`write_cache.ledger_entries`** in `/metrics`: the length of the staging record the write
+  cache uses to select objects for reclamation.
+- **`eviction_coordination.staging_evictions_skipped_lock_held`** in `/metrics`: reclamation
+  passes skipped because another instance held the eviction lock.
+- Write-cache size corrections applied by a validation scan are now logged, so recurring
+  drift is visible without comparing state files by hand.
+- **[REQUEST_AWARE_ROUTING.md](docs/REQUEST_AWARE_ROUTING.md)**, a new guide to putting
+  HAProxy in front of a fleet: it encrypts the client hop, removes the per-GB load balancer
+  charge on cache hits when run on the client host, and hashes on object key and byte range
+  so every read of a page goes to one instance, which a Layer 4 balancer cannot do. Includes
+  a tested configuration. Optional and sample code; nothing changes for existing deployments.
+
+### Changed
+
+- **A full write cache no longer stops new uploads being cached.** The write cache allocation
+  (`cache.write_cache_percent`) is now a target rather than a hard limit. An upload is cached
+  even when the allocation is already full, and the excess is reclaimed in the background by
+  removing the oldest staged objects that have not yet been read; objects whose write cache
+  TTL expired without ever being read are reclaimed first. Reclamation begins at
+  `cache.eviction_trigger_percent` of the allocation and runs until usage reaches
+  `cache.eviction_target_percent`, the same two settings the read cache uses. This matches how
+  the download path already behaves: no limit on admission, space reclaimed once past a
+  threshold.
+
+  One bound still declines to cache, and only one: available space. A write-through upload is
+  skipped when caching it would take the cache past `cache.max_cache_size`, or when the cache
+  volume has less than 1 GiB free beyond what the object needs. Skipping is reported as
+  `disk_safety` in `signed_put.skipped_puts_total`, and `/health` reports the cache component
+  as `Degraded` while it is happening, so a volume that has run out of space is visible rather
+  than silent. Uploads themselves are never affected. `capacity_refused` is retired from that
+  counter's reason set.
+
+- **Reclaiming space in the write cache now costs time proportional to what is removed**,
+  rather than to the size of the whole cache. The proxy keeps a compact append-only record of
+  what it has staged and selects candidates from that. The record is a hint only: each
+  candidate is re-checked against the authoritative metadata before anything is deleted, so an
+  entry that has since been read, replaced or removed is skipped. No action is required on
+  upgrade. The record starts empty and is populated from the cache itself by the first full
+  validation scan, which also repairs it if entries are ever lost.
+
+- **The write cache allocation is enforced across all instances sharing a cache volume,
+  continuously.** It is now evaluated against the staged bytes recorded for the volume as a
+  whole on every background maintenance cycle, rather than against a per-instance figure
+  reconciled only at startup. A deployment whose staged working set has drifted above its
+  configured percentage will see reclamation begin where none happened before; raise
+  `cache.write_cache_percent` if that larger working set is intended.
+
+- The metadata read performed on the first read of a written object no longer blocks a request
+  worker.
+
+- A failed write-cache transition is now logged rather than silently discarded.
+
+### Fixed
+
+- **Write-cache size accounting now decreases as well as increases.** The figure is reduced
+  when a staged object is first read and becomes an ordinary read-cached object, when it is
+  removed to reclaim space, when it expires or is invalidated before ever being read, and when
+  it is replaced by a newer upload of the same key. Previously it only ever grew, so on a
+  long-running deployment it could climb past the allocation and stop new objects being cached
+  while little or nothing was actually staged. The first-read decrement is applied once per
+  object even when several instances read the same object at the same moment, and the cached
+  object count now decreases alongside the size. A deployment that had reached that state
+  recovers on its own with no cache wipe; see
+  [EVICTION.md](docs/EVICTION.md#recovery-from-an-inflated-write-cache-figure) for the timeline
+  and for the manual path if you would rather not wait for the next validation scan.
+
+- **Objects written through the cache are counted when they are written, and counted once.**
+  Single-object upload paths write the cache entry directly so that an immediate read is served
+  from cache, and that shortcut previously left them out of both the total and write-cache
+  figures; multipart uploads already recorded both. Credits are now deduplicated across every
+  path, so completing a multipart upload for an already-cached key, re-caching a full object
+  after a miss, or caching a range another instance already holds on shared storage each count
+  once rather than adding a phantom copy.
+
+- **Re-caching bytes that were previously removed counts again.** A range removed by eviction,
+  invalidation or overwrite now releases its already-counted marker, so caching that range
+  again is recorded. Invalidate-then-re-read is the ordinary flow for an object that changed in
+  S3, and the cache had been under-reporting itself for it. Because the limit is enforced
+  against that figure, that could admit more data than `cache.max_cache_size`.
+
+- **Validation scans re-ground the write-cache size.** A full scan recomputes it from the cache
+  on disk, a rolling scan extrapolates it the same way it does the total, and the write-cache
+  figure is clamped so it can never exceed the total of which it is a subset.
+
+- **Write-cache membership is recorded per range**, at the moment data is cached, rather than
+  once per object. The two differ for an object uploaded through the cache that later had a
+  *different* part of it downloaded: the downloaded part belongs to the read cache, and is no
+  longer counted toward the write-cache figure. Objects entirely uploaded or entirely
+  downloaded — the common cases — are unaffected. Range metadata written by earlier releases
+  keeps the previous behaviour until it is rewritten, so the figure converges as data is
+  refreshed.
+
+- **`cache.total_cache_size` and `cache.read_cache_size` no longer count the same bytes
+  twice.** The total was previously the read, write-cache and RAM figures added together, but
+  those are not independent: staged bytes were part of the read figure, and the RAM figure
+  counts copies of bytes also held on disk. The total is now the bytes on the shared cache
+  volume, and the read figure is the non-staged remainder, so the two partition the volume and
+  an object moves between them on first read without changing the total.
+
+- **The PUT cache-capacity check now reads the maintained cache size.** Both the signed and
+  presigned upload paths skip write-through caching when an object will not fit in the
+  remaining capacity; they now compute usage from the maintained figure rather than from fields
+  populated only on another path. If that read fails the request is cached as before rather than
+  refused, and the failure is logged.
+
+- **The `/health` cache component now reports actual usage.** Usage is the bytes on the shared
+  cache volume as a percentage of `cache.max_cache_size` (the same pair the cache's own
+  capacity and eviction decisions use), and the component reports `Degraded` above 95%. It
+  previously reported `Cache usage: NaN%` and `Healthy` at any utilisation. A deployment with no
+  `cache.max_cache_size` configured reports `Healthy` and states that no limit is set.
+
+- **Refusing a write-through PUT is now immediate**, rather than first reading and parsing every
+  cached object's metadata on the shared volume, which had been adding several seconds to each
+  refusal on a cache holding a few thousand objects. That scan also could not tell which
+  instance had staged an entry, so no instance now removes staged data another instance cached
+  on a shared volume on the strength of its own local counter.
+
+- **An upload is no longer refused because of a figure carried over from startup.** The
+  in-flight upload counter now starts at zero, which is correct for a process with no uploads in
+  flight, and residency is read from the shared cache state instead. Previously the counter was
+  seeded from resident bytes and never released, so it could sit at its limit from the moment
+  the proxy started and decline write-through caching indefinitely. The startup summary reports
+  both figures separately.
+
+- **An object read shortly after being overwritten is no longer an intermittent cache miss.**
+  Removal records now apply only to the copy they were written for. An overwrite that keeps the
+  object the same length reuses the same byte range, and the record could previously match the
+  replacement and remove it from the cache index a few seconds later. Reads were always served
+  correctly; this surfaced as an occasional slow read.
+
+- **Cache bookkeeping recorded while an object is uploaded is retained.** Size changes, access
+  counts and TTL refreshes made during an upload now reach the shared cache journal, and
+  concurrent uploads serialise their journal appends so one upload's entries cannot overwrite
+  another's.
+
+- **Superseded range files are removed when an object is cached in full.** When a full-object
+  copy replaces the partial ranges already cached for a key, the old range files are now deleted
+  and their bytes deducted whether or not the object's ETag changed. Previously a changed object
+  left its old range files on disk, unreferenced, until the background orphan sweep reclaimed
+  them.
+
+- **`write_cache.staged_entries` no longer drifts upward over time.** The gauge now decrements
+  on all four ways an entry can leave the staging tier — first read, replacement, reclamation,
+  and expiry or invalidation — rather than on first read alone. This is observability only; the
+  gauge feeds no caching or eviction decision.
+
 ## [2.6.3] - 2026-08-23
 
 ### Changed

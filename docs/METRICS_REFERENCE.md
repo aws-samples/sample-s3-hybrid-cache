@@ -63,7 +63,8 @@ Keys appear in this order.
 timestamp, uptime_seconds, cache, compression, connection_pool,
 eviction_coordination, signed_put, cache_size, atomic_metadata,
 consolidation, coalescing, cache_rules, page_cache, request_metrics,
-bucket_traffic, download_bandwidth, hedged_requests, inflight_memory
+bucket_traffic, download_bandwidth, hedged_requests, inflight_memory,
+write_cache
 ```
 
 **`timestamp`** is **not** a number and not RFC3339. It serializes as an object:
@@ -91,15 +92,12 @@ requests, so this does not track the quantity `max_concurrent_requests` bounds.
 
 **Use `request_metrics.permits_held`** for in-flight requests.
 
-### `cache.ram_cache_hit_rate_percent` changed scale in 2.5.0
+### `cache.ram_cache_hit_rate_percent` is a `0`–`100` percentage
 
-Up to 2.4.3 the field was a `0.0`–`1.0` fraction despite the `_percent` suffix, and it was
-also written from two different code paths — one of which computed it from **overall** cache
-hits rather than RAM-tier hits, so it could reflect the wrong quantity.
-
-From 2.5.0 it is a true `0`–`100` percentage sourced only from RAM-tier hit and miss counts,
-matching its sibling `cache.cache_hit_rate_percent`. A dashboard that multiplied this field
-by 100 to work around the old scale now reads 100x high and must drop the multiplication.
+It is sourced only from RAM-tier hit and miss counts, matching its sibling
+`cache.cache_hit_rate_percent`. It was a `0.0`–`1.0` fraction before 2.5.0, so a dashboard
+carried over from an earlier release that multiplied by 100 reads 100x high; see
+[UPGRADING.md](UPGRADING.md).
 
 To derive the same rate independently:
 
@@ -142,12 +140,31 @@ Nullable. Sizes, hit counters, and error counters for the disk and RAM tiers.
 
 ### Sizes and rates
 
-| Field | Kind | Meaning |
-|---|---|---|
-| `total_cache_size` | gauge | Total disk bytes (read + write) |
-| `read_cache_size` | gauge | Read-cache bytes |
-| `write_cache_size` | gauge | Write-cache bytes |
-| `ram_cache_size` | gauge | Current RAM range-cache bytes |
+| Field | Kind | Meaning | Scope |
+|---|---|---|---|
+| `total_cache_size` | gauge | Bytes on the shared cache volume. Exactly `read_cache_size + write_cache_size` | fleet-wide |
+| `max_cache_size_limit` | gauge | Configured `cache.max_cache_size` — the figure `total_cache_size` is a fraction of. `0` means no limit is configured | per-instance config |
+| `read_cache_size` | gauge | Non-staged bytes: objects that have been read at least once | fleet-wide |
+| `write_cache_size` | gauge | Staged bytes: written through the cache, not yet read | fleet-wide |
+| `ram_cache_size` | gauge | Current RAM range-cache bytes, counting promoted copies of bytes that are also on disk | **this instance only** |
+
+> **The two disk gauges are disjoint; the RAM gauge is not part of the total.**
+> `read_cache_size` and `write_cache_size` partition the cache volume, so
+> `total_cache_size` is their exact sum. An object moves from the second to the first
+> when it is first read, with no change to the total.
+>
+> `ram_cache_size` is deliberately outside that sum. It counts promoted copies of bytes
+> that are also on disk, so adding it double-counts, and it is per-instance where the
+> other three are fleet-wide — sum it across instances for fleet RAM residency, but never
+> add it to the disk figures.
+>
+> `total_cache_size` and `read_cache_size` changed meaning in 2.7.0; see
+> [UPGRADING.md](UPGRADING.md) if you are carrying a dashboard built against an earlier
+> release.
+>
+> For "how full is the cache", compare `total_cache_size` against the configured
+> `cache.max_cache_size` — that is the pair every eviction and capacity decision uses,
+> and what the `/health` cache component reports as a percentage.
 | `cache_hit_rate_percent` | derived | `cache_hits / (cache_hits + cache_misses) * 100`. `0.0` when no lookups |
 | `ram_cache_hit_rate_percent` | derived | RAM-tier hit rate, `0`–`100`. `0.0` when the RAM cache is disabled. Was a `0.0`–`1.0` fraction before 2.5.0 — see above |
 | `total_requests` | derived | `cache_hits + cache_misses`. Lookups, not HTTP requests |
@@ -308,6 +325,52 @@ has the sizing guidance; read it before setting a ceiling from this number.
 
 ---
 
+## `write_cache`
+
+Always present, including when write caching or the cache manager is not wired in — in
+that case every field is zeroed rather than the section going `null`, the same shape
+`inflight_memory` uses when disabled.
+
+Observability for the Staging_Tier (write-through cached, not-yet-read objects), added as
+part of the `write-cache-accounting-and-eviction` spec. Before this section existed,
+`cache.evictions` reporting `0` was easy to misread as "the write cache is not evicting
+anything", when it has never counted write-cache eviction at all.
+
+| Field | Kind | Meaning |
+|---|---|---|
+| `resident_bytes` | gauge | Staged bytes on the shared volume. Read from the Journal_Consolidator's in-memory Size_State (`SizeState::write_cache_size`) — the same fleet-wide figure `cache.write_cache_size` reports, not a separate walk |
+| `staging_bound_bytes` | config-derived | The configured Staging_Bound: `max_cache_size * write_cache_percent`. See [CONFIGURATION.md — Write Cache Configuration](CONFIGURATION.md#write-cache-configuration) |
+| `inflight_bytes` | gauge | This instance's current in-flight `WriteReservation` total. **Per-instance, not shared** — do not sum across the fleet expecting a global figure |
+| `over_bound` | derived (bool) | `resident_bytes > staging_bound_bytes`, exposed explicitly so the condition needs no arithmetic to detect |
+| `staged_entries` | gauge | Live count of currently staged (write-cached, not-yet-graduated) entries. **Approximate and best-effort** — a live gauge maintained per instance, not a scan result. Incremented on every write-through commit; decremented when an entry leaves the staging tier by any of the four routes — graduation (first read), a re-PUT superseding the previous entry, eviction, or invalidation (expiry or explicit) — so the gauge tracks entries entering and leaving rather than only entering and graduating |
+| `graduations_total` | counter | Cumulative entries that left the staging tier by being read. **Per-instance.** Read it alongside `staged_entries`: a flat gauge on its own cannot distinguish an idle proxy from a broken graduation path, and graduation is how the tier is meant to drain. Together with `staging_evictions_total` it accounts for the two ways an entry leaves — graduation keeps the bytes on disk (they move to the read tier, so `resident_bytes` falls while `cache.size` does not), eviction reclaims them. Not the accounting authority: the authoritative decrement is applied to Size_State under the consolidation lock, so two proxies reading the same key at once can both count here while only one decrement lands |
+| `staging_evictions_total` | counter | Cumulative objects evicted from the write/staging tier (`WriteCacheManager::evict_write_cached_object`). Deliberately separate from `cache.evictions`, which reflects read-tier eviction only |
+| `staging_eviction_bytes_total` | counter | Cumulative compressed bytes freed by staging eviction |
+| `ledger_entries` | gauge | Write_Ledger length: records across every instance's ledger file under `metadata/_write_ledger/`. Counts the same population as `staged_entries` by a different route — that one is a per-instance in-memory gauge, this is a count of records on shared storage — so a **persistent** gap between them is the signal that appends are being lost or compaction is not keeping up. A transient gap is normal: compaction runs on a 5-minute interval. Not the accounting authority; `resident_bytes` is, and a ledger figure must never be reported as a cache size |
+
+**When `over_bound` is `true`, expect a rate-limited WARN log line** (not a metric) naming
+both `resident_bytes` and `staging_bound_bytes`, emitted at most once per 60 seconds — so
+the condition is visible in logs even without polling `/metrics`.
+
+**`resident_bytes` and `inflight_bytes` are different quantities and are allowed to
+diverge.** `resident_bytes` is fleet-wide and read from the shared Size_State;
+`inflight_bytes` is this instance's in-memory reservation total. Write admission gates on
+`inflight_bytes`, so that is the figure to check when PUTs are being refused — a healthy
+`resident_bytes` beside a refusing proxy means this instance's own counter is the problem.
+They are normally close because one is seeded from the other at start, which is exactly why
+seeing them equal to the byte is not corroboration that either is right.
+
+**Two log lines make write-cache drift visible without diffing state files:** a full
+validation scan logs the write-cache drift it corrected (at WARN when non-zero), and the
+consolidator logs `old_write_cache_size`/`new_write_cache_size`/`write_cache_drift` on every
+validation update. Recurring non-zero drift means bytes are being credited or debited
+somewhere that is not paired.
+
+Not exported over OTLP as of this writing — see
+[OTLP_METRICS.md](OTLP_METRICS.md#not-exported-via-otlp).
+
+---
+
 ## `page_cache`
 
 Always present. Page-aligned range caching, off unless a rule enables `page_widening`.
@@ -429,8 +492,8 @@ Nullable. The size-tracking accumulator and validation scan.
 | `current_size` | gauge | Tracked total bytes |
 | `write_cache_size` | gauge | Tracked write-cache bytes |
 | `last_checkpoint` | **deprecated stub** | Always the current time — set to `now()` on every read. Not a checkpoint timestamp |
-| `last_validation` | gauge | Unix seconds, or `null` if no scan has run |
-| `last_validation_drift` | gauge | Signed byte drift the last scan found, or `null` |
+| `last_validation` | gauge | Unix seconds, or `null` if no scan has run or the last was a rolling cycle |
+| `last_validation_drift` | gauge | Signed byte drift the last full scan found, or `null` |
 | `checkpoint_count` | **deprecated stub** | Always `0` |
 | `delta_log_size` | **deprecated stub** | Always `0` |
 
@@ -444,6 +507,11 @@ instead — those are real.
 `last_validation_drift` is the accuracy signal for tracked size. Persistent large drift on
 a multi-instance deployment is the expected symptom of concurrent-write over-counting;
 see [SHARED_STORAGE.md](SHARED_STORAGE.md).
+
+**Both validation fields are populated by full scans only.** After a rolling cycle they
+report `null`, so a large cache that has settled into rolling mode leaves them null
+indefinitely — read the validation log lines instead. See
+[SHARED_STORAGE.md — Full and rolling modes](SHARED_STORAGE.md#full-and-rolling-modes).
 
 ---
 
@@ -485,7 +553,8 @@ coordination; see [SHARED_STORAGE.md](SHARED_STORAGE.md).
 
 Nullable in type, always present in practice. All counters:
 `lock_acquisitions_successful`, `lock_acquisitions_failed`, `stale_locks_recovered`,
-`evictions_coordinated`, `evictions_skipped_lock_held`, and `total_lock_hold_time_ms`
+`evictions_coordinated`, `evictions_skipped_lock_held`,
+`staging_evictions_skipped_lock_held`, and `total_lock_hold_time_ms`
 — which is a cumulative **sum**, not a mean.
 
 ---
@@ -500,6 +569,29 @@ Nullable in type, always present in practice.
 A climbing `bypassed_puts_total` means write-through caching is declining objects, usually
 on `write_cache_max_object_size` or capacity. See
 [CONFIGURATION.md — Write Cache Configuration](CONFIGURATION.md#write-cache-configuration).
+
+### `skipped_puts_total`
+
+A map, always present, `{}` when nothing has been skipped. Keys are reason strings, values
+are cumulative counts — the same map-valued shape as `bucket_traffic` and
+`cache.cache_bypasses_by_reason` above, chosen for the same reason: the list of skip
+reasons is a minimum, not a closed set fixed at compile time, so a fixed field per reason
+would need extending by hand every time a new one appears.
+
+Known reason keys as of this writing:
+
+| Key | Meaning |
+|---|---|
+| `write_cache_disabled` | Caching disabled by rule for this key |
+| `unknown_length` | Decoded content length could not be determined (e.g. chunked-encoded signed PUTs) |
+| `capacity_refused` | Not emitted. Retired in 2.7.0, when the write cache allocation stopped being an admission gate; a refusal that would once have landed here now reports `disk_safety`. Documented only so existing dashboards referencing it are explicable |
+| `disk_safety` | Write-through caching skipped because caching the object would take the cache past `max_cache_size`, or because the cache volume has under 1 GiB free beyond the object's own size. The only capacity-shaped refusal, and the remedy is more disk or a lower `max_cache_size` rather than a different `write_cache_percent`. While this is being recorded, `/health` reports the cache component `Degraded` — a recency signal that clears 300s after the last refusal, so it reflects "happening now" rather than "happened once". The upload itself always succeeds and is never affected |
+| `object_too_large` | Upload exceeds `write_cache_max_object_size` |
+| `commit_failed` | The write-cache commit failed after the object was already streamed to S3 |
+
+A PUT counted here still succeeds against S3 — these are write-through caching skips, not
+upload failures. A non-zero total here alongside flat cache-population figures is the
+signal that a fleet is taking PUT traffic and caching none of it.
 
 ---
 

@@ -52,6 +52,7 @@ fn test_range_spec_lru_score() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 1,
+        staged: None,
     };
 
     // More recently accessed range should have higher score
@@ -73,6 +74,7 @@ fn test_range_spec_tinylfu_score() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(10),
         access_count: 100,
+        staged: None,
     };
 
     // Infrequently accessed, old range (cold)
@@ -86,6 +88,7 @@ fn test_range_spec_tinylfu_score() {
         created_at: now - Duration::from_secs(7200),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 5,
+        staged: None,
     };
 
     // Hot range should have higher score (less likely to be evicted)
@@ -105,6 +108,7 @@ fn test_range_spec_record_access() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(1800),
         access_count: 5,
+        staged: None,
     };
 
     let old_last_accessed = range.last_accessed;
@@ -133,6 +137,7 @@ fn test_range_spec_serialization_with_access_fields() {
         created_at: now,
         last_accessed: now,
         access_count: 1,
+        staged: None,
     };
 
     // Serialize
@@ -168,6 +173,7 @@ fn test_lru_eviction_order() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(3600), // Oldest
         access_count: 10,
+        staged: None,
     };
 
     let range2 = RangeSpec {
@@ -180,6 +186,7 @@ fn test_lru_eviction_order() {
         created_at: now - Duration::from_secs(1800),
         last_accessed: now - Duration::from_secs(1800), // Middle
         access_count: 5,
+        staged: None,
     };
 
     let range3 = RangeSpec {
@@ -192,6 +199,7 @@ fn test_lru_eviction_order() {
         created_at: now - Duration::from_secs(600),
         last_accessed: now - Duration::from_secs(600), // Newest
         access_count: 2,
+        staged: None,
     };
 
     // LRU: Lower score = older = evict first
@@ -214,6 +222,7 @@ fn test_tinylfu_eviction_order() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(10),
         access_count: 100,
+        staged: None,
     };
 
     // Warm range: medium frequency, medium recency
@@ -227,6 +236,7 @@ fn test_tinylfu_eviction_order() {
         created_at: now - Duration::from_secs(3600),
         last_accessed: now - Duration::from_secs(600),
         access_count: 50,
+        staged: None,
     };
 
     // Cold range: low frequency, old access
@@ -240,6 +250,7 @@ fn test_tinylfu_eviction_order() {
         created_at: now - Duration::from_secs(7200),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 5,
+        staged: None,
     };
 
     // TinyLFU: Higher score = more valuable = keep longer

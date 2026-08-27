@@ -124,18 +124,26 @@ impl HybridMetadataWriter {
                 .write_empty_object_metadata(cache_key, object_metadata, ttl)
                 .await;
         } else {
-            RangeSpec::new(
+            let file_path = format!(
+                "{}_{}-{}.bin",
+                sanitize_cache_key_for_filename(cache_key),
+                0,
+                object_metadata.content_length.saturating_sub(1)
+            );
+            // Live write path, so membership is recorded explicitly (R12.2).
+            // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+            let counts_as_staged = crate::cache_types::classify_new_range_as_staged(
+                &file_path,
+                object_metadata.is_write_cached,
+            );
+            RangeSpec::new_staged(
                 0,
                 object_metadata.content_length.saturating_sub(1),
-                format!(
-                    "{}_{}-{}.bin",
-                    sanitize_cache_key_for_filename(cache_key),
-                    0,
-                    object_metadata.content_length.saturating_sub(1)
-                ),
+                file_path,
                 crate::compression::CompressionAlgorithm::Lz4,
                 object_metadata.content_length,
                 object_metadata.content_length,
+                counts_as_staged,
             )
         };
 
@@ -265,7 +273,6 @@ impl HybridMetadataWriter {
             object_ttl_secs: Some(ttl.as_secs()),
             access_increment: None,
             object_metadata, // Include object metadata for journal consolidation
-            metadata_written: false, // Range NOT written to .meta - consolidation SHOULD count size
         };
 
         match self
@@ -333,7 +340,6 @@ impl HybridMetadataWriter {
         {
             Ok(()) => {
                 // Immediate write succeeded, also write to journal for redundancy
-                // Set metadata_written: true because range is already in .meta
                 let journal_entry = JournalEntry {
                     timestamp: SystemTime::now(),
                     instance_id: self.get_instance_id(),
@@ -346,7 +352,6 @@ impl HybridMetadataWriter {
                     object_ttl_secs: Some(ttl.as_secs()),
                     access_increment: None,
                     object_metadata: None, // Not needed in hybrid mode - immediate write already created .meta
-                    metadata_written: true, // Range already in .meta - consolidation should NOT count size
                 };
 
                 // Journal write failure is not critical in hybrid mode since immediate write succeeded

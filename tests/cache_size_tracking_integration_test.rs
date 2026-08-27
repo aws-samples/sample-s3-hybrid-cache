@@ -362,6 +362,7 @@ fn create_test_range_spec(start: u64, end: u64, compressed_size: u64) -> RangeSp
         created_at: now,
         last_accessed: now,
         access_count: 1,
+        staged: None,
     }
 }
 
@@ -386,7 +387,6 @@ fn create_test_journal_entry(
         object_ttl_secs: None,
         access_increment: None,
         object_metadata: None,
-        metadata_written: false,
     }
 }
 

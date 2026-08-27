@@ -66,7 +66,7 @@ HTTP_PORT=8081 ./s3-proxy -c config.yaml
 server:
   http_port: 80              # HTTP proxy port (caching enabled)
   https_port: 443            # HTTPS proxy port (TCP passthrough, no caching)
-  max_concurrent_requests: 1000   # default; raised from 200 in 2.5.0
+  max_concurrent_requests: 1000   # default
   request_timeout: "30s"          # NOT ENFORCED — see below
 ```
 
@@ -99,11 +99,11 @@ Default `1000`.
 - Large deployments (500+ users): 300-1000+
 - High-throughput scenarios: 1000+
 
-These bands predate 2.5.0, when a permit covered only request setup. A permit now
-covers the whole transfer, so the same number admits fewer simultaneous requests
-than it used to — treat the bands as a starting point and confirm against
-`/metrics` → `request_metrics.permits_held_peak` under your own load. For
-reference, a 100-client fleet test of 8 MiB ranged reads peaked at 71 permits held.
+A permit is held for the whole transfer, not just request setup, so these bands
+admit fewer simultaneous requests than the raw numbers suggest. Treat them as a
+starting point and confirm against `/metrics` →
+`request_metrics.permits_held_peak` under your own load. For reference, a
+100-client test of 8 MiB ranged reads peaked at 71 permits held.
 
 ##### What this limit actually covers
 
@@ -201,9 +201,8 @@ rejected with the same HTTP 503 `SlowDown` + `Retry-After` response used by
 request itself is too large. AWS SDKs retry 503 with backoff automatically.
 Startup validation rejects a non-zero `max_inflight_buffer_bytes` below **1 MiB**,
 the internal bound on a single buffered request body — below that floor every
-maximal buffered body would be rejected regardless of load. `0` is exempt. The
-floor was 5 GiB before 2.5.0, which no recommended instance could satisfy; any
-ceiling at or above 1 MiB is now legal with no other configuration change.
+maximal buffered body would be rejected regardless of load. `0` is exempt. Any
+ceiling at or above 1 MiB is legal with no other configuration change.
 
 A single request counts once against the ceiling for a given set of bytes, even when
 serving it involves an internal re-fetch of the same range (for example repairing a
@@ -643,20 +642,67 @@ cache:
   (expires after one `get_ttl` window from the first GET, regardless of how
   frequently it is accessed).
 - Objects never read expire after the original `put_ttl` and are evicted normally.
+- The transition also **releases the object's bytes from the write-cache allocation**.
+  Until the first read the object counts against `write_cache_percent`; afterwards it
+  counts only against the total cache size. The bytes are not moved or rewritten — only
+  which allocation they are charged to changes, so `cache.write_cache_size` falls while
+  `cache.size` does not. `write_cache.graduations_total` counts these transitions; see
+  [METRICS_REFERENCE.md](METRICS_REFERENCE.md#write_cache).
+- The release is applied once per object across the whole fleet, so several proxies
+  reading the same object at the same moment cannot release its bytes more than once.
 
 ### Capacity Management
 
-Write cache is limited to a percentage of total disk cache to prevent starving read cache:
+The write cache is allocated a percentage of the total disk cache, so that uploads cannot
+crowd out read-cached data:
 
 ```yaml
 cache:
   write_cache_percent: 10.0  # Default: 10% of max_cache_size
 ```
 
+**What `write_cache_percent` bounds.** It bounds **un-graduated staging** —
+objects that have been written through the cache but not yet read — not all write-cached
+data. Once an object is read for the first time it graduates: it stops counting against
+this allocation and counts only against the total cache size instead, exactly as described
+under [TTL Transition on First Read](#how-write-caching-works) above. A deployment whose
+workload reads back what it writes therefore keeps very little resident against this
+percentage at any given moment, regardless of how much has been written through overall.
+
+The bound applies to bytes resident on the **shared cache volume**, fleet-wide, not to a
+private per-instance figure. Every proxy sharing the volume reads and enforces against the
+same underlying size, so the allocation is not multiplied by the number of instances.
+
+Enforcement is continuous, against the staged bytes recorded for the shared volume. Going
+over the allocation triggers background reclamation and refuses nothing — see Eviction
+behavior below. If a larger unread working set is intended, raise `write_cache_percent`
+rather than letting reclamation churn against it.
+
 **Eviction behavior**:
-- When write cache is full, oldest write-cached objects are evicted first
-- Uses the same eviction algorithm as read cache (LRU or TinyLFU)
-- If eviction cannot free enough space, the PUT bypasses caching
+- **The allocation is a target, not a limit.** An upload is cached even when the allocation
+  is already full; the excess is reclaimed in the background rather than by refusing the
+  upload. Reclamation starts at `eviction_trigger_percent` of the allocation and runs until
+  it reaches `eviction_target_percent` — the same two knobs the read cache uses, so
+  hysteresis tuned for one tier applies to both.
+- **Reclamation order is oldest-staged-first, with expired entries first.** An object that
+  has never been read cannot change its own eviction rank — its last-access time *is* its
+  write time — so there is no frequency or recency score to compute. Objects whose
+  `put_ttl` has elapsed without ever being read are reclaimed ahead of those still within
+  it, and both are candidates.
+- **Reclamation never runs on the request path.** It is driven from the background
+  maintenance cycle, so no upload waits on it, and a deployment that stops uploading still
+  drains its staging tier.
+- Staged bytes also leave the allocation without any reclamation, by being read for the
+  first time (graduation, described above) — which is the normal case for a
+  read-after-write workload.
+- **Only available space declines to cache.** A write-through upload is skipped when
+  caching it would take the cache past `max_cache_size`, or when the cache volume has less
+  than 1 GiB free beyond the object's own size. This is reported as `disk_safety` in
+  `signed_put.skipped_puts_total`, and `/health` reports the cache component as `Degraded`
+  while it is happening. The upload itself always proceeds to S3 regardless.
+- See
+  [EVICTION.md — Recovery from an inflated write-cache figure](EVICTION.md#recovery-from-an-inflated-write-cache-figure)
+  if the reported write-cache size looks too high for what is actually staged.
 
 ### Incomplete Upload Cleanup
 
@@ -912,8 +958,8 @@ See [CACHING.md](CACHING.md#cache-rules) for the runtime behavior of each settin
 Request-flow walkthroughs for each TTL state — fresh cache, expired GET TTL, a
 PUT-cached object read for the first time, HEAD revalidation, conditional requests,
 multipart, and incomplete-upload cleanup — live in
-[CACHING.md — Cache Validation Flow](CACHE_FRESHNESS.md#cache-validation-flow), which covers
-thirteen scenarios rather than the four this section used to duplicate.
+[CACHE_FRESHNESS.md — Cache Validation Flow](CACHE_FRESHNESS.md#cache-validation-flow),
+which covers thirteen scenarios.
 
 For the fields that drive them, see [Time-To-Live (TTL) Configuration](#time-to-live-ttl-configuration).
 
@@ -1141,8 +1187,9 @@ cache:
     recovery_max_concurrent: 10             # Default: 10
 ```
 
-`validation_threshold_warn` and `validation_threshold_error` select a **log level only**.
-Neither gates the size correction, which the validation scan applies unconditionally.
+`validation_threshold_warn` and `validation_threshold_error` select a **log level only**,
+and only on rolling scans. Neither gates the size correction, which the validation scan
+applies unconditionally.
 
 **Note**: Journal-based metadata writes and distributed eviction locking are always enabled for consistency across all deployment modes. There is no `enabled` flag - these features are always active.
 
@@ -1175,12 +1222,13 @@ See [SHARED_STORAGE.md](SHARED_STORAGE.md) for how each works and its failure mo
 | `lock_timeout` | Max wait for file locks | Small cache: 60s, Large cache: up to 300s (the validated maximum) |
 | `consolidation_interval` | Journal flush frequency | 5s (default), reduce for faster consistency |
 | `validation_frequency` | Accepted and validated, but **not read by the scheduler** | Leave at the default; see [Validation Scan](#validation-scan) |
-| `validation_max_duration` | Time budget for validation scan | 4h (default). Controls automatic full↔rolling mode switching |
+| `validation_max_duration` | Selects the next cycle's scan mode; does **not** bound the scan in progress | 4h (default). Controls automatic full↔rolling mode switching |
 | `eviction_lock_timeout` | Distributed eviction timeout | Match lock_timeout for consistency |
 
 ### Validation Scan
 
-A daily scan reconciles tracked cache size against actual disk usage.
+A daily scan reads every cached `.meta` file and reconciles tracked cache size against the
+sizes those files record. It does not stat the range (`.bin`) files.
 
 **Cadence is not configurable.** It fires once per day at midnight local time, plus up to
 one hour of random jitter to avoid a thundering herd across instances.
@@ -1199,9 +1247,14 @@ mode (all 256 L1 shard directories in parallel) and a **rolling** mode (a subset
 cycle, resuming from a persistent cursor) depending on whether the previous scan fit
 inside this budget. No manual mode switching is needed.
 
+It selects the next cycle's mode and does not bound the current one — nothing aborts a scan
+in progress. A full scan runs to completion, then warns that it overran, and the following
+cycle switches to rolling.
+
 **`validation_threshold_warn`** (default `5.0`) and **`validation_threshold_error`**
-(default `20.0`) are drift percentages that select a **log level only**. Neither gates the
-size correction, which is applied unconditionally.
+(default `20.0`) are drift percentages that select a **log level only**, and they apply to
+**rolling scans only**. Neither gates the size correction, which is applied unconditionally
+in both modes.
 
 The mode-selection rules, the rolling scan's adaptive batch sizing and cursor persistence,
 and what to monitor are in
@@ -1220,7 +1273,7 @@ cache:
 
 When multiple requests arrive for the same uncached resource (full object, byte range, or part number), only one request fetches from S3 while others wait. Waiters serve from cache after the fetcher completes.
 
-On waiter timeout the proxy does **not** launch an independent duplicate fetch — that behaviour was removed in 1.16.0 because it defeated the point of coalescing under load. A timed-out waiter is re-subscribed to the still-in-flight fetch, up to `download_coordination.max_waiter_resubscriptions` (default 3); once that budget is exhausted the waiter receives HTTP 504.
+On waiter timeout the proxy does **not** launch an independent duplicate fetch, which would defeat the point of coalescing under load. A timed-out waiter is re-subscribed to the still-in-flight fetch, up to `download_coordination.max_waiter_resubscriptions` (default 3); once that budget is exhausted the waiter receives HTTP 504.
 
 Disable for single-instance deployments with no concurrent duplicate requests, or when debugging cache behavior.
 

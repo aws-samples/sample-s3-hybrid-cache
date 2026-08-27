@@ -7,6 +7,8 @@
 //! - Requirement 5.2: Uses invalidate_cache_unified_for_operation with "DELETE"
 //! - Requirement 5.3: Cache invalidation failure logged at WARN, successful S3 response still returned
 
+mod common;
+
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::{MetadataCacheConfig, SharedStorageConfig};
@@ -74,9 +76,15 @@ async fn store_test_cache_entry(cache_manager: &CacheManager, cache_key: &str) -
         access_count: 0,
         last_accessed: std::time::SystemTime::now(),
     };
-    cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
-        .await
+    common::put_through_write_cache(
+        cache_manager,
+        cache_key,
+        &data,
+        headers,
+        metadata,
+        HashMap::new(),
+    )
+    .await
 }
 
 /// Test: signed DELETE with success status triggers cache invalidation

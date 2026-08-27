@@ -26,6 +26,7 @@ fn create_test_range_spec(start: u64, end: u64) -> RangeSpec {
         created_at: now,
         last_accessed: now,
         access_count: 1,
+        staged: None,
     }
 }
 

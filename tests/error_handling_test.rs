@@ -101,6 +101,7 @@ async fn test_missing_range_file_handling() {
             created_at: now,
             last_accessed: now,
             access_count: 1,
+            staged: None,
         }],
         created_at: now,
         expires_at: now + std::time::Duration::from_secs(3600),

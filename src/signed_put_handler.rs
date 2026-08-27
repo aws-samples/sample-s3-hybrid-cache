@@ -835,6 +835,13 @@ impl SignedPutHandler {
                     "Streaming PUT: decoded object length unknown, skipping cache: cache_key={}",
                     cache_key
                 );
+                if let Some(metrics) = &self.metrics_manager {
+                    metrics
+                        .read()
+                        .await
+                        .record_skipped_put("unknown_length")
+                        .await;
+                }
                 return (None, None);
             }
         };
@@ -873,6 +880,27 @@ impl SignedPutHandler {
                     "Streaming PUT: write-cache capacity unavailable, skipping cache: cache_key={}",
                     cache_key
                 );
+                if let Some(metrics) = &self.metrics_manager {
+                    // `open_write_cache_sink` returns `Ok(None)` for two distinct
+                    // reasons, distinguished here rather than inside it so its control
+                    // flow stays untouched.
+                    //
+                    // **`capacity_refused` is deliberately no longer one of them.** The
+                    // Staging_Bound stopped being an admission gate in 2.7.0 (R3.1):
+                    // going over it now triggers asynchronous eviction and still caches.
+                    // So the only remaining refusals are the per-object size cap and the
+                    // Disk_Safety_Bound, and attributing the latter to `capacity_refused`
+                    // would point an operator at `write_cache_percent` when the actual
+                    // cause is the whole cache being full or the volume being out of
+                    // space — two very different remedies.
+                    let max_object_size = cache_manager.get_write_cache_max_object_size().await;
+                    let reason = if decoded_len > max_object_size {
+                        "object_too_large"
+                    } else {
+                        crate::cache::DISK_SAFETY_SKIP_REASON
+                    };
+                    metrics.read().await.record_skipped_put(reason).await;
+                }
                 return (None, None);
             }
             Err(e) => {
@@ -2594,7 +2622,35 @@ impl SignedPutHandler {
             write_cache_expires_at: Some(now + write_ttl),
             write_cache_created_at: Some(now),
             write_cache_last_accessed: Some(now),
+            graduation_accounted: false,
         };
+
+        // Record per-range staging membership before the `.meta` is written.
+        //
+        // A FIFTH credit site, not in R12.4's list of four, and it is the one that
+        // matters most for the defect. R12.4 names
+        // `write_multipart_journal_entries` as the multipart credit site, which is
+        // where the *accounting* credit happens — but this function writes the
+        // `.meta` **directly and first** (for atomicity, see the comment on the
+        // journal call below), so the persisted range is this copy, not the journal's.
+        // Stamping only the journal copy would leave every multipart part on disk with
+        // `staged: None` and therefore on the object-flag fallback.
+        //
+        // That is precisely the reachable shape: R12's mixed state needs a flagged
+        // object with incomplete range coverage that then takes a GET range-miss, and
+        // task 74 records multipart write-through as its most likely production route.
+        // Leaving this site out would have fixed the defect everywhere except where it
+        // actually occurs.
+        //
+        // Derived from the object flag rather than hardcoded `Some(true)`, so a future
+        // change to `is_write_cached` above cannot silently mis-tier every part.
+        // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
+        for range_spec in &mut range_specs {
+            range_spec.staged = Some(crate::cache_types::classify_new_range_as_staged(
+                &range_spec.file_path,
+                object_metadata.is_write_cached,
+            ));
+        }
 
         // Delete old range files if this is overwriting an existing object
         // This prevents disk space leaks and stale data issues
@@ -2692,6 +2748,11 @@ impl SignedPutHandler {
                     )
                     .await;
             }
+
+            // Best-effort staged-entry gauge: a new write-cached (is_write_cached:
+            // true) `.meta` was just committed atomically above.
+            // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
+            cache_mgr.increment_write_cache_staged_entries().await;
         }
 
         // Log the final summary with human-readable format
@@ -3472,12 +3533,13 @@ impl SignedPutHandler {
                 );
                 if let Some(m) = &metrics {
                     m.read().await.record_put_cache_failure().await;
+                    m.read().await.record_skipped_put("commit_failed").await;
                 }
                 return StreamingCacheOutcome::Skipped("commit_error");
             }
         };
-        let range_spec = match finalize_res {
-            Ok(range_spec) => range_spec,
+        let (range_spec, range_already_existed) = match finalize_res {
+            Ok(pair) => pair,
             Err(e) => {
                 // Finalize failed (disk error, length mismatch, etc.). The writer was
                 // consumed and its `.tmp` cleaned up; the upload is unaffected
@@ -3488,6 +3550,7 @@ impl SignedPutHandler {
                 );
                 if let Some(m) = &metrics {
                     m.read().await.record_put_cache_failure().await;
+                    m.read().await.record_skipped_put("commit_failed").await;
                 }
                 return StreamingCacheOutcome::Skipped("commit_error");
             }
@@ -3501,6 +3564,7 @@ impl SignedPutHandler {
                         range_spec,
                         object_metadata,
                         ttl,
+                        range_already_existed,
                     )
                     .await
                 {
@@ -3528,6 +3592,7 @@ impl SignedPutHandler {
                         );
                         if let Some(m) = &metrics {
                             m.read().await.record_put_cache_failure().await;
+                            m.read().await.record_skipped_put("commit_failed").await;
                         }
                         StreamingCacheOutcome::Skipped("commit_error")
                     }
@@ -3625,6 +3690,7 @@ impl SignedPutHandler {
             write_cache_expires_at: Some(now + ttl),
             write_cache_created_at: Some(now),
             write_cache_last_accessed: Some(now),
+            graduation_accounted: false,
             ..Default::default()
         }
     }
@@ -3959,6 +4025,7 @@ impl SignedPutHandler {
                 );
                 if let Some(m) = &metrics {
                     m.read().await.record_put_cache_failure().await;
+                    m.read().await.record_skipped_put("commit_failed").await;
                 }
                 StreamingCacheOutcome::Skipped("part_record_error")
             }

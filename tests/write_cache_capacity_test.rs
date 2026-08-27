@@ -115,8 +115,12 @@ async fn test_get_write_cache_capacity_different_percentages() -> Result<()> {
         64,                                 // ram_cache_shard_count
         std::time::Duration::from_secs(5),  // upstream_first_byte_timeout
     );
-    cache_manager.update_total_cache_size(1024 * 1024 * 1024); // 1GB
-
+    // Capacity is derived from `max_cache_size_limit`, which the constructor's
+    // `1024 * 1024 * 1024` argument above already set. There used to be an
+    // `update_total_cache_size(1 GiB)` call here, but it wrote a different field
+    // (`total_cache_size`) that `get_write_cache_capacity` never reads — so it looked
+    // load-bearing while contributing nothing. That setter had no other caller and was
+    // deleted; this test's assertion is unchanged and still passes.
     let capacity = cache_manager.get_write_cache_capacity();
     assert!(capacity > 53_000_000 && capacity < 54_000_000); // ~5% of 1GB
 

@@ -3,6 +3,8 @@
 //! Tests cleanup of incomplete multipart uploads that have exceeded the timeout.
 //! Validates Requirements 7a.1, 7a.2, 7a.3, 7a.4, 7a.5 from unified-range-write-cache spec.
 
+mod common;
+
 use s3_proxy::{cache::CacheManager, config::SharedStorageConfig, Result};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -246,7 +248,7 @@ async fn test_cleanup_incomplete_uploads_preserves_completed() -> Result<()> {
         false,
         SharedStorageConfig::default(),
         10.0,
-        true, // write_cache_enabled: true - this test uses store_write_cache_entry
+        true, // write_cache_enabled: true - this test uses common::put_through_write_cache
         Duration::from_secs(86400), // 1 day incomplete_upload_ttl
         s3_proxy::config::MetadataCacheConfig::default(),
         95,                                 // eviction_trigger_percent
@@ -275,9 +277,15 @@ async fn test_cleanup_incomplete_uploads_preserves_completed() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(path, test_data, headers, metadata, HashMap::new())
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        path,
+        test_data,
+        headers,
+        metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     let cache_key = CacheManager::generate_cache_key(path, None);
 

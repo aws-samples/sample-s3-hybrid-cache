@@ -184,6 +184,7 @@ async fn test_remove_invalidated_range() {
         created_at: now - Duration::from_secs(7200),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 5,
+        staged: None,
     };
 
     let metadata = NewCacheMetadata {
@@ -234,6 +235,7 @@ async fn test_remove_invalidated_range_with_remaining_ranges() {
         created_at: now - Duration::from_secs(7200),
         last_accessed: now - Duration::from_secs(3600),
         access_count: 5,
+        staged: None,
     };
 
     // Valid range

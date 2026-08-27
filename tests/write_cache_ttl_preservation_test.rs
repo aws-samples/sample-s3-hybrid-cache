@@ -80,6 +80,7 @@ async fn store_read_cached_object(
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
         ..Default::default()
     };
 
@@ -122,6 +123,7 @@ async fn store_write_cached_object_with_expiry(
         write_cache_expires_at: Some(expires_at),
         write_cache_created_at: Some(now),
         write_cache_last_accessed: Some(now),
+        graduation_accounted: false,
         ..Default::default()
     };
 

@@ -7,6 +7,8 @@
 //! - Task 6.1: ETag comparison in find_cached_ranges
 //! - Task 6.2: Method to invalidate stale ranges
 
+mod common;
+
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::CacheMetadata;
 use s3_proxy::config::SharedStorageConfig;
@@ -85,9 +87,15 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        &data,
+        headers,
+        metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Step 2: Create range handler
     let range_handler = RangeHandler::new(cache_manager.clone(), disk_cache_manager.clone());
@@ -195,9 +203,15 @@ async fn test_invalidate_stale_ranges() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        &data,
+        headers,
+        metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Step 2: Verify data is stored
     let metadata_before = cache_manager.get_metadata_from_disk(cache_key).await?;
@@ -289,9 +303,15 @@ async fn test_invalidate_stale_ranges_no_mismatch() -> Result<()> {
         last_accessed: std::time::SystemTime::now(),
     };
 
-    cache_manager
-        .store_write_cache_entry(cache_key, &data, headers, metadata, HashMap::new())
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        &data,
+        headers,
+        metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Step 2: Try to invalidate with same ETag (should not invalidate)
     let invalidated = cache_manager

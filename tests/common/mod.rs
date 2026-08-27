@@ -516,3 +516,141 @@ impl S3ClientApi for StubS3Client {
 pub fn test_tls_config() -> Option<TlsConfig> {
     None
 }
+
+/// Seed `size_tracking/validation.json` so `CacheManager::initialize` does **not**
+/// start a validation scan concurrently with the test body.
+///
+/// # The race this closes
+///
+/// `initialize` starts the background validation task, and
+/// `CacheSizeTracker::calculate_next_validation_time` returns `SystemTime::now()`
+/// whenever `read_validation_metadata()` fails — logging "No validation metadata
+/// found, scheduling immediate validation". A fresh `TempDir` has no
+/// `validation.json`, and `validation_enabled` defaults to `true`, so **every** test
+/// that calls `initialize()` on a temp cache dir starts a full validation scan
+/// immediately, racing whatever the test does next.
+///
+/// `perform_full_validation` re-grounds the size state from its own disk snapshot and
+/// calls `SizeAccumulator::reset()`. So a test that writes cache files and then asserts
+/// on a size figure can have its result overwritten by a scan whose snapshot predates
+/// those writes, and it fails reporting zero.
+///
+/// Measured on 2026-08-25 against `cache_statistics_test`: 3/3 passes when the machine
+/// is idle, 2/5 failures under eight busy CPU-bound processes. It reproduced on both
+/// sides of an unrelated change, which is what identified it as load sensitivity rather
+/// than a regression. Two full-suite runs that day failed on it; the run the day before
+/// passed. That is the signature to recognise — a size assertion that fails with a
+/// plausible-looking zero, only under load, only in the full suite.
+///
+/// # How it works
+///
+/// Writing a `last_validation` of "now" makes `calculate_next_validation_time` schedule
+/// the next scan at the configured time of day tomorrow plus up to an hour of jitter, so
+/// the spawned task sleeps for hours and never runs inside the test. Only the six
+/// non-`#[serde(default)]` fields of `ValidationMetadata` are needed;
+/// `last_validation` serialises as epoch seconds.
+///
+/// Call this **before** `initialize()`. Calling it after does nothing: the scan is
+/// scheduled by then.
+///
+/// 71 test files under `tests/` call `initialize()` on a temp dir and therefore carry
+/// this race latently. Only `cache_statistics_test` has been observed failing, because
+/// it is one of the few that asserts on a size figure the scan can overwrite. Adopt this
+/// helper in the others as they are touched rather than in one sweep.
+pub fn seed_validation_metadata(cache_dir: &std::path::Path) {
+    let size_tracking = cache_dir.join("size_tracking");
+    std::fs::create_dir_all(&size_tracking).expect("create size_tracking dir");
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs();
+
+    let metadata = serde_json::json!({
+        "last_validation": now_secs,
+        "scanned_size": 0,
+        "tracked_size": 0,
+        "drift_bytes": 0,
+        "scan_duration_ms": 0,
+        "metadata_files_scanned": 0,
+    });
+
+    std::fs::write(
+        size_tracking.join("validation.json"),
+        serde_json::to_string_pretty(&metadata).expect("serialize validation metadata"),
+    )
+    .expect("write validation.json");
+}
+
+/// Cache an object the way a real client PUT does, for tests that mean
+/// "a write-through PUT happened".
+///
+/// # Why this exists
+///
+/// `CacheManager::store_write_cache_entry` was the production write-through entry
+/// point once — `.kiro/specs/archived/unified-range-write-cache/` records rewiring it
+/// onto `store_full_object_as_range` — and production later moved to
+/// `SignedPutHandler` without the tests following, so most of the write-cache suite
+/// asserted things about a path customers never took. **It has since been deleted**
+/// (task 61 of `write-cache-accounting-and-eviction`, 2026-08-26): every `tests/`
+/// caller was migrated to this helper, and the function itself is gone from
+/// `src/cache.rs`. The two paths differed in ways that mattered to what those tests
+/// claimed, and are kept here for anyone reading old history or a diff against it:
+///
+/// | | Production (`SignedPutHandler`) | Retired `store_write_cache_entry` |
+/// |---|---|---|
+/// | Pre-store invalidation | `invalidate_cache_unified_for_operation` → `invalidate_cache_hierarchy` (ranges, `.meta`, RAM, multipart fields, granular range keys) | its own inline loop (ranges + `.meta` only) |
+/// | Store | `store_put_as_write_cached_range` → sink → `store_new_metadata` + `credit_staged_range` | `store_full_object_as_range_new` |
+/// | Range file layout | `DiskCacheManager::get_new_range_file_path` — **sharded** (`ranges/{bucket}/{XX}/{YYY}/...`) | `CacheManager::get_new_range_file_path` — **flat** (`ranges/{key}_{s}-{e}.bin`) |
+/// | Size accounting | credits and debits | **neither** |
+///
+/// The range-file-layout row is a real finding the migration surfaced, not a fixture
+/// artefact: `put_conflict_invalidation_test.rs`'s `test_put_deletes_range_files_on_conflict`
+/// walked `ranges/` with a flat `read_dir` and found nothing until it was rewritten to
+/// walk recursively — the file was always being created correctly, just not where a
+/// flat scan looked.
+///
+/// # What it does
+///
+/// Exactly what `signed_put_handler.rs:3062-3079` does, in the same order: invalidate,
+/// then store through the production entry point. Nothing else — deliberately no
+/// convenience beyond that, so a test using it is exercising the real sequence.
+///
+/// # Not covered here: the streaming path
+///
+/// Production has a second write-through path for bodies large enough to stream
+/// (`SignedPutHandler::run_streaming_cache_write` → `store_streamed_write_cache_metadata`),
+/// and it is **`pub(crate)`**, so an integration test under `tests/` cannot reach it.
+/// That path already has in-crate unit coverage in `signed_put_handler.rs`'s own test
+/// module. Do not widen its visibility just to call it from here — add cases to the
+/// in-crate module instead, and leave this helper covering the buffered path only.
+pub async fn put_through_write_cache(
+    cache_manager: &s3_proxy::cache::CacheManager,
+    cache_key: &str,
+    data: &[u8],
+    headers: HashMap<String, String>,
+    metadata: CacheMetadata,
+    response_headers: HashMap<String, String>,
+) -> Result<()> {
+    // Step 1, as production does it first. This is the step whose semantics differ
+    // most from the retired helper: it also clears RAM entries, multipart metadata
+    // fields, and granular range-eviction keys.
+    cache_manager
+        .invalidate_cache_unified_for_operation(cache_key, "PUT")
+        .await?;
+
+    // Step 2. `etag` and `last_modified` come off the `CacheMetadata` the caller
+    // already builds; `content_type` comes off the request headers, which is the same
+    // mapping the now-retired `store_write_cache_entry` used internally, so callers
+    // that migrated off it needed no argument changes.
+    cache_manager
+        .store_put_as_write_cached_range(
+            cache_key,
+            data,
+            metadata.etag.clone(),
+            metadata.last_modified.clone(),
+            headers.get("content-type").cloned(),
+            response_headers,
+        )
+        .await
+}

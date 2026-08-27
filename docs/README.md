@@ -41,6 +41,7 @@ Then: [Configuration Reference](CONFIGURATION.md) for every field, and
 | Cap origin download bandwidth or share it fairly | [BANDWIDTH_QOS.md](BANDWIDTH_QOS.md) |
 | Cut upstream tail latency | [HEDGING.md](HEDGING.md) |
 | Run several proxies against one cache volume | [SHARED_STORAGE.md](SHARED_STORAGE.md) |
+| Route concurrent readers of the same bytes to one instance | [REQUEST_AWARE_ROUTING.md](REQUEST_AWARE_ROUTING.md) |
 | Parse the access log | [ACCESS_LOG_FORMAT.md](ACCESS_LOG_FORMAT.md) |
 | Build, test, or contribute | [DEVELOPER.md](DEVELOPER.md) |
 
@@ -62,6 +63,10 @@ Then: [Configuration Reference](CONFIGURATION.md) for every field, and
   failure modes
 - [ERROR_HANDLING.md](ERROR_HANDLING.md) — cache corruption, missing range files, disk
   exhaustion, orphaned files, and the upstream idle watchdog
+- [REQUEST_AWARE_ROUTING.md](REQUEST_AWARE_ROUTING.md) — optional HAProxy pattern that
+  selects a fleet member by object key and byte range, so concurrent readers of the same
+  bytes converge on one instance. Covers where it is worth running, bounded load, DNS
+  discovery, and a health-check trap that hides a broken fleet certificate
 
 ## Configuration
 

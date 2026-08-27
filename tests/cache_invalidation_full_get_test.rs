@@ -6,6 +6,8 @@
 //! - Verify that cached ranges from PUT are utilized
 //! - Verify that the proxy doesn't unnecessarily fetch from S3
 
+mod common;
+
 use s3_proxy::cache::CacheManager;
 use s3_proxy::cache_types::{CacheMetadata, UploadState};
 use s3_proxy::disk_cache::DiskCacheManager;
@@ -89,16 +91,16 @@ async fn test_put_then_full_get_uses_cache() {
     };
 
     println!("[TEST] Step 1: Storing PUT data in write cache");
-    cache_manager
-        .store_write_cache_entry(
-            &cache_key,
-            test_data,
-            headers.clone(),
-            metadata.clone(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        test_data,
+        headers.clone(),
+        metadata.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify the data was cached
     let cached_metadata = cache_manager
@@ -291,10 +293,16 @@ async fn test_put_then_full_get_large_object() {
     };
 
     println!("[TEST] Storing 1MB PUT data in write cache");
-    cache_manager
-        .store_write_cache_entry(&cache_key, &test_data, headers, metadata, HashMap::new())
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        &test_data,
+        headers,
+        metadata,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Simulate full object GET
     let requested_range = RangeSpec {
@@ -390,10 +398,16 @@ async fn test_has_cached_ranges_optimization() {
     };
 
     println!("[TEST] Step 1: Storing PUT data");
-    cache_manager
-        .store_write_cache_entry(&cache_key, test_data, headers, metadata, HashMap::new())
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        &cache_key,
+        test_data,
+        headers,
+        metadata,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Step 2: Call has_cached_ranges to check if optimization works
     println!("[TEST] Step 2: Checking has_cached_ranges");

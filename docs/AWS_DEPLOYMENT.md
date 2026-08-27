@@ -44,15 +44,27 @@ The origin is in a different Region to your compute, or outside AWS entirely, so
 
 ## Shared cache volume
 
-Use **FSx for OpenZFS** in an HA deployment type — `SINGLE_AZ_HA_2` if clients are concentrated in one AZ, `MULTI_AZ_1` or EFS Regional if clients span AZs — and place proxies in the same AZ as the clients they serve.
+Use **FSx for OpenZFS** in an HA deployment type: `SINGLE_AZ_HA_2` if clients are concentrated in one AZ, `MULTI_AZ_1` if they span AZs. Place proxies in the same AZ as the clients they serve. [EFS is a viable alternative](#the-efs-alternative) at low duty cycle.
 
-The volume is a shared dependency of the whole fleet, so its availability is the fleet's availability. HA pairs [fail over in under 60 seconds](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/availability-durability.html) where non-HA file systems self-heal in roughly 30 minutes, and throughput changes and maintenance become failovers rather than outages. HA doubles the unit price of throughput ($0.52 vs $0.26 per MBps-month) and IOPS ($0.012 vs $0.006); storage is $0.09 per GB-month either way (see [FSx for OpenZFS pricing](https://aws.amazon.com/fsx/openzfs/pricing/), us-east-1).
+The volume is a shared dependency of the whole fleet, so its availability is the fleet's availability. HA pairs [fail over in under 60 seconds](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/availability-durability.html) where non-HA file systems self-heal in roughly 30 minutes, and throughput changes and maintenance become failovers rather than outages.
+
+Both HA types are priced per provisioned unit ([FSx for OpenZFS pricing](https://aws.amazon.com/fsx/openzfs/pricing/), us-east-1):
+
+| Per month | `SINGLE_AZ_HA_2` | `MULTI_AZ_1` |
+|---|---|---|
+| Throughput | $0.52 /MBps | $0.87 /MBps (1.7×) |
+| SSD storage | $0.09 /GB | $0.18 /GB (2×) |
+| Provisioned SSD IOPS | $0.012 | $0.024 (2×) |
+
+Multi-AZ synchronously replicates storage across AZs, which is what doubles the SSD storage price.
 
 > **Note**: `SINGLE_AZ_HA_2` is not offered in every Region — check [Availability by AWS Region](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/available-aws-regions.html). Where it is absent, prefer `MULTI_AZ_1` over `SINGLE_AZ_HA_1`, which caps at 4,096 MB/s.
 
-**Multi-AZ clients**: when compute spans Availability Zones, use `MULTI_AZ_1` or EFS Regional so every proxy mounts through an AZ-local endpoint with no cross-AZ transfer charge. Place a proxy group in each AZ alongside the clients in that AZ; the file system replicates internally and all proxies share one cache namespace. With a single-AZ file system you can still place proxies local to clients in each AZ — RAM cache hits and origin fetches avoid cross-AZ transfer — but every disk-cache read crosses the AZ boundary to the file system, adding latency and per-GB transfer on the majority of requests that are not RAM-hot.
+**Multi-AZ clients**: `MULTI_AZ_1` is a preferred and a standby file server in two AZs, one active at a time behind a floating IP that follows the active server across failover. There is [no data transfer charge from any AZ in the Region](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/access-within-aws.html), but only proxies in the active server's AZ read locally. The rest traverse an inter-AZ network path on every disk-cache read, adding latency; a failover moves which AZ is local. AWS recommends placing clients in the preferred file server's AZ.
 
-**Single-AZ clients**: `SINGLE_AZ_HA_2` is the lower-cost, lower-latency choice when all compute is in one AZ. Place the file system in the same AZ as the proxies. FSx Multi-AZ costs roughly 1.7× on throughput and 2× on storage and IOPS.
+Place a proxy group in each AZ alongside the clients it serves. All proxies share one cache namespace. A Single-AZ file system adds per-GB transfer on top of that latency for proxies outside its AZ, on every request that is not a RAM hit.
+
+**Single-AZ clients**: `SINGLE_AZ_HA_2` is the lower-cost, lower-latency choice when all compute is in one AZ. Place the file system in the same AZ as the proxies.
 
 ### Sizing the file system
 
@@ -71,9 +83,11 @@ Storage adds $0.09 per GB-month on a 64 GiB minimum. Rates are [us-east-1 list p
 
 Size against the cached-read column, not the headline throughput figure. Reads served from the file server's memory run at roughly **2.4× the provisioned rate** (2.05× at the top tier) — these ratios are derived from the table above (cached-read baseline ÷ provisioned throughput). The provisioned number is the disk ceiling while cached reads are bound only by the network path. A cache is re-read heavy by nature, so this is the column that applies — but the benefit holds only while the working set fits the memory shown; beyond that, reads fall back to the disk rate.
 
+Throughput capacity also provisions the file server's CPU, which bounds metadata operation rates as well as bandwidth. At the 160 MB/s floor tier, parallel unlink and file creation flatten well below what the cached-read column implies. If the cache churns many small ranges, size a tier above what read throughput alone would justify.
+
 Pick the smallest tier whose **baseline** cached-read throughput clears your fleet's aggregate cache-hit read throughput with headroom. Size against the bytes the proxy reads off the volume — the compressed size, so client-delivered throughput divided by your compression ratio. Assume a ratio of 1 unless you know the content compresses; cached media, Parquet, and archives largely do not. The low tiers burst above baseline, which suits a spiky cache, but burst credits accrue only while you are under baseline, so do not size sustained load against them. Start modest: capacity is adjustable later, and on an HA file system adjusting it is a failover rather than an outage.
 
-Set storage capacity above `cache.max_cache_size`, leaving room for journals, locks, size-tracking state, and in-flight `.tmp` writes. SSD capacity grows but never shrinks.
+Set storage capacity above `cache.max_cache_size`, leaving room for journals, locks, size-tracking state, and in-flight `.tmp` writes. SSD capacity can be expanded but not reduced.
 
 Leave IOPS at the included 3 IOPS/GiB unless the volume is small. The proxy's demand is bounded by its own design — large-block range I/O, per-cycle journal consolidation, and `metadata_io_concurrency` capping metadata I/O at 32 concurrent operations per proxy — so the included IOPS on a multi-TB volume is ample. Provision explicitly below roughly 1 TB, where 3 IOPS/GiB is starved.
 
@@ -81,7 +95,7 @@ Leave compression to the proxy, which LZ4-compresses range data before writing. 
 
 ### The EFS alternative
 
-EFS is viable but not performance-equivalent. FSx has lower per-operation latency, which is why this project benchmarks on it; EFS offers lower cost at low duty cycle, elastic capacity, and simpler multi-AZ deployment.
+EFS is viable but not performance-equivalent. FSx answers each operation faster; EFS scales bulk operations wider, costs less at low duty cycle, has elastic capacity, and puts a mount target in every AZ.
 
 | | Read latency | Write latency |
 |---|---|---|
@@ -92,33 +106,91 @@ EFS is viable but not performance-equivalent. FSx has lower per-operation latenc
 
 Latency matters more here than headline throughput: each cache hit reads `.meta`, may take a lock, then reads range data, so per-operation cost lands on the critical path before any bytes flow. The gap is widest for small objects and amortizes away on large sequential reads.
 
+For an AZ-spanning fleet, EFS Regional has [a mount target in each AZ](https://docs.aws.amazon.com/efs/latest/ug/how-it-works.html) and each proxy mounts its own, so every proxy reads locally with no cross-AZ charge. This is the one place EFS beats FSx Multi-AZ, which keeps only one file server active. EFS One Zone has a single mount target and charges data access from other AZs.
+
 On EFS, **use Elastic Throughput and mount with the EFS client** (`amazon-efs-utils` 2.0 or later, or the EFS CSI driver). Both are required for the [1,500 MiBps per-client cap](https://docs.aws.amazon.com/efs/latest/ug/performance.html); any other combination is limited to 500 MiBps, and each proxy counts as one client. This is also why EFS has no use for `nconnect` — the client provides that connection parallelism itself, so the mount option that FSx needs has no equivalent here. Note that 2.0 replaced `stunnel` with `efs-proxy`, and existing mounts must be re-mounted to pick up its behaviour.
 
-FSx charges a flat rate for provisioned capacity; EFS charges per GB transferred ([$0.03/GB read, $0.06/GB written](https://aws.amazon.com/efs/pricing/) in us-east-1 Elastic Throughput), and because a miss writes to the volume, the effective EFS rate depends on hit rate. Compare like for like — 500 GB cache, 1,280 MB/s throughput:
+#### Storage backend behavior
+
+FSx for OpenZFS and EFS solve different problems.
+
+**FSx for OpenZFS** suits cache workloads that are sensitive to per-operation latency. Cache
+hits commonly read metadata, take a lock, and read range data, so several filesystem operations
+sit on the request path. Size its provisioned throughput for both cached-read capacity and the
+file server memory that holds frequently accessed data.
+
+**EFS Regional** suits fleets that need an AZ-local mount target for every proxy, elastic
+capacity, or a lower fixed cost at low duty cycle. It can scale bulk operations across its
+distributed service, but has higher metadata and locking latency than FSx. Use Elastic
+Throughput with the EFS mount helper so each proxy can reach the documented per-client limit.
+
+A Multi-AZ FSx file system has one active file server at a time. Clients in that server's AZ
+read locally; clients in other AZs traverse the regional network path. The file system fails
+over automatically, so which AZ is local can change. EFS Regional instead gives each AZ its own
+mount target.
+
+Choose the backend from the workload:
+
+- Choose **FSx** when cache-hit latency, lock-heavy maintenance, or predictable storage cost
+  matters most.
+- Choose **EFS Regional** when proxies span AZs, demand is elastic, or the workload stays below
+  the cost crossover below.
+- Size either backend from the traffic the proxy actually sends to the shared volume, after
+  accounting for compression and the two NIC crossings on a shared-volume cache hit.
+
+#### Cost comparison
+
+FSx charges a fixed rate for provisioned capacity; EFS charges per GB transferred
+([$0.03/GB read, $0.06/GB written](https://aws.amazon.com/efs/pricing/) in us-east-1
+Elastic Throughput). A cache miss writes to the volume, so the effective EFS transfer rate
+depends on hit rate.
+
+**Illustrative starting fleet:** three `c6in.large` proxies. The [network model below](#sizing-the-network)
+projects roughly 560 MiB/s of sustained shared-cache hits and 3,750 MiB/s while EC2 burst
+credits last. The 160 MB/s FSx tier cannot cover that burst. The 640 MB/s tier is the first
+that can: it supplies 1,550 MB/s cached-read baseline and roughly 5,000 MB/s burst from the
+sizing table. AWS documents the same performance levels for [Multi-AZ and Single-AZ 2](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/performance.html).
+
+EFS Elastic Throughput has no matching provisioned tier. Its 1,500 MiB/s per-client limit
+exceeds one proxy's share of this fleet's burst, so the proxy NICs bind before EFS does. This
+is a cost crossover for the documented starting fleet, not a performance-equivalence claim.
+For sustained load, size FSx against its cached-read **baseline**, as [Sizing the file system](#sizing-the-file-system) requires.
+
+The storage model assumes **500 GB of proxy-accounted compressed payload**, a **0.5 MB average
+range**, and one `.meta` per range: 1,000,000 pairs. On EFS, a 500,000-byte `.bin` rounds to
+503,808 bytes and carries a 2 KiB inode; a small `.meta` carries 2 KiB metadata plus a 4 KiB
+allocation. The pair meters at 512,000 bytes, so the payload cache occupies **512 GB** of EFS
+metered storage before directories and lock files. Recalculate for your range size and
+ranges-per-object ratio.
 
 **Multi-AZ** — FSx Multi-AZ vs EFS Regional:
 
-FSx: `$90 storage + $1,114 throughput` = $1,204/month. EFS: $150/month storage + transfer.
+FSx: `$90 storage + $557 throughput` = $647/month. EFS: **$153.60/month storage** + transfer.
 
 | Cache hit rate | EFS transfer per GB served | Break-even |
-|---|---|---|
-| 100% | $0.030 | ~35 TB/month served |
-| 50% | $0.045 | ~23 TB/month |
-| 0% | $0.060 | ~18 TB/month |
+|---|---:|---:|
+| 100% | $0.030 | ~16.4 TB/month served |
+| 50% | $0.045 | ~11.0 TB/month |
+| 0% | $0.060 | ~8.2 TB/month |
 
 **Single-AZ** — FSx Single-AZ HA vs EFS One Zone:
 
-FSx: `$45 storage + $666 throughput` = $711/month. EFS: $80/month storage + transfer.
+FSx: `$45 storage + $333 throughput` = $378/month. EFS: **$81.92/month storage** + transfer.
 
 | Cache hit rate | EFS transfer per GB served | Break-even |
-|---|---|---|
-| 100% | $0.030 | ~21 TB/month served |
-| 50% | $0.045 | ~14 TB/month |
-| 0% | $0.060 | ~11 TB/month |
+|---|---:|---:|
+| 100% | $0.030 | ~9.9 TB/month served |
+| 50% | $0.045 | ~6.6 TB/month |
+| 0% | $0.060 | ~4.9 TB/month |
 
-EFS is least competitive when the cache is cold or churning. Metering minimums (32 KiB per data operation, 4 KiB per metadata operation) add about 0.5% for large-object workloads, and 5–10× where objects are mostly under 32 KiB.
+EFS is least competitive when the cache is cold or churning. The 512 GB storage model above
+adds 12 GB (2.4%) for the `.bin` and `.meta` objects at a 0.5 MB average range; it excludes
+directory and lock-file allocation, so treat it as a floor. Elastic Throughput separately
+meters a minimum 32 KiB per data operation and 4 KiB per metadata operation. Those are transfer
+charges, not stored capacity: at 0.5 MB per range the data-operation minimum does not change
+the per-GB transfer figures above, but metadata operations still add cost.
 
-**Choose EFS** for spiky or low-duty-cycle workloads below the break-even, or for elastic capacity with no tier to size. **Choose FSx** when performance is the priority. A reasonable hybrid is cache on FSx, configuration and logs on EFS.
+**Choose EFS** for spiky or low-duty-cycle workloads below the break-even, or for elastic capacity with no tier to size, provided your mean cached range clears the eviction figure above. **Choose FSx** when performance or cost predictability is the priority, or when the cache churns small ranges: FSx bills a flat rate for provisioned capacity, so the monthly cost is fixed regardless of traffic, while the EFS bill tracks bytes served. A reasonable hybrid is cache on FSx, configuration and logs on EFS.
 
 ## EC2 fleet
 
@@ -171,39 +243,6 @@ The multiplier applies to burst too, so the same fleet has roughly 3,750 MiB/s o
 client-facing read headroom while credits last. A RAM hit crosses the NIC once, so
 raising `cache.max_ram_cache_size` buys network capacity as well as latency, often
 more cheaply than adding instances.
-
-#### A client faster than the fleet fails rather than slows
-
-When a client's throughput ceiling exceeds the fleet's aggregate, requests queue and
-time-to-first-byte grows. Clients built on the AWS Common Runtime (Mountpoint for
-Amazon S3, and the AWS CLI and SDKs using the CRT S3 client) enforce a minimum
-per-connection throughput and tear down connections that fall below it.
-
-Measured 2026-08-20: a 96-vCPU, 100 Gbps client wrote a 100 GiB file through
-Mountpoint into three `m6in.large` proxies. `UploadPart` kept returning `HTTP 200`,
-but time-to-first-byte reached about 30 seconds, at which point the client aborted
-the upload with `AWS_ERROR_HTTP_CHANNEL_THROUGHPUT_FAILURE` and the filesystem write
-returned `EIO`. The proxies stayed healthy and rejected nothing; the client gave up
-first.
-
-Two mitigations, which compose:
-
-- **Size for the write direction** using the table above, so the queue never forms.
-  Do this first.
-- **Set `server.max_concurrent_requests` to what the instance can service**, rather
-  than leaving the default of 1000. A permit spans the whole transfer, so the limit
-  is an admission-control gate: over-budget requests are shed immediately with
-  `503 SlowDown` and a `Retry-After`, which CRT-based clients retry with backoff,
-  instead of being accepted and left to stall. Check
-  `request_metrics.permits_held_peak` in `/metrics` to see how close a value is to
-  binding before lowering it.
-
-For what a fleet delivers, see the measured figures in [Performance](../README.md#performance). Against a cross-region bucket, 8 proxies reached **2.0 GiB/s** on cache misses and **5.5 GiB/s** on cache hits — roughly double the same test on 3 proxies. A separate same-Region test isolating one large proxy peaked at **3.6 GiB/s** on misses and **7.1 GiB/s** on RAM cache hits. Scale to 8 or more proxies when throughput requires it.
-
-Scaling up buys more connections per instance and raises the per-instance baseline:
-`m6in.2xlarge` sustains 12.5 Gbps against `m6in.large`'s 3.125. Scale out for
-aggregate throughput; scale up when a single client is fast enough to overrun one
-proxy, as in [A client faster than the fleet](#a-client-faster-than-the-fleet-fails-rather-than-slows).
 
 Sizing memory: `server.max_concurrent_requests` now bounds the whole request including its transfer, not just setup, so the streaming-path memory formula `~200 MiB + max_concurrent_requests × ~5 MiB` (see [Configuration → Memory Impact](CONFIGURATION.md#server-configuration)) is a sound fleet-wide ceiling for the streaming paths. It does not cover the read paths that still buffer a whole range — those are bounded in aggregate across concurrent requests by the opt-in `max_inflight_buffer_bytes` ceiling. On a 4 GiB `c6in.large` with the default 512 MiB RAM cache, 512 MiB (`536870912`) is a reasonable starting ceiling. `cache.max_ram_cache_size` (default 512 MiB) is a third, independent budget on top of both. Confirm all three against measured peak resident memory and the corresponding `/metrics` fields (`request_metrics.permits_held_peak`, `inflight_memory.peak_reserved_bytes`) under representative load.
 
@@ -329,7 +368,7 @@ To let clients use the default port instead, point the NLB's TCP listener on 443
 
 **Auto Scaling with NLB**: attach the ASG directly to the target group. Registration and deregistration are automatic — no lifecycle hook or Lambda needed. The deregistration delay drains in-flight connections before the instance is terminated.
 
-Use an NLB, not an ALB — see [Why Layer 4, Not Layer 7](GETTING_STARTED.md#why-layer-4-not-layer-7).
+**Use an NLB, not an ALB.** The proxy already terminates and interprets HTTP itself, so an ALB redoes that work on every request for no gain and inserts its own HTTP behaviour between client and proxy. An NLB forwards bytes at Layer 4 and stays out of the way. If you specifically want a Layer 7 router that picks an instance from the request path, that is a different design — see [Request-Aware Routing](REQUEST_AWARE_ROUTING.md).
 
 ### Choosing between DNS and NLB
 
@@ -342,7 +381,9 @@ Use an NLB, not an ALB — see [Why Layer 4, Not Layer 7](GETTING_STARTED.md#why
 | Client → proxy encryption | Cleartext (HTTP on port 80 for caching); HTTPS on 443 passes through uncached | Encrypted and cached via the TLS listener on 3129 — Pattern 3 (re-encrypt at NLB) or Pattern 2 (TCP passthrough) |
 | Cost | < $1/month (query charges) | ~$450/month at 100 GB/hr; ~$2,200/month at 500 GB/hr ([pricing](https://aws.amazon.com/elasticloadbalancing/pricing/)) |
 
-NLB is the simpler path for multi-AZ fleets with Auto Scaling: AZ affinity, health checking, and scaling are all managed for you, and it is the only client-routing mechanism that encrypts the client→proxy hop while still caching. DNS is cheaper at any throughput and simpler for static fleets and CRT clients, but the caching path is cleartext — see [What a Cleartext Hop Exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes). [VPC Encryption Controls](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-encryption-controls.html) can mitigate this: in monitor or enforce mode, Nitro hardware encrypts traffic between instances even when the application layer is cleartext, so the HTTP hop is protected from network-level observers without changing the proxy configuration. Choose DNS when cost matters more than managed health checking and automatic registration, and either VPC Encryption Controls is active or the cleartext exposure is acceptable for your network.
+NLB is the simpler path for multi-AZ fleets with Auto Scaling: AZ affinity, health checking, and scaling are all managed for you, and of the two mechanisms compared here it is the only one that encrypts the client→proxy hop while still caching. DNS is cheaper at any throughput and simpler for static fleets and CRT clients, but the caching path is cleartext — see [What a Cleartext Hop Exposes](ARCHITECTURE.md#what-a-cleartext-hop-exposes). [VPC Encryption Controls](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-encryption-controls.html) can mitigate this: in monitor or enforce mode, Nitro hardware encrypts traffic between instances even when the application layer is cleartext, so the HTTP hop is protected from network-level observers without changing the proxy configuration. Choose DNS when cost matters more than managed health checking and automatic registration, and either VPC Encryption Controls is active or the cleartext exposure is acceptable for your network.
+
+**A third option, self-managed.** Running HAProxy in front of the fleet also encrypts the client hop while caching, and adds routing by object key and byte range so concurrent readers of the same bytes converge on one instance. On a client host it removes the load balancer from the data path entirely, which is the only way to avoid the per-GB charge above while keeping an encrypted hop. The cost is that you operate it. See [Request-Aware Routing](REQUEST_AWARE_ROUTING.md), which also explains why putting it *behind* an NLB on AWS keeps the charge it was meant to avoid.
 
 ## Origin configuration
 

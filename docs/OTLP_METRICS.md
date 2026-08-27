@@ -99,10 +99,22 @@ Most metrics are **gauges with no per-metric dimensions**. Two groups are except
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `cache.total_cache_size` | Gauge (bytes) | Total cache size (read + write + RAM) |
-| `cache.read_cache_size` | Gauge (bytes) | Disk read cache size |
-| `cache.write_cache_size` | Gauge (bytes) | Disk write cache size |
-| `cache.ram_cache_size` | Gauge (bytes) | RAM cache size |
+| `cache.total_cache_size` | Gauge (bytes) | Bytes on the shared cache volume, exactly `read + write_cache`. Fleet-wide |
+| `cache.max_cache_size_limit` | Gauge (bytes) | Configured `cache.max_cache_size`. Divide `total_cache_size` by this for utilisation. `0` means unlimited |
+| `cache.read_cache_size` | Gauge (bytes) | Non-staged bytes: read at least once. Fleet-wide |
+| `cache.write_cache_size` | Gauge (bytes) | Staged bytes: written through, not yet read. Fleet-wide |
+| `cache.ram_cache_size` | Gauge (bytes) | RAM cache size, counting copies of bytes also on disk. **Per-instance** |
+
+The two disk gauges are disjoint and partition the volume, so
+`cache.total_cache_size = cache.read_cache_size + cache.write_cache_size` holds exactly.
+`cache.ram_cache_size` is **not** part of that sum: it counts copies of bytes already on
+disk, and it is per-instance where the other three are fleet-wide. Sum it across instances
+for fleet RAM residency; do not aggregate the other three, which are already fleet-wide
+and would be multiplied by the instance count.
+
+`cache.total_cache_size` and `cache.read_cache_size` changed meaning in 2.7.0. A panel
+carried over from an earlier release that stacked the four gauges, or added read and
+write_cache to get a total, was double-counting; see [UPGRADING.md](UPGRADING.md).
 
 ### Cache — Hits / Misses / Evictions
 
@@ -216,6 +228,14 @@ The `page_cache.*` metrics for page-aligned range caching are **not** OTLP-expor
 They are available from the `/metrics` JSON endpoint and in the dashboard's
 `/api/cache-stats` payload. If you need them in a metrics backend, scrape `/metrics`.
 See [CACHING.md — Page-Aligned Range Caching](CACHE_READ_PATHS.md#page-aligned-range-caching).
+
+The `write_cache.*` section (Staging_Tier observability — `resident_bytes`,
+`staging_bound_bytes`, `inflight_bytes`, `over_bound`, `staged_entries`,
+`staging_evictions_total`, `staging_eviction_bytes_total`) and
+`signed_put.skipped_puts_total` are also **not** OTLP-exported. Both are available only
+from the `/metrics` JSON endpoint — scrape it directly if you need them in a metrics
+backend. See [METRICS_REFERENCE.md](METRICS_REFERENCE.md#write_cache) and
+[METRICS_REFERENCE.md](METRICS_REFERENCE.md#skipped_puts_total).
 
 ## Configuration Options
 

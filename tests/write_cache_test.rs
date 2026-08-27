@@ -6,6 +6,8 @@
 //! Note: For detailed unit tests of PUT storage, metadata, and TTL behavior,
 //! see write_cache_unit_test.rs
 
+mod common;
+
 use s3_proxy::{
     cache::CacheManager, cache_types::CacheMetadata, config::SharedStorageConfig, Result,
 };
@@ -70,15 +72,15 @@ async fn test_write_cache_basic_operations() -> Result<()> {
     let metadata = create_test_metadata("test-etag", test_data.len() as u64);
 
     // Store write cache entry
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata.clone(),
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata.clone(),
+        HashMap::new(),
+    )
+    .await?;
 
     // Retrieve and verify
     let retrieved = cache_manager.get_write_cache_entry(cache_key).await?;
@@ -159,15 +161,15 @@ async fn test_write_cache_ttl_expiration() -> Result<()> {
     let test_data = b"Test data";
     let metadata = create_test_metadata("expired-etag", test_data.len() as u64);
 
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Should exist and not be expired yet
     assert!(cache_manager
@@ -193,15 +195,15 @@ async fn test_write_cache_cleanup() -> Result<()> {
     let test_data = b"Data to be cleaned up";
     let metadata = create_test_metadata("cleanup-etag", test_data.len() as u64);
 
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Cleanup should remove the entry
     cache_manager.cleanup_failed_put(cache_key).await?;
@@ -232,15 +234,15 @@ async fn test_write_cache_statistics() -> Result<()> {
         .await?
         .is_none());
 
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata,
-            HashMap::new(),
-        )
-        .await?;
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata,
+        HashMap::new(),
+    )
+    .await?;
 
     // Verify the entry was stored (write cache size tracking is async via JournalConsolidator,
     // so we verify the entry exists on disk rather than checking in-memory tracker stats)

@@ -58,6 +58,39 @@ impl Default for HealthManager {
     }
 }
 
+/// Cache usage threshold, as a percentage of the configured limit, above which the
+/// cache component reports [`HealthStatus::Degraded`].
+const CACHE_USAGE_DEGRADED_PERCENT: f64 = 95.0;
+
+/// Classify on-disk cache usage against the configured cache size limit.
+///
+/// Split out from [`HealthManager::check_cache_health`] so the arithmetic is testable
+/// without constructing a `CacheManager`, and so the two edge cases have named
+/// coverage: an unconfigured limit, and the division that used to produce `NaN`.
+///
+/// `limit_bytes` of 0 means no cache size limit is configured (`max_cache_size_limit`
+/// defaults to 0, and `CacheManager` itself treats `max_size > 0` as the precondition
+/// for every capacity comparison). There is no capacity to be a percentage of, so this
+/// reports Healthy and says so, rather than dividing by zero.
+fn evaluate_cache_usage(used_bytes: u64, limit_bytes: u64) -> (HealthStatus, String) {
+    if limit_bytes == 0 {
+        return (
+            HealthStatus::Healthy,
+            format!("Cache usage: {} bytes, no limit configured", used_bytes),
+        );
+    }
+
+    let usage_percent = (used_bytes as f64 / limit_bytes as f64) * 100.0;
+
+    let status = if usage_percent > CACHE_USAGE_DEGRADED_PERCENT {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Healthy
+    };
+
+    (status, format!("Cache usage: {:.1}%", usage_percent))
+}
+
 impl HealthManager {
     /// Create new health manager
     pub fn new() -> Self {
@@ -147,30 +180,92 @@ impl HealthManager {
     }
 
     /// Check cache system health
+    ///
+    /// # Why this reads `get_cache_size_stats` rather than `get_statistics`
+    ///
+    /// This check was vacuous on every deployment until 2026-08-26. It divided by
+    /// `get_statistics().total_cache_size`, and that is the *stored* copy of the
+    /// statistics, whose `total_cache_size` was only ever written by
+    /// `CacheStatistics::default()` (zero) and by a test-only setter (since removed
+    /// along with this fix, having had no production caller). The figure is computed in
+    /// `get_cache_size_stats`, on a local copy that is never written back — so in
+    /// production the denominator was always 0, the ratio was always `NaN`,
+    /// `NaN > 95.0` is false, and the component reported Healthy regardless of how
+    /// full the cache was. Observed directly on all three verification-fleet proxies:
+    /// `Cache usage: NaN%`.
+    ///
+    /// The arithmetic was also wrong independently of that. The numerator was
+    /// `read_cache_size + write_cache_size` and the denominator the old three-way sum,
+    /// so the numerator was a *subset* of the denominator: the ratio could not exceed
+    /// 100% and could not express "95% of capacity" at all. Capacity is
+    /// `max_cache_size_limit`, which is what every eviction and capacity decision in
+    /// `CacheManager` already compares against, so this now uses the same pair —
+    /// on-disk bytes over the configured limit.
+    ///
+    /// Spec: write-cache-accounting-and-eviction. Requirements: 8.3
     async fn check_cache_health(&self, cache_manager: &Arc<CacheManager>) -> ComponentHealth {
         let start_time = SystemTime::now();
 
-        let stats = cache_manager.get_statistics();
+        let stats = cache_manager.get_cache_size_stats().await;
+
         let response_time = start_time
             .elapsed()
             .unwrap_or(Duration::from_millis(0))
             .as_millis() as u64;
 
-        // Consider cache unhealthy if it's using more than 95% of available space
-        let usage_percent = (stats.read_cache_size + stats.write_cache_size) as f64
-            / stats.total_cache_size as f64
-            * 100.0;
-
-        let status = if usage_percent > 95.0 {
-            HealthStatus::Degraded
-        } else {
-            HealthStatus::Healthy
+        let (status, message) = match stats {
+            // Compares the whole-cache figure against the configured limit — the same
+            // pair every capacity and eviction decision in `CacheManager` uses. `sizes` is
+            // always `Some` from `get_cache_size_stats`; `None` would mean the figures were
+            // never computed, which is a distinct condition from an empty cache and is
+            // reported as such rather than as 0%.
+            Ok(stats) => match stats.sizes {
+                Some(sizes) => {
+                    let (usage_status, usage_message) =
+                        evaluate_cache_usage(sizes.total_cache_size, stats.max_cache_size_limit);
+                    // R4.4: a live Disk_Safety_Bound breach degrades regardless of the
+                    // utilisation percentage, because the two can disagree. Free space on
+                    // the volume is a fact about the filesystem, whereas
+                    // `max_cache_size` is a configured intention — a volume smaller than
+                    // configured, or shared with something else, runs out of space while
+                    // utilisation still reads comfortably low. Reporting only the
+                    // percentage would call that Healthy while write-through caching was
+                    // being declined on every upload.
+                    match crate::cache::disk_safety_recently_breached() {
+                        Some(age_secs) => (
+                            HealthStatus::Degraded,
+                            format!(
+                                "{}. Write-through caching is being declined: the disk safety \
+                                 bound was breached {}s ago (cache volume out of space, or the \
+                                 cache is at its configured maximum). Uploads still succeed; \
+                                 they are not being cached.",
+                                usage_message, age_secs
+                            ),
+                        ),
+                        None => (usage_status, usage_message),
+                    }
+                }
+                None => (
+                    HealthStatus::Degraded,
+                    "Cache usage unknown: cache size figures were not computed".to_string(),
+                ),
+            },
+            // Report this rather than defaulting to Healthy. Failing to read the cache
+            // size is itself a signal, and silently passing is what made the old
+            // version of this check useless.
+            Err(e) => (
+                HealthStatus::Degraded,
+                format!(
+                    "Cache usage unknown: failed to read cache size stats: {}",
+                    e
+                ),
+            ),
         };
 
         ComponentHealth {
             name: "cache".to_string(),
             status,
-            message: Some(format!("Cache usage: {:.1}%", usage_percent)),
+            message: Some(message),
             last_check: start_time,
             response_time_ms: Some(response_time),
         }
@@ -321,6 +416,83 @@ mod tests {
     fn test_determine_overall_status_empty_is_healthy() {
         let mgr = HealthManager::new();
         assert_eq!(mgr.determine_overall_status(&[]), HealthStatus::Healthy);
+    }
+
+    /// The regression that made this check useless for the life of the project.
+    ///
+    /// The old code divided by `get_statistics().total_cache_size`, which is never
+    /// written in production and so was always 0. `0.0 / 0.0` is `NaN`, and
+    /// `NaN > 95.0` is `false`, so the component reported Healthy no matter how full
+    /// the cache was — observed as `Cache usage: NaN%` on all three verification-fleet
+    /// proxies. This asserts the zero-limit case is handled explicitly instead.
+    #[test]
+    fn cache_usage_with_no_configured_limit_does_not_produce_nan() {
+        let (status, message) = evaluate_cache_usage(20_767_307_686, 0);
+
+        assert_eq!(status, HealthStatus::Healthy);
+        assert!(
+            !message.contains("NaN"),
+            "message must not report NaN, got: {}",
+            message
+        );
+        assert!(
+            message.contains("no limit configured"),
+            "message should say the limit is unset, got: {}",
+            message
+        );
+    }
+
+    /// Both figures zero is the genuinely empty case, and must also not be `NaN`.
+    #[test]
+    fn cache_usage_with_empty_cache_and_no_limit_does_not_produce_nan() {
+        let (status, message) = evaluate_cache_usage(0, 0);
+
+        assert_eq!(status, HealthStatus::Healthy);
+        assert!(!message.contains("NaN"), "got: {}", message);
+    }
+
+    /// The live verification-fleet figures at the time of the fix: 20,767,307,686
+    /// bytes on disk against a 100 GiB configured limit is 19.3%, which is the answer
+    /// the old code should have given instead of `NaN`.
+    #[test]
+    fn cache_usage_reports_real_percentage_against_configured_limit() {
+        let (status, message) = evaluate_cache_usage(20_767_307_686, 107_374_182_400);
+
+        assert_eq!(status, HealthStatus::Healthy);
+        assert_eq!(message, "Cache usage: 19.3%");
+    }
+
+    #[test]
+    fn cache_usage_above_threshold_is_degraded() {
+        // 96 GiB of a 100 GiB limit = 96%, over the 95% threshold.
+        let (status, message) =
+            evaluate_cache_usage(96 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024);
+
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(message, "Cache usage: 96.0%");
+    }
+
+    /// The threshold is exclusive, so exactly 95% stays Healthy.
+    #[test]
+    fn cache_usage_exactly_at_threshold_is_healthy() {
+        let (status, message) = evaluate_cache_usage(95, 100);
+
+        assert_eq!(status, HealthStatus::Healthy);
+        assert_eq!(message, "Cache usage: 95.0%");
+    }
+
+    /// Structural check on the arithmetic, not just the threshold.
+    ///
+    /// The old numerator (`read + write`) was a subset of the old denominator
+    /// (`read + write + ram`), so the ratio was mathematically incapable of exceeding
+    /// 100% — it could not express "over capacity" at all, independently of the `NaN`
+    /// bug. Usage over the configured limit must now be representable and Degraded.
+    #[test]
+    fn cache_usage_over_the_limit_exceeds_one_hundred_percent() {
+        let (status, message) = evaluate_cache_usage(150, 100);
+
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(message, "Cache usage: 150.0%");
     }
 
     #[test]

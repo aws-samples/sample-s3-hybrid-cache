@@ -541,6 +541,8 @@ cache_dir/
 │   │   └── ...
 │   └── _journals/             # Access tracking journals for distributed eviction
 │       └── {instance_id}.journal   # Per-instance journal files
+│   └── _write_ledger/         # Staged (uploaded, not yet read) object records
+│       └── {instance_id}.ledger    # Per-instance; see EVICTION.md
 ├── ranges/                     # All cached data stored as binary ranges
 │   ├── {bucket}/              # S3 bucket name (first level)
 │   │   ├── {XX}/              # First 2 hex digits of BLAKE3(object_key)
@@ -855,6 +857,7 @@ Consolidated access data is written to range metadata:
       "end": 8388607,
       "access_count": 42,
       "last_accessed": "2024-01-15T10:30:00Z",
+      "staged": true,
       ...
     }
   ],
@@ -862,6 +865,18 @@ Consolidated access data is written to range metadata:
   "head_last_accessed": "2024-01-15T10:30:00Z"
 }
 ```
+
+**`staged`** records whether the range counts toward the write (staging) tier, decided
+once when the range was written and never re-derived. It is optional: a `.meta` written
+before this field existed omits it, and such a range is classified from the object's
+`is_write_cached` flag instead. That fallback is why the field is nullable rather than a
+plain boolean — reading a missing field as `false` would report the whole staging tier as
+empty on the first scan after an upgrade.
+
+Membership is per range because credits and debits are per range. A write-through PUT
+stages one range; a later GET for a different range of the same object caches that one to
+the read tier, while the object stays flagged until it graduates. Only the first range's
+bytes belong to `write_cache_size`.
 
 **Atomic Updates**: Metadata updates use temp file + rename pattern for atomicity.
 
@@ -1212,7 +1227,70 @@ Size State File (size_tracking/size_state.json):
 
 **Fields:**
 - **total_size**: Total cache size in bytes (read cache + write cache)
-- **write_cache_size**: Write cache size in bytes (subset of total_size)
+- **write_cache_size**: Write cache bytes — a **subset** of `total_size`, not an addition to
+  it, so read-cache bytes are `total_size - write_cache_size`. Counts the compressed bytes
+  of objects written through the cache that have **not yet been read**. An object leaves
+  this figure by being read for the first time (it becomes read-cached, and the bytes stay
+  on disk) or by being removed. Maintained only by the consolidator: adjusted incrementally
+  as objects are cached, read, and removed, and re-grounded absolutely by a full validation
+  scan.
+
+  Every credit and debit is by `compressed_size` and is classified through one shared
+  predicate, so a range cannot be added under one rule and subtracted under another. The
+  credit is applied when the cache entry is written, by whichever path wrote it — the two
+  single-object upload paths write their entry directly rather than through the journal (so
+  that an immediate read of a just-uploaded object is a cache hit), which means they credit
+  the accounting themselves; multipart completion credits via its journal entries. A range
+  that already existed on shared storage is not credited again, because the instance that
+  published it credited it then.
+
+  **A credit is only durable if it lands on the consolidator the background consolidation
+  task holds.** Deltas accumulate in memory on the consolidator instance and are written to
+  a delta file only by `run_consolidation_cycle`, which runs on the single `Arc` captured at
+  startup. There is therefore exactly one `JournalConsolidator` per process, created on the
+  first `create_configured_disk_cache_manager()` call and reused by every later one — the
+  same applies to the `HybridMetadataWriter` and `CacheHitUpdateBuffer` created alongside it,
+  which are likewise drained only by their own startup tasks. Constructing a second instance
+  of any of the three does not duplicate a component; it creates a sink whose contents are
+  discarded, because nothing that drains it holds a reference. The cycle's idle
+  short-circuit makes the failure total rather than partial: `has_pending_delta()` is false
+  on the task's own accumulator, so it returns before flushing anything.
+
+  If you add a code path that needs one of these, take it from
+  `create_configured_disk_cache_manager()` or the `get_*` accessors. Do not construct one.
+  `journal_components_identity_tests` in `src/cache.rs` pins this.
+
+  **Every deletion of a range file must debit, and must release the range's dedup entry.**
+  A path that removes a `.bin` and does not debit leaves the figure holding bytes the disk
+  no longer has; the two write paths that replace an object's content
+  (`store_put_as_write_cached_range_with_ttl` on a re-PUT and
+  `store_full_object_as_range_new` when it supersedes partial ranges) did exactly that, so
+  each overwrite added a phantom copy. Both now route through `remove_range_files` +
+  `debit_removed_ranges`.
+
+  Two rules that are easy to get half-right:
+
+  - **Debit only files that existed and deleted cleanly.** Iterating `metadata.ranges`
+    directly charges for files that were already gone — a phantom debit, permanent until the
+    next full scan because nothing re-credits it. `remove_range_files` returns a filtered
+    list for this reason; do not widen it.
+  - **Use `SizeAccumulator::subtract_range`, not `subtract`, wherever the range's identity
+    is known.** `add_range` credits only when it can insert into the dedup set, and
+    `subtract` leaves that entry behind — so a delete-then-rewrite debits once and credits
+    nothing, leaving the figure *short*. Adding the re-PUT debit with a plain `subtract`
+    took the total to zero for an object still on disk. `subtract` remains for callers with
+    no range identity to offer; the dedup set is cleared only by a validation scan, never by
+    a flush, so an entry left behind suppresses credits for up to a full validation interval.
+
+  Classification is always `cache_types::is_staged_range_spec`, which reads the range's
+  own recorded membership (`RangeSpec.staged`) and falls back to the `is_write_cached` of
+  the `.meta` the deleting call actually read only for a range written before that field
+  existed. Membership is per range, not per object: a range credited to the read tier and
+  then attached to a still-flagged object must not be debited from the write tier. Do not consult
+  `graduation_accounted` — it is the consolidator's exactly-once token and no debit site
+  reads it. Reading the flag at delete time is what keeps a concurrent graduation from being
+  debited twice, and that in turn relies on `refresh_write_cache_ttl` writing the
+  flag-cleared `.meta` *before* appending its `Graduation` entry.
 - **last_consolidation**: Unix timestamp of last consolidation cycle
 - **consolidation_count**: Number of consolidation cycles completed
 - **last_updated_by**: Instance ID that last updated the state

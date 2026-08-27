@@ -3,6 +3,8 @@
 //! This test verifies that PUT-cached objects can serve range requests
 //! and that TTL transitions happen correctly.
 
+mod common;
+
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::cache_types::{CacheMetadata, UploadState};
 use s3_proxy::config::SharedStorageConfig;
@@ -84,16 +86,16 @@ async fn test_range_request_from_write_cache() {
 
     // Store as write cache entry (simulating PUT request)
     println!("Storing PUT-cached object...");
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata.clone(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Verify metadata was created with PUT_TTL
     let disk_cache = disk_cache_manager.read().await;
@@ -321,16 +323,16 @@ async fn test_full_object_range_from_write_cache() {
     };
 
     // Store as write cache entry
-    cache_manager
-        .store_write_cache_entry(
-            cache_key,
-            test_data,
-            HashMap::new(),
-            metadata.clone(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+    common::put_through_write_cache(
+        &cache_manager,
+        cache_key,
+        test_data,
+        HashMap::new(),
+        metadata.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     // Request full object as range (0 to content_length-1)
     let range_spec = RangeSpec {

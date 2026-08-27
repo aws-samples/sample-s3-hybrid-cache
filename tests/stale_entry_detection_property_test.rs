@@ -85,8 +85,14 @@ enum StalenessResult {
 /// 1. Whether the range file exists
 /// 2. The entry's timestamp relative to current time
 ///
-/// This function implements the same logic as JournalConsolidator::validate_journal_entries_with_staleness()
-/// but as a pure function for property testing.
+/// This function models the range-file-existence branch of
+/// JournalConsolidator::validate_journal_entries_with_staleness() as a pure function for
+/// property testing. It does NOT model the object-level exemption for `TtlRefresh`,
+/// `AccessUpdate`, and `Graduation` entries (which validate against the `.meta`, not a
+/// range file) — task 45 in `.kiro/specs/write-cache-accounting-and-eviction/` found
+/// that gap the hard way when `Graduation` was missing from that exemption in
+/// production. This model covers only the staleness-timeout arithmetic below; it makes
+/// no claim about operation-type dispatch.
 ///
 /// # Arguments
 /// * `entry_timestamp_secs` - Entry timestamp in seconds since UNIX_EPOCH

@@ -145,6 +145,7 @@ fn create_test_metadata(
             created_at: SystemTime::now(),
             last_accessed: SystemTime::now(),
             access_count: 1,
+            staged: None,
         }],
         created_at: SystemTime::now(),
         expires_at: SystemTime::now() + Duration::from_secs(3600),
@@ -300,26 +301,36 @@ fn prop_single_directory_scan_coordination(
     })
 }
 
-/// **Feature: coordinated-cache-initialization, Property 8: Cross-validation threshold behavior**
-/// **Validates: Requirements 4.2, 4.3**
+/// **Feature: write-cache-accounting-and-eviction, Requirements 3.3, 7.1, 7.2**
 ///
-/// For any write cache size discrepancy between subsystems, the system should log
-/// a warning if discrepancy exceeds 5% and an error if it exceeds 20%.
+/// *For any* pair of Inflight_Bytes and Resident_Bytes figures, cross-validation reports
+/// consistency and raises no warning.
+///
+/// This replaces `prop_cross_validation_threshold_behavior`, which asserted that a
+/// discrepancy above 5% warned and above 20% escalated to `error!`. Task 27 removed the
+/// seeding of `WriteCacheManager::current_size` from scan results, because seeding an
+/// admission counter from persisted state was the defect behind a months-long
+/// write-caching outage on the fleet. The two figures the old property compared therefore
+/// measure different things:
+///
+/// - `write_cache_manager_size` — Inflight_Bytes: bytes held by uploads streaming on THIS
+///   instance, released on drop. Zero on a freshly started process, by design.
+/// - `size_tracker_write_cache_size` — Resident_Bytes: staged bytes on the SHARED volume.
+///
+/// There is no correct expected relationship between them, so no threshold can be right,
+/// and the old 20% rule would have fired `error!` on every startup of any deployment
+/// holding staged data.
+///
+/// Asserting the retirement across the *same generated input space* is deliberately
+/// stronger than deleting the test: if the comparison is ever reinstated, this fails for
+/// essentially every generated pair rather than only for a hand-picked fixture.
 #[quickcheck]
-fn prop_cross_validation_threshold_behavior(manager_size: u32, tracker_size: u32) -> TestResult {
-    // Filter out cases where both sizes are zero (no meaningful discrepancy)
-    if manager_size == 0 && tracker_size == 0 {
-        return TestResult::discard();
-    }
-
-    // Limit sizes to reasonable values for testing
+fn prop_inflight_and_resident_are_never_cross_validated(
+    manager_size: u32,
+    tracker_size: u32,
+) -> TestResult {
     let manager_size = (manager_size % 10000) as u64;
     let tracker_size = (tracker_size % 10000) as u64;
-
-    // Skip cases where one is zero but the other isn't (edge case)
-    if (manager_size == 0) != (tracker_size == 0) {
-        return TestResult::discard();
-    }
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -332,105 +343,64 @@ fn prop_cross_validation_threshold_behavior(manager_size: u32, tracker_size: u32
             config.clone(),
         );
 
-        // Create write cache manager with specified size
         let write_cache_manager = WriteCacheManager::new(
             temp_dir.path().to_path_buf(),
-            1024 * 1024, // 1MB total cache
-            50.0,        // 50% for write cache
+            1024 * 1024,
+            50.0,
             config.put_ttl,
             config.incomplete_upload_ttl,
             s3_proxy::cache::CacheEvictionAlgorithm::LRU,
             config.write_cache_max_object_size,
         );
 
-        // Set the manager size via initialization (replaces removed reserve_capacity)
-        if manager_size > 0 {
-            write_cache_manager.initialize_from_scan_results(manager_size, 1);
-        }
+        // Put `manager_size` bytes genuinely in flight, rather than seeding a counter —
+        // `initialize_from_scan_results` no longer exists, and a real reservation is what
+        // the figure now means. Held for the duration of the assertion.
+        let _reservation = if manager_size > 0 {
+            write_cache_manager.try_reserve(manager_size).await
+        } else {
+            None
+        };
 
-        // Create size tracker with JournalConsolidator
         let (size_tracker, consolidator) = create_test_size_tracker(temp_dir.path()).await;
 
-        // Set the write cache size via consolidator's size state
+        // `total_size` must be at least the write-cache figure: the staged figure is a
+        // SUBSET of the total and `update_size_from_validation` clamps it with a WARN
+        // otherwise (R6.4).
         if tracker_size > 0 {
             consolidator
-                .update_size_from_validation(0, Some(tracker_size), None)
+                .update_size_from_validation(tracker_size, Some(tracker_size), None)
                 .await;
         }
 
-        // Perform cross-validation
         let validation_results = coordinator
             .cross_validate_subsystems(Some(&write_cache_manager), Some(&size_tracker))
             .await
             .unwrap();
 
-        // Calculate expected discrepancy percentage
-        let expected_discrepancy = if manager_size == 0 && tracker_size == 0 {
-            0.0
-        } else {
-            let max_size = manager_size.max(tracker_size) as f64;
-            let diff = (manager_size as i64 - tracker_size as i64).abs() as f64;
-            (diff / max_size) * 100.0
-        };
-
-        // Property 8: Cross-validation threshold behavior
-        // Verify that validation was performed
+        // Validation still runs and still reports both figures — retiring the comparison
+        // must not lose the observability.
         if !validation_results.was_performed() {
             return TestResult::failed();
         }
-
-        // Verify discrepancy calculation is correct
-        let actual_discrepancy = validation_results.size_discrepancy_percent;
-        if (actual_discrepancy - expected_discrepancy).abs() > 0.1 {
-            return TestResult::failed();
-        }
-
-        // Verify threshold behavior
-        if expected_discrepancy > 20.0 {
-            // Should be marked as inconsistent with serious discrepancy
-            if validation_results.write_cache_consistent {
-                return TestResult::failed();
-            }
-            if !validation_results.has_serious_discrepancy() {
-                return TestResult::failed();
-            }
-            // Should have validation warnings
-            if validation_results.validation_warnings.is_empty() {
-                return TestResult::failed();
-            }
-        } else if expected_discrepancy > 5.0 {
-            // Should be marked as inconsistent with minor discrepancy
-            if validation_results.write_cache_consistent {
-                return TestResult::failed();
-            }
-            if !validation_results.has_minor_discrepancy() {
-                return TestResult::failed();
-            }
-            // Should have validation warnings
-            if validation_results.validation_warnings.is_empty() {
-                return TestResult::failed();
-            }
-        } else {
-            // Should be marked as consistent
-            if !validation_results.write_cache_consistent {
-                return TestResult::failed();
-            }
-            if validation_results.has_serious_discrepancy()
-                || validation_results.has_minor_discrepancy()
-            {
-                return TestResult::failed();
-            }
-            // Should not have validation warnings for consistency
-            if !validation_results.validation_warnings.is_empty() {
-                return TestResult::failed();
-            }
-        }
-
-        // Verify that the sizes are correctly recorded
-        if validation_results.write_cache_manager_size != Some(manager_size) {
-            return TestResult::failed();
-        }
         if validation_results.size_tracker_write_cache_size != Some(tracker_size) {
+            return TestResult::failed();
+        }
+
+        // The retirement itself: no discrepancy, no warning, never inconsistent, for any
+        // combination of the two figures.
+        if !validation_results.write_cache_consistent {
+            return TestResult::failed();
+        }
+        if validation_results.size_discrepancy_percent != 0.0 {
+            return TestResult::failed();
+        }
+        if !validation_results.validation_warnings.is_empty() {
+            return TestResult::failed();
+        }
+        if validation_results.has_serious_discrepancy()
+            || validation_results.has_minor_discrepancy()
+        {
             return TestResult::failed();
         }
 

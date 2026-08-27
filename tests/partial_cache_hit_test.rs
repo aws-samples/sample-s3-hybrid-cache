@@ -89,6 +89,7 @@ async fn test_partial_cache_hit_scenario() {
         write_cache_expires_at: None,
         write_cache_created_at: None,
         write_cache_last_accessed: None,
+        graduation_accounted: false,
     };
 
     // Store each cached range
