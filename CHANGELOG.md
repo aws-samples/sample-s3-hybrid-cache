@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.8.0] - 2026-08-31
 
+**Upgrade impact:** expired reads revalidate instead of re-downloading, so body transfers fall
+while conditional requests rise; orphan range files are kept at startup rather than swept, so
+watch free space on a cache volume that accumulates them; and the `Consolidation cycle:` and
+`Consolidation cycle complete:` log lines change fields. No configuration change is required to
+keep running.
+
 ### Added
 
 - `docs/LOCAL_NVME_CACHE.md`, a guide to running a fleet on local NVMe instance store instead of
