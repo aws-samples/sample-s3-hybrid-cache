@@ -71,6 +71,8 @@ Hybrid Cache for Amazon S3 provides an intelligent caching layer that accelerate
 
 The same proxy accelerates access to a cross-region Amazon S3 bucket or an S3-compatible store outside AWS. Deploy a fleet of EC2 instances sharing an FSx for OpenZFS or EFS cache volume, front them with Route 53 multi-value DNS or an NLB, and cache hits avoid the cross-region round-trip and per-GB transfer charge entirely. See the **[AWS Deployment Guide](docs/AWS_DEPLOYMENT.md)** for sizing, bootstrap scripts, client routing patterns, and cost modelling.
 
+Where every client host can run a sidecar [affinity router](docs/REQUEST_AWARE_ROUTING.md), a cheaper option opens up: give each proxy its own local NVMe instance store. The router hashes each request to one proxy by object key and page index, so the private disks behave as one cache, at about 39% lower cost than a capacity-matched shared volume. The cache is erased when an instance is replaced. See **[Local NVMe Cache Fleets](docs/LOCAL_NVME_CACHE.md)**.
+
 ## Documentation
 
 ### Core Documentation
@@ -78,6 +80,7 @@ The same proxy accelerates access to a cross-region Amazon S3 bucket or an S3-co
 - **[Configuration](docs/CONFIGURATION.md)** - Complete configuration reference
 - **[Architecture](docs/ARCHITECTURE.md)** - Technical architecture and design principles
 - **[AWS Deployment](docs/AWS_DEPLOYMENT.md)** - Deploying on EC2 with FSx/EFS for cross-region or external origins
+- **[Local NVMe Cache Fleets](docs/LOCAL_NVME_CACHE.md)** - Cheaper per-instance instance-store cache behind an affinity router
 - **[Security Considerations](docs/ARCHITECTURE.md#security-considerations)** - Network security and shared cache access model
 - **[Developer Guide](docs/DEVELOPER.md)** - Design decisions, implementation notes, build and test workflow
 
@@ -93,7 +96,7 @@ The same proxy accelerates access to a cross-region Amazon S3 bucket or an S3-co
 - **[Compression](docs/COMPRESSION.md)** - LZ4 compression and content detection
 - **[Connection Pooling](docs/CONNECTION_POOLING.md)** - Connection management and load balancing
 - **[Hedged Requests](docs/HEDGING.md)** - Racing a duplicate upstream fetch to cut tail latency
-- **[Request-Aware Routing](docs/REQUEST_AWARE_ROUTING.md)** - Optional HAProxy pattern for encrypting the client-to-fleet hop or routing by object key and byte range so concurrent readers converge on one instance
+- **[Request-Aware Routing](docs/REQUEST_AWARE_ROUTING.md)** - Optional HAProxy pattern for encrypting the client-to-fleet hop or routing by object key and byte range so concurrent readers converge on one instance. Required for [local NVMe cache fleets](docs/LOCAL_NVME_CACHE.md)
 - **[Bandwidth QoS](docs/BANDWIDTH_QOS.md)** - Origin download ceiling and fair sharing
 - **[Dashboard](docs/DASHBOARD.md)** - Web-based monitoring interface
 - **[Error Handling](docs/ERROR_HANDLING.md)** - Error handling patterns
