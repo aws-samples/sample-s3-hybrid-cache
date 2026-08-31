@@ -7,13 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.8.0] - 2026-08-31
 
-**Upgrade impact:** expired reads revalidate instead of re-downloading, so body transfers fall
-while conditional requests rise; orphan range files are kept at startup rather than swept, so
-watch free space on a cache volume that accumulates them; `cache.ram_cache_verification_interval`
-is deprecated; and the `RAM-disk coherency:`, `RAM cache flush config:`, `Consolidation cycle:`
-and `Consolidation cycle complete:` log lines change fields. No configuration change is required
-to keep running.
-
 ### Added
 
 - `docs/LOCAL_NVME_CACHE.md`, a guide to running a fleet on local NVMe instance store instead of
@@ -33,15 +26,6 @@ to keep running.
 - Orphan range files are kept at startup rather than swept, so a range file another instance has
   just written and not yet consolidated stays intact. The periodic orphan recovery scan
   (`cache.shared_storage.orphan_recovery_enabled`) is unchanged.
-
-### Deprecated
-
-- **`cache.ram_cache_verification_interval` has no effect and will be removed in a future
-  release.** An existing config file setting it still parses and starts, and a value other than
-  the 1s default logs a startup warning naming the field. The `RAM-disk coherency:` and `RAM
-  cache flush config:` startup log lines drop their `verification_interval` field. RAM staleness
-  is bounded by `cache.metadata_cache.refresh_interval` and the per-key `get_ttl` instead. No
-  replacement field is added.
 
 ### Removed
 
