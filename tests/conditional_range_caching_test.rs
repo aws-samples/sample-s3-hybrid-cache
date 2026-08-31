@@ -198,11 +198,7 @@ fn count_cache_object_files(dir: &Path) -> usize {
 /// for a `conditional_forward` range request: nothing cached, the full range
 /// missing, cannot serve from cache.
 fn all_missing_overlap(range_spec: &RangeSpec) -> RangeOverlap {
-    RangeOverlap {
-        missing_ranges: vec![range_spec.clone()],
-        cached_ranges: Vec::new(),
-        can_serve_from_cache: false,
-    }
+    RangeOverlap::all_missing(range_spec)
 }
 
 // =========================================================================

@@ -112,6 +112,12 @@ disk, and it is per-instance where the other three are fleet-wide. Sum it across
 for fleet RAM residency; do not aggregate the other three, which are already fleet-wide
 and would be multiplied by the instance count.
 
+**That last rule assumes a shared cache volume**, which is what makes every instance report the
+same figure. Give each proxy its own local cache directory and the three disk gauges become
+per-instance too, so the fleet total is their sum and a dashboard built on this section reads low
+by roughly the instance count. See
+[Local NVMe Cache Fleets](LOCAL_NVME_CACHE.md#what-to-alarm-on).
+
 `cache.total_cache_size` and `cache.read_cache_size` changed meaning in 2.7.0. A panel
 carried over from an earlier release that stacked the four gauges, or added read and
 write_cache to get a total, was double-counting; see [UPGRADING.md](UPGRADING.md).

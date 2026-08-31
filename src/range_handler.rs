@@ -8,7 +8,7 @@
 //! [`suffix_page_target`]. Spec: `page-aligned-range-cache`.
 
 use crate::cache::{CacheManager, Range};
-use crate::cache_types::ObjectMetadata;
+use crate::cache_types::{ObjectMetadata, StoredFreshness};
 use crate::disk_cache::DiskCacheManager;
 use crate::{ProxyError, Result};
 use bytes::Bytes;
@@ -316,7 +316,58 @@ pub enum RangeParseResult {
 pub struct RangeOverlap {
     pub cached_ranges: Vec<Range>,
     pub missing_ranges: Vec<RangeSpec>,
+    /// **Coverage completeness only** — `missing_ranges.is_empty()`. It does not
+    /// mean the bytes may be served; see [`RangeOverlap::is_serveable_unvalidated`].
+    ///
+    /// The name predates the freshness marker below and is left alone
+    /// deliberately: it is read at a dozen sites and its meaning has not changed.
     pub can_serve_from_cache: bool,
+    /// Stored-expiry state of the entry this coverage came from
+    /// (`.kiro/specs/expired-entry-revalidation/` R1.2).
+    ///
+    /// Only ever [`crate::cache_types::StoredFreshness::Expired`] when the lookup was made with
+    /// [`crate::cache_types::RangeLookupPurpose::RevalidationCandidate`]; a `FreshServe` lookup
+    /// returns empty coverage past stored expiry, so its overlaps are always
+    /// `Fresh`. Existing `FreshServe` callers therefore see no behaviour change.
+    pub stored_freshness: StoredFreshness,
+}
+
+impl RangeOverlap {
+    /// An all-missing overlap: nothing cached, everything requested.
+    pub fn all_missing(requested: &RangeSpec) -> Self {
+        Self {
+            cached_ranges: Vec::new(),
+            missing_ranges: vec![requested.clone()],
+            can_serve_from_cache: false,
+            // No entry was consulted, so no stored expiry could have passed.
+            stored_freshness: StoredFreshness::Fresh,
+        }
+    }
+
+    /// May these bytes be served on the cache's own authority?
+    ///
+    /// True only when coverage is complete **and** the entry was within its
+    /// stored expiry. A Stored_Expired candidate returns `false` even with
+    /// complete coverage, which is Requirement 1.2: discovering an expired range
+    /// must not by itself authorise serving it.
+    ///
+    /// Callers that hold a *separate* authority — a successful conditional `304`,
+    /// a matching client `If-Match` (Mode B), or a live-TTL `Fresh` verdict —
+    /// must use [`RangeOverlap::has_complete_coverage`] and name that authority
+    /// at the call site. That asymmetry is the point: serving expired bytes
+    /// requires writing down why it is allowed.
+    pub fn is_serveable_unvalidated(&self) -> bool {
+        self.can_serve_from_cache && self.stored_freshness == StoredFreshness::Fresh
+    }
+
+    /// Is every requested byte covered, regardless of freshness?
+    ///
+    /// Use only where the caller holds an explicit freshness authority. A `304`
+    /// proves the cached representation is current but says nothing about whether
+    /// the cache still *covers* the request, so that check is still needed.
+    pub fn has_complete_coverage(&self) -> bool {
+        self.can_serve_from_cache
+    }
 }
 
 /// Represents a segment of data to be merged
@@ -641,12 +692,23 @@ impl RangeHandler {
     /// - Logs ETag mismatch warning
     /// - Treats all cached ranges as missing (returns empty cached_ranges)
     /// - Caller should invalidate stale ranges and fetch fresh data from S3
+    /// # `purpose` (`.kiro/specs/expired-entry-revalidation/`, R1.1-R1.5)
+    ///
+    /// Passed straight through to [`crate::disk_cache::DiskCacheManager::find_cached_ranges`], which
+    /// owns the stored-expiry decision. The resulting
+    /// [`StoredFreshness`] is carried on the returned [`RangeOverlap`], so an
+    /// expired candidate cannot reach a caller as ordinary serveable coverage.
+    ///
+    /// Use [`RangeOverlap::is_serveable_unvalidated`] rather than reading
+    /// `can_serve_from_cache` directly unless you hold a separate freshness
+    /// authority and can name it.
     pub async fn find_cached_ranges(
         &self,
         cache_key: &str,
         requested_range: &RangeSpec,
         current_etag: Option<&str>,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
+        purpose: crate::cache_types::RangeLookupPurpose,
     ) -> Result<RangeOverlap> {
         // Requirement 1.1: Log cache key, requested range, and current ETag
         debug!(
@@ -718,11 +780,7 @@ impl RangeHandler {
                     }
 
                     // Return empty cached ranges, forcing a fetch from S3
-                    return Ok(RangeOverlap {
-                        cached_ranges: Vec::new(),
-                        missing_ranges: vec![requested_range.clone()],
-                        can_serve_from_cache: false,
-                    });
+                    return Ok(RangeOverlap::all_missing(requested_range));
                 } else {
                     debug!(
                         "ETag validation passed for cache_key: {}, etag: {}",
@@ -744,18 +802,24 @@ impl RangeHandler {
                 "[CACHE_LOOKUP] Calling disk_cache.find_cached_ranges: cache_key={}, requested_range={}-{}",
                 cache_key, requested_range.start, requested_range.end
             );
-            let overlapping_range_specs = disk_cache
+            let lookup = disk_cache
                 .find_cached_ranges(
                     cache_key,
                     requested_range.start,
                     requested_range.end,
                     preloaded_metadata,
+                    purpose,
                 )
                 .await?;
+            let stored_freshness = lookup.stored_freshness;
+            let overlapping_range_specs = lookup.ranges;
 
             debug!(
-                "[CACHE_LOOKUP] disk_cache.find_cached_ranges returned: cache_key={}, overlapping_ranges_count={}",
-                cache_key, overlapping_range_specs.len()
+                "[CACHE_LOOKUP] disk_cache.find_cached_ranges returned: cache_key={}, overlapping_ranges_count={}, purpose={:?}, stored_freshness={:?}",
+                cache_key,
+                overlapping_range_specs.len(),
+                purpose,
+                stored_freshness
             );
 
             if !overlapping_range_specs.is_empty() {
@@ -804,14 +868,15 @@ impl RangeHandler {
                 let can_serve_from_cache = missing_ranges.is_empty();
 
                 debug!(
-                    "[CACHE_LOOKUP] Cache lookup result: cache_key={}, overlapping_ranges={}, missing_ranges={}, requested_range={}-{}, can_serve_from_cache={}",
-                    cache_key, overlapping_ranges.len(), missing_ranges.len(), requested_range.start, requested_range.end, can_serve_from_cache
+                    "[CACHE_LOOKUP] Cache lookup result: cache_key={}, overlapping_ranges={}, missing_ranges={}, requested_range={}-{}, can_serve_from_cache={}, stored_freshness={:?}",
+                    cache_key, overlapping_ranges.len(), missing_ranges.len(), requested_range.start, requested_range.end, can_serve_from_cache, stored_freshness
                 );
 
                 return Ok(RangeOverlap {
                     cached_ranges: overlapping_ranges,
                     missing_ranges,
                     can_serve_from_cache,
+                    stored_freshness,
                 });
             } else {
                 debug!(
@@ -834,11 +899,7 @@ impl RangeHandler {
             "[CACHE_LOOKUP] No cached entry found: cache_key={}",
             cache_key
         );
-        Ok(RangeOverlap {
-            cached_ranges: Vec::new(),
-            missing_ranges: vec![requested_range.clone()],
-            can_serve_from_cache: false,
-        })
+        Ok(RangeOverlap::all_missing(requested_range))
     }
 
     /// Calculate missing ranges that are not covered by cached ranges

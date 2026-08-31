@@ -125,7 +125,13 @@ async fn test_range_consolidation_small_gaps() {
 
     // Find cached ranges and missing ranges
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -287,7 +293,13 @@ async fn test_range_consolidation_large_gaps() {
 
     // Find cached ranges and missing ranges
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -410,7 +422,13 @@ async fn test_range_consolidation_mixed_gaps() {
 
     // Find missing ranges
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -521,7 +539,13 @@ async fn test_range_consolidation_with_fetch_and_merge() {
 
     // Find missing ranges
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 

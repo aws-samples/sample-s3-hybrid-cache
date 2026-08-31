@@ -220,11 +220,17 @@ pub struct ConsolidationCycleResult {
     /// Duration of the consolidation cycle
     pub cycle_duration: Duration,
 
-    /// Whether eviction was triggered
+    /// Whether an eviction pass was **spawned** by this cycle.
+    ///
+    /// Deliberately not accompanied by a byte figure. Eviction runs as a detached task
+    /// (v1.1.35, "Decoupled Eviction from Consolidation Cycle") so that the cycle can
+    /// release the global consolidation lock immediately instead of holding it for the
+    /// 100+ seconds an eviction pass can take. The cycle therefore returns before any
+    /// byte count exists, and a `bytes_evicted` field here was structurally always 0
+    /// from v1.1.35 until it was removed. The real figure is logged by the spawned task
+    /// itself ("Background eviction completed: bytes_freed=..."); exposing it on
+    /// `/metrics` is owned by Requirement 12.1 of `.kiro/specs/cache-eviction-at-scale/`.
     pub eviction_triggered: bool,
-
-    /// Bytes freed by eviction (0 if not triggered)
-    pub bytes_evicted: u64,
 
     /// Current total cache size after this cycle
     pub current_size: u64,
@@ -2300,16 +2306,21 @@ impl JournalConsolidator {
     /// Check if eviction is needed and trigger it via CacheManager
     ///
     /// Called at the end of each consolidation cycle.
-    /// Returns (eviction_triggered, bytes_freed).
+    ///
+    /// Returns whether an eviction pass was **spawned**, not how much it freed. The pass
+    /// is a detached task (v1.1.35) precisely so the cycle does not wait for it, so no
+    /// byte figure is available to return here. Do not change this to await the pass in
+    /// order to report bytes freed: that reinstates the 100+ second global-lock hold that
+    /// v1.1.35 removed. See the doc on `ConsolidationCycleResult::eviction_triggered`.
     ///
     /// # Arguments
     ///
     /// * `known_size` - Optional pre-fetched current size to avoid extra NFS read.
     ///   If None, will read from disk.
-    async fn maybe_trigger_eviction(&self, known_size: Option<u64>) -> (bool, u64) {
+    async fn maybe_trigger_eviction(&self, known_size: Option<u64>) -> bool {
         // Check if max_cache_size is configured (0 means disabled)
         if self.config.max_cache_size == 0 {
-            return (false, 0);
+            return false;
         }
 
         // Use provided size or read from disk
@@ -2326,7 +2337,7 @@ impl JournalConsolidator {
 
         // Check if we're over the trigger threshold
         if current_size <= trigger_threshold {
-            return (false, 0);
+            return false;
         }
 
         // Check if eviction is already running (Requirement 1.4, 1.5)
@@ -2336,7 +2347,7 @@ impl JournalConsolidator {
             .is_err()
         {
             debug!("Eviction already in progress, skipping");
-            return (false, 0);
+            return false;
         }
 
         // Get cache manager reference — reset guard on failure paths
@@ -2346,7 +2357,7 @@ impl JournalConsolidator {
                 Err(e) => {
                     warn!("Failed to acquire cache_manager lock for eviction: {}", e);
                     self.eviction_in_progress.store(false, Ordering::SeqCst);
-                    return (false, 0);
+                    return false;
                 }
             };
 
@@ -2355,7 +2366,7 @@ impl JournalConsolidator {
                 None => {
                     debug!("Cache manager not available, skipping eviction");
                     self.eviction_in_progress.store(false, Ordering::SeqCst);
-                    return (false, 0);
+                    return false;
                 }
             }
         };
@@ -2382,8 +2393,15 @@ impl JournalConsolidator {
                 .await
             {
                 Ok(bytes_freed) => {
+                    // This is the ONLY report of the real figure — the consolidation cycle
+                    // returns before the pass runs, so it cannot carry it. The zero case is
+                    // logged too (at debug, to leave INFO volume unchanged): a pass that
+                    // triggered and freed nothing is the failure mode worth seeing, and
+                    // `eviction_triggered=true` in the cycle log says nothing about yield.
                     if bytes_freed > 0 {
                         info!("Background eviction completed: bytes_freed={}", bytes_freed);
+                    } else {
+                        debug!("Background eviction completed: bytes_freed=0");
                     }
                 }
                 Err(e) => {
@@ -2393,8 +2411,9 @@ impl JournalConsolidator {
             }
         });
 
-        // Return immediately after spawning (Requirement 1.6)
-        (true, 0)
+        // Return immediately after spawning (Requirement 1.6). No byte figure is available
+        // here by construction — the pass has only just started. See the fn doc.
+        true
     }
 
     /// Run a complete consolidation cycle
@@ -2427,7 +2446,6 @@ impl JournalConsolidator {
                 size_delta: 0,
                 cycle_duration: cycle_start.elapsed(),
                 eviction_triggered: false,
-                bytes_evicted: 0,
                 current_size: 0, // Skip size read when idle
             });
         }
@@ -2454,7 +2472,6 @@ impl JournalConsolidator {
                     size_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
                     eviction_triggered: false,
-                    bytes_evicted: 0,
                     current_size: self.get_current_size().await,
                 });
             }
@@ -2467,7 +2484,6 @@ impl JournalConsolidator {
                     size_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
                     eviction_triggered: false,
-                    bytes_evicted: 0,
                     current_size: self.get_current_size().await,
                 });
             }
@@ -2518,8 +2534,7 @@ impl JournalConsolidator {
                 warn!("Failed to discover pending journal entries: {}", e);
                 // Even on error, check if eviction is needed
                 let current_size = self.get_current_size().await;
-                let (eviction_triggered, bytes_evicted) =
-                    self.maybe_trigger_eviction(Some(current_size)).await;
+                let eviction_triggered = self.maybe_trigger_eviction(Some(current_size)).await;
                 return Ok(ConsolidationCycleResult {
                     keys_processed: 0,
                     keys_skipped: 0,
@@ -2527,7 +2542,6 @@ impl JournalConsolidator {
                     size_delta: 0,
                     cycle_duration: cycle_start.elapsed(),
                     eviction_triggered,
-                    bytes_evicted,
                     current_size,
                 });
             }
@@ -2541,8 +2555,7 @@ impl JournalConsolidator {
         // This handles the case where cache is over capacity but no new data is being added
         if cache_keys.is_empty() {
             let current_size = self.get_current_size().await;
-            let (eviction_triggered, bytes_evicted) =
-                self.maybe_trigger_eviction(Some(current_size)).await;
+            let eviction_triggered = self.maybe_trigger_eviction(Some(current_size)).await;
             return Ok(ConsolidationCycleResult {
                 keys_processed: 0,
                 keys_skipped: 0,
@@ -2550,7 +2563,6 @@ impl JournalConsolidator {
                 size_delta: 0,
                 cycle_duration: cycle_start.elapsed(),
                 eviction_triggered,
-                bytes_evicted,
                 current_size,
             });
         }
@@ -2726,8 +2738,7 @@ impl JournalConsolidator {
         // Always check eviction at the end of every cycle, not just when size_delta > 0
         // This ensures eviction triggers even during idle periods when cache is over capacity
         let current_size = self.get_current_size().await;
-        let (eviction_triggered, bytes_evicted) =
-            self.maybe_trigger_eviction(Some(current_size)).await;
+        let eviction_triggered = self.maybe_trigger_eviction(Some(current_size)).await;
 
         // Staging tier, on the same schedule and for the same reason: residency falls
         // only by graduation or eviction, so a tier left over its bound by a write burst
@@ -2742,9 +2753,9 @@ impl JournalConsolidator {
         // Log summary if there was activity
         if total_entries_consolidated > 0 || eviction_triggered || accumulator_size_delta != 0 {
             info!(
-                "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, total_cache_size={}, eviction_triggered={}, bytes_evicted={}",
+                "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, total_cache_size={}, eviction_triggered={}",
                 keys_processed, total_entries_consolidated, accumulator_size_delta,
-                cycle_duration.as_millis(), current_size, eviction_triggered, bytes_evicted
+                cycle_duration.as_millis(), current_size, eviction_triggered
             );
         }
 
@@ -2755,7 +2766,6 @@ impl JournalConsolidator {
             size_delta: accumulator_size_delta, // Use accumulator delta (what was actually applied)
             cycle_duration,
             eviction_triggered,
-            bytes_evicted,
             current_size,
         })
     }
@@ -6098,7 +6108,6 @@ mod tests {
         assert_eq!(result.entries_consolidated, 0);
         assert_eq!(result.size_delta, 0);
         assert!(!result.eviction_triggered);
-        assert_eq!(result.bytes_evicted, 0);
         assert_eq!(result.current_size, 0);
     }
 
@@ -6181,7 +6190,6 @@ mod tests {
         assert_eq!(result.entries_consolidated, 1);
         assert_eq!(result.size_delta, 1024); // Add operation adds 1024 bytes
         assert!(!result.eviction_triggered);
-        assert_eq!(result.bytes_evicted, 0);
         assert_eq!(result.current_size, 1024);
 
         // Verify size state was updated
@@ -6298,7 +6306,6 @@ mod tests {
             size_delta: -1024,
             cycle_duration: Duration::from_millis(150),
             eviction_triggered: true,
-            bytes_evicted: 5000,
             current_size: 100000,
         };
 
@@ -6307,7 +6314,6 @@ mod tests {
         assert_eq!(result.size_delta, -1024);
         assert_eq!(result.cycle_duration, Duration::from_millis(150));
         assert!(result.eviction_triggered);
-        assert_eq!(result.bytes_evicted, 5000);
         assert_eq!(result.current_size, 100000);
     }
 
@@ -7099,7 +7105,7 @@ mod tests {
     // ===== Unit tests for eviction decoupling (Task 1.4) =====
     // Requirements: 1.1, 1.2, 1.3, 1.6
 
-    /// Test: When guard is already `true`, maybe_trigger_eviction returns (false, 0)
+    /// Test: When guard is already `true`, maybe_trigger_eviction returns `false`
     /// and does NOT spawn a new eviction task.
     /// Validates: Requirement 1.4
     #[tokio::test]
@@ -7134,10 +7140,9 @@ mod tests {
             .store(true, Ordering::SeqCst);
 
         // Call with size over threshold (1000 > 950)
-        let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(1000)).await;
+        let triggered = consolidator.maybe_trigger_eviction(Some(1000)).await;
 
         assert!(!triggered, "Should not trigger when guard is already true");
-        assert_eq!(bytes, 0, "Bytes should be 0 when skipping");
         // Guard should remain true (unchanged)
         assert!(
             consolidator.eviction_in_progress.load(Ordering::SeqCst),
@@ -7146,7 +7151,7 @@ mod tests {
     }
 
     /// Test: When over threshold and guard is false, maybe_trigger_eviction acquires
-    /// the guard (sets it to true). Without a cache_manager, it resets and returns (false, 0),
+    /// the guard (sets it to true). Without a cache_manager, it resets and returns `false`,
     /// but the guard acquisition itself is validated.
     /// Validates: Requirements 1.2, 1.4
     #[tokio::test]
@@ -7182,15 +7187,14 @@ mod tests {
         );
 
         // No cache_manager set, so the method will acquire the guard, fail to get
-        // cache_manager, reset the guard, and return (false, 0).
+        // cache_manager, reset the guard, and return `false`.
         // This validates the guard acquisition + reset-on-failure path.
-        let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(1000)).await;
+        let triggered = consolidator.maybe_trigger_eviction(Some(1000)).await;
 
         assert!(
             !triggered,
             "Should return false when cache_manager unavailable"
         );
-        assert_eq!(bytes, 0);
         // Guard should be reset to false after the cache_manager failure path
         assert!(
             !consolidator.eviction_in_progress.load(Ordering::SeqCst),
@@ -7198,7 +7202,7 @@ mod tests {
         );
     }
 
-    /// Test: When under threshold, maybe_trigger_eviction returns (false, 0)
+    /// Test: When under threshold, maybe_trigger_eviction returns `false`
     /// without touching the guard at all.
     /// Validates: Requirement 1.1 (only triggers when over threshold)
     #[tokio::test]
@@ -7228,10 +7232,9 @@ mod tests {
         );
 
         // Call with size under threshold (500 <= 950)
-        let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(500)).await;
+        let triggered = consolidator.maybe_trigger_eviction(Some(500)).await;
 
         assert!(!triggered, "Should not trigger when under threshold");
-        assert_eq!(bytes, 0);
         // Guard should remain false (never touched)
         assert!(
             !consolidator.eviction_in_progress.load(Ordering::SeqCst),
@@ -7286,7 +7289,7 @@ mod tests {
         );
     }
 
-    /// Test: When max_cache_size is 0 (disabled), maybe_trigger_eviction returns (false, 0)
+    /// Test: When max_cache_size is 0 (disabled), maybe_trigger_eviction returns `false`
     /// regardless of current size or guard state.
     /// Validates: Requirement 1.1 (eviction only when configured)
     #[tokio::test]
@@ -7311,10 +7314,9 @@ mod tests {
             config,
         );
 
-        let (triggered, bytes) = consolidator.maybe_trigger_eviction(Some(999999)).await;
+        let triggered = consolidator.maybe_trigger_eviction(Some(999999)).await;
 
         assert!(!triggered, "Should not trigger when max_cache_size is 0");
-        assert_eq!(bytes, 0);
     }
 
     /// **Feature: consolidation-throughput, Property 1: All discovered keys are submitted for processing**
@@ -7800,11 +7802,68 @@ mod tests {
             size_delta: 0,
             cycle_duration: Duration::from_millis(500),
             eviction_triggered: false,
-            bytes_evicted: 0,
             current_size: 0,
         };
         assert_eq!(result.keys_skipped, 2);
         assert_eq!(result.keys_processed, 5);
+    }
+
+    /// `maybe_trigger_eviction` reports only WHETHER a pass was spawned, and the cycle
+    /// result carries no byte figure.
+    ///
+    /// This is the guard on the removal of `ConsolidationCycleResult.bytes_evicted`, which
+    /// was structurally always 0 from v1.1.35 onward. It is deliberately shaped as a
+    /// *shape* assertion rather than a value assertion, because a value assertion against a
+    /// field that is always 0 is exactly what let the dead field survive 40+ releases:
+    /// `assert_eq!(result.bytes_evicted, 0)` passed for the whole time the field was broken.
+    ///
+    /// The red side is the type system, and it was demonstrated rather than assumed:
+    /// reinstating `pub bytes_evicted: u64` on the struct and reverting this method to
+    /// `(bool, u64)` produces E0308 at the `let triggered: bool` annotation below
+    /// ("expected `bool`, found `(bool, u64)`"), plus E0063 "missing field `bytes_evicted`"
+    /// at every exhaustive struct literal — including the two in the neighbouring
+    /// `test_consolidation_cycle_result_fields` and `test_keys_skipped_field_in_result`.
+    /// The annotation guards the return type; those literals guard the field. Both halves
+    /// are needed, because this test does not construct the struct.
+    ///
+    /// Awaiting the pass in order to populate such a field would reintroduce the 100+
+    /// second global-lock hold that the `tokio::spawn` in `maybe_trigger_eviction` exists
+    /// to avoid (v1.1.35). Report the figure asynchronously, per R12.1 — not from here.
+    #[tokio::test]
+    async fn test_eviction_is_reported_as_a_boolean_not_a_byte_figure() {
+        let temp_dir = TempDir::new().unwrap();
+        let journal_manager = Arc::new(JournalManager::new(
+            temp_dir.path().to_path_buf(),
+            "test-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = JournalConsolidator::new(
+            temp_dir.path().to_path_buf(),
+            journal_manager,
+            lock_manager,
+            ConsolidationConfig {
+                max_cache_size: 0, // eviction disabled
+                ..ConsolidationConfig::default()
+            },
+        );
+
+        // max_cache_size is 0 (eviction disabled), so no pass is spawned. The
+        // point of the assertion is the TYPE: a bare bool, with nowhere to put a byte
+        // count, because the count does not exist at the moment this returns.
+        let triggered: bool = consolidator.maybe_trigger_eviction(None).await;
+        assert!(
+            !triggered,
+            "eviction must not spawn when max_cache_size is 0 (disabled)"
+        );
+
+        // And the cycle result exposes the same boolean with no companion byte field.
+        let result = consolidator.run_consolidation_cycle().await.unwrap();
+        let _: bool = result.eviction_triggered;
+        assert!(!result.eviction_triggered);
     }
 }
 

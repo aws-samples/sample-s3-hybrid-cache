@@ -161,7 +161,13 @@ async fn test_archive_zip_corruption_bug_multipart_upload_and_download() {
 
         // Find cached ranges
         let overlap = range_handler
-            .find_cached_ranges(&cache_key, &requested_range, None, None)
+            .find_cached_ranges(
+                &cache_key,
+                &requested_range,
+                None,
+                None,
+                s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
             .unwrap();
 
@@ -295,7 +301,13 @@ async fn test_non_aligned_range_requests_after_multipart_upload() {
         let requested_range = RangeSpec { start, end };
 
         let overlap = range_handler
-            .find_cached_ranges(&cache_key, &requested_range, None, None)
+            .find_cached_ranges(
+                &cache_key,
+                &requested_range,
+                None,
+                None,
+                s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
             .unwrap();
 
@@ -388,7 +400,13 @@ async fn test_single_byte_range_requests() {
         };
 
         let overlap = range_handler
-            .find_cached_ranges(&cache_key, &requested_range, None, None)
+            .find_cached_ranges(
+                &cache_key,
+                &requested_range,
+                None,
+                None,
+                s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
             .unwrap();
 
@@ -474,7 +492,13 @@ async fn test_last_part_smaller_than_standard() {
     };
 
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -497,7 +521,13 @@ async fn test_last_part_smaller_than_standard() {
     };
 
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &last_part_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &last_part_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -577,7 +607,13 @@ async fn test_aws_sdk_sync_simulation() {
             let requested_range = RangeSpec { start, end };
 
             let overlap = range_handler
-                .find_cached_ranges(&cache_key, &requested_range, None, None)
+                .find_cached_ranges(
+                    &cache_key,
+                    &requested_range,
+                    None,
+                    None,
+                    s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+                )
                 .await
                 .unwrap();
 

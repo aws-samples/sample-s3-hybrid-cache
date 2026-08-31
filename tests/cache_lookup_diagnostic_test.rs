@@ -117,9 +117,16 @@ async fn test_cache_lookup_diagnostic_basic() {
     println!("  requested_range: {}-{}", range_start, range_end);
 
     let found_ranges = cache_manager
-        .find_cached_ranges(cache_key, range_start, range_end, None)
+        .find_cached_ranges(
+            cache_key,
+            range_start,
+            range_end,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .ranges;
 
     println!("Found {} cached range(s)", found_ranges.len());
     for (i, range) in found_ranges.iter().enumerate() {
@@ -252,9 +259,16 @@ async fn test_cache_lookup_diagnostic_key_formats() {
 
         // Find cached ranges
         let found_ranges = cache_manager
-            .find_cached_ranges(cache_key, range_start, range_end, None)
+            .find_cached_ranges(
+                cache_key,
+                range_start,
+                range_end,
+                None,
+                s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .ranges;
 
         assert!(
             !found_ranges.is_empty(),
@@ -342,9 +356,16 @@ async fn test_cache_lookup_diagnostic_multiple_ranges() {
         println!("Looking up range: {}-{}", start, end);
 
         let found_ranges = cache_manager
-            .find_cached_ranges(cache_key, *start, *end, None)
+            .find_cached_ranges(
+                cache_key,
+                *start,
+                *end,
+                None,
+                s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .ranges;
 
         assert!(
             !found_ranges.is_empty(),
@@ -364,9 +385,16 @@ async fn test_cache_lookup_diagnostic_multiple_ranges() {
     // Test finding a range that spans multiple cached ranges
     println!("\n=== Finding range spanning multiple cached ranges ===");
     let found_ranges = cache_manager
-        .find_cached_ranges(cache_key, 0, 499, None)
+        .find_cached_ranges(
+            cache_key,
+            0,
+            499,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .ranges;
 
     println!("Found {} overlapping ranges", found_ranges.len());
     assert_eq!(
@@ -439,9 +467,16 @@ async fn test_cache_lookup_diagnostic_partial_overlap() {
         println!("Requesting range: {}-{}", start, end);
 
         let found_ranges = cache_manager
-            .find_cached_ranges(cache_key, start, end, None)
+            .find_cached_ranges(
+                cache_key,
+                start,
+                end,
+                None,
+                s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .ranges;
 
         if should_find {
             assert!(
@@ -518,9 +553,16 @@ async fn test_cache_lookup_diagnostic_expired_ranges() {
     // Try to find the expired range
     println!("\n=== Looking up expired range ===");
     let found_ranges = cache_manager
-        .find_cached_ranges(cache_key, 0, (test_data.len() - 1) as u64, None)
+        .find_cached_ranges(
+            cache_key,
+            0,
+            (test_data.len() - 1) as u64,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .ranges;
 
     assert!(
         found_ranges.is_empty(),

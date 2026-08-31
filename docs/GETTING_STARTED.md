@@ -362,21 +362,45 @@ Without a matching SAN, TLS clients will reject the certificate with a hostname 
 
 ##### Configuring Clients to Trust the Certificate
 
-AWS CLI and SDKs need to trust the proxy's certificate. Two options:
+The certificate being verified belongs to the **proxy**, on the `HTTP_PROXY` hop — not to S3. That distinction decides which setting works, and most of the obvious ones do not.
+
+**`AWS_CA_BUNDLE` and `--no-verify-ssl` don't apply here** — both configure the connection to the endpoint URL, which is plain `http://` in this deployment, so neither ever reaches the proxy connection. There is no CLI flag that trusts or bypasses the proxy's certificate. Install it explicitly:
 
 ```bash
-export AWS_CA_BUNDLE=/path/to/cert.pem  # Tell the SDK to trust this CA
+# Amazon Linux, RHEL, Fedora
+sudo cp cert.pem /etc/pki/ca-trust/source/anchors/s3-proxy.crt && sudo update-ca-trust
+
+# Debian, Ubuntu
+sudo cp cert.pem /usr/local/share/ca-certificates/s3-proxy.crt && sudo update-ca-certificates
 ```
 
-Or for quick testing (disables all TLS verification — not for production):
+Then point the client at the TLS listener, keeping `--endpoint-url` on `http://`:
 
 ```bash
+export HTTP_PROXY=https://<proxy-host>:3129  # TLS to the proxy, not to S3
+export NO_PROXY=169.254.169.254              # On EC2, keep IMDS off the proxy path
 aws s3 cp s3://your-bucket/key ./local \
   --endpoint-url http://s3.us-east-1.amazonaws.com \
-  --no-verify-ssl
+  --region us-east-1
 ```
 
-For production, use a certificate signed by your organization's internal CA, or add the self-signed certificate to the system trust store.
+An `https://` endpoint URL would make the SDK open a `CONNECT` tunnel that bypasses the cache — see "Why `HTTP_PROXY`, not `HTTPS_PROXY`" above.
+
+botocore's `proxy_ca_bundle` setting can trust a proxy certificate without touching the system
+trust store, but only from boto3 — it must be passed as a `Config` object and is not read from
+`~/.aws/config`, so there is no AWS CLI equivalent:
+
+```python
+import boto3
+from botocore.config import Config
+
+cfg = Config(proxies_config={'proxy_ca_bundle': '/path/to/cert.pem'})
+s3 = boto3.client('s3', endpoint_url='http://s3.us-east-1.amazonaws.com', config=cfg)
+```
+
+For the AWS CLI, the system trust store above is the only option.
+
+For production, prefer a certificate signed by your organization's internal CA, which needs no per-client configuration on hosts that already trust that CA.
 
 #### Option B: DNS Zone (Production Deployments)
 
@@ -978,7 +1002,7 @@ s3 = boto3.client('s3',
 Notes:
 
 - The `https` proxy URL typically uses the `http://` scheme — that is the scheme of the proxy connection, not the target.
-- For encrypted client-to-proxy transport, point the proxy URL at the TLS proxy listener (e.g., `'https://<proxy-ip>:3129'`) and set `AWS_CA_BUNDLE` or pass `verify=` on the client.
+- For encrypted client-to-proxy transport, point the proxy URL at the TLS proxy listener (e.g., `'https://<proxy-ip>:3129'`) and trust its certificate via the system trust store or `Config(proxies_config=...)` as shown above — `AWS_CA_BUNDLE` and `verify=` don't apply to the proxy hop, only to the endpoint connection.
 - Without `config=`, boto3 picks up `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` from the environment. The per-client `Config` only overrides proxy settings for that specific client, leaving other clients in the same process unaffected.
 - Set `NO_PROXY=169.254.169.254` on EC2 to keep IMDS credential retrieval off the proxy path. Not needed off EC2 unless you have other IPs to bypass.
 - Use `proxies_config={'proxy_use_forwarding_for_https': False}` (the default) to make HTTPS requests tunnel via `CONNECT`. Setting it to `True` switches to forward-proxy style, which bypasses caching.
@@ -1118,11 +1142,13 @@ aws s3 cp s3://bucket/key ./local \
 
 ```bash
 export HTTP_PROXY=https://<proxy-ip>:3129
-export AWS_CA_BUNDLE=/path/to/proxy-cert.pem
+export NO_PROXY=169.254.169.254
 aws s3 cp s3://bucket/key ./local \
   --endpoint-url http://s3.us-east-1.amazonaws.com \
   --region us-east-1
 ```
+
+The proxy's certificate must be in the client host's system trust store. `AWS_CA_BUNDLE` does not apply to the `HTTP_PROXY` hop — see [Configuring Clients to Trust the Certificate](#configuring-clients-to-trust-the-certificate).
 
 **On EC2, add `export NO_PROXY=169.254.169.254`** so IMDS credential retrieval bypasses the proxy (otherwise instance-profile credentials fail to load). Add other IPs or hostnames to `NO_PROXY` as needed.
 

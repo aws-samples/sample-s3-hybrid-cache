@@ -332,6 +332,7 @@ async fn merge_range_segments_rejects_holey_cached_extents() {
             &RangeSpec { start: 0, end: 29 },
             Some(ETAG),
             None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
         )
         .await
         .expect("overlap");
@@ -358,7 +359,13 @@ async fn merge_ranges_with_fallback_refetches_holey_cached_extents() {
     cache_ranges(&disk_cache, cache_key, &[(0, 9), (20, 29)]).await;
     let request = RangeSpec { start: 0, end: 29 };
     let overlap = range_handler
-        .find_cached_ranges(cache_key, &request, Some(ETAG), None)
+        .find_cached_ranges(
+            cache_key,
+            &request,
+            Some(ETAG),
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .expect("overlap");
     let stub: Arc<dyn S3ClientApi + Send + Sync> = Arc::new(
@@ -758,7 +765,13 @@ async fn ledger_refused_repair_fetch_surfaces_ceiling_exceeded() {
     cache_ranges(&disk_cache, cache_key, &[(0, 9), (20, 29)]).await;
     let request = RangeSpec { start: 0, end: 29 };
     let overlap = range_handler
-        .find_cached_ranges(cache_key, &request, Some(ETAG), None)
+        .find_cached_ranges(
+            cache_key,
+            &request,
+            Some(ETAG),
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .expect("overlap");
 

@@ -107,7 +107,13 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
     };
 
     let overlap_with_old_etag = range_handler
-        .find_cached_ranges(cache_key, &requested_range, Some(old_etag), None)
+        .find_cached_ranges(
+            cache_key,
+            &requested_range,
+            Some(old_etag),
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await?;
 
     assert_eq!(
@@ -122,7 +128,13 @@ async fn test_etag_mismatch_detection_in_find_cached_ranges() -> Result<()> {
 
     // Step 4: Query with new ETag (should NOT find the range due to mismatch)
     let overlap_with_new_etag = range_handler
-        .find_cached_ranges(cache_key, &requested_range, Some(new_etag), None)
+        .find_cached_ranges(
+            cache_key,
+            &requested_range,
+            Some(new_etag),
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await?;
 
     assert_eq!(

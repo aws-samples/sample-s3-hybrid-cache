@@ -638,9 +638,19 @@ impl WriteCacheManager {
     /// adjusted only `self.current_size` — a per-instance, in-memory counter. It wrote
     /// no journal entries and touched neither the size accumulator nor Size_State, so
     /// `write_cache_size` ratcheted upward forever while data was being deleted. That
-    /// is the R5 leak; read-tier eviction has always done this correctly
+    /// is the R5 leak; read-tier eviction did debit both channels
     /// (`CacheManager::perform_eviction_with_lock`, Step 5), which is the evidence
     /// that the omission was an oversight rather than a definition difference.
+    ///
+    /// **Corrected 2026-08-28.** This paragraph used to say read-tier eviction "has
+    /// always done this correctly", and R5.4 below cited it as the model. That was
+    /// true of *which figures* it debited and false of *which ranges*: it built its
+    /// debit list from the candidate list rather than from what was deleted, so a
+    /// range whose `.bin` unlink failed was debited with its bytes still on disk.
+    /// Fixed under `cache-eviction-at-scale` R7.2, which copied the
+    /// `deleted_ranges` pattern below in the opposite direction. Do not restore the
+    /// stronger wording — it is the reason the read-tier defect went unexamined
+    /// while this one was being fixed.
     ///
     /// Three rules, and each maps to an acceptance criterion:
     ///

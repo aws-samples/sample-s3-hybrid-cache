@@ -1317,11 +1317,7 @@ async fn range_fetcher_branch_completes_success_on_2xx() {
     let inflight_tracker = Arc::new(InFlightTracker::new());
     let cache_key = "bucket/range-fetcher-success.bin".to_string();
     let range_spec = RangeSpec { start: 0, end: 99 };
-    let overlap = s3_proxy::range_handler::RangeOverlap {
-        missing_ranges: vec![range_spec.clone()],
-        cached_ranges: Vec::new(),
-        can_serve_from_cache: false,
-    };
+    let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec);
 
     let stub = StubS3Client::new().with_default(
         StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
@@ -1378,11 +1374,7 @@ async fn range_fetcher_branch_completes_error_on_non_2xx() {
     let inflight_tracker = Arc::new(InFlightTracker::new());
     let cache_key = "bucket/range-fetcher-error.bin".to_string();
     let range_spec = RangeSpec { start: 0, end: 99 };
-    let overlap = s3_proxy::range_handler::RangeOverlap {
-        missing_ranges: vec![range_spec.clone()],
-        cached_ranges: Vec::new(),
-        can_serve_from_cache: false,
-    };
+    let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec);
 
     let stub = StubS3Client::new().with_default(StubResponse::forbidden());
     let s3_client = stub.clone().into_trait_object();
@@ -1606,11 +1598,7 @@ async fn coordination_disabled_bypasses_inflight_tracker_range() {
     let inflight_tracker = Arc::new(InFlightTracker::new());
     let cache_key = "bucket/disabled-range.bin".to_string();
     let range_spec = RangeSpec { start: 0, end: 49 };
-    let overlap = s3_proxy::range_handler::RangeOverlap {
-        missing_ranges: vec![range_spec.clone()],
-        cached_ranges: Vec::new(),
-        can_serve_from_cache: false,
-    };
+    let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec);
 
     let stub = StubS3Client::new().with_default(
         StubResponse::with_status(StatusCode::PARTIAL_CONTENT)

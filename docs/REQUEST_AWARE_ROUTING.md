@@ -32,6 +32,11 @@ here.
 
 ## What affinity adds
 
+An HAProxy tier configured this way is an **affinity router**: it hashes each request to one proxy
+by object key and page index, so every read of a given page reaches the same instance. Other
+documents in this set use that term for it, [Local NVMe Cache Fleets](LOCAL_NVME_CACHE.md) in
+particular, where the router is a prerequisite rather than an optimisation.
+
 Routing by object and page buys two distinct things.
 
 **RAM cache efficiency, on every repeat read.** Each instance keeps its own RAM tier.
@@ -61,7 +66,7 @@ fronts it change.
 
 | | On-premises | AWS |
 |---|---|---|
-| **Central** | Recommended. Replaces the load-balancing tier you already operate and reuses its existing virtual address, so affinity costs no new component. Encrypts the client hop. | Not recommended. Needs a load balancer in front, which keeps the per-GB charge it was meant to avoid. |
+| **Central** | Recommended. Nothing meters the hop, so affinity costs a component to operate rather than a per-GB charge: two HAProxy instances behind a floating address ([High availability](#high-availability)), or the load-balancing tier you already operate if you have one. Encrypts the client hop. | Not recommended. Needs a load balancer in front, which keeps the per-GB charge it was meant to avoid. |
 | **Sidecar on each client host** | Works, and needs no client TLS at all because the cleartext hop never leaves the host. Costs a process, a config, and the fleet CA on every host. | The only way to get affinity without paying for a load balancer in front. |
 
 ### The router's certificate
@@ -222,6 +227,10 @@ backend cache_fleet
     option httpchk GET /health
     http-check expect status 200
 
+    # Overrides the defaults block: a redispatched retry goes to a DIFFERENT member,
+    # which is the one thing an affinity backend must not do. See below.
+    no option redispatch
+
     # hash-key addr is REQUIRED whenever more than one router exists.
     server-template m 1-16 cache-fleet.internal:3129 check port 8080 resolvers fleetdns init-addr none ssl verify required ca-file /etc/haproxy/tls/fleet-ca.pem hash-key addr
 
@@ -265,6 +274,24 @@ failure will be masked:
 ```bash
 haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl reload haproxy
 ```
+
+### Why the backend turns off `redispatch`
+
+`option redispatch` in the `defaults` block sends a retried request to a **different** server.
+Every other backend wants that. An affinity backend does not: the whole point is that one member
+owns a page, and redispatching hands the request to a member that does not, which fetches the same
+bytes from the origin and caches a second copy. So the backend overrides it with
+`no option redispatch`, and the retry goes back to the owner.
+
+`retries 2` is left alone, because HAProxy's default `retry-on` is `conn-failure` — a retry fires
+only when the connection could not be established, before any request body has been forwarded. That
+is worth keeping: it rides out a transient connect failure without the router having to replay
+anything.
+
+**If you widen `retry-on`, exclude writes.** Adding response-shaped conditions
+(`empty-response`, `response-timeout`, `503`, and so on) lets a retry fire after the body has
+started moving, and HAProxy cannot replay a request body it has already streamed. On a large `PUT`
+or `UploadPart` that produces a failed upload rather than a retried one.
 
 ### Deploying a sidecar
 
@@ -340,12 +367,31 @@ single page against three members, the average is 8, so:
 | 150 (cap 12) | 12 / 12 | 2 |
 | 110 (cap 9) | 9 / 9 / 6 | 3 |
 
-Requests that spill still succeed and still land on a member that can read the same bytes
-from the shared volume, so a spill costs some cache locality, not correctness.
+Requests that spill still succeed, and what a spill costs depends on where the cache lives.
 
-150 is a reasonable starting point. Do not tune it by watching a single burst;
-concentration only appears under genuine concurrency, and a sequential test will show one
-member regardless of the setting.
+**On a shared cache volume it is nearly free.** The spill target reads the same bytes off the same
+volume, so a spill costs some cache locality and not correctness. 150 is a reasonable starting
+point. Do not tune it by watching a single burst; concentration only appears under genuine
+concurrency, and a sequential test will show one member regardless of the setting.
+
+**On [local NVMe](LOCAL_NVME_CACHE.md) it is billable, and the recommendation inverts: leave the
+directive out.** The spill target has none of those bytes, so it fetches from the origin and keeps
+its own copy. Measured on a four-instance fleet: duplicate copies are exactly linear in the members
+the factor admits, 1.00 / 3.00 / 4.00 copies at absent / 150 / 110. That is per-GB origin traffic
+plus lost cache capacity, arriving precisely when load is highest.
+
+**Either way, be deliberate about multipart uploads.** Every operation of one upload —
+`CreateMultipartUpload`, every `UploadPart`, and Complete — carries the object in `path` and no
+`Range` header, so they all share the `full` routing key and one member owns the whole upload.
+Bounded load will spill parts off that owner: ten parts in flight across three members average 3.3,
+so a factor of 150 caps the owner at 5 and spills the rest, and one large file through the AWS CLI
+reaches ten at the default `max_concurrent_requests`. Split parts and the object is not cached, even
+though S3 still completes the upload — see
+[MULTIPART_UPLOAD.md](MULTIPART_UPLOAD.md#multi-instance-deployments).
+
+Omitting the directive keeps an upload together and caps a single object's write throughput at one
+member's capacity, since nothing else can absorb it. That trade is not avoidable by tuning; it is
+what one-owner-per-key means for a write.
 
 ## Discovery
 
@@ -398,8 +444,11 @@ public CA need no file of their own: use `@system-ca` and HAProxy verifies again
 system trust store. A self-signed fleet certificate is its own CA file, and then every
 router needs a copy.
 
-Either way, store the fleet's certificate on the shared volume so all instances present the
-same one, and make sure its SANs cover the addresses or names HAProxy connects to.
+Either way, give every instance the same certificate, and make sure its SANs cover the addresses or
+names HAProxy connects to. On a shared cache volume the simplest place to keep it is that volume. A
+[local NVMe fleet](LOCAL_NVME_CACHE.md) has no shared volume, so distribute it the same way you
+distribute `cache_rules.json` — configuration management, or a fetch from S3 in userdata. Do not put
+it on the instance store, which is erased whenever an instance stops.
 
 With a certificate that does not validate, requests fail closed: HAProxy returns 503 and
 logs the server-side connection error, and no data is returned. That is the correct
@@ -441,8 +490,10 @@ depend on the health check being right.
   balancer.
 - **It does not coordinate across routers at runtime.** Routers agree because they hash the
   same key over the same member addresses, not because they talk to each other. Brief
-  disagreement during membership change costs a duplicate fetch, not correctness, because
-  the new owner reads the same shared volume.
+  disagreement during membership change costs a duplicate fetch rather than correctness. On a
+  shared cache volume that fetch is a read off the volume; on [local NVMe](LOCAL_NVME_CACHE.md)
+  it is an origin fetch and a second cached copy, so the window costs transfer as well as
+  latency.
 - **It reads the health endpoint as a signal, not as data.** [Health
   checking](#health-checking) covers liveness well, and taking an instance out of service is
   just a matter of it failing its own check. What `option httpchk` cannot do is read *values*

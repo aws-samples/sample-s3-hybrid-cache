@@ -180,7 +180,13 @@ async fn test_cached_range_hit_logging() {
         end: 1023,
     };
     let overlap = range_handler
-        .find_cached_ranges(cache_key, &range_spec, None, None)
+        .find_cached_ranges(
+            cache_key,
+            &range_spec,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -305,7 +311,13 @@ async fn test_complete_cache_hit_metrics() {
         end: 1023,
     };
     let overlap = range_handler
-        .find_cached_ranges(cache_key, &range_spec, None, None)
+        .find_cached_ranges(
+            cache_key,
+            &range_spec,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 

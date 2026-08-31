@@ -6,6 +6,57 @@ correctness checks applied before cached bytes reach a client.
 `docs/ARCHITECTURE.md` → Range Read-Path Map is the quick answer for a single entry point
 (RAM consulted? RAM promoted? under which key?). This document is the mechanism.
 
+## Lookup purpose, and what authorises a cached serve
+
+Every cache-coverage lookup states **why** it is asking, because the answer changes what an
+expired entry looks like. `RangeLookupPurpose` is a required argument on both
+`DiskCacheManager::find_cached_ranges` and `RangeHandler::find_cached_ranges`; there is no
+default, so a new call site has to choose.
+
+| Purpose | Past stored expiry | For callers that |
+|---|---|---|
+| `FreshServe` | returns **no** coverage | may serve what they get with no further freshness check |
+| `RevalidationCandidate` | returns coverage, marked `StoredFreshness::Expired` | will evaluate freshness themselves before serving |
+
+The question to ask at a call site is: **between this lookup and bytes reaching a client,
+what bounds the staleness?** A live-TTL verdict, a client validator, or a successful `304`
+means `RevalidationCandidate`. Nothing but the lookup itself means `FreshServe`. If the
+answer is "nothing at all", the call site is a defect whichever purpose it names.
+
+`RevalidationCandidate` grants **discovery, not permission**. `RangeOverlap` enforces that
+in its accessors rather than by convention:
+
+- `is_serveable_unvalidated()` — complete coverage **and** stored-fresh. Safe on its own.
+- `has_complete_coverage()` — coverage only. Requires the caller to hold a separate
+  authority and say which one.
+
+So serving expired bytes always involves reaching for the second accessor and writing down
+why it is allowed.
+
+### Which authority each cached serve holds
+
+| Read path | Purpose | What authorises the serve |
+|---|---|---|
+| Full-object mainline GET | `RevalidationCandidate` | Mode B matching `If-Match`, or a live-TTL `Fresh` verdict, or a `304` |
+| Range path, early full-object shortcut | `FreshServe` | Live-TTL `Fresh` verdict; when expired it falls through rather than serving |
+| Range path, range-specific lookup | `RevalidationCandidate` | Live-TTL `Fresh` verdict, or a `304` |
+| Page widening (`find_page_overlap`) | `FreshServe` | Stored expiry only — see the caveat below |
+| Part-scoped lookup (`?partNumber=N`) | `FreshServe` | Stored expiry only — see the caveat below |
+| Post-`304` validated-serve helpers | `RevalidationCandidate` | The `304` itself; coverage is re-checked because a `304` proves the version, not the coverage |
+| Degraded coalescing fallbacks | `FreshServe` | Stored expiry only; these run when S3 errored, so there is no validation to lean on |
+
+**Caveat on the two `FreshServe`-only rows.** Page widening and the part-scoped lookup are
+bounded by *stored* expiry rather than by the currently resolved `get_ttl`, so lowering
+`get_ttl` does not take effect on already-cached data on those paths until the old
+`expires_at` elapses. The widened path additionally consults the RAM tier before this
+lookup. Both are pre-existing, both are tracked separately, and neither is a consequence
+of candidate revalidation. The mainline GET paths are bounded by the resolved `get_ttl` and
+honour a `get_ttl` change without a restart or a cache wipe.
+
+If you need `get_ttl` to take effect immediately on a key, keep it off page widening
+(`page_widening` defaults to off) and read whole objects or ordinary ranges rather than
+part-scoped (`?partNumber=N`) requests.
+
 ## Cache Types
 
 ### Full Object Cache

@@ -20,6 +20,7 @@ Primary source file: `src/signed_put_handler.rs`.
 - [Compression and integrity](#compression-and-integrity)
 - [Threat model](#threat-model)
 - [Tests to consult](#tests-to-consult)
+- [Common gotchas](#common-gotchas)
 
 ## Why multipart caching matters
 
@@ -163,7 +164,7 @@ The proxy is designed to scale horizontally. For multipart uploads, there are th
 
 **Multi-proxy, shared cache volume** (EFS/NFS): Different proxy instances may handle different `UploadPart` calls for the same `uploadId`, and any instance may handle the `Complete`. Because `mpus_in_progress/{uploadId}/` is on shared storage, each part's record is written by whichever instance cached it and read by whichever instance completes. Cross-instance exclusion is needed only between writers of the *same* part number, which `part{N}.lock` provides — an OS file lock that NFS respects, with the usual caveats about NFS lock recovery. Complete's correctness comes from polling the shared volume for the records it needs, so nothing depends on which instance holds what in memory. No additional coordination layer needed.
 
-**Multi-proxy, independent cache volumes**: Each proxy has its own local `mpus_in_progress/` directory. If parts land on different proxies, the instance that handles `Complete` waits the full 10 seconds for records that will never appear, declines at the missing-parts gate, and leaves staging for the TTL sweep. S3 still completes the upload; the proxy just doesn't retain the object. This is a degraded cache hit rate and a slower Complete, not a correctness problem.
+**Multi-proxy, independent cache volumes**: Each proxy has its own local `mpus_in_progress/` directory, so an upload is cached only when all of its operations reach one instance. Consistent-hash affinity achieves that with no extra coordination: all four operations carry the object in the request path and none carries a `Range` header, so hashing on the path routes them together (see [Request-Aware Routing](REQUEST_AWARE_ROUTING.md)). Leave `hash-balance-factor` out, since every part of an upload shares one routing key and bounded load would spill parts to other instances. Without affinity, the instance that handles `Complete` waits the full 10 seconds for records that will never appear, declines at the missing-parts gate, and leaves staging for the TTL sweep. S3 still completes the upload; the proxy just doesn't retain the object. This is a degraded cache hit rate and a slower Complete, not a correctness problem. [LOCAL_NVME_CACHE.md](LOCAL_NVME_CACHE.md) covers this deployment in full.
 
 In all three shapes the correctness gates guarantee the same invariant: **the cache either holds the exact bytes S3 holds, or holds nothing for that object.**
 

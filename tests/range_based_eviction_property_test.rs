@@ -563,7 +563,8 @@ fn prop_metadata_removes_evicted_ranges(config: MetadataUpdateConfig) -> TestRes
             .await;
 
         match result {
-            Ok((_bytes_freed, all_evicted, _deleted_paths)) => {
+            Ok(deletion) => {
+                let all_evicted = deletion.all_ranges_evicted;
                 if !all_evicted {
                     let updated_metadata = match read_metadata(&meta_path) {
                         Ok(m) => m,
@@ -641,7 +642,8 @@ fn prop_metadata_preserves_object_metadata(config: MetadataUpdateConfig) -> Test
             .await;
 
         match result {
-            Ok((_bytes_freed, all_evicted, _deleted_paths)) => {
+            Ok(deletion) => {
+                let all_evicted = deletion.all_ranges_evicted;
                 if !all_evicted {
                     let updated_metadata = match read_metadata(&meta_path) {
                         Ok(m) => m,

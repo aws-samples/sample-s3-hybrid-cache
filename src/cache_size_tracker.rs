@@ -211,6 +211,31 @@ struct ScanFileResult {
     cache_skipped: bool,
     /// Whether GET cache expiration encountered an error
     cache_error: bool,
+    /// Whether this scan pass left no `.meta` at the scanned path — because the pass
+    /// itself removed it (unparseable self-heal, write-cache expiry, GET expiry) or
+    /// because something else did between the read and the check.
+    ///
+    /// The object census must not count an entry the scan just deleted: the census is
+    /// installed as `cached_objects`, so counting a removed entry reports an object
+    /// that no longer exists and biases the figure **upward** — the direction that
+    /// makes a future Entry_Budget (R4.4) over-evict.
+    ///
+    /// **This is set from `path.exists()`, deliberately, not from the return value of
+    /// the deleting call.** Those return values do not answer the question the census
+    /// asks. `check_and_invalidate_expired_write_cache` returns `Ok(true)` even when
+    /// its own `remove_file` failed (`src/cache.rs:10933`, whose `metadata_deleted`
+    /// flag gates only the decrement), `invalidate_cache` returns `Ok(())` without
+    /// promising which paths went, and the unparseable arm's `remove_file` can fail on
+    /// a read-only or contended volume. Each of those is a case where the `.meta`
+    /// survives and must still be counted. Reading the filesystem asks the predicate
+    /// the census is defined over — "is there a `.meta` here now" — rather than an
+    /// adjacent figure that usually agrees with it.
+    ///
+    /// Costs one `stat` per deletion branch only, never on the common non-deleting
+    /// path, which matters at the 100M-object design point (F8's traversal budget).
+    ///
+    /// Spec: cache-eviction-at-scale. Requirements: 7.1
+    meta_removed: bool,
 }
 
 /// Format bytes in human-readable units (KiB, MiB, GiB, TiB)
@@ -1291,10 +1316,19 @@ impl CacheSizeTracker {
             cache_expired,
             cache_skipped,
             cache_errors,
-            scanned_objects,
+            files_visited,
+            metas_removed,
             scanned_staged_size,
             staged_paths,
         ) = self.scan_metadata_with_shared_validator().await?;
+        // The census is the surviving population, not the number of files visited. The
+        // scan deletes `.meta` files as it goes — unparseable ones it self-heals (F7),
+        // plus write-cache and GET expiry — and an object whose `.meta` this pass removed
+        // is not a cached object. Counting it inflates `cached_objects`, the direction
+        // that makes a future Entry_Budget (R4.4) evict against a phantom population.
+        // `files_visited` is retained for `files_scanned` in validation.json, which is a
+        // work-done figure. Spec: cache-eviction-at-scale. Requirements: 7.1
+        let scanned_objects = files_visited.saturating_sub(metas_removed);
         let tracked_size = self.get_size().await; // Delegate to consolidator (Task 12.3)
         let tracked_staged_size = self.get_write_cache_size().await;
         let drift = scanned_size as i64 - tracked_size as i64;
@@ -1324,7 +1358,9 @@ impl CacheSizeTracker {
                 format_bytes_human(scanned_staged_size),
                 if staged_drift >= 0 { "+" } else { "-" },
                 format_bytes_human(staged_drift.unsigned_abs()),
-                scanned_objects
+                // Files the figure was computed from, including any removed on this pass
+                // (which contribute zero bytes) — a provenance figure, not the census.
+                files_visited
             );
         } else {
             debug!(
@@ -1343,8 +1379,28 @@ impl CacheSizeTracker {
         }
 
         // Always update size state from validation — even when size drift is zero,
-        // cached_objects may have drifted due to multi-instance double-counting.
-        // The validation scan's .meta file count is the authoritative object count.
+        // `cached_objects` may have drifted, because increments and decrements are applied
+        // per-instance to a shared counter and a missed decrement is never noticed by the
+        // instance that missed it.
+        //
+        // **The absolute install below is sound HERE and only here**, because this is a
+        // full scan: it visits every `.meta` under `metadata/`, so `scanned_objects` is a
+        // whole-cache census and replacing the counter with it is a re-grounding rather
+        // than an estimate. The previous wording — "the validation scan's .meta file count
+        // is the authoritative object count" — was true of *this* function and read as
+        // true of the scan in general. It is not true of `perform_rolling_validation`,
+        // which observes a subset and can only extrapolate; see the block at that call
+        // site for why that extrapolation cannot converge the counter and what R5 changes.
+        //
+        // Two consequences worth stating, since R4.4's Entry_Budget will consume this:
+        //  - `scanned_objects` excludes `.meta` files this pass deleted (see above). Before
+        //    that subtraction the census counted them, so it over-reported by the number of
+        //    expiries and self-heals in the pass.
+        //  - At the design point R4.5 says the full scan does not fit its budget, so this
+        //    path may never run in the field. A counter that converges only here converges
+        //    only in theory — which is why the Entry_Budget must check `validation_type`.
+        //
+        // Spec: cache-eviction-at-scale. Requirements: 7.1, 4.4, 4.5
         //
         // Requirement 6.1: pass the recomputed write-cache figure rather than `None`.
         // This is a full scan of every `.meta`, so `scanned_staged_size` is a
@@ -1364,8 +1420,11 @@ impl CacheSizeTracker {
         // Also the in-place upgrade path — see the method doc.
         self.reappend_missing_ledger_entries(&staged_paths).await;
 
-        // Write validation metadata
-        let files_scanned = scanned_objects;
+        // Write validation metadata. This is a work-done figure — how many `.meta` files
+        // the pass opened — so it stays `files_visited` rather than the census, which is
+        // smaller by the number removed on this pass.
+        // Spec: cache-eviction-at-scale. Requirements: 7.1
+        let files_scanned = files_visited;
         self.write_validation_metadata(
             scanned_size,
             tracked_size,
@@ -1491,6 +1550,10 @@ impl CacheSizeTracker {
         // sum over the scanned L1 subset. Requirement 6.3.
         let mut total_staged = 0u64;
         let mut total_objects = 0u64;
+        // `.meta` files visited that this pass removed. `total_objects - total_removed` is
+        // the surviving population over the scanned subset, and that — not `total_objects`
+        // — is what the census may report. Spec: cache-eviction-at-scale. Requirements: 7.1
+        let mut total_removed = 0u64;
         let mut _total_cache_expired = 0u64;
         let mut _total_cache_skipped = 0u64;
         let mut _total_cache_errors = 0u64;
@@ -1520,6 +1583,12 @@ impl CacheSizeTracker {
             // through the same proportional correction total_size does.
             let batch_staged = AtomicU64::new(0);
             let batch_objects = AtomicU64::new(0);
+            // `.meta` files this pass removed. Subtracted from `batch_objects` before the
+            // census is installed, so the scan does not report objects it just deleted.
+            // Kept as a separate counter rather than by not incrementing `batch_objects`,
+            // so "files visited" stays available for the log line and the two figures can
+            // be compared. Spec: cache-eviction-at-scale. Requirements: 7.1
+            let batch_removed = AtomicU64::new(0);
             let batch_expired = AtomicU64::new(0);
             let batch_skipped = AtomicU64::new(0);
             let batch_errors = AtomicU64::new(0);
@@ -1547,6 +1616,9 @@ impl CacheSizeTracker {
                         batch_size.fetch_add(result.size_bytes, Ordering::Relaxed);
                         batch_staged.fetch_add(result.staged_bytes, Ordering::Relaxed);
                         batch_objects.fetch_add(1, Ordering::Relaxed);
+                        if result.meta_removed {
+                            batch_removed.fetch_add(1, Ordering::Relaxed);
+                        }
                         if result.cache_expired {
                             batch_expired.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1563,6 +1635,7 @@ impl CacheSizeTracker {
             total_size += batch_size.load(Ordering::Relaxed);
             total_staged += batch_staged.load(Ordering::Relaxed);
             total_objects += batch_objects.load(Ordering::Relaxed);
+            total_removed += batch_removed.load(Ordering::Relaxed);
             _total_cache_expired += batch_expired.load(Ordering::Relaxed);
             _total_cache_skipped += batch_skipped.load(Ordering::Relaxed);
             _total_cache_errors += batch_errors.load(Ordering::Relaxed);
@@ -1592,12 +1665,57 @@ impl CacheSizeTracker {
 
         // 7.3: Compute proportional size correction and update size state
         if total_dirs_scanned > 0 {
+            // Exclude `.meta` files this pass removed. Feeding `total_objects` here would
+            // extrapolate a population that includes entries the scan itself deleted, and
+            // because the correction adds the observed discrepancy to `tracked_objects`,
+            // that error is multiplied by `256 / total_dirs_scanned` on the way in.
+            // Spec: cache-eviction-at-scale. Requirements: 7.1
+            let surviving_objects = total_objects.saturating_sub(total_removed);
+            if total_removed > 0 {
+                info!(
+                    "Rolling validation: {} of {} .meta files visited were removed on this pass; \
+                     census reports {} surviving",
+                    total_removed, total_objects, surviving_objects
+                );
+            }
             let (corrected_size, corrected_objects) = self.apply_proportional_correction(
                 total_size,
-                total_objects,
+                surviving_objects,
                 total_dirs_scanned.min(256),
                 tracked_size,
                 tracked_objects,
+            );
+
+            // A rolling pass observes a subset and therefore may NOT install an absolute
+            // `cached_objects`; `corrected_objects` above is an extrapolation, and it is
+            // recorded as such rather than presented as a census. Three things make it
+            // unsound as a convergence mechanism, and none of them is fixable here:
+            //
+            //  1. The expectation `tracked * dirs_scanned / 256` is derived from the very
+            //     value being corrected (R5.3).
+            //  2. `total_dirs_scanned` advances by *intended* L1 index slots, including
+            //     when `select_l1_directories` found nothing on disk, so the numerator and
+            //     denominator describe different things (R5.3, F6).
+            //  3. Every instance installs its own extrapolation absolutely over the shared
+            //     `size_state.json`, so two rolling scans race — which is the
+            //     multi-instance problem the full scan's comment names but the rolling
+            //     path reproduces rather than resolves.
+            //
+            // R5.2's absolute per-shard aggregates are what make this sound: a shard's
+            // count is replaced only by a pass that actually scanned that shard, and the
+            // global figure is a sum rather than an extrapolation. Until then
+            // `cached_objects` converges only when a full scan runs — a mode R4.5 says
+            // does not exist at the design point — so R4.4's Entry_Budget MUST consult
+            // `validation_type` in `validation.json` ("full" vs "rolling") before treating
+            // this figure as a population count.
+            // Spec: cache-eviction-at-scale. Requirements: 7.1, 4.4, 4.5, 5.2, 5.3
+            debug!(
+                "Rolling validation: cached_objects {} -> {} is an EXTRAPOLATION from {} \
+                 surviving objects over {} of 256 L1 index slots, not a census",
+                tracked_objects,
+                corrected_objects,
+                surviving_objects,
+                total_dirs_scanned.min(256)
             );
 
             // Requirement 6.3: apply the SAME proportional correction to the write-cache
@@ -1863,7 +1981,7 @@ impl CacheSizeTracker {
     #[allow(clippy::type_complexity)]
     async fn scan_metadata_with_shared_validator(
         &self,
-    ) -> Result<(u64, u64, u64, u64, u64, u64, Vec<std::path::PathBuf>)> {
+    ) -> Result<(u64, u64, u64, u64, u64, u64, u64, Vec<std::path::PathBuf>)> {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1871,7 +1989,7 @@ impl CacheSizeTracker {
         let metadata_dir = self.cache_dir.join("metadata");
 
         if !metadata_dir.exists() {
-            return Ok((0, 0, 0, 0, 0, 0, Vec::new()));
+            return Ok((0, 0, 0, 0, 0, 0, 0, Vec::new()));
         }
 
         // Paths of `.meta` files found still staged, for the ledger re-append.
@@ -1886,6 +2004,10 @@ impl CacheSizeTracker {
         let cache_skipped = AtomicU64::new(0);
         let cache_errors = AtomicU64::new(0);
         let files_processed = AtomicU64::new(0);
+        // `.meta` files this pass removed — self-healed as unparseable, or deleted by
+        // write-cache/GET expiry. Subtracted from `files_processed` to give the census.
+        // Spec: cache-eviction-at-scale. Requirements: 7.1
+        let metas_removed = AtomicU64::new(0);
 
         // Collect L1 shard directories for parallel traversal.
         // Structure: metadata/{bucket}/{L1}/{L2}/*.meta
@@ -1964,6 +2086,14 @@ impl CacheSizeTracker {
                     if result.cache_error {
                         cache_errors.fetch_add(1, Ordering::Relaxed);
                     }
+                    // A `.meta` this pass removed is not part of the population the
+                    // census describes. `files_processed` stays a work-done figure (it
+                    // drives the progress log and `files_scanned` in validation.json);
+                    // the census is `files_processed - metas_removed`.
+                    // Spec: cache-eviction-at-scale. Requirements: 7.1
+                    if result.meta_removed {
+                        metas_removed.fetch_add(1, Ordering::Relaxed);
+                    }
                     let count = files_processed.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(100_000) {
                         info!("Cache validation progress: {} files processed", count);
@@ -1973,7 +2103,18 @@ impl CacheSizeTracker {
         });
 
         let total = files_processed.load(Ordering::Relaxed);
-        info!("Cache validation: processed {} metadata files", total);
+        let removed = metas_removed.load(Ordering::Relaxed);
+        if removed > 0 {
+            info!(
+                "Cache validation: processed {} metadata files, {} removed on this pass, \
+                 census reports {} surviving objects",
+                total,
+                removed,
+                total.saturating_sub(removed)
+            );
+        } else {
+            info!("Cache validation: processed {} metadata files", total);
+        }
 
         Ok((
             total_size.load(Ordering::Relaxed),
@@ -1981,6 +2122,7 @@ impl CacheSizeTracker {
             cache_skipped.load(Ordering::Relaxed),
             cache_errors.load(Ordering::Relaxed),
             files_processed.load(Ordering::Relaxed),
+            removed,
             staged_total.load(Ordering::Relaxed),
             staged_paths.into_inner().unwrap_or_default(),
         ))
@@ -2001,6 +2143,7 @@ impl CacheSizeTracker {
                     cache_expired: false,
                     cache_skipped: false,
                     cache_error: true,
+                    meta_removed: false,
                 };
             }
         };
@@ -2029,6 +2172,9 @@ impl CacheSizeTracker {
                     cache_expired: false,
                     cache_skipped: false,
                     cache_error: true,
+                    // F7 self-heal. Ask the filesystem rather than trusting the
+                    // `remove_file` result — a failed unlink leaves a countable object.
+                    meta_removed: !path.exists(),
                 };
             }
         };
@@ -2065,6 +2211,7 @@ impl CacheSizeTracker {
                             cache_expired: false,
                             cache_skipped: false,
                             cache_error: true,
+                            meta_removed: false,
                         };
                     }
                 },
@@ -2076,6 +2223,7 @@ impl CacheSizeTracker {
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: false,
+                        meta_removed: false,
                     };
                 }
             };
@@ -2101,6 +2249,10 @@ impl CacheSizeTracker {
                         cache_expired: true,
                         cache_skipped: false,
                         cache_error: false,
+                        // `Ok(true)` does NOT mean the `.meta` went — that function
+                        // returns true on the expiry decision and gates only its own
+                        // decrement on `metadata_deleted`. Read the path instead.
+                        meta_removed: !path.exists(),
                     };
                 }
                 Some(false) => {
@@ -2121,6 +2273,7 @@ impl CacheSizeTracker {
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: true,
+                        meta_removed: false,
                     };
                 }
             }
@@ -2145,6 +2298,7 @@ impl CacheSizeTracker {
                             cache_expired: false,
                             cache_skipped: false,
                             cache_error: true,
+                            meta_removed: false,
                         };
                     }
                 },
@@ -2156,6 +2310,7 @@ impl CacheSizeTracker {
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: false,
+                        meta_removed: false,
                     };
                 }
             };
@@ -2185,6 +2340,7 @@ impl CacheSizeTracker {
                     cache_expired: false,
                     cache_skipped: true,
                     cache_error: false,
+                    meta_removed: false,
                 };
             }
 
@@ -2210,6 +2366,9 @@ impl CacheSizeTracker {
                         cache_expired: true,
                         cache_skipped: false,
                         cache_error: false,
+                        // `invalidate_cache` returns `Ok(())` without stating which
+                        // paths it managed to unlink, so read the path.
+                        meta_removed: !path.exists(),
                     };
                 }
                 None => {
@@ -2223,6 +2382,7 @@ impl CacheSizeTracker {
                         cache_expired: false,
                         cache_skipped: false,
                         cache_error: true,
+                        meta_removed: false,
                     };
                 }
             }
@@ -2235,6 +2395,7 @@ impl CacheSizeTracker {
             cache_expired: false,
             cache_skipped: false,
             cache_error: false,
+            meta_removed: false,
         }
     }
 }
@@ -3484,6 +3645,651 @@ mod tests {
         assert!(
             json.get("scanned_size").is_some(),
             "Existing scanned_size field should be preserved"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 round-trip: does a rolling cycle leave validation.json readable?
+    //
+    // Spec: cache-eviction-at-scale, Phase 0 task 0c.
+    // Finding: .kiro/specs/cache-eviction-at-scale/validation-scan-findings.md § F1
+    // Requirements: 4.5 (bearing, not home — see the task note)
+    //
+    // The claim under test is structural: `write_rolling_state` writes twelve
+    // fields via a `json!` literal, and `ValidationMetadata` requires five that
+    // are not among them and carry no `#[serde(default)]` — `scanned_size`,
+    // `tracked_size`, `drift_bytes`, `scan_duration_ms`, `metadata_files_scanned`.
+    // If that holds, `read_validation_metadata` cannot deserialize the file after
+    // any rolling cycle, and two consumers branch on that failure:
+    // `calculate_next_validation_time` returns `SystemTime::now()`, collapsing the
+    // daily cadence into continuous scanning, and `get_metrics` reports
+    // `last_validation_drift: None`.
+    //
+    // WHY NO EXISTING TEST CATCHES THIS. Every rolling test in
+    // `tests/rolling_validation_scan_integration_test.rs` reads the file back with
+    // `read_rolling_state` or raw `serde_json::Value`, both of which pick fields out
+    // by name and tolerate absent ones. `ValidationMetadata` is the only strict
+    // deserialization target for this file, and nothing pointed it at rolling output.
+    //
+    // WHAT THIS TEST DRIVES. A genuine cycle: `perform_validation()` selects the
+    // mode itself from the on-disk state and calls `perform_rolling_validation`,
+    // which scans real seeded `.meta` files and persists through the real
+    // `write_rolling_state`. The file under assertion is written by the writer, not
+    // hand-constructed to resemble it. A guard below asserts the file really was
+    // produced by a rolling cycle before any conclusion is drawn from it.
+    //
+    // ATTRIBUTION. A baseline is taken before the cycle, when validation.json holds
+    // genuine full-scan output. Both observations must hold there first, so a
+    // post-cycle failure is attributable to the rolling cycle rather than to the
+    // file having been missing or the schedule being misconfigured. The primary
+    // assertion is the deserialization RESULT itself — the value the failing line
+    // branches on — not a downstream figure that could look wrong for other reasons.
+    // STATUS: this test FAILS on the current tree, and that is the finding, not a
+    // regression. It is `#[ignore]`d only so a known-red assertion does not block
+    // the pre-push gate for unrelated work — task 0c writes the test, Phase 5 owns
+    // the fix. Whoever fixes F1 MUST delete this attribute and confirm the test
+    // goes green; that is the red-then-green evidence for the fix. Observed
+    // 2026-08-27 (run it with `cargo test --lib -- f1_rolling_cycle --ignored
+    // --nocapture`):
+    //
+    //   read_validation_metadata() = Err(Cache error: Failed to parse validation
+    //     metadata: missing field `scanned_size` at line 14 column 1)
+    //   calculate_next_validation_time() = 0s from now (healthy: >18000s)
+    //   last_validation_drift = None
+    //
+    // All three baseline assertions and both fixture guards passed in that run, so
+    // the failure is attributable to the rolling cycle alone.
+    #[tokio::test]
+    #[ignore = "F1 is an open defect (cache-eviction-at-scale Phase 0 task 0c); the fix is Phase 5. Remove this attribute with the fix."]
+    async fn f1_rolling_cycle_leaves_validation_json_deserializable() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec, UploadState,
+        };
+        use crate::compression::CompressionAlgorithm;
+        use chrono::{Duration as ChronoDuration, Local, Timelike};
+        use std::collections::HashMap;
+
+        // Put the scheduled time-of-day ~6 hours ahead in clock terms so the
+        // healthy branch of `calculate_next_validation_time` lands 6-7h out
+        // (target + 0..1h jitter) and the failing branch lands at ~now. Without
+        // this the default "00:00" could legitimately be minutes away, leaving the
+        // two branches indistinguishable near midnight.
+        let target = Local::now() + ChronoDuration::hours(6);
+        let config = CacheSizeConfig {
+            validation_time_of_day: format!("{:02}:{:02}", target.hour(), target.minute()),
+            // A 1s budget against the 10s full-scan duration seeded below is what
+            // makes `determine_scan_mode` choose Rolling.
+            validation_max_duration: Duration::from_secs(1),
+            ..CacheSizeConfig::default()
+        };
+        let (tracker, _consolidator, temp_dir) = create_test_tracker_with_config(config).await;
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        // Seed real .meta files across the first few L1 shards so the rolling scan
+        // has genuine work to do. Batch size on a first cycle (no scan rate) is 64
+        // shards from cursor 0, so 00-05 all fall inside it.
+        let now = SystemTime::now();
+        for idx in 0u8..6 {
+            let meta_path = cache_dir
+                .join("metadata")
+                .join("test-bucket")
+                .join(format!("{:02x}", idx))
+                .join("000")
+                .join("f1_object.meta");
+            std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+            let meta = NewCacheMetadata {
+                cache_key: format!("test-bucket:f1-object-{:02x}", idx),
+                object_metadata: ObjectMetadata {
+                    etag: "\"f1\"".to_string(),
+                    last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+                    content_length: 1024,
+                    content_type: Some("application/octet-stream".to_string()),
+                    upload_state: UploadState::Complete,
+                    cumulative_size: 1024,
+                    parts: Vec::new(),
+                    response_headers: HashMap::new(),
+                    compression_algorithm: CompressionAlgorithm::Lz4,
+                    compressed_size: 1024,
+                    parts_count: None,
+                    part_ranges: HashMap::new(),
+                    upload_id: None,
+                    is_write_cached: false,
+                    write_cache_expires_at: None,
+                    write_cache_created_at: None,
+                    write_cache_last_accessed: None,
+                    graduation_accounted: false,
+                },
+                ranges: vec![RangeSpec {
+                    start: 0,
+                    end: 1023,
+                    file_path: format!("f1_{:02x}_0.bin", idx),
+                    compression_algorithm: CompressionAlgorithm::Lz4,
+                    compressed_size: 1024,
+                    uncompressed_size: 1024,
+                    created_at: now,
+                    last_accessed: now,
+                    access_count: 1,
+                    staged: None,
+                }],
+                created_at: now,
+                expires_at: now + Duration::from_secs(86400),
+                compression_info: CompressionInfo::default(),
+                head_expires_at: None,
+                head_last_accessed: None,
+                head_access_count: 0,
+                head_cached_at: None,
+            };
+            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        }
+
+        // Establish the baseline through the REAL full-mode writers: the metadata
+        // writer, then the duration/type stamp a completed full scan leaves behind.
+        tracker
+            .write_validation_metadata(4096, 4096, 0, Duration::from_secs(10), 4, 0, 0, 0)
+            .await
+            .unwrap();
+        tracker.persist_full_scan_duration(10.0).await.unwrap();
+
+        assert!(
+            tracker.read_validation_metadata().await.is_ok(),
+            "BASELINE BROKEN: validation.json written by the full-scan path must \
+             deserialize. If this fails the rest of the test proves nothing."
+        );
+        let baseline_next = tracker.calculate_next_validation_time().await;
+        assert!(
+            baseline_next
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+                > Duration::from_secs(5 * 3600),
+            "BASELINE BROKEN: with full-scan metadata present the next validation \
+             must be ~6h out, not immediate. Got {:?} from now.",
+            baseline_next.duration_since(SystemTime::now())
+        );
+        assert!(
+            tracker.get_metrics().await.last_validation_drift.is_some(),
+            "BASELINE BROKEN: last_validation_drift must be populated from \
+             full-scan metadata."
+        );
+
+        // Drive a genuine cycle. `perform_validation` selects the mode from the
+        // on-disk state and dispatches; nothing here forces the rolling branch.
+        tracker
+            .perform_validation()
+            .await
+            .expect("validation cycle should succeed");
+
+        // Guard: confirm what actually ran, before drawing any conclusion from the
+        // file. A cycle that took the full branch, or wrote nothing, would make
+        // every assertion below unattributable.
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tracker.validation_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw.get("validation_type").and_then(|v| v.as_str()),
+            Some("rolling"),
+            "FIXTURE: the cycle did not take the rolling branch, so this test \
+             measured full-mode output. validation.json = {}",
+            raw
+        );
+        assert!(
+            raw.get("rolling_objects_validated")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 0,
+            "FIXTURE: the rolling cycle validated no objects, so the seeded .meta \
+             files were not reached. validation.json = {}",
+            raw
+        );
+
+        // --- The three observations. Collected first, reported together, asserted
+        // last, so a failure of the primary one does not hide the other two.
+        let deser = tracker.read_validation_metadata().await;
+        let next = tracker.calculate_next_validation_time().await;
+        let drift = tracker.get_metrics().await.last_validation_drift;
+
+        let deser_ok = deser.is_ok();
+        let deser_detail = match &deser {
+            Ok(_) => "Ok".to_string(),
+            Err(e) => format!("Err({})", e),
+        };
+        let until_next = next.duration_since(SystemTime::now()).unwrap_or_default();
+        let cadence_ok = until_next > Duration::from_secs(5 * 3600);
+
+        println!(
+            "F1 observations after a genuine rolling cycle:\n  \
+             read_validation_metadata() = {}\n  \
+             calculate_next_validation_time() = {}s from now (healthy: >18000s)\n  \
+             last_validation_drift = {:?}",
+            deser_detail,
+            until_next.as_secs(),
+            drift
+        );
+
+        // (A) PRIMARY — the value the failing line branches on.
+        assert!(
+            deser_ok,
+            "F1 ESTABLISHED (A): read_validation_metadata() failed after a rolling \
+             cycle: {}. The five fields ValidationMetadata requires without a serde \
+             default are absent from write_rolling_state's output. Fix belongs in \
+             Phase 5, not here.",
+            deser_detail
+        );
+
+        // (B) First runtime consequence — the daily cadence.
+        assert!(
+            cadence_ok,
+            "F1 ESTABLISHED (B): next validation scheduled {}s from now instead of \
+             ~6h, i.e. calculate_next_validation_time took the \"No validation \
+             metadata found\" immediate-reschedule branch. The daily cadence has \
+             collapsed into continuous scanning.",
+            until_next.as_secs()
+        );
+
+        // (C) Second runtime consequence — the only drift metric rolling mode has.
+        assert!(
+            drift.is_some(),
+            "F1 ESTABLISHED (C): cache_size.last_validation_drift is null after a \
+             rolling cycle. This is the field docs/SHARED_STORAGE.md tells operators \
+             to read for drift."
+        );
+    }
+
+    // =====================================================================
+    // Object census must exclude `.meta` files the scan removed on this pass
+    //
+    // Spec: cache-eviction-at-scale. Requirements: 7.1
+    //
+    // The scan mutates as it walks: it self-heals unparseable `.meta` files
+    // (`validation-scan-findings.md` F7), and it deletes write-cache and GET
+    // entries that have expired. Both counted toward the object census, which is
+    // installed as `cached_objects` — so the counter reported objects that had
+    // just ceased to exist, always in the upward direction. R4.4's Entry_Budget
+    // is to be built on that counter.
+    //
+    // RED SIDE (measured before the fix, both tests):
+    //   full: `cached_objects` = 3, expected 2
+    //   rolling: `cached_objects` = 3, expected 2
+    // Both are assertion-level failures against the pre-fix binary, not compile
+    // errors — the fixtures use only pre-existing API.
+    // =====================================================================
+
+    /// Build a valid, non-expired, read-cached `.meta` at `path` with one range of
+    /// `size` compressed bytes.
+    fn write_valid_meta(path: &std::path::Path, cache_key: &str, size: u64) {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectMetadata, RangeSpec, UploadState,
+        };
+        use crate::compression::CompressionAlgorithm;
+        use std::collections::HashMap;
+
+        let now = SystemTime::now();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let meta = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"census\"".to_string(),
+                last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+                content_length: size,
+                content_type: Some("application/octet-stream".to_string()),
+                upload_state: UploadState::Complete,
+                cumulative_size: size,
+                parts: Vec::new(),
+                response_headers: HashMap::new(),
+                compression_algorithm: CompressionAlgorithm::Lz4,
+                compressed_size: size,
+                parts_count: None,
+                part_ranges: HashMap::new(),
+                upload_id: None,
+                is_write_cached: false,
+                write_cache_expires_at: None,
+                write_cache_created_at: None,
+                write_cache_last_accessed: None,
+                graduation_accounted: false,
+            },
+            ranges: vec![RangeSpec {
+                start: 0,
+                end: size.saturating_sub(1),
+                file_path: format!("{}_0.bin", cache_key.replace([':', '/'], "_")),
+                compression_algorithm: CompressionAlgorithm::Lz4,
+                compressed_size: size,
+                uncompressed_size: size,
+                created_at: now,
+                last_accessed: now,
+                access_count: 1,
+                staged: None,
+            }],
+            created_at: now,
+            // Far future, so the GET-expiry branch is not involved — this test is
+            // about the self-heal branch only.
+            expires_at: now + Duration::from_secs(86_400),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: None,
+            head_last_accessed: None,
+            head_access_count: 0,
+            head_cached_at: None,
+        };
+        std::fs::write(path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    /// Two valid `.meta` files plus one unparseable one, laid out under L1 shards
+    /// `00`, `01`, `02` so both the full walk and a first-cycle rolling batch
+    /// (64 slots from cursor 0) cover all three.
+    fn seed_two_valid_one_corrupt(cache_dir: &std::path::Path) -> std::path::PathBuf {
+        let meta_root = cache_dir.join("metadata").join("census-bucket");
+        write_valid_meta(
+            &meta_root.join("00").join("000").join("good_a.meta"),
+            "census-bucket:good-a",
+            1024,
+        );
+        write_valid_meta(
+            &meta_root.join("01").join("000").join("good_b.meta"),
+            "census-bucket:good-b",
+            2048,
+        );
+        let corrupt = meta_root.join("02").join("000").join("corrupt.meta");
+        std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt, b"{ this is not valid NewCacheMetadata json").unwrap();
+        corrupt
+    }
+
+    #[tokio::test]
+    async fn full_validation_census_excludes_meta_removed_on_this_pass() {
+        let (tracker, consolidator, temp_dir) = create_test_tracker().await;
+        let cache_dir = temp_dir.path().to_path_buf();
+        let corrupt = seed_two_valid_one_corrupt(&cache_dir);
+
+        tracker.perform_full_validation().await.unwrap();
+
+        // Fixture guard: the self-heal must actually have fired, or this test
+        // proves nothing about the census.
+        assert!(
+            !corrupt.exists(),
+            "FIXTURE BROKEN: the unparseable .meta survived the scan, so no removal \
+             happened and the census assertion below is vacuous"
+        );
+
+        let state = consolidator.get_size_state().await;
+        assert_eq!(
+            state.cached_objects, 2,
+            "census counted a .meta this pass deleted: cached_objects={} for a tree \
+             holding 2 surviving objects (3 .meta files visited, 1 self-healed away). \
+             The census is installed absolutely by a full scan, so this over-reports \
+             the population the Entry_Budget would evict against.",
+            state.cached_objects
+        );
+
+        // The work-done figure must NOT have been reduced — it is what an operator
+        // reads to see how much the scan got through, and conflating the two is how
+        // this defect became invisible in the first place.
+        let meta = tracker.read_validation_metadata().await.unwrap();
+        assert_eq!(
+            meta.metadata_files_scanned, 3,
+            "validation.json metadata_files_scanned should stay a work-done figure \
+             (3 files visited), not the census (2 surviving)"
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_validation_census_excludes_meta_removed_on_this_pass() {
+        let (tracker, consolidator, temp_dir) = create_test_tracker().await;
+        let cache_dir = temp_dir.path().to_path_buf();
+        let corrupt = seed_two_valid_one_corrupt(&cache_dir);
+
+        // `cached_objects` starts at 0, which makes the proportional correction the
+        // identity on the scanned figure for any `dirs_scanned`:
+        //   corrected = tracked + (surviving - tracked * d / 256) = surviving
+        // so this test measures the census itself rather than the extrapolation.
+        // That is deliberate — the extrapolation's unsoundness is R5's subject and
+        // is documented at the call site, not asserted here.
+        assert_eq!(
+            consolidator.get_size_state().await.cached_objects,
+            0,
+            "FIXTURE BROKEN: this test needs tracked_objects == 0 for the \
+             proportional correction to be the identity"
+        );
+
+        tracker.perform_rolling_validation().await.unwrap();
+
+        assert!(
+            !corrupt.exists(),
+            "FIXTURE BROKEN: the unparseable .meta survived the rolling scan, so no \
+             removal happened and the census assertion below is vacuous"
+        );
+
+        let state = consolidator.get_size_state().await;
+        assert_eq!(
+            state.cached_objects, 2,
+            "rolling census counted a .meta this pass deleted: cached_objects={} for \
+             a tree holding 2 surviving objects. The error is worse here than in full \
+             mode: the proportional correction multiplies the observed discrepancy by \
+             256 / dirs_scanned on the way in.",
+            state.cached_objects
+        );
+    }
+
+    /// The predicate is "is there a `.meta` at this path now", NOT "did the delete
+    /// call return Ok". The two agree on every happy path, so this is the only test
+    /// that can tell them apart: make the unlink fail and require the object to
+    /// still be counted.
+    ///
+    /// Without this, a refactor that set `meta_removed: true` unconditionally in the
+    /// parse-failure arm would pass both census tests above while under-counting
+    /// every corrupt `.meta` on a read-only or contended volume.
+    ///
+    /// Spec: cache-eviction-at-scale. Requirements: 7.1
+    #[tokio::test]
+    async fn unparseable_meta_that_survives_unlink_is_still_counted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tracker, _consolidator, temp_dir) = create_test_tracker().await;
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        let dir = cache_dir
+            .join("metadata")
+            .join("census-bucket")
+            .join("03")
+            .join("000");
+        std::fs::create_dir_all(&dir).unwrap();
+        let corrupt = dir.join("undeletable.meta");
+        std::fs::write(&corrupt, b"not json").unwrap();
+
+        // Deny write on the containing directory, which is what unlink permission
+        // derives from. Probe it rather than assuming: running as root (as the CI
+        // container does) ignores the mode bits entirely, and a test that silently
+        // becomes vacuous is worse than one that says so.
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_mode(0o500);
+        std::fs::set_permissions(&dir, readonly).unwrap();
+
+        let probe = dir.join("probe.meta");
+        let can_still_write = std::fs::write(&probe, b"x").is_ok();
+        if can_still_write {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&dir, original).unwrap();
+            eprintln!(
+                "SKIPPED unparseable_meta_that_survives_unlink_is_still_counted: this \
+                 environment ignores directory mode bits (running as root?), so an \
+                 unlink failure cannot be constructed here. The assertion is \
+                 unverifiable rather than passing."
+            );
+            return;
+        }
+
+        let result = tracker.scan_metadata_file(&corrupt, SystemTime::now());
+
+        // Restore before asserting so a failure does not leave an undeletable temp dir.
+        std::fs::set_permissions(&dir, original).unwrap();
+
+        assert!(
+            corrupt.exists(),
+            "FIXTURE BROKEN: the unlink succeeded despite the read-only directory, so \
+             the assertion below cannot distinguish the two predicates"
+        );
+        assert!(
+            !result.meta_removed,
+            "scan_metadata_file reported meta_removed for a .meta that is still on \
+             disk. meta_removed must be read from the filesystem, not inferred from \
+             the remove_file/invalidate call's return value — those return success or \
+             a value unrelated to whether this path went."
+        );
+        assert!(
+            result.cache_error,
+            "an unparseable .meta is still an error regardless of whether it could be \
+             removed"
+        );
+    }
+}
+
+/// Task 14 timing harness for a generated, disposable fixture root.
+///
+/// The test invokes the private `perform_full_validation` path directly because Task 14
+/// measures that scan's metadata traversal, parsing, reconciliation, and validation-state
+/// writes. It deliberately bypasses `perform_validation`'s scheduler, mode choice, incomplete-MPU
+/// cleanup, and validation-lock acquisition; those are not part of the full-scan rate being
+/// measured. The root must be a newly generated fixture, never a live cache.
+#[cfg(test)]
+mod task14_full_validation_timing_tests {
+    use super::*;
+    use crate::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
+    use crate::journal_manager::JournalManager;
+    use crate::metadata_lock_manager::MetadataLockManager;
+
+    const FIXTURE_ROOT_ENV: &str = "S3HC_TASK14_FIXTURE_ROOT";
+
+    async fn tracker_over_fixture(
+        cache_dir: PathBuf,
+    ) -> (Arc<CacheSizeTracker>, Arc<JournalConsolidator>) {
+        std::fs::create_dir_all(cache_dir.join("metadata/_journals")).unwrap();
+        std::fs::create_dir_all(cache_dir.join("size_tracking")).unwrap();
+        std::fs::create_dir_all(cache_dir.join("locks")).unwrap();
+
+        let journal_manager = Arc::new(JournalManager::new(
+            cache_dir.clone(),
+            "task14-timing".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            cache_dir.join("locks"),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = Arc::new(JournalConsolidator::new(
+            cache_dir.clone(),
+            journal_manager,
+            lock_manager,
+            ConsolidationConfig::default(),
+        ));
+        consolidator.initialize().await.unwrap();
+
+        let tracker = Arc::new(
+            CacheSizeTracker::new(
+                cache_dir,
+                CacheSizeConfig {
+                    validation_enabled: false,
+                    validation_max_duration: Duration::from_secs(4 * 3600),
+                    ..CacheSizeConfig::default()
+                },
+                false,
+                consolidator.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        (tracker, consolidator)
+    }
+
+    /// Measure a real full validation scan over a fixture named by
+    /// `S3HC_TASK14_FIXTURE_ROOT`.
+    ///
+    /// Run only against a fresh generated fixture root, for example:
+    /// `S3HC_TASK14_FIXTURE_ROOT=/backend/fixture cargo test --lib
+    /// task14_timed_full_validation_over_generated_fixture -- --ignored --nocapture`.
+    /// The scan creates `metadata/_journals`, `locks`, and `size_tracking`; cleanup must remove
+    /// the entire fixture root afterwards.
+    #[tokio::test]
+    #[ignore = "Task 14 timed backend measurement; requires a fresh generated fixture root"]
+    async fn task14_timed_full_validation_over_generated_fixture() {
+        let cache_dir = PathBuf::from(
+            std::env::var(FIXTURE_ROOT_ENV)
+                .expect("set S3HC_TASK14_FIXTURE_ROOT to a fresh generated fixture root"),
+        );
+        let marker = cache_dir.join(".s3hc-fixture");
+        let manifest_path = cache_dir.join("FIXTURE_MANIFEST.json");
+        assert!(
+            marker.is_file(),
+            "fixture marker missing: {}",
+            marker.display()
+        );
+        assert!(
+            manifest_path.is_file(),
+            "fixture manifest missing: {}",
+            manifest_path.display()
+        );
+        assert!(
+            !cache_dir.join("size_tracking/size_state.json").exists(),
+            "fixture has already been scanned; generate a fresh root instead"
+        );
+        assert!(
+            !cache_dir.join("metadata/_journals").exists(),
+            "fixture has journal state; generate a fresh root instead"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let objects = manifest["objects"].as_u64().expect("manifest objects");
+        let ranges = manifest["ranges"].as_u64().expect("manifest ranges");
+        let recorded_bytes = manifest["recorded_compressed_bytes"]
+            .as_u64()
+            .expect("manifest recorded_compressed_bytes");
+        let staged_objects = manifest["staged_objects"]
+            .as_u64()
+            .expect("manifest staged_objects");
+        assert_eq!(staged_objects, 0, "Task 14 fixture must be read-tier only");
+
+        let (tracker, consolidator) = tracker_over_fixture(cache_dir.clone()).await;
+        let outer_start = Instant::now();
+        tracker.perform_full_validation().await.unwrap();
+        let outer_elapsed = outer_start.elapsed();
+
+        let metadata = tracker.read_validation_metadata().await.unwrap();
+        assert_eq!(metadata.metadata_files_scanned, objects);
+        assert_eq!(metadata.scanned_size, recorded_bytes);
+        assert_eq!(metadata.tracked_size, 0);
+        assert_eq!(metadata.drift_bytes, recorded_bytes as i64);
+        assert_eq!(metadata.cache_entries_expired, 0);
+        assert_eq!(metadata.cache_entries_skipped, 0);
+        assert_eq!(metadata.cache_expiration_errors, 0);
+        assert!(!metadata.active_expiration_enabled);
+
+        let state = consolidator.get_size_state().await;
+        assert_eq!(state.total_size, recorded_bytes);
+        assert_eq!(state.write_cache_size, 0);
+        assert_eq!(state.cached_objects, objects);
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cache_dir.join("size_tracking/validation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw["validation_type"].as_str(),
+            Some("full"),
+            "full validation must stamp its own mode"
+        );
+        assert!(
+            raw["last_full_scan_duration_secs"].as_f64().is_some(),
+            "full validation must persist its in-method scan duration"
+        );
+
+        println!(
+            "Task 14 full validation: root={} objects={} ranges={} recorded_bytes={} \
+             scan_ms={} outer_ms={} entries_per_s={:.1}",
+            cache_dir.display(),
+            objects,
+            ranges,
+            recorded_bytes,
+            metadata.scan_duration_ms,
+            outer_elapsed.as_millis(),
+            objects as f64 / metadata.scan_duration_ms.max(1) as f64 * 1000.0,
         );
     }
 }

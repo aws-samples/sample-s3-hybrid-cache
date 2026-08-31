@@ -4,10 +4,11 @@
 //! Validates Requirements 8.1, 8.2, 8.3, 8.4 from cache-key-simplification spec.
 
 use s3_proxy::cache::CacheManager;
-use s3_proxy::cache_types::CacheMetadata;
+use s3_proxy::cache_types::{CacheMetadata, NewCacheMetadata};
+use s3_proxy::disk_cache::get_sharded_path;
 use s3_proxy::Result;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 /// Helper to create test metadata
@@ -21,6 +22,51 @@ fn create_test_metadata(etag: &str, content_length: u64) -> CacheMetadata {
         access_count: 0,
         last_accessed: SystemTime::now(),
     }
+}
+
+/// Backdate the recorded `last_accessed` of every range of one cached entry so the
+/// entry is past the eviction admission window.
+///
+/// `collect_range_candidates_for_eviction` applies an unconditional 60-second
+/// admission window, so a range stored moments ago is skipped as *ineligible*.
+/// Ageing the entry first keeps the assertion about **discoverability** rather than
+/// about admission policy.
+///
+/// This locates the `.meta` by computing its sharded path from the cache key, which
+/// is deliberately the opposite of how the scan finds it. If the two disagree the
+/// file will not be found and this panics, rather than leaving the assertion to pass
+/// against an entry that was never aged.
+fn age_entry_past_admission_window(cache_dir: &std::path::Path, cache_key: &str) {
+    let meta_path = get_sharded_path(&cache_dir.join("metadata"), cache_key, ".meta")
+        .expect("cache key should map to a sharded metadata path");
+
+    let content = std::fs::read_to_string(&meta_path).unwrap_or_else(|e| {
+        panic!(
+            "no .meta at {} for key {}: {}",
+            meta_path.display(),
+            cache_key,
+            e
+        )
+    });
+    let mut metadata: NewCacheMetadata =
+        serde_json::from_str(&content).expect(".meta should parse as NewCacheMetadata");
+
+    assert!(
+        !metadata.ranges.is_empty(),
+        "stored entry {} should have at least one range",
+        cache_key
+    );
+
+    let aged = SystemTime::now() - Duration::from_secs(3600);
+    for range in &mut metadata.ranges {
+        range.last_accessed = aged;
+    }
+
+    std::fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&metadata).expect("metadata should serialize"),
+    )
+    .expect("aged .meta should be writable");
 }
 
 /// Helper to create and initialize a test cache manager with JournalConsolidator
@@ -76,13 +122,38 @@ async fn test_cache_entry_identification_new_format() -> Result<()> {
         );
     }
 
-    // Verify eviction can identify all entries
-    let entries = cache_manager.collect_cache_entries_for_eviction().await?;
+    // Verify eviction can identify all entries.
+    //
+    // Eviction does not know the cache keys. It has to find entries by traversing the
+    // sharded cache tree and recover each key from the `.meta` contents, so this asks a
+    // different question from the `get_cached_response` loop above, which derives a path
+    // from a key it already has. A new-format key that hashed into a directory the scan
+    // does not walk, or wrote a `.meta` the scan cannot parse, would still be served
+    // above while being invisible to eviction.
+    for (cache_key, _) in &test_cases {
+        age_entry_past_admission_window(temp_dir.path(), cache_key);
+    }
+
+    let candidates = cache_manager
+        .collect_range_candidates_for_eviction()
+        .await?;
+    let discovered: Vec<&str> = candidates.iter().map(|c| c.cache_key.as_str()).collect();
+
+    for (cache_key, _) in &test_cases {
+        assert!(
+            discovered.contains(cache_key),
+            "Eviction scan should discover new-format cache key {}; discovered {:?}",
+            cache_key,
+            discovered
+        );
+    }
+
+    // Negative control: a key that was never stored must not appear, so the loop above
+    // cannot pass on a scan that reports everything it walks past.
     assert!(
-        entries.len() >= test_cases.len(),
-        "Should identify at least {} cache entries, found {}",
-        test_cases.len(),
-        entries.len()
+        !discovered.contains(&"bucket/never-stored.jpg"),
+        "Eviction scan should not discover a key that was never stored; discovered {:?}",
+        discovered
     );
 
     Ok(())

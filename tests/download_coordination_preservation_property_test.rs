@@ -1174,11 +1174,23 @@ fn prop_different_flight_keys_are_independent(shape_tag: u8) -> TestResult {
                 // Seed empty overlap — no cached ranges — so the coordination
                 // helper routes to the S3 forward path.
                 let overlap_a = range_handler
-                    .find_cached_ranges(&cache_key, &range_a, None, None)
+                    .find_cached_ranges(
+                        &cache_key,
+                        &range_a,
+                        None,
+                        None,
+                        s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+                    )
                     .await
                     .expect("overlap a");
                 let overlap_b = range_handler
-                    .find_cached_ranges(&cache_key, &range_b, None, None)
+                    .find_cached_ranges(
+                        &cache_key,
+                        &range_b,
+                        None,
+                        None,
+                        s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+                    )
                     .await
                     .expect("overlap b");
 

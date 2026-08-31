@@ -257,10 +257,10 @@ async fn main() -> Result<()> {
             "RAM cache: enabled, max_size={}MB",
             config.cache.max_ram_cache_size / 1024 / 1024
         );
-        info!("RAM-disk coherency: flush_interval={:?}, flush_threshold={}, verification_interval={:?}",
-            config.cache.ram_cache_flush_interval,
-            config.cache.ram_cache_flush_threshold,
-            config.cache.ram_cache_verification_interval);
+        info!(
+            "RAM-disk coherency: flush_interval={:?}, flush_threshold={}",
+            config.cache.ram_cache_flush_interval, config.cache.ram_cache_flush_threshold
+        );
     } else {
         info!("RAM cache: disabled");
     }
@@ -488,11 +488,14 @@ async fn main() -> Result<()> {
                         match consolidator.run_consolidation_cycle().await {
                             Ok(result) => {
                                 if result.entries_consolidated > 0 || result.eviction_triggered {
+                                    // No bytes-evicted figure: eviction is a detached task
+                                    // (v1.1.35) and has only just been spawned. The figure is
+                                    // logged by that task ("Background eviction completed").
                                     info!(
-                                        "Consolidation cycle: entries={}, size_delta={:+}, evicted={}, total_cache_size={}",
+                                        "Consolidation cycle: entries={}, size_delta={:+}, eviction_triggered={}, total_cache_size={}",
                                         result.entries_consolidated,
                                         result.size_delta,
-                                        result.bytes_evicted,
+                                        result.eviction_triggered,
                                         result.current_size
                                     );
                                 }

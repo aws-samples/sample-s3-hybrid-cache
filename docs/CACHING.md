@@ -8,7 +8,7 @@ entry point; the depth lives in five companion documents.
 | [CACHE_INTERNALS.md](CACHE_INTERNALS.md) | On-disk and in-memory layout, sharding, cache keys, access tracking, journal and size-tracking internals |
 | [CACHE_FRESHNESS.md](CACHE_FRESHNESS.md) | TTL, revalidation, conditional requests |
 | [CACHE_READ_PATHS.md](CACHE_READ_PATHS.md) | How a read is satisfied: range merging, page widening, write-through, multipart, coherency checks, download coordination |
-| [EVICTION.md](EVICTION.md) | Reclaiming space: algorithms, admission window, critical capacity bypass |
+| [EVICTION.md](EVICTION.md) | Reclaiming space: algorithms, admission window |
 | [SHARED_STORAGE.md](SHARED_STORAGE.md) | Running several proxies against one cache volume |
 
 Field types, defaults, and valid ranges for every option named here are in

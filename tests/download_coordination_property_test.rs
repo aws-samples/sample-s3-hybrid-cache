@@ -591,11 +591,7 @@ async fn launch_range_concurrent(
         let range_spec_clone = range_spec.clone();
 
         join_set.spawn(async move {
-            let overlap = s3_proxy::range_handler::RangeOverlap {
-                missing_ranges: vec![range_spec_clone.clone()],
-                cached_ranges: Vec::new(),
-                can_serve_from_cache: false,
-            };
+            let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec_clone);
             let response = HttpProxy::forward_range_with_coordination(
                 Method::GET,
                 uri,
@@ -640,11 +636,7 @@ async fn launch_range_concurrent(
 
         join_set.spawn(async move {
             tokio::time::sleep(Duration::from_micros(50)).await;
-            let overlap = s3_proxy::range_handler::RangeOverlap {
-                missing_ranges: vec![range_spec_clone.clone()],
-                cached_ranges: Vec::new(),
-                can_serve_from_cache: false,
-            };
+            let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec_clone);
             let response = HttpProxy::forward_range_with_coordination(
                 Method::GET,
                 uri,

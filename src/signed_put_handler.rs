@@ -39,7 +39,9 @@
 //!   and the non-multipart PUT path.
 
 use crate::aws_chunked_decoder;
-use crate::capacity_manager::{check_cache_capacity, log_bypass_decision, CacheDecision};
+use crate::capacity_manager::{
+    check_cache_capacity, check_streaming_capacity, log_bypass_decision, CacheDecision,
+};
 use crate::compression::CompressionHandler;
 use crate::metrics::{MetricsManager, RequestType};
 use crate::path_safety::is_safe_path_component;
@@ -153,6 +155,46 @@ pub(crate) enum StreamingCacheOutcome {
     /// stable reason for diagnostics/tests (e.g. `"decoded_length_mismatch"`,
     /// `"s3_error"`, `"cache_write_error"`).
     Skipped(&'static str),
+}
+
+/// Cache-capacity budget carried by an `UploadPart` whose body length was not
+/// known up front, so that the staging write can be bounded while it streams.
+///
+/// [`check_cache_capacity`] returns [`CacheDecision::StreamWithCapacityCheck`]
+/// when the request has no usable Content-Length, which is the only decision that
+/// reaches the part path with **no** size gate applied: the part sink is not
+/// pre-sized, does not reserve write-cache capacity, and
+/// `CacheManager::open_multipart_part_sink` performs no disk-safety refusal. This
+/// budget is the missing gate. It is `Some` only for that decision — a
+/// [`CacheDecision::Cache`] part was already gated by
+/// [`check_cache_capacity`]'s Content-Length arithmetic and needs no per-frame
+/// re-check.
+///
+/// Both figures are snapshots taken at handler construction, so the bound is a
+/// bound on *this* part rather than a fleet-wide accounting fix; concurrent parts
+/// each read the same `current_usage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamingCapacityBudget {
+    /// Cache usage in bytes excluding this upload, as observed by the handler.
+    pub(crate) current_usage: u64,
+    /// Maximum cache capacity in bytes.
+    pub(crate) max_capacity: u64,
+}
+
+/// Read the body length of an `UploadPart` request from its headers.
+///
+/// Returns `None` both when the header is absent and when it is present but does
+/// not parse as a `u64`. Either way [`check_cache_capacity`] returns
+/// [`CacheDecision::StreamWithCapacityCheck`], which is the decision that reaches
+/// the part-staging path with no size gate of its own — hence the
+/// [`StreamingCapacityBudget`] (R16.8). Extracted from `handle_upload_part` so both
+/// `None` cases are testable directly; the AWS CLI always sets a valid
+/// Content-Length, so neither is reachable through it.
+fn part_content_length(request_headers: &HashMap<String, String>) -> Option<u64> {
+    request_headers
+        .get("content-length")
+        .or_else(|| request_headers.get("Content-Length"))
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 /// Represents a part from the CompleteMultipartUpload request body XML.
@@ -1328,10 +1370,7 @@ impl SignedPutHandler {
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
-        let content_length = request_headers
-            .get("content-length")
-            .or_else(|| request_headers.get("Content-Length"))
-            .and_then(|v| v.parse::<u64>().ok());
+        let content_length = part_content_length(&request_headers);
 
         // Check capacity
         let cache_decision = self.should_cache(content_length);
@@ -1352,84 +1391,45 @@ impl SignedPutHandler {
         let (bucket_ref, _) = parse_cache_key(&cache_key);
         let bucket_owned = bucket_ref.to_string();
 
+        // R16.8: the two non-bypass decisions no longer share a single arm.
+        // `Cache` was gated by `should_cache`'s Content-Length arithmetic in
+        // `check_cache_capacity`. `StreamWithCapacityCheck` means the
+        // Content-Length was absent or unparseable (the parse above is
+        // `.and_then(|v| v.parse::<u64>().ok())`), so no size gate applied to it at
+        // all — that arm carries a `StreamingCapacityBudget` which
+        // `check_streaming_capacity` enforces per frame as the part stages.
         let result = match cache_decision {
-            CacheDecision::Cache | CacheDecision::StreamWithCapacityCheck => {
-                // Stream the part body to the upstream verbatim while teeing it to
-                // the part-staging cache sink (streaming-write-path Req 6.2). This
-                // replaces the former buffer-then-forward implementation
-                // (`read_request_body_bounded` + inline `raw_request` assembly +
-                // `forward_raw_request_to_s3` + a whole-buffer part cache write):
-                // the client body frames flow straight to the upstream (the awaited
-                // socket write is the primary backpressure), and the same frames are
-                // tee'd to a bounded channel feeding the incremental part-cache task.
-                // The upstream always receives the original bytes byte-for-byte
-                // (SigV4 intact); only the cache branch decodes aws-chunked (now done
-                // incrementally inside the cache task, not up front).
-                let method = req.method().clone();
-                let uri = req.uri().clone();
-                let headers = req.headers().clone();
-                let version = req.version();
-                let body = req.into_body();
-
-                // The cache branch decodes aws-chunked incrementally; the decoded
-                // part length comes from `x-amz-decoded-content-length` for
-                // aws-chunked, else the Content-Length. Used only to validate the
-                // decoded length at finish (Req 3.4); the upstream always receives
-                // the original bytes verbatim.
-                let is_aws_chunked = aws_chunked_decoder::is_aws_chunked(&request_headers);
-                let decoded_len = if is_aws_chunked {
-                    aws_chunked_decoder::get_decoded_content_length(&request_headers)
-                } else {
-                    content_length
-                };
-
-                // Open the part sink + spawn the incremental part-cache task when
-                // caching is viable. `tee = None` means no caching, but the body
-                // still streams to the upstream (Req 7.2).
-                let (tee, s3_result_tx) = self
-                    .setup_upload_part_cache_tee(
-                        &cache_key,
-                        &upload_id,
-                        part_number,
-                        is_aws_chunked,
-                        decoded_len,
-                    )
-                    .await;
-
-                // Stream the original body to the upstream verbatim (Req 1.1, 4.1),
-                // enforcing the body-size cap without buffering the whole body.
-                let s3_response = forward_signed_request_streaming(
-                    &method,
-                    &uri,
-                    &headers,
-                    version,
-                    body,
+            CacheDecision::Cache => {
+                self.stage_and_forward_upload_part(
+                    req,
+                    &cache_key,
                     &target_host,
                     &transport,
-                    self.proxy_referer.as_deref(),
-                    STREAMED_BODY_CAP,
-                    tee,
+                    &upload_id,
+                    part_number,
+                    &request_headers,
+                    content_length,
+                    None,
                 )
-                .await;
-
-                // Deliver the S3 result (status + headers, or error) to the
-                // background part-cache task. On success it finalizes the part under
-                // `upload.lock` and records the tracker with the response ETag; on
-                // error/non-success/skip it discards the staged part — the per-part
-                // correctness gate (commit only on S3 success) is preserved.
-                if let Some(s3_result_tx) = s3_result_tx {
-                    let response_info = match &s3_response {
-                        Ok(resp) => Ok(ResponseInfo {
-                            status: resp.status(),
-                            headers: resp.headers().clone(),
-                        }),
-                        Err(e) => Err(e.clone()),
-                    };
-                    let _ = s3_result_tx.send(response_info);
-                }
-
-                // Return the S3 response to the client unchanged (Req 5.5).
-                s3_response
+                .await
+            }
+            CacheDecision::StreamWithCapacityCheck => {
+                let budget = StreamingCapacityBudget {
+                    current_usage: self.current_cache_usage,
+                    max_capacity: self.max_cache_capacity,
+                };
+                self.stage_and_forward_upload_part(
+                    req,
+                    &cache_key,
+                    &target_host,
+                    &transport,
+                    &upload_id,
+                    part_number,
+                    &request_headers,
+                    content_length,
+                    Some(budget),
+                )
+                .await
             }
             CacheDecision::Bypass(reason) => {
                 log_bypass_decision(&cache_key, &reason);
@@ -1451,7 +1451,116 @@ impl SignedPutHandler {
                 .await
             }
         };
+        self.finish_upload_part(result, &bucket_owned, body_bytes_uploaded)
+            .await
+    }
 
+    /// Stream an `UploadPart` body to the upstream verbatim while teeing it to the
+    /// part-staging cache sink (streaming-write-path Req 6.2).
+    ///
+    /// Shared by the two caching decisions that reach the part path. They differ
+    /// only in `capacity_budget`: `None` for [`CacheDecision::Cache`], whose
+    /// Content-Length was already checked against available capacity, and `Some`
+    /// for [`CacheDecision::StreamWithCapacityCheck`], whose length was unknown and
+    /// which is therefore bounded while it streams (R16.8).
+    ///
+    /// The client body frames flow straight to the upstream (the awaited socket
+    /// write is the primary backpressure), and the same frames are tee'd to a
+    /// bounded channel feeding the incremental part-cache task. The upstream always
+    /// receives the original bytes byte-for-byte (SigV4 intact); only the cache
+    /// branch decodes aws-chunked, incrementally inside the cache task rather than
+    /// up front.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_and_forward_upload_part(
+        &self,
+        req: Request<hyper::body::Incoming>,
+        cache_key: &str,
+        target_host: &str,
+        transport: &Arc<UpstreamTransport>,
+        upload_id: &str,
+        part_number: u32,
+        request_headers: &HashMap<String, String>,
+        content_length: Option<u64>,
+        capacity_budget: Option<StreamingCapacityBudget>,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        let method = req.method().clone();
+        let uri = req.uri().clone();
+        let headers = req.headers().clone();
+        let version = req.version();
+        let body = req.into_body();
+
+        // The cache branch decodes aws-chunked incrementally; the decoded
+        // part length comes from `x-amz-decoded-content-length` for
+        // aws-chunked, else the Content-Length. Used only to validate the
+        // decoded length at finish (Req 3.4); the upstream always receives
+        // the original bytes verbatim.
+        let is_aws_chunked = aws_chunked_decoder::is_aws_chunked(request_headers);
+        let decoded_len = if is_aws_chunked {
+            aws_chunked_decoder::get_decoded_content_length(request_headers)
+        } else {
+            content_length
+        };
+
+        // Open the part sink + spawn the incremental part-cache task when
+        // caching is viable. `tee = None` means no caching, but the body
+        // still streams to the upstream (Req 7.2).
+        let (tee, s3_result_tx) = self
+            .setup_upload_part_cache_tee(
+                cache_key,
+                upload_id,
+                part_number,
+                is_aws_chunked,
+                decoded_len,
+                capacity_budget,
+            )
+            .await;
+
+        // Stream the original body to the upstream verbatim (Req 1.1, 4.1),
+        // enforcing the body-size cap without buffering the whole body.
+        let s3_response = forward_signed_request_streaming(
+            &method,
+            &uri,
+            &headers,
+            version,
+            body,
+            target_host,
+            transport,
+            self.proxy_referer.as_deref(),
+            STREAMED_BODY_CAP,
+            tee,
+        )
+        .await;
+
+        // Deliver the S3 result (status + headers, or error) to the
+        // background part-cache task. On success it finalizes the part under
+        // `upload.lock` and records the tracker with the response ETag; on
+        // error/non-success/skip it discards the staged part — the per-part
+        // correctness gate (commit only on S3 success) is preserved.
+        if let Some(s3_result_tx) = s3_result_tx {
+            let response_info = match &s3_response {
+                Ok(resp) => Ok(ResponseInfo {
+                    status: resp.status(),
+                    headers: resp.headers().clone(),
+                }),
+                Err(e) => Err(e.clone()),
+            };
+            let _ = s3_result_tx.send(response_info);
+        }
+
+        // Return the S3 response to the client unchanged (Req 5.5).
+        s3_response
+    }
+
+    /// Record per-bucket traffic for a completed `UploadPart` and return its
+    /// response unchanged. Split out of [`Self::handle_upload_part`] when its
+    /// caching arms were separated (R16.8); the accounting is identical for every
+    /// arm, including bypass.
+    async fn finish_upload_part(
+        &self,
+        result: Result<Response<BoxBody<Bytes, hyper::Error>>>,
+        bucket_owned: &str,
+        body_bytes_uploaded: u64,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
         // Per-bucket traffic accounting — Spec: per-bucket-metrics, Req 2.1, 2.2, 2.3
         // UploadPart maps to RequestType::Put (Design §4a). Record once at the completion
         // of the full request-response cycle (Req 2.3). Skip if bucket empty (Req 2.4).
@@ -1462,7 +1571,7 @@ impl SignedPutHandler {
                     .read()
                     .await
                     .record_bucket_traffic(
-                        &bucket_owned,
+                        bucket_owned,
                         None,             // prefix: no per-bucket prefix config in this handler
                         RequestType::Put, // UploadPart is a PUT operation
                         0,                // bytes_served: UploadPart response body is empty
@@ -3706,9 +3815,22 @@ impl SignedPutHandler {
     ///
     /// Both `None` means no caching for this part — the body still streams to the
     /// upstream verbatim (Req 7.2). Caching is skipped (no tee) when there is no
-    /// cache manager or the part sink cannot be opened. Unlike the single-part PUT
-    /// sink, a part is not pre-sized and not write-cache-capacity-reserved; the
-    /// handler's `should_cache` decision already gated this call.
+    /// cache manager or the part sink cannot be opened.
+    ///
+    /// Unlike the single-part PUT sink, a part is not pre-sized and not
+    /// write-cache-capacity-reserved: `CacheManager::open_multipart_part_sink`
+    /// applies none of the three gates `open_write_cache_sink` applies — no
+    /// `write_cache_max_object_size` check via `WriteCacheManager::try_reserve`, no
+    /// sizing reservation, and no `disk_safety_refusal`. What the handler's
+    /// `should_cache` decision contributes is narrower than that absence suggests:
+    /// it is `check_cache_capacity`'s arithmetic on `content_length`,
+    /// `current_cache_usage` and `max_cache_capacity` only — no free-space check, no
+    /// per-object cap, no part count, and staged parts under `mpus_in_progress/` do
+    /// not appear in the `current_cache_usage` snapshot, so concurrent parts each
+    /// read the same pre-upload total. When the Content-Length was absent or
+    /// unparseable it contributes no size gate at all, which is why
+    /// `capacity_budget` is `Some` in that case and the drain loop bounds the part
+    /// as it stages (R16.8).
     async fn setup_upload_part_cache_tee(
         &self,
         cache_key: &str,
@@ -3716,6 +3838,7 @@ impl SignedPutHandler {
         part_number: u32,
         is_aws_chunked: bool,
         decoded_len: Option<u64>,
+        capacity_budget: Option<StreamingCapacityBudget>,
     ) -> (
         Option<tokio::sync::mpsc::Sender<Bytes>>,
         Option<tokio::sync::oneshot::Sender<Result<ResponseInfo>>>,
@@ -3756,6 +3879,7 @@ impl SignedPutHandler {
             decoded_len,
             self.cache_dir.clone(),
             self.metrics_manager.clone(),
+            capacity_budget,
         );
 
         (Some(tee_tx), Some(s3_result_tx))
@@ -3776,6 +3900,7 @@ impl SignedPutHandler {
         expected_decoded_len: Option<u64>,
         cache_dir: PathBuf,
         metrics: Option<Arc<RwLock<MetricsManager>>>,
+        capacity_budget: Option<StreamingCapacityBudget>,
     ) {
         tokio::spawn(async move {
             let _ = Self::run_streaming_part_cache_write(
@@ -3789,6 +3914,7 @@ impl SignedPutHandler {
                 expected_decoded_len,
                 cache_dir,
                 metrics,
+                capacity_budget,
             )
             .await;
         });
@@ -3802,6 +3928,13 @@ impl SignedPutHandler {
     /// object metadata. On any S3 failure / non-success / skip, the staged part is
     /// discarded — the upload already streamed verbatim and its response is returned
     /// by the forward loop, untouched (Req 7).
+    ///
+    /// `capacity_budget` is `Some` only when the request carried no usable
+    /// Content-Length, so no size gate was applied before staging began (R16.8). In
+    /// that case every frame written to the sink is checked with
+    /// [`check_streaming_capacity`] against the bytes staged so far, and the part is
+    /// discarded with reason `"capacity_exceeded"` the moment the budget is
+    /// breached. The upload itself is unaffected either way (Req 7.1).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_streaming_part_cache_write(
         cache_key: String,
@@ -3814,6 +3947,7 @@ impl SignedPutHandler {
         expected_decoded_len: Option<u64>,
         cache_dir: PathBuf,
         metrics: Option<Arc<RwLock<MetricsManager>>>,
+        capacity_budget: Option<StreamingCapacityBudget>,
     ) -> StreamingCacheOutcome {
         // The cache branch decodes aws-chunked incrementally; the upstream leg always
         // receives the original bytes verbatim.
@@ -3849,10 +3983,17 @@ impl SignedPutHandler {
         let drain = tokio::task::spawn_blocking(move || {
             let mut sink = sink;
             let mut decoder = decoder;
+            // Bytes staged into the sink so far — the figure `check_streaming_capacity`
+            // evaluates. Decoded bytes, not wire bytes, since that is what occupies
+            // the cache.
+            let mut staged_bytes: u64 = 0;
             while let Some(frame) = tee_rx.blocking_recv() {
                 let write_result = match decoder.as_mut() {
                     Some(dec) => match dec.push(frame.as_ref()) {
-                        Ok(decoded) => sink.write(&decoded),
+                        Ok(decoded) => {
+                            staged_bytes = staged_bytes.saturating_add(decoded.len() as u64);
+                            sink.write(&decoded)
+                        }
                         Err(e) => {
                             // aws-chunked decode error → skip caching, keep forwarding
                             // (Req 3.4, 7.2).
@@ -3868,7 +4009,10 @@ impl SignedPutHandler {
                             };
                         }
                     },
-                    None => sink.write(frame.as_ref()),
+                    None => {
+                        staged_bytes = staged_bytes.saturating_add(frame.len() as u64);
+                        sink.write(frame.as_ref())
+                    }
                 };
 
                 if let Err(e) = write_result {
@@ -3884,6 +4028,35 @@ impl SignedPutHandler {
                         reason: "cache_write_error",
                         record_failure: true,
                     };
+                }
+
+                // R16.8: bound the staging write when nothing sized this part up
+                // front. `check_streaming_capacity` is the verdict; a breach discards
+                // the staged part and leaves the upload untouched (Req 7.1). Checked
+                // after the write so an I/O failure keeps reporting its own cause.
+                if let Some(budget) = capacity_budget {
+                    if let Err(e) = check_streaming_capacity(
+                        staged_bytes,
+                        budget.current_usage,
+                        budget.max_capacity,
+                    ) {
+                        warn!(
+                            "Streaming part cache: capacity budget exceeded, skipping cache (upload unaffected): cache_key={}, upload_id={}, part_number={}, staged_bytes={}, current_usage={}, max_capacity={}, error={}",
+                            drain_key,
+                            drain_upload,
+                            part_number,
+                            staged_bytes,
+                            budget.current_usage,
+                            budget.max_capacity,
+                            e
+                        );
+                        sink.discard();
+                        tee_rx.close();
+                        return PartDrainOutcome::Skip {
+                            reason: "capacity_exceeded",
+                            record_failure: false,
+                        };
+                    }
                 }
             }
             PartDrainOutcome::Continue { sink, decoder }
@@ -7661,6 +7834,7 @@ mod tests {
             None,
             temp_dir.path().to_path_buf(),
             None,
+            None, // capacity_budget: Cache decision, already size-gated
         )
         .await;
         assert_eq!(outcome, StreamingCacheOutcome::Committed);
@@ -7743,6 +7917,7 @@ mod tests {
             Some(payload.len() as u64),
             temp_dir.path().to_path_buf(),
             None,
+            None, // capacity_budget: Cache decision, already size-gated
         )
         .await;
         assert_eq!(outcome, StreamingCacheOutcome::Committed);
@@ -7815,6 +7990,7 @@ mod tests {
             None,
             temp_dir.path().to_path_buf(),
             None,
+            None, // capacity_budget: Cache decision, already size-gated
         )
         .await;
         assert_eq!(outcome, StreamingCacheOutcome::Skipped("s3_error"));
@@ -7827,6 +8003,531 @@ mod tests {
         assert!(
             !upload_dir.join("upload.meta").exists(),
             "no tracker should be written on S3 error"
+        );
+    }
+
+    // =========================================================================
+    // Bounding the `StreamWithCapacityCheck` arm of `UploadPart` (R16.8)
+    //
+    // `check_cache_capacity` returns `StreamWithCapacityCheck` when the request
+    // carries no usable Content-Length. That decision used to share an arm with
+    // `CacheDecision::Cache`, so such a part staged with no capacity consideration
+    // of any kind: the part sink is not pre-sized, does not reserve write-cache
+    // capacity, and `open_multipart_part_sink` runs no `disk_safety_refusal`.
+    //
+    // Neither `None` case is reachable through the AWS CLI, which always sets a
+    // valid Content-Length, so these fixtures build the request state directly.
+    // =========================================================================
+
+    /// Both ways a part's Content-Length can go missing land on the unbounded
+    /// decision: header absent, and header present but unparseable. `parse::<u64>()`
+    /// with `.ok()` discards the error, so a malformed value is indistinguishable
+    /// from an absent one downstream — which is why the bound has to cover both.
+    #[test]
+    fn part_without_usable_content_length_takes_the_streaming_decision() {
+        let temp_dir = TempDir::new().unwrap();
+        let handler = create_test_handler(&temp_dir);
+
+        // Sub-case 1: header absent.
+        let absent: HashMap<String, String> = HashMap::new();
+        assert_eq!(part_content_length(&absent), None, "absent header");
+        assert_eq!(
+            handler.should_cache(part_content_length(&absent)),
+            CacheDecision::StreamWithCapacityCheck
+        );
+
+        // Sub-case 2: header present but unparseable. Each of these is a distinct
+        // way to defeat `parse::<u64>()`.
+        for bad in [
+            "",
+            "not-a-number",
+            "-1",
+            "1.5",
+            "12abc",
+            "99999999999999999999",
+        ] {
+            let mut headers: HashMap<String, String> = HashMap::new();
+            headers.insert("content-length".to_string(), bad.to_string());
+            assert_eq!(
+                part_content_length(&headers),
+                None,
+                "unparseable Content-Length {bad:?} must not yield a length"
+            );
+            assert_eq!(
+                handler.should_cache(part_content_length(&headers)),
+                CacheDecision::StreamWithCapacityCheck,
+                "unparseable Content-Length {bad:?} must take the streaming decision"
+            );
+        }
+
+        // Control: a parseable value that fits does NOT take this decision, so the
+        // two sub-cases above are attributable to the parse failing rather than to
+        // every part taking the same route.
+        let mut good: HashMap<String, String> = HashMap::new();
+        good.insert("content-length".to_string(), "1024".to_string());
+        assert_eq!(part_content_length(&good), Some(1024));
+        assert_eq!(
+            handler.should_cache(Some(1024)),
+            CacheDecision::Cache,
+            "a part that fits must be gated by the Content-Length arithmetic, not the budget"
+        );
+    }
+
+    /// Fixture for the three budget cases below. Stages `body` through the real
+    /// streaming part path with the supplied budget and returns the outcome plus the
+    /// upload directory, so the caller can assert on published files too.
+    async fn stage_part_with_budget(
+        temp_dir: &TempDir,
+        cache_key: &str,
+        upload_id: &str,
+        body: &[u8],
+        capacity_budget: Option<StreamingCapacityBudget>,
+    ) -> (StreamingCacheOutcome, PathBuf) {
+        use crate::cache::CacheManager;
+
+        let cache_manager = Arc::new(CacheManager::new(
+            temp_dir.path().to_path_buf(),
+            false,
+            0,
+            1024,
+            true,
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager.initialize().await.unwrap();
+
+        let part_number = 1u32;
+        let sink = cache_manager
+            .open_multipart_part_sink(cache_key, upload_id, part_number)
+            .await
+            .expect("open_multipart_part_sink should succeed");
+
+        // Two frames, so a budget breach can be observed mid-part rather than only
+        // at the end.
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+        let split = body.len() / 2;
+        tee_tx
+            .send(Bytes::copy_from_slice(&body[..split]))
+            .await
+            .unwrap();
+        tee_tx
+            .send(Bytes::copy_from_slice(&body[split..]))
+            .await
+            .unwrap();
+        drop(tee_tx);
+        // S3 succeeds in every case, so an S3-side skip cannot be mistaken for the
+        // capacity verdict.
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_part_cache_write(
+            cache_key.to_string(),
+            upload_id.to_string(),
+            part_number,
+            sink,
+            tee_rx,
+            s3_rx,
+            false,
+            None,
+            temp_dir.path().to_path_buf(),
+            None,
+            capacity_budget,
+        )
+        .await;
+
+        let upload_dir = temp_dir.path().join("mpus_in_progress").join(upload_id);
+        (outcome, upload_dir)
+    }
+
+    /// A part with no usable Content-Length is refused when staging it would take
+    /// the cache past its maximum, and the refusal is `check_streaming_capacity`'s.
+    ///
+    /// **Validates: Requirements 16.8, 16.13, 16.15**
+    #[tokio::test]
+    async fn no_content_length_part_is_refused_when_over_budget() {
+        const BODY_LEN: usize = 8000;
+        const MAX_CAPACITY: u64 = 10_000;
+        const CURRENT_USAGE: u64 = 9_000;
+
+        // Preconditions, asserted rather than assumed. The predicate under test is
+        // `check_streaming_capacity`'s `current_usage + bytes_written > max_capacity`
+        // in `src/capacity_manager.rs`; these assertions exist so that a later change
+        // to any neighbouring constant cannot make the arm vacuous by refusing the
+        // fixture for a different reason.
+        assert!(
+            CURRENT_USAGE + BODY_LEN as u64 > MAX_CAPACITY,
+            "fixture must breach the predicate under test"
+        );
+        assert!(
+            BODY_LEN as u64 <= MAX_CAPACITY,
+            "fixture must fit in an empty cache, so the refusal is attributable to \
+             accumulated usage rather than to the part exceeding the whole cache"
+        );
+        // Guards `WriteCacheManager::try_reserve`'s object-size refusal
+        // (`src/write_cache_manager.rs`, the `size > self.max_object_size` branch).
+        // That gate is not on the part path today; if it is ever added, this
+        // assertion is what stops the test passing for its reason instead of ours.
+        assert!(
+            BODY_LEN as u64 <= crate::config::CacheConfig::default().write_cache_max_object_size,
+            "fixture must be under the write-cache per-object cap"
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let body: Vec<u8> = (0..BODY_LEN).map(|i| (i % 251) as u8).collect();
+
+        let (outcome, upload_dir) = stage_part_with_budget(
+            &temp_dir,
+            "test-bucket/part-over-budget",
+            "upload-over-budget",
+            &body,
+            Some(StreamingCapacityBudget {
+                current_usage: CURRENT_USAGE,
+                max_capacity: MAX_CAPACITY,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            StreamingCacheOutcome::Skipped("capacity_exceeded"),
+            "an over-budget part with no Content-Length must be refused by \
+             check_streaming_capacity"
+        );
+        assert!(
+            !upload_dir.join("part1.bin").exists(),
+            "a refused part must not be published"
+        );
+        assert!(
+            !upload_dir.join("upload.meta").exists(),
+            "a refused part must not be recorded in the tracker"
+        );
+    }
+
+    /// The same fixture with room to spare commits, so the budget is a bound rather
+    /// than a blanket refusal.
+    ///
+    /// **Validates: Requirements 16.8**
+    #[tokio::test]
+    async fn no_content_length_part_within_budget_still_commits() {
+        const BODY_LEN: usize = 8000;
+        const MAX_CAPACITY: u64 = 10_000_000;
+        const CURRENT_USAGE: u64 = 9_000;
+
+        assert!(
+            CURRENT_USAGE + BODY_LEN as u64 <= MAX_CAPACITY,
+            "fixture must satisfy the predicate under test"
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let body: Vec<u8> = (0..BODY_LEN).map(|i| (i % 251) as u8).collect();
+
+        let (outcome, upload_dir) = stage_part_with_budget(
+            &temp_dir,
+            "test-bucket/part-within-budget",
+            "upload-within-budget",
+            &body,
+            Some(StreamingCapacityBudget {
+                current_usage: CURRENT_USAGE,
+                max_capacity: MAX_CAPACITY,
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome, StreamingCacheOutcome::Committed);
+        assert!(upload_dir.join("part1.bin").exists());
+    }
+
+    /// The red side, kept as a control: with **no** budget the identical
+    /// over-capacity fixture commits. That is what the combined arm did for every
+    /// no-Content-Length part, and it is what makes the refusal above attributable
+    /// to the budget alone — the only input that differs between the two tests.
+    ///
+    /// **Validates: Requirements 16.15**
+    #[tokio::test]
+    async fn part_without_a_budget_stages_regardless_of_capacity() {
+        let temp_dir = TempDir::new().unwrap();
+        // Same 8000 bytes that the over-budget test refuses.
+        let body: Vec<u8> = (0..8000).map(|i| (i % 251) as u8).collect();
+
+        let (outcome, upload_dir) = stage_part_with_budget(
+            &temp_dir,
+            "test-bucket/part-no-budget",
+            "upload-no-budget",
+            &body,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            StreamingCacheOutcome::Committed,
+            "with no budget the part stages regardless of capacity — the behaviour \
+             R16.8 replaces for the no-Content-Length case"
+        );
+        assert!(upload_dir.join("part1.bin").exists());
+    }
+
+    /// Build deterministic incompressible data with the same operation as
+    /// `head -c N /dev/zero | openssl enc -aes-256-ctr`. Zero-filled bytes would
+    /// compress away and would not exercise the disk volume that multipart staging
+    /// actually consumes; `/dev/urandom` would add an unnecessary fixture bottleneck.
+    fn openssl_ctr_fixture(bytes: usize) -> Vec<u8> {
+        use std::process::Command;
+
+        let command = format!(
+            "head -c {bytes} /dev/zero | openssl enc -aes-256-ctr \\
+             -K 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \\
+             -iv 000102030405060708090a0b0c0d0e0f"
+        );
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .expect("openssl must be available for the incompressible fixture");
+        assert!(
+            output.status.success(),
+            "openssl fixture generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout.len(),
+            bytes,
+            "AES-CTR must preserve the fixture length"
+        );
+        output.stdout
+    }
+
+    async fn admission_current_cache_usage(cache_manager: &crate::cache::CacheManager) -> u64 {
+        cache_manager
+            .get_cache_size_stats()
+            .await
+            .expect("admission snapshot must be readable")
+            .sizes
+            .expect("get_cache_size_stats must populate CacheSizes")
+            .total_cache_size
+    }
+
+    async fn skipped_put_count(metrics: &Arc<RwLock<MetricsManager>>, reason: &str) -> u64 {
+        metrics
+            .read()
+            .await
+            .collect_metrics()
+            .await
+            .signed_put
+            .expect("signed PUT metrics must be present")
+            .skipped_puts_total
+            .get(reason)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    async fn initialized_accounting_cache_manager(
+        cache_dir: std::path::PathBuf,
+        max_cache_size: u64,
+    ) -> Arc<crate::cache::CacheManager> {
+        let cache_manager = Arc::new(crate::cache::CacheManager::new_with_shared_storage(
+            cache_dir,
+            false,
+            0,
+            max_cache_size,
+            crate::cache::CacheEvictionAlgorithm::default(),
+            1,
+            true,
+            std::time::Duration::from_secs(315_360_000),
+            std::time::Duration::from_secs(3_600),
+            std::time::Duration::from_secs(3_600),
+            false,
+            crate::config::SharedStorageConfig::default(),
+            10.0,
+            true,
+            std::time::Duration::from_secs(86_400),
+            crate::config::MetadataCacheConfig::default(),
+            95,
+            80,
+            true,
+            std::time::Duration::from_secs(60),
+            1_048_576,
+            false,
+            std::time::Duration::from_secs(10),
+            64,
+            std::time::Duration::from_secs(5),
+        ));
+        let _ = cache_manager.create_configured_disk_cache_manager();
+        cache_manager.initialize().await.unwrap();
+        cache_manager
+    }
+
+    async fn stage_accounting_part(
+        cache_manager: &Arc<crate::cache::CacheManager>,
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: &[u8],
+        metrics: Arc<RwLock<MetricsManager>>,
+    ) {
+        let sink = cache_manager
+            .open_multipart_part_sink(cache_key, upload_id, part_number)
+            .await
+            .expect("multipart part sink must open");
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+        let split = body.len() / 2;
+        tee_tx
+            .send(Bytes::copy_from_slice(&body[..split]))
+            .await
+            .unwrap();
+        tee_tx
+            .send(Bytes::copy_from_slice(&body[split..]))
+            .await
+            .unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_part_cache_write(
+            cache_key.to_string(),
+            upload_id.to_string(),
+            part_number,
+            sink,
+            tee_rx,
+            s3_rx,
+            false,
+            None,
+            cache_dir.to_path_buf(),
+            Some(metrics),
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            StreamingCacheOutcome::Committed,
+            "the real multipart staging path must publish the part before measuring admission"
+        );
+    }
+
+    /// R16.9's red side: parts written below `mpus_in_progress/` are invisible to
+    /// the `current_cache_usage` snapshot `HttpProxy` passes to
+    /// `check_cache_capacity`. The accounting fix belongs to Phase 3, so this test
+    /// remains ignored until that phase makes the assertion pass.
+    ///
+    /// The single-PUT positive controls prove the two skipped-PUT label observers
+    /// work on their only producers. The multipart body then commits through
+    /// `open_multipart_part_sink` under the same metrics handle and neither label
+    /// changes, establishing that those labels cannot report multipart staging.
+    ///
+    /// **Validates: Requirements 16.2, 16.5, 16.9, 16.12**
+    #[tokio::test]
+    #[ignore = "R16.9 red-side regression: multipart staging is not yet accounted"]
+    async fn multipart_staging_moves_disk_bytes_without_moving_admission_usage() {
+        const PARTS: u32 = 3;
+        const PART_BYTES: usize = 1024 * 1024;
+        const MAX_CACHE_CAPACITY: u64 = 16 * 1024 * 1024;
+        const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
+
+        let temp_dir = TempDir::new().unwrap();
+        let metrics = Arc::new(RwLock::new(MetricsManager::new()));
+
+        // Prove each counter can move on its real single-PUT producer before using
+        // it as a negative observation for multipart staging. No body is sent: the
+        // decision happens while `setup_put_cache_tee` opens its sink.
+        let object_manager = initialized_accounting_cache_manager(
+            temp_dir.path().join("object-too-large"),
+            3 * MAX_OBJECT_SIZE,
+        )
+        .await;
+        let mut object_put = SignedPutHandler::new(
+            temp_dir.path().to_path_buf(),
+            (*object_manager.get_compression_handler()).clone(),
+            0,
+            u64::MAX,
+            None,
+            10 * 1024 * 1024,
+            4,
+        );
+        object_put.set_cache_manager(object_manager);
+        object_put.set_metrics_manager(metrics.clone());
+        let (tee, result) = object_put
+            .setup_put_cache_tee(
+                "test-bucket/object-too-large",
+                &HashMap::new(),
+                false,
+                Some(MAX_OBJECT_SIZE + 1),
+            )
+            .await;
+        assert!(tee.is_none() && result.is_none());
+        assert_eq!(skipped_put_count(&metrics, "object_too_large").await, 1);
+
+        let disk_manager =
+            initialized_accounting_cache_manager(temp_dir.path().join("disk-safety"), 1).await;
+        let mut disk_put = SignedPutHandler::new(
+            temp_dir.path().to_path_buf(),
+            (*disk_manager.get_compression_handler()).clone(),
+            0,
+            u64::MAX,
+            None,
+            10 * 1024 * 1024,
+            4,
+        );
+        disk_put.set_cache_manager(disk_manager);
+        disk_put.set_metrics_manager(metrics.clone());
+        let (tee, result) = disk_put
+            .setup_put_cache_tee("test-bucket/disk-safety", &HashMap::new(), false, Some(2))
+            .await;
+        assert!(tee.is_none() && result.is_none());
+        assert_eq!(skipped_put_count(&metrics, "disk_safety").await, 1);
+
+        let cache_manager = initialized_accounting_cache_manager(
+            temp_dir.path().join("multipart-staging"),
+            MAX_CACHE_CAPACITY,
+        )
+        .await;
+        let body = openssl_ctr_fixture(PART_BYTES);
+        let before = admission_current_cache_usage(&cache_manager).await;
+        let disk_safety_before = skipped_put_count(&metrics, "disk_safety").await;
+        let object_too_large_before = skipped_put_count(&metrics, "object_too_large").await;
+
+        for part_number in 1..=PARTS {
+            let current_cache_usage = admission_current_cache_usage(&cache_manager).await;
+            assert!(
+                matches!(
+                    check_cache_capacity(
+                        Some(PART_BYTES as u64),
+                        current_cache_usage,
+                        MAX_CACHE_CAPACITY,
+                    ),
+                    CacheDecision::Cache
+                ),
+                "part {part_number} must reach multipart staging through the same admission \
+                 arithmetic HttpProxy uses"
+            );
+            stage_accounting_part(
+                &cache_manager,
+                temp_dir.path(),
+                "test-bucket/multipart-accounting",
+                "multipart-accounting-upload",
+                part_number,
+                &body,
+                metrics.clone(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            skipped_put_count(&metrics, "disk_safety").await,
+            disk_safety_before,
+            "disk_safety has no producer on the multipart part path"
+        );
+        assert_eq!(
+            skipped_put_count(&metrics, "object_too_large").await,
+            object_too_large_before,
+            "object_too_large has no producer on the multipart part path"
+        );
+
+        let after = admission_current_cache_usage(&cache_manager).await;
+        let staged_bytes = PARTS as u64 * PART_BYTES as u64;
+        assert!(
+            after >= before + staged_bytes,
+            "R16.9: current_cache_usage (the value check_cache_capacity reads) must include \
+             the {staged_bytes} bytes staged below mpus_in_progress; before={before}, after={after}"
         );
     }
 

@@ -114,7 +114,13 @@ async fn test_multipart_upload_followed_by_get() {
 
     // Find cached ranges that overlap with the request
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -224,7 +230,13 @@ async fn test_multipart_upload_partial_get() {
 
     // Find cached ranges
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -299,7 +311,13 @@ async fn test_multipart_upload_non_aligned_get() {
 
     // Find cached ranges
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 

@@ -156,7 +156,13 @@ async fn test_put_then_full_get_uses_cache() {
     );
 
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -317,7 +323,13 @@ async fn test_put_then_full_get_large_object() {
 
     println!("[TEST] Finding cached ranges for full object GET");
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -449,7 +461,13 @@ async fn test_has_cached_ranges_optimization() {
     ));
 
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 

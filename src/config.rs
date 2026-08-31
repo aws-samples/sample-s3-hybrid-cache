@@ -1412,8 +1412,12 @@ pub struct CacheConfig {
     /// Default: false (do not flush on eviction to avoid blocking)
     #[serde(default = "default_ram_cache_flush_on_eviction")]
     pub ram_cache_flush_on_eviction: bool,
-    /// Interval between RAM cache coherency verification checks
-    /// Default: 1 second, Range: 1-60 seconds
+    /// DEPRECATED: has no effect. There is no RAM-versus-disk verification loop —
+    /// this field was parsed, validated and logged but never read by any logic.
+    /// RAM/disk coherency is bounded by `metadata_cache.refresh_interval` and by the
+    /// per-key `get_ttl` instead; see `docs/CACHE_FRESHNESS.md`.
+    /// Retained for one release cycle for backward-compatible config parsing.
+    /// Will be removed in a future release.
     #[serde(
         default = "default_ram_cache_verification_interval",
         deserialize_with = "duration_serde::deserialize"
@@ -2538,24 +2542,25 @@ impl Default for Config {
                 get_ttl: Duration::from_secs(315360000),        // ~10 years (infinite caching)
                 head_ttl: Duration::from_secs(60),              // 1 minute
                 actively_remove_cached_data: false,             // Lazy expiration by default
-                shared_storage: SharedStorageConfig::default(), // Disabled by default (single-instance mode)
+                // Coordination is unconditional; this configures its parameters, including lock timeouts.
+                shared_storage: SharedStorageConfig::default(),
                 download_coordination: DownloadCoordinationConfig::default(), // Enabled by default
-                range_merge_gap_threshold: 1024 * 1024,         // 1MiB
-                eviction_buffer_percent: 5,                     // 5% buffer
-                ram_cache_flush_interval: Duration::from_secs(10), // 10 seconds (Req 19)
-                ram_cache_flush_threshold: 100,                 // 100 pending updates
-                ram_cache_flush_on_eviction: false,             // Do not flush on eviction
+                range_merge_gap_threshold: 1024 * 1024,                       // 1MiB
+                eviction_buffer_percent: 5,                                   // 5% buffer
+                ram_cache_flush_interval: Duration::from_secs(10),            // 10 seconds (Req 19)
+                ram_cache_flush_threshold: 100,                               // 100 pending updates
+                ram_cache_flush_on_eviction: false, // Do not flush on eviction
                 ram_cache_verification_interval: Duration::from_secs(1), // 1 second
                 incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
                 initialization: InitializationConfig::default(), // Default initialization config
-                cache_bypass_headers_enabled: true,             // Enabled by default
+                cache_bypass_headers_enabled: true, // Enabled by default
                 metadata_cache: MetadataCacheConfig::default(), // RAM metadata cache config
-                eviction_trigger_percent: 95,                   // Trigger eviction at 95% capacity
-                eviction_target_percent: 80,                    // Reduce to 80% after eviction
-                full_object_check_threshold: 67_108_864,        // 64 MiB
-                disk_streaming_threshold: 1_048_576,            // 1 MiB
-                compression_batch_size: 1_048_576,              // 1 MiB
-                read_cache_enabled: true,                       // Read caching enabled by default
+                eviction_trigger_percent: 95,       // Trigger eviction at 95% capacity
+                eviction_target_percent: 80,        // Reduce to 80% after eviction
+                full_object_check_threshold: 67_108_864, // 64 MiB
+                disk_streaming_threshold: 1_048_576, // 1 MiB
+                compression_batch_size: 1_048_576,  // 1 MiB
+                read_cache_enabled: true,           // Read caching enabled by default
                 bucket_settings_staleness_threshold: Duration::from_secs(60), // 60 seconds
                 evaluate_conditions_from_cache: true, // Default: serve If-Match from cache; If-None-Match/etc still forward
                 ram_cache_shard_count: default_ram_cache_shard_count(),
@@ -2898,6 +2903,14 @@ impl Config {
                 "Configuration field 'cache.eviction_buffer_percent' is deprecated and has no effect. \
                  Eviction behavior is controlled by 'cache.eviction_trigger_percent' (default 95%) \
                  and 'cache.eviction_target_percent' (default 80%). This field will be removed in a future release."
+            );
+        }
+        if self.cache.ram_cache_verification_interval != default_ram_cache_verification_interval() {
+            warn!(
+                "Configuration field 'cache.ram_cache_verification_interval' is deprecated and has no effect. \
+                 There is no RAM-versus-disk verification loop; RAM staleness is bounded by \
+                 'cache.metadata_cache.refresh_interval' and by the per-key 'get_ttl'. \
+                 This field will be removed in a future release."
             );
         }
         if !self.metrics.include_cache_stats {
@@ -3602,24 +3615,18 @@ impl Config {
             self.cache.ram_cache_flush_threshold = 100;
         }
 
-        // Validate verification_interval (1-60 seconds)
-        let verification_interval_secs = self.cache.ram_cache_verification_interval.as_secs();
-        if !(1..=60).contains(&verification_interval_secs) {
-            warn!(
-                "Invalid ram_cache_verification_interval: {}s (must be 1-60s), using default 1s",
-                verification_interval_secs
-            );
-            self.cache.ram_cache_verification_interval = Duration::from_secs(1);
-        }
+        // `ram_cache_verification_interval` is deliberately NOT range-validated here.
+        // It has no consumer, so clamping an out-of-range value to 1s corrected nothing
+        // and only made a dead field look live. A non-default value is reported once by
+        // `log_deprecated_fields()` instead.
 
         // Log configuration
         if self.cache.ram_cache_enabled {
             info!(
-                "RAM cache flush config: interval={}s, threshold={}, flush_on_eviction={}, verification_interval={}s",
+                "RAM cache flush config: interval={}s, threshold={}, flush_on_eviction={}",
                 self.cache.ram_cache_flush_interval.as_secs(),
                 self.cache.ram_cache_flush_threshold,
-                self.cache.ram_cache_flush_on_eviction,
-                self.cache.ram_cache_verification_interval.as_secs()
+                self.cache.ram_cache_flush_on_eviction
             );
         }
 
@@ -4513,6 +4520,67 @@ logging:
         assert_eq!(
             config.connection_pool.hedged_requests.max_inflight_fraction, 0.1,
             "hedged_requests.max_inflight_fraction must default to 0.1"
+        );
+    }
+
+    #[test]
+    fn test_deprecated_ram_cache_verification_interval_still_parses() {
+        // Config-compat (config-compatibility.md, cache-eviction-at-scale Req 9.4):
+        // `cache.ram_cache_verification_interval` is deprecated and has no consumer,
+        // but an existing deployment's config file sets it. Such a file MUST still
+        // parse, and the value MUST still round-trip into the struct so
+        // `log_deprecated_fields()` can recognise it as non-default and warn.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+  ram_cache_verification_interval: "600s"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml)
+            .expect("a config setting the deprecated field must still parse");
+        assert_eq!(
+            config.cache.ram_cache_verification_interval,
+            Duration::from_secs(600),
+            "the deprecated field must round-trip so the startup warning can detect a non-default value"
+        );
+        // 600s is outside the range the removed validator accepted (1-60s), and nothing
+        // clamps it any more: the range check went with the consumer, so the parsed
+        // value survives untouched rather than being silently rewritten to 1s. Clamping
+        // a field nothing reads corrected nothing and made a dead field look live.
+        assert_ne!(
+            config.cache.ram_cache_verification_interval,
+            default_ram_cache_verification_interval(),
+            "a set value must remain distinguishable from the default"
+        );
+    }
+
+    #[test]
+    fn test_deprecated_ram_cache_verification_interval_defaults_when_omitted() {
+        // The other half of the compatibility contract: a config file that omits the
+        // deprecated field must parse and apply the default, so no operator is forced
+        // to add a field that does nothing.
+        let yaml = r#"
+cache:
+  cache_dir: "./cache"
+logging:
+  access_log_dir: "./logs/access"
+  app_log_dir: "./logs/app"
+"#;
+
+        let config: Config = serde_yaml_ng::from_str(yaml)
+            .expect("a config omitting the deprecated field must parse");
+        assert_eq!(
+            config.cache.ram_cache_verification_interval,
+            default_ram_cache_verification_interval(),
+            "omitting the deprecated field must apply the default, not fail validation"
+        );
+        assert_eq!(
+            config.cache.ram_cache_verification_interval,
+            Duration::from_secs(1),
+            "the default is unchanged by the deprecation"
         );
     }
 
@@ -7735,9 +7803,12 @@ mod rolling_validation_config_property_tests {
         );
         assert_eq!(config.cache.ram_cache_flush_threshold, 100);
         assert!(!config.cache.ram_cache_flush_on_eviction);
+        // `ram_cache_verification_interval` is deprecated and the example no longer
+        // sets it, so this now asserts the serde default is applied rather than that a
+        // value was read from the file. Kept because the field must still parse.
         assert_eq!(
             config.cache.ram_cache_verification_interval,
-            Duration::from_secs(1)
+            default_ram_cache_verification_interval()
         );
         assert_eq!(
             config.cache.incomplete_upload_ttl,

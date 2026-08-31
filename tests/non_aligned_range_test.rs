@@ -128,7 +128,13 @@ async fn test_non_aligned_range_request() {
 
     // Find cached ranges that overlap with the request
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -293,7 +299,13 @@ async fn test_non_aligned_range_multiple_boundaries() {
     ));
 
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -401,7 +413,13 @@ async fn test_non_aligned_range_at_start() {
     ));
 
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -496,7 +514,13 @@ async fn test_non_aligned_range_at_end() {
     ));
 
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 

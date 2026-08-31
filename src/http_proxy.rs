@@ -3450,6 +3450,21 @@ impl HttpProxy {
                             &full_range,
                             None,
                             preloaded_metadata.as_ref(),
+                            // RevalidationCandidate. The initial ordinary
+                            // full-object lookup. While this was FreshServe, a
+                            // Stored_Expired entry produced an empty overlap, the
+                            // `can_serve_from_cache` arm below was never taken, and
+                            // Mode B, `check_object_expiration`, the conditional
+                            // request, `ttl_revalidations_total` and the cached
+                            // serve — all nested inside it — were unreachable.
+                            //
+                            // Discovery, not permission. Every serve reachable from
+                            // here is gated: the Mode B arm by a matching client
+                            // `If-Match`, the cache-hit arm by a live-TTL `Fresh`
+                            // verdict, and the post-`304` arm by S3's own
+                            // confirmation. Nothing serves on the strength of the
+                            // lookup alone. R1.1, R2.1.
+                            crate::cache_types::RangeLookupPurpose::RevalidationCandidate,
                         )
                         .await
                     {
@@ -3682,7 +3697,16 @@ impl HttpProxy {
                                                         }
                                                     }
 
-                                                    // Serve from cache
+                                                    // Serve from cache. The 304 is
+                                                    // the authority — S3 has
+                                                    // confirmed this representation
+                                                    // is current — so stored expiry
+                                                    // must not veto it. Coverage was
+                                                    // established by the lookup that
+                                                    // opened this arm; a missing
+                                                    // `.bin` still fails at load time
+                                                    // and falls back rather than
+                                                    // serving. R2.2, R2.3.
                                                     let header_map: HeaderMap = header_map
                                                         .iter()
                                                         .filter_map(|(k, v)| {
@@ -3713,19 +3737,42 @@ impl HttpProxy {
                                                     cache_key, cached_range.start, cached_range.end
                                                 );
 
-                                                    let mut disk_cache_guard =
-                                                        disk_cache.write().await;
-                                                    if let Err(e) = disk_cache_guard
-                                                        .remove_invalidated_range(
-                                                            &cache_key,
-                                                            cached_range.start,
-                                                            cached_range.end,
-                                                        )
+                                                    // R2.4: ALL old-version coverage,
+                                                    // not just `cached_ranges[0]`. A
+                                                    // full object can be covered by
+                                                    // several extents when it was
+                                                    // assembled from ranged reads, and
+                                                    // removing only the first leaves
+                                                    // superseded bytes on disk under a
+                                                    // `.meta` that still references
+                                                    // them. This path then falls
+                                                    // through to a forward rather than
+                                                    // to a cache-serving helper, so the
+                                                    // consequence here is a stale
+                                                    // remnant rather than an immediate
+                                                    // stale serve — but the remnant is
+                                                    // reachable by the next request,
+                                                    // which is exactly what was
+                                                    // measured on the range path. See
+                                                    // `tests/changed_range_revalidation_stale_serve_test.rs`.
+                                                    if let Err(e) = cache_manager
+                                                        .invalidate_cache_hierarchy(&cache_key)
                                                         .await
                                                     {
-                                                        debug!("Failed to remove invalidated full object range: {}", e);
+                                                        warn!(
+                                                            "Failed to invalidate changed full object's cached coverage: cache_key={}, error={}",
+                                                            cache_key, e
+                                                        );
                                                     }
-                                                    drop(disk_cache_guard);
+                                                    if let Err(e) = cache_manager
+                                                        .invalidate_ram_ranges(&cache_key)
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            "Failed to invalidate changed full object's RAM ranges: cache_key={}, error={}",
+                                                            cache_key, e
+                                                        );
+                                                    }
 
                                                     if let Some(g) = fetcher_guard.take() {
                                                         g.complete_success();
@@ -6004,11 +6051,7 @@ impl HttpProxy {
         // path below re-sends the client's conditional header to S3 so the
         // precondition is evaluated fresh on every request (Requirement 2.6).
         let overlap = if has_range_conditional {
-            crate::range_handler::RangeOverlap {
-                cached_ranges: Vec::new(),
-                missing_ranges: vec![page_range.clone()],
-                can_serve_from_cache: false,
-            }
+            crate::range_handler::RangeOverlap::all_missing(&page_range)
         } else {
             Self::find_page_overlap(cache_key, &page_range, current_etag, range_handler).await?
         };
@@ -6282,8 +6325,23 @@ impl HttpProxy {
         current_etag: Option<&str>,
         range_handler: &Arc<RangeHandler>,
     ) -> Result<crate::range_handler::RangeOverlap> {
+        // FreshServe. Page widening applies no live-TTL gate: `fill_page`
+        // consults the RAM tier before this function is reached, and the disk arm
+        // below is bounded by stored expiry alone. Requirement 1.3 keeps it that
+        // way, and this spec deliberately does not absorb the widened path's
+        // freshness work — that is owned by
+        // `.kiro/specs/page-widening-freshness/` (its R1 and R2), which is a live
+        // violation in this same area. Do not "improve" this to
+        // RevalidationCandidate: there is no gate here to revalidate behind, so
+        // an expired candidate would be served directly.
         let overlap = range_handler
-            .find_cached_ranges(cache_key, page_range, current_etag, None)
+            .find_cached_ranges(
+                cache_key,
+                page_range,
+                current_etag,
+                None,
+                crate::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await?;
         if overlap.can_serve_from_cache || !overlap.cached_ranges.is_empty() {
             return Ok(overlap);
@@ -6335,6 +6393,10 @@ impl HttpProxy {
             cached_ranges,
             missing_ranges,
             can_serve_from_cache,
+            // Journal records carry no expiry, so none can have passed. This
+            // branch's staleness is bounded by neither mechanism — a pre-existing
+            // gap owned by `page-widening-freshness`, not introduced here.
+            stored_freshness: crate::cache_types::StoredFreshness::Fresh,
         })
     }
 
@@ -6720,76 +6782,140 @@ impl HttpProxy {
                                         &full_range,
                                         current_etag.as_deref(),
                                         preloaded_metadata.as_ref(),
+                                        // FreshServe, permanently. This shortcut
+                                        // can direct-serve below, so it must not
+                                        // receive an expired candidate. Task 5
+                                        // adds the live-TTL check it is missing
+                                        // and makes it fall through to the
+                                        // range-specific RevalidationCandidate
+                                        // lookup instead of serving. R4.1, R4.2.
+                                        crate::cache_types::RangeLookupPurpose::FreshServe,
                                     )
                                     .await
                                 {
                                     Ok(full_overlap)
-                                        if full_overlap.can_serve_from_cache && !forward_to_s3 =>
+                                        if full_overlap.is_serveable_unvalidated()
+                                            && !forward_to_s3 =>
                                     {
-                                        debug!(
+                                        // R4.1/R4.2/R4.3: this shortcut used to
+                                        // direct-serve here with no live-TTL check
+                                        // at all, so it was bounded by STORED
+                                        // expiry alone. Tightening or zeroing
+                                        // `get_ttl` therefore had no effect on a
+                                        // ranged read of an already-cached full
+                                        // object until the old `expires_at`
+                                        // elapsed — a silent configuration
+                                        // failure, which
+                                        // `.kiro/steering/cache-coherency-invariants.md`
+                                        // names as the worst kind: freshness was
+                                        // explicitly requested and quietly
+                                        // ignored.
+                                        //
+                                        // The verdict must come from the currently
+                                        // resolved `get_ttl`. When it says expired
+                                        // we fall THROUGH to the range-specific
+                                        // RevalidationCandidate lookup rather than
+                                        // starting a second, independent
+                                        // validation flow here — one conditional
+                                        // path for the range request, as R4.2
+                                        // requires.
+                                        let live_ttl_expired = {
+                                            let disk_cache = range_handler.get_disk_cache_manager();
+                                            let guard = disk_cache.read().await;
+                                            matches!(
+                                                guard
+                                                    .check_object_expiration(
+                                                        &cache_key,
+                                                        resolved.get_ttl,
+                                                    )
+                                                    .await,
+                                                Ok(ObjectExpirationResult::Expired { .. })
+                                            )
+                                        };
+                                        if live_ttl_expired {
+                                            debug!(
+                                                "Full-object shortcut live-TTL expired, falling through to range-specific revalidation: cache_key={}, get_ttl={:?}",
+                                                cache_key, resolved.get_ttl
+                                            );
+                                        } else {
+                                            debug!(
                                         "Range request served from full object cache: cache_key={}, requested_range={}-{}, full_object_size={} bytes",
                                         cache_key, range_spec.start, range_spec.end, total_size
                                     );
 
-                                        // Filter cached ranges to only include those that overlap with the requested range
-                                        let mut filtered_cached_ranges = Vec::new();
-                                        for cached_range in &full_overlap.cached_ranges {
-                                            // Check if this cached range overlaps with the requested range
-                                            if cached_range.start <= range_spec.end
-                                                && cached_range.end >= range_spec.start
-                                            {
-                                                filtered_cached_ranges.push(cached_range.clone());
+                                            // Filter cached ranges to only include those that overlap with the requested range
+                                            let mut filtered_cached_ranges = Vec::new();
+                                            for cached_range in &full_overlap.cached_ranges {
+                                                // Check if this cached range overlaps with the requested range
+                                                if cached_range.start <= range_spec.end
+                                                    && cached_range.end >= range_spec.start
+                                                {
+                                                    filtered_cached_ranges
+                                                        .push(cached_range.clone());
+                                                }
                                             }
-                                        }
 
-                                        // Preserve the range handler's completeness contract after
-                                        // filtering full-object extents to this request.
-                                        let filtered_range_specs: Vec<_> = filtered_cached_ranges
-                                            .iter()
-                                            .map(|cached_range| crate::range_handler::RangeSpec {
-                                                start: cached_range.start,
-                                                end: cached_range.end,
-                                            })
-                                            .collect();
-                                        let missing_ranges = range_handler
-                                            .calculate_missing_ranges(
+                                            // Preserve the range handler's completeness contract after
+                                            // filtering full-object extents to this request.
+                                            let filtered_range_specs: Vec<_> =
+                                                filtered_cached_ranges
+                                                    .iter()
+                                                    .map(|cached_range| {
+                                                        crate::range_handler::RangeSpec {
+                                                            start: cached_range.start,
+                                                            end: cached_range.end,
+                                                        }
+                                                    })
+                                                    .collect();
+                                            let missing_ranges = range_handler
+                                                .calculate_missing_ranges(
+                                                    &range_spec,
+                                                    &filtered_range_specs,
+                                                );
+                                            let filtered_overlap =
+                                                crate::range_handler::RangeOverlap {
+                                                    cached_ranges: filtered_cached_ranges,
+                                                    can_serve_from_cache: missing_ranges.is_empty(),
+                                                    missing_ranges,
+                                                    // Inherited from the lookup that
+                                                    // produced these extents. FreshServe
+                                                    // above means this is always Fresh;
+                                                    // carrying it rather than hardcoding
+                                                    // keeps the invariant true if that
+                                                    // purpose ever changes.
+                                                    stored_freshness: full_overlap.stored_freshness,
+                                                };
+
+                                            // Serve the requested range from the filtered cache ranges
+                                            let header_map: HeaderMap = client_headers
+                                                .iter()
+                                                .filter_map(|(k, v)| {
+                                                    let name =
+                                                        k.parse::<hyper::header::HeaderName>().ok();
+                                                    let val = v
+                                                        .parse::<hyper::header::HeaderValue>()
+                                                        .ok();
+                                                    name.zip(val)
+                                                })
+                                                .collect();
+                                            return Self::serve_range_from_cache(
+                                                method,
                                                 &range_spec,
-                                                &filtered_range_specs,
-                                            );
-                                        let filtered_overlap = crate::range_handler::RangeOverlap {
-                                            cached_ranges: filtered_cached_ranges,
-                                            can_serve_from_cache: missing_ranges.is_empty(),
-                                            missing_ranges,
-                                        };
-
-                                        // Serve the requested range from the filtered cache ranges
-                                        let header_map: HeaderMap = client_headers
-                                            .iter()
-                                            .filter_map(|(k, v)| {
-                                                let name =
-                                                    k.parse::<hyper::header::HeaderName>().ok();
-                                                let val =
-                                                    v.parse::<hyper::header::HeaderValue>().ok();
-                                                name.zip(val)
-                                            })
-                                            .collect();
-                                        return Self::serve_range_from_cache(
-                                            method,
-                                            &range_spec,
-                                            &filtered_overlap,
-                                            &cache_key,
-                                            cache_manager,
-                                            range_handler,
-                                            s3_client.clone(),
-                                            &host,
-                                            &uri.to_string(),
-                                            &header_map,
-                                            config.clone(),
-                                            preloaded_metadata.as_ref(),
-                                            resolved,
-                                            permit.clone(),
-                                        )
-                                        .await;
+                                                &filtered_overlap,
+                                                &cache_key,
+                                                cache_manager,
+                                                range_handler,
+                                                s3_client.clone(),
+                                                &host,
+                                                &uri.to_string(),
+                                                &header_map,
+                                                config.clone(),
+                                                preloaded_metadata.as_ref(),
+                                                resolved,
+                                                permit.clone(),
+                                            )
+                                            .await;
+                                        } // end if !live_ttl_expired
                                     }
                                     Ok(_) => {
                                         debug!("Full object not completely cached, falling back to range-specific lookup: cache_key={}", cache_key);
@@ -6828,6 +6954,19 @@ impl HttpProxy {
                         &range_spec,
                         current_etag.as_deref(),
                         preloaded_metadata.as_ref(),
+                        // RevalidationCandidate. This is the range-specific
+                        // ordinary lookup and the customer-blocking half of issue
+                        // #17: while this was FreshServe, a Stored_Expired entry
+                        // produced an empty overlap, the non-empty guard below was
+                        // false, and `check_object_expiration` plus the whole
+                        // conditional-request path behind it were unreachable.
+                        // Every sequential ranged re-read became a full body
+                        // transfer plus a cache rewrite.
+                        //
+                        // The candidate is discoverable here, NOT serveable. The
+                        // serve gate below requires either stored freshness or an
+                        // explicit live-TTL Fresh verdict. R1.1, R3.1.
+                        crate::cache_types::RangeLookupPurpose::RevalidationCandidate,
                     )
                     .await
                 {
@@ -6860,6 +6999,25 @@ impl HttpProxy {
                                 i, missing_range.start, missing_range.end
                             );
                         }
+
+                        // Authority for serving a Stored_Expired candidate below.
+                        //
+                        // A stored-fresh overlap needs no such record — its
+                        // `is_serveable_unvalidated()` is already true. This flag
+                        // exists for the one case where stored expiry has passed
+                        // but the live verdict says Fresh, which happens when an
+                        // operator LENGTHENS `get_ttl` on an already-cached key.
+                        // R4.3 makes the live verdict authoritative on mainline
+                        // GETs, so that serve is permitted — but only with the
+                        // verdict written down, per R1.2.
+                        //
+                        // Note what deliberately does NOT happen in that arm: the
+                        // stored `expires_at` is not refreshed. `refresh_object_ttl`
+                        // is access-time anchored, so refreshing here would extend
+                        // freshness from now rather than preserving the
+                        // `created_at`-anchored bound, and would let repeated reads
+                        // walk an entry forward indefinitely.
+                        let mut live_ttl_fresh_verdict = false;
 
                         // Check if cached ranges are expired and need conditional validation (Requirement 1.4)
                         if !overlap.cached_ranges.is_empty() {
@@ -6975,20 +7133,63 @@ impl HttpProxy {
                                         }
                                     }
 
-                                    // Build validation headers
+                                    // Build validation headers.
+                                    //
+                                    // R3.2 — PRESERVE THE RAW `Range`. This used to
+                                    // overwrite the header with
+                                    // `format!("bytes={}-{}", range_spec.start,
+                                    // range_spec.end)`, reconstructed from parsed
+                                    // offsets. Two things break when it does:
+                                    //
+                                    //   * suffix (`bytes=-512`) and open-ended
+                                    //     (`bytes=512-`) forms are normalised to
+                                    //     absolute offsets. Equivalent against this
+                                    //     object, a different string on the wire.
+                                    //   * when `range` is in SigV4 `SignedHeaders`,
+                                    //     a different string is an INVALID
+                                    //     SIGNATURE. `is_range_signed` is not
+                                    //     consulted until much later at the forward
+                                    //     branch, so the rewrite happened
+                                    //     unconditionally, signed or not.
+                                    //
+                                    // The client's own value is already in
+                                    // `client_headers`; it is set explicitly from
+                                    // `range_header` so the intent survives a future
+                                    // refactor of how that map is built.
+                                    //
+                                    // R4.5 — DO NOT OVERWRITE CLIENT PRECONDITIONS.
+                                    // The proxy validator is injected only when the
+                                    // client sent none. Clobbering a client's
+                                    // `If-None-Match` changes the RFC-defined result
+                                    // of its request, and the client is entitled to
+                                    // the answer it asked for; when one is present we
+                                    // leave the request alone and let the ordinary
+                                    // forward path evaluate it.
+                                    let client_sent_conditional = client_headers.keys().any(|k| {
+                                        let k = k.to_ascii_lowercase();
+                                        k == "if-none-match" || k == "if-modified-since"
+                                    });
+
                                     let mut validation_headers = client_headers.clone();
-                                    if let Some(ref lm) = last_modified {
-                                        validation_headers
-                                            .insert("if-modified-since".to_string(), lm.clone());
+                                    validation_headers
+                                        .insert("range".to_string(), range_header.to_string());
+                                    if !client_sent_conditional {
+                                        if let Some(ref lm) = last_modified {
+                                            validation_headers.insert(
+                                                "if-modified-since".to_string(),
+                                                lm.clone(),
+                                            );
+                                        }
+                                        if let Some(ref et) = etag {
+                                            validation_headers
+                                                .insert("if-none-match".to_string(), et.clone());
+                                        }
+                                    } else {
+                                        debug!(
+                                            "Client sent its own conditional; not injecting proxy validators: cache_key={}",
+                                            cache_key
+                                        );
                                     }
-                                    if let Some(ref et) = etag {
-                                        validation_headers
-                                            .insert("if-none-match".to_string(), et.clone());
-                                    }
-                                    validation_headers.insert(
-                                        "range".to_string(),
-                                        format!("bytes={}-{}", range_spec.start, range_spec.end),
-                                    );
 
                                     // Build S3 request context for conditional validation
                                     let validation_context =
@@ -7032,7 +7233,16 @@ impl HttpProxy {
                                                     }
                                                 }
 
-                                                if overlap.can_serve_from_cache {
+                                                // The 304 is the authority here, so
+                                                // `has_complete_coverage` rather than
+                                                // `is_serveable_unvalidated`: S3 has
+                                                // confirmed the version, and vetoing
+                                                // on stored expiry would discard a
+                                                // valid Validated_Serve. It proves the
+                                                // version, not the coverage, so
+                                                // completeness is still required —
+                                                // R3.4, R3.6, R2.3.
+                                                if overlap.has_complete_coverage() {
                                                     let header_map: HeaderMap = client_headers
                                                         .iter()
                                                         .filter_map(|(k, v)| {
@@ -7087,28 +7297,76 @@ impl HttpProxy {
                                                     permit.clone(),
                                                 )
                                                 .await;
-                                            } else if response.status == StatusCode::OK {
-                                                // 200 OK - data changed, remove invalidated range and cache new data (Requirement 1.6)
+                                            } else if response.status == StatusCode::OK
+                                                || response.status == StatusCode::PARTIAL_CONTENT
+                                            {
+                                                // CHANGED OBJECT. R3.5, R2.4.
+                                                //
+                                                // Both statuses are proof the cached
+                                                // version is stale, and `206` is the
+                                                // one S3 actually sends here, because
+                                                // this request carries `Range`. There
+                                                // was no `206` arm: it fell into the
+                                                // generic "unexpected status" branch
+                                                // below, which removed
+                                                // `overlap.cached_ranges[0]` ALONE and
+                                                // then handed the stale, pre-
+                                                // invalidation `overlap` to
+                                                // `forward_range_request_to_s3` —
+                                                // whose first act is
+                                                // `if overlap.missing_ranges.is_empty()`
+                                                // → serve from cache.
+                                                //
+                                                // With one cached extent that was
+                                                // survivable by accident: the deleted
+                                                // `.bin` made the load fail and the
+                                                // request fell through to a real
+                                                // fetch. With TWO extents — what any
+                                                // sequential reader leaves behind — it
+                                                // was not. Measured on the fixture in
+                                                // `tests/changed_range_revalidation_stale_serve_test.rs`:
+                                                // extent `512-1023` survived on disk,
+                                                // still REFERENCED by a `.meta` that
+                                                // still carried the OLD ETag, and a
+                                                // later read of those bytes served 512
+                                                // stale bytes from cache. Nothing
+                                                // upstream caught it, because
+                                                // `current_etag` comes from
+                                                // `get_object_etag`, which reads the
+                                                // same `.meta`, so the ETag-mismatch
+                                                // guard compares a value with itself.
+                                                //
+                                                // So: invalidate ALL old-version
+                                                // coverage, disk and RAM, BEFORE any
+                                                // helper can see the old overlap, then
+                                                // forward with an all-missing overlap.
                                                 debug!(
-                                                "Conditional validation returned 200 OK, data changed: cache_key={}, range={}-{}",
-                                                cache_key, cached_range.start, cached_range.end
-                                            );
+                                                    "Conditional validation returned {} — object changed, invalidating all old-version coverage: cache_key={}, extents={}",
+                                                    response.status,
+                                                    cache_key,
+                                                    overlap.cached_ranges.len()
+                                                );
 
-                                                let mut disk_cache_guard = disk_cache.write().await;
-                                                if let Err(e) = disk_cache_guard
-                                                    .remove_invalidated_range(
-                                                        &cache_key,
-                                                        cached_range.start,
-                                                        cached_range.end,
-                                                    )
+                                                // Requirement 5.3: changed-object
+                                                // refetch is a distinct log outcome.
+                                                if let Err(e) = cache_manager
+                                                    .invalidate_cache_hierarchy(&cache_key)
                                                     .await
                                                 {
                                                     warn!(
-                                                        "Failed to remove invalidated range: {}",
-                                                        e
+                                                        "Failed to invalidate changed object's cached coverage: cache_key={}, error={}",
+                                                        cache_key, e
                                                     );
                                                 }
-                                                drop(disk_cache_guard);
+                                                if let Err(e) = cache_manager
+                                                    .invalidate_ram_ranges(&cache_key)
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        "Failed to invalidate changed object's RAM ranges: cache_key={}, error={}",
+                                                        cache_key, e
+                                                    );
+                                                }
 
                                                 if let Some(g) = fetcher_guard.take() {
                                                     g.complete_success();
@@ -7120,7 +7378,31 @@ impl HttpProxy {
                                                     }
                                                 }
 
-                                                // Forward request to S3 to get and cache new data
+                                                // DESIGN DEVIATION, recorded per
+                                                // `design.md` § "Handle changed 200
+                                                // and 206": the fresh response has
+                                                // already been received, and the ideal
+                                                // is to push it through the normal
+                                                // response/caching pipeline. There is
+                                                // no helper that accepts an
+                                                // already-received `S3Response` for a
+                                                // range and both returns and caches
+                                                // it, so this re-fetches against an
+                                                // all-missing overlap instead. Cost:
+                                                // one extra upstream request in the
+                                                // changed case only. Serving the old
+                                                // overlap is not an option, and the
+                                                // design names this as the sanctioned
+                                                // fallback.
+                                                //
+                                                // `all_missing` is what makes the
+                                                // helper's `missing_ranges.is_empty()`
+                                                // short-circuit unreachable — the fix
+                                                // does not depend on the invalidation
+                                                // above having deleted every file.
+                                                // Two independent guards, because the
+                                                // single-extent case showed how easily
+                                                // one of them holds by accident.
                                                 return Self::forward_range_request_to_s3(
                                                     method,
                                                     uri.clone(),
@@ -7128,12 +7410,18 @@ impl HttpProxy {
                                                     client_headers.clone(),
                                                     cache_key.clone(),
                                                     range_spec.clone(),
-                                                    overlap,
+                                                    crate::range_handler::RangeOverlap::all_missing(
+                                                        &range_spec,
+                                                    ),
                                                     cache_manager,
                                                     range_handler.clone(),
                                                     s3_client,
                                                     config.clone(),
-                                                    preloaded_metadata.as_ref(),
+                                                    // The old metadata describes the
+                                                    // superseded version and has just
+                                                    // been invalidated; passing it on
+                                                    // would reintroduce it.
+                                                    None,
                                                     resolved,
                                                     proxy_referer,
                                                     None,
@@ -7201,7 +7489,14 @@ impl HttpProxy {
                                                     }
                                                 }
 
-                                                // Forward original request to S3 and cache response if successful
+                                                // R3.5: an all-missing overlap, never
+                                                // the stale one. `remove_invalidated_range`
+                                                // above only touched
+                                                // `cached_ranges[0]`, so with several
+                                                // extents the old overlap still claims
+                                                // complete coverage and would take
+                                                // `forward_range_request_to_s3`'s
+                                                // cache-serve short-circuit.
                                                 return Self::forward_range_request_to_s3(
                                                     method,
                                                     uri.clone(),
@@ -7209,7 +7504,9 @@ impl HttpProxy {
                                                     client_headers.clone(),
                                                     cache_key.clone(),
                                                     range_spec.clone(),
-                                                    overlap,
+                                                    crate::range_handler::RangeOverlap::all_missing(
+                                                        &range_spec,
+                                                    ),
                                                     cache_manager,
                                                     range_handler.clone(),
                                                     s3_client,
@@ -7260,7 +7557,18 @@ impl HttpProxy {
                                                 }
                                             }
 
-                                            // Forward original request to S3 and cache response if successful
+                                            // R3.5: an all-missing overlap, so the
+                                            // stale one cannot reach the cache-serve
+                                            // short-circuit. Note this arm still
+                                            // deletes the range on a TRANSPORT error,
+                                            // which is pre-existing and arguably wrong
+                                            // — a network failure is not evidence the
+                                            // object changed. Left as-is deliberately:
+                                            // changing cache-retention behaviour on
+                                            // transport errors is a separate decision
+                                            // from the stale-serve fix, and bundling
+                                            // them would make a future regression hard
+                                            // to attribute.
                                             return Self::forward_range_request_to_s3(
                                                 method,
                                                 uri.clone(),
@@ -7268,7 +7576,9 @@ impl HttpProxy {
                                                 client_headers.clone(),
                                                 cache_key.clone(),
                                                 range_spec.clone(),
-                                                overlap,
+                                                crate::range_handler::RangeOverlap::all_missing(
+                                                    &range_spec,
+                                                ),
                                                 cache_manager,
                                                 range_handler.clone(),
                                                 s3_client,
@@ -7284,11 +7594,29 @@ impl HttpProxy {
                                     }
                                 }
                                 Ok(ObjectExpirationResult::Fresh) => {
-                                    // Not expired - fall through to serve from cache
+                                    // Not expired - fall through to serve from cache.
+                                    // R4.3: the live verdict is authoritative, so it
+                                    // authorises the serve below even when stored
+                                    // expiry has passed (operator lengthened get_ttl).
+                                    // Requirement 5.3: fresh-cache-serve outcome.
+                                    debug!(
+                                        "Range live-TTL fresh, serving from cache: cache_key={}, stored_freshness={:?}",
+                                        cache_key, overlap.stored_freshness
+                                    );
+                                    live_ttl_fresh_verdict = true;
                                     drop(disk_cache_guard);
                                 }
                                 Err(e) => {
-                                    // Unexpected error - log and fall through
+                                    // Unexpected error - log and fall through.
+                                    //
+                                    // `check_object_expiration` fail-safes to Expired
+                                    // on any read or parse failure, so this arm is
+                                    // near-unreachable. It is left fail-open for a
+                                    // STORED-FRESH entry, which is the pre-existing
+                                    // behaviour, but it deliberately does NOT set
+                                    // `live_ttl_fresh_verdict` — a Stored_Expired
+                                    // candidate must not be served on the strength of
+                                    // an error.
                                     warn!(
                                         "Error checking object expiration: cache_key={}, error={}",
                                         cache_key, e
@@ -7298,7 +7626,16 @@ impl HttpProxy {
                             }
                         }
 
-                        if overlap.can_serve_from_cache && !forward_to_s3 {
+                        // R1.2: complete coverage alone does not authorise a serve.
+                        // A stored-fresh overlap is serveable on its own
+                        // (`is_serveable_unvalidated`); a Stored_Expired candidate
+                        // needs the live-TTL Fresh verdict recorded above. Without
+                        // the second clause this gate would serve expired bytes the
+                        // moment the lookup became a RevalidationCandidate, which is
+                        // exactly the failure the purpose enum exists to prevent.
+                        let serve_authorised = overlap.is_serveable_unvalidated()
+                            || (overlap.has_complete_coverage() && live_ttl_fresh_verdict);
+                        if serve_authorised && !forward_to_s3 {
                             // Requirement 4.3: Log when full object is served entirely from cache
                             // Include cache efficiency metrics
                             let total_cached_bytes: u64 = overlap
@@ -7354,11 +7691,7 @@ impl HttpProxy {
                             // by the existing ETag-mismatch invalidation on the next overlap
                             // computation (no destructive blanket invalidation).
                             let overlap = if forward_to_s3 {
-                                crate::range_handler::RangeOverlap {
-                                    cached_ranges: Vec::new(),
-                                    missing_ranges: vec![range_spec.clone()],
-                                    can_serve_from_cache: false,
-                                }
+                                crate::range_handler::RangeOverlap::all_missing(&range_spec)
                             } else {
                                 overlap
                             };
@@ -10337,11 +10670,24 @@ impl HttpProxy {
                     start: 0,
                     end: total_size - 1,
                 };
+                // RevalidationCandidate under the explicit authority of the 304
+                // just received: S3 has confirmed the cached representation is
+                // current, so stored expiry must not veto serving it. That is why
+                // the guard below reads `has_complete_coverage` — the 304 proves
+                // the version, not the coverage, so completeness is still checked
+                // and a missing range still falls through to a signed fetch.
+                // Requirements 2.3, 4.7.
                 match range_handler
-                    .find_cached_ranges(&cache_key, &full_range, None, Some(&metadata))
+                    .find_cached_ranges(
+                        &cache_key,
+                        &full_range,
+                        None,
+                        Some(&metadata),
+                        crate::cache_types::RangeLookupPurpose::RevalidationCandidate,
+                    )
                     .await
                 {
-                    Ok(overlap) if overlap.can_serve_from_cache => {
+                    Ok(overlap) if overlap.has_complete_coverage() => {
                         let header_map: HeaderMap = headers
                             .iter()
                             .filter_map(|(k, v)| {
@@ -10632,11 +10978,21 @@ impl HttpProxy {
             start: 0,
             end: total_size - 1,
         };
+        // FreshServe. This is the degraded path taken when S3 errored or was
+        // unreachable, and it serves cached bytes with no validation of any kind —
+        // there is no 304 to lean on here, unlike `serve_from_cache_validated`. So
+        // stored expiry remains its only bound. Requirement 1.3.
         let overlap = match range_handler
-            .find_cached_ranges(cache_key, &full_range, None, Some(metadata))
+            .find_cached_ranges(
+                cache_key,
+                &full_range,
+                None,
+                Some(metadata),
+                crate::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
         {
-            Ok(o) if o.can_serve_from_cache => o,
+            Ok(o) if o.is_serveable_unvalidated() => o,
             _ => {
                 // Cache evicted — we can't serve. Return 503 so callers see
                 // the failure rather than silently hanging.
@@ -10718,11 +11074,7 @@ impl HttpProxy {
                 );
                 // Metadata missing — use an empty overlap so the forwarder
                 // treats the request as a complete cache miss.
-                let empty_overlap = crate::range_handler::RangeOverlap {
-                    missing_ranges: vec![range_spec.clone()],
-                    cached_ranges: Vec::new(),
-                    can_serve_from_cache: false,
-                };
+                let empty_overlap = crate::range_handler::RangeOverlap::all_missing(&range_spec);
                 return if is_signed {
                     Self::forward_signed_range_request(
                         method,
@@ -10818,21 +11170,31 @@ impl HttpProxy {
                     );
                 }
                 // Recompute overlap and serve range from cache.
+                //
+                // RevalidationCandidate under the explicit authority of the 304
+                // just received: S3 has confirmed this representation is current,
+                // so stored expiry must not veto serving it. The guard checks
+                // `has_complete_coverage` because a 304 proves the version, not
+                // the coverage — an incomplete overlap still falls through to a
+                // signed fetch below. Requirements 2.3, 3.4, 4.7.
                 let overlap = match range_handler
-                    .find_cached_ranges(&cache_key, &range_spec, None, Some(&metadata))
+                    .find_cached_ranges(
+                        &cache_key,
+                        &range_spec,
+                        None,
+                        Some(&metadata),
+                        crate::cache_types::RangeLookupPurpose::RevalidationCandidate,
+                    )
                     .await
                 {
-                    Ok(o) if o.can_serve_from_cache => o,
+                    Ok(o) if o.has_complete_coverage() => o,
                     _ => {
                         debug!(
                             "Coalescing range waiter (validated): range missing after 304 for {}:{}-{}, falling back to signed S3 fetch",
                             cache_key, range_spec.start, range_spec.end
                         );
-                        let empty_overlap = crate::range_handler::RangeOverlap {
-                            missing_ranges: vec![range_spec.clone()],
-                            cached_ranges: Vec::new(),
-                            can_serve_from_cache: false,
-                        };
+                        let empty_overlap =
+                            crate::range_handler::RangeOverlap::all_missing(&range_spec);
                         return if is_signed {
                             Self::forward_signed_range_request(
                                 method,
@@ -11008,11 +11370,20 @@ impl HttpProxy {
         config: Arc<Config>,
         resolved: &crate::bucket_settings::ResolvedSettings,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        // FreshServe. Degraded path — S3 errored or was unreachable — serving
+        // cached bytes with no validation, so stored expiry is its only bound.
+        // Mirrors `serve_cached_fallback_full`. Requirement 1.3.
         let overlap = match range_handler
-            .find_cached_ranges(cache_key, range_spec, None, Some(metadata))
+            .find_cached_ranges(
+                cache_key,
+                range_spec,
+                None,
+                Some(metadata),
+                crate::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
         {
-            Ok(o) if o.can_serve_from_cache => o,
+            Ok(o) if o.is_serveable_unvalidated() => o,
             _ => {
                 warn!(
                     "Coalescing range waiter (validated): cache evicted during degraded fallback for {}:{}-{}",

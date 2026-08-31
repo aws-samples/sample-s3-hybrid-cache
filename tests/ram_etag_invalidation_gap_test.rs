@@ -247,6 +247,7 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
             },
             Some(ETAG_B),
             Some(&preloaded),
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
         )
         .await
         .expect("find_cached_ranges with mismatching etag");
@@ -290,7 +291,13 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
     let journal_visible = disk_cache_manager
         .read()
         .await
-        .find_cached_ranges(KEY, RANGE_START, RANGE_END, None)
+        .find_cached_ranges(
+            KEY,
+            RANGE_START,
+            RANGE_END,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .map(|r| !r.is_empty())
         .unwrap_or(false);

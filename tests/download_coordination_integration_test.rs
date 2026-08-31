@@ -774,11 +774,7 @@ async fn integration_coalesce_range_flow() {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            let overlap = RangeOverlap {
-                missing_ranges: vec![range_spec.clone()],
-                cached_ranges: Vec::new(),
-                can_serve_from_cache: false,
-            };
+            let overlap = RangeOverlap::all_missing(&range_spec);
             let response = HttpProxy::forward_range_with_coordination(
                 method,
                 uri,

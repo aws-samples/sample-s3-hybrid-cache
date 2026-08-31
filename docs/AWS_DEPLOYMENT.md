@@ -2,22 +2,13 @@
 
 Deployment recommendations for two cases with a high-latency origin: a **cross-region** S3 bucket, and an **S3-compatible store outside AWS**. For installation see the [Quick Start Guide](GETTING_STARTED.md); for the full option list see the [Configuration Reference](CONFIGURATION.md); for measured throughput see [Performance](../README.md#performance).
 
+This guide gives the fleet one shared cache volume, which is the default and suits most deployments. If every client can reach the fleet through an [affinity router](REQUEST_AWARE_ROUTING.md), [Local NVMe Cache Fleets](LOCAL_NVME_CACHE.md) is the alternative: each proxy caches to its own instance store, which costs about 39% less for the same capacity but does not survive instance replacement. Read that comparison before provisioning a file system, since moving between the two later means re-warming the cache.
+
 - [When this guide applies](#when-this-guide-applies)
 - [Shared cache volume](#shared-cache-volume)
-  - [Sizing the file system](#sizing-the-file-system)
-  - [The EFS alternative](#the-efs-alternative)
 - [EC2 fleet](#ec2-fleet)
-  - [Instance sizing](#instance-sizing)
-  - [Bootstrap](#bootstrap)
-  - [Service configuration](#service-configuration)
-  - [Credentials and network access](#credentials-and-network-access)
 - [Client routing](#client-routing)
-  - [DNS: Route 53 private hosted zones](#dns-route-53-private-hosted-zones)
-  - [Load balancer: encrypting the client hop](#load-balancer-encrypting-the-client-hop)
-  - [Choosing between DNS and NLB](#choosing-between-dns-and-nlb)
 - [Origin configuration](#origin-configuration)
-  - [Cross-region S3](#cross-region-s3)
-  - [S3-compatible store outside AWS](#s3-compatible-store-outside-aws)
 - [Mount and configuration](#mount-and-configuration)
 - [Verification](#verification)
 - [Monitoring](#monitoring)
@@ -44,7 +35,7 @@ The origin is in a different Region to your compute, or outside AWS entirely, so
 
 ## Shared cache volume
 
-Use **FSx for OpenZFS** in an HA deployment type: `SINGLE_AZ_HA_2` if clients are concentrated in one AZ, `MULTI_AZ_1` if they span AZs. Place proxies in the same AZ as the clients they serve. [EFS is a viable alternative](#the-efs-alternative) at low duty cycle.
+Use **FSx for OpenZFS** in an HA deployment type: `SINGLE_AZ_HA_2` if clients are concentrated in one AZ, `MULTI_AZ_1` if they span AZs. Place proxies in the same AZ as the clients they serve. [EFS is a viable alternative](#the-efs-alternative) at low duty cycle, and [local NVMe instance store](LOCAL_NVME_CACHE.md) replaces the shared volume entirely where the fleet sits behind an [affinity router](REQUEST_AWARE_ROUTING.md).
 
 The volume is a shared dependency of the whole fleet, so its availability is the fleet's availability. HA pairs [fail over in under 60 seconds](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/availability-durability.html) where non-HA file systems self-heal in roughly 30 minutes, and throughput changes and maintenance become failovers rather than outages.
 
@@ -145,16 +136,19 @@ FSx charges a fixed rate for provisioned capacity; EFS charges per GB transferre
 Elastic Throughput). A cache miss writes to the volume, so the effective EFS transfer rate
 depends on hit rate.
 
-**Illustrative starting fleet:** three `c6in.large` proxies. The [network model below](#sizing-the-network)
-projects roughly 560 MiB/s of sustained shared-cache hits and 3,750 MiB/s while EC2 burst
-credits last. The 160 MB/s FSx tier cannot cover that burst. The 640 MB/s tier is the first
-that can: it supplies 1,550 MB/s cached-read baseline and roughly 5,000 MB/s burst from the
-sizing table. AWS documents the same performance levels for [Multi-AZ and Single-AZ 2](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/performance.html).
+**Illustrative starting fleet:** three `c8gn.large` proxies, which the [network model below](#sizing-the-network)
+projects at roughly 1,118 MiB/s (1,172 MB/s) of sustained shared-cache hits. The **640 MB/s tier**
+covers that on its 1,550 MB/s cached-read baseline, with 1.3× headroom. AWS documents the same performance levels for [Multi-AZ and Single-AZ 2](https://docs.aws.amazon.com/fsx/latest/OpenZFSGuide/performance.html).
 
-EFS Elastic Throughput has no matching provisioned tier. Its 1,500 MiB/s per-client limit
-exceeds one proxy's share of this fleet's burst, so the proxy NICs bind before EFS does. This
-is a cost crossover for the documented starting fleet, not a performance-equivalence claim.
-For sustained load, size FSx against its cached-read **baseline**, as [Sizing the file system](#sizing-the-file-system) requires.
+Size against baseline, not burst. EC2 network burst and FSx burst are both credit-based, so
+matching one against the other sizes for a rate neither side can hold — [Sizing the file system](#sizing-the-file-system)
+requires the baseline comparison.
+
+EFS Elastic Throughput has no matching provisioned tier. On sustained load one proxy's share is
+~373 MiB/s, comfortably inside the [1,500 MiB/s per-client cap](https://docs.aws.amazon.com/efs/latest/ug/performance.html).
+At full network burst that share reaches ~1,788 MiB/s and the cap binds, so on this fleet EFS sets
+the burst ceiling where the proxy NIC does on 3× `c6in.large` (~1,490 MiB/s, just under). This is a
+cost crossover for the documented starting fleet, not a performance-equivalence claim.
 
 The storage model assumes **500 GB of proxy-accounted compressed payload**, a **0.5 MB average
 range**, and one `.meta` per range: 1,000,000 pairs. On EFS, a 500,000-byte `.bin` rounds to
@@ -198,13 +192,24 @@ the per-GB transfer figures above, but metadata operations still add cost.
 
 Scale out, not up: adding proxies raises aggregate throughput, while enlarging a single one mainly buys more concurrent connections, because the bottleneck is per-connection processing rather than total CPU.
 
-**Recommended starting point**: 3× `c6in.large` (2 vCPU, 4 GiB, **3.125 Gbps sustained**, 25 Gbps burst) — the network-optimized family, sized for the proxy's actual resource use. Every upload path and cache-miss GET streams rather than buffering whole objects, so memory on them is independent of object size. What still buffers is read-side: range merge, page widening, buffered range serving, and the recovery fallbacks. Those are bounded in aggregate by `server.max_inflight_buffer_bytes` (opt-in, disabled by default — see [Configuration → In-Flight Memory Ceiling](CONFIGURATION.md#in-flight-memory-ceiling)).
+**Recommended starting point**: 3× `c8gn.large` (2 vCPU, 4 GiB, **6.25 Gbps sustained**, 30 Gbps burst) — Graviton, network-optimized, sized for the proxy's actual resource use.
+
+**Use Graviton, and keep the `n`.** Each x86 network-optimized instance has a Graviton counterpart with the same vCPU and memory, twice the sustained bandwidth, and about 4.5% more cost:
+
+| Instead of | Use | vCPU / RAM | Sustained | $/hour |
+|---|---|---|---|---|
+| `c6in.large` | **`c8gn.large`** | 2 / 4 GiB | 3.125 → **6.25 Gbps** | $0.1134 → $0.1185 |
+| `m6in.large` | **`m8gn.large`** | 2 / 8 GiB | 3.125 → **6.25 Gbps** | $0.1392 → $0.1455 |
+
+Prefer `c8gn` over `c7gn`: same specification at every size, roughly 5% cheaper. Build for aarch64 on a Graviton host and do not mix architectures within one fleet; nothing in the proxy is architecture-specific. See [Binary Portability](GETTING_STARTED.md#binary-portability).
+
+`m8g` without the `n` is general-purpose: `m8g.large` sustains 0.937 Gbps against `m8gn.large`'s 6.25. Take the figure from [`describe-instance-types`](https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-instance-types.html) (`NetworkInfo.NetworkCards[].BaselineBandwidthInGbps`) rather than from the family name or the generation number. Every upload path and cache-miss GET streams rather than buffering whole objects, so memory on them is independent of object size. What still buffers is read-side: range merge, page widening, buffered range serving, and the recovery fallbacks. Those are bounded in aggregate by `server.max_inflight_buffer_bytes` (opt-in, disabled by default — see [Configuration → In-Flight Memory Ceiling](CONFIGURATION.md#in-flight-memory-ceiling)).
 
 #### Sizing the network
 
-`c6in.large` and `m6in.large` sustain 3.125 Gbps (≈373 MiB/s) indefinitely. The "up
-to 25 Gbps" in their spec is credit-based burst: credits accrue below baseline and
-drain above it.
+`c8gn.large` and `m8gn.large` sustain 6.25 Gbps (≈745 MiB/s) indefinitely; the older
+`c6in.large` and `m6in.large` sustain 3.125 Gbps (≈373 MiB/s). The "up to 30 Gbps" in
+the spec is credit-based burst: credits accrue below baseline and drain above it.
 
 **Burst suits a cache.** Cache traffic is usually spiky — a working set is pulled in,
 read hard for a few minutes, then the fleet idles and rebuilds credit. Sizing every
@@ -234,21 +239,26 @@ Whichever figure you size against, the proxy's NIC carries each byte more than o
 | Cache miss | 2 (fetch from S3, write the client) plus the cache write | ~50% or less |
 | Write (PUT or `UploadPart`) | ~3 (ingest, forward to S3, write the part to the volume) | ~33% |
 
-A 3× `c6in.large` fleet has ~1,118 MiB/s of aggregate baseline, so about **560 MiB/s
-of client-facing reads on shared-volume cache hits and 370 MiB/s of sustained
-writes**. Divide your required client-facing throughput by the relevant share above;
-do not compare it to the raw baseline. Writes are the expensive direction.
+A 3× `c8gn.large` fleet has ~2,235 MiB/s of aggregate baseline (6.25 Gbps ÷ 8 =
+781 MB/s = 745 MiB/s each), so about **1,118 MiB/s of client-facing reads on
+shared-volume cache hits and 738 MiB/s of sustained writes**. Divide your required
+client-facing throughput by the relevant share above; do not compare it to the raw
+baseline. Writes are the expensive direction. On 3× `c6in.large` halve both figures,
+since its baseline is half.
 
-The multiplier applies to burst too, so the same fleet has roughly 3,750 MiB/s of
-client-facing read headroom while credits last. A RAM hit crosses the NIC once, so
-raising `cache.max_ram_cache_size` buys network capacity as well as latency, often
-more cheaply than adding instances.
+The multiplier applies to burst too. At 30 Gbps peak each, the same fleet has
+~10,700 MiB/s of aggregate burst and so roughly **5,360 MiB/s of client-facing read
+headroom** while credits last. A RAM hit crosses the NIC once, so raising
+`cache.max_ram_cache_size` buys network capacity as well as latency, often more
+cheaply than adding instances.
 
-Sizing memory: `server.max_concurrent_requests` now bounds the whole request including its transfer, not just setup, so the streaming-path memory formula `~200 MiB + max_concurrent_requests × ~5 MiB` (see [Configuration → Memory Impact](CONFIGURATION.md#server-configuration)) is a sound fleet-wide ceiling for the streaming paths. It does not cover the read paths that still buffer a whole range — those are bounded in aggregate across concurrent requests by the opt-in `max_inflight_buffer_bytes` ceiling. On a 4 GiB `c6in.large` with the default 512 MiB RAM cache, 512 MiB (`536870912`) is a reasonable starting ceiling. `cache.max_ram_cache_size` (default 512 MiB) is a third, independent budget on top of both. Confirm all three against measured peak resident memory and the corresponding `/metrics` fields (`request_metrics.permits_held_peak`, `inflight_memory.peak_reserved_bytes`) under representative load.
+Sizing memory: `server.max_concurrent_requests` now bounds the whole request including its transfer, not just setup, so the streaming-path memory formula `~200 MiB + max_concurrent_requests × ~5 MiB` (see [Configuration → Memory Impact](CONFIGURATION.md#server-configuration)) is a sound fleet-wide ceiling for the streaming paths. It does not cover the read paths that still buffer a whole range — those are bounded in aggregate across concurrent requests by the opt-in `max_inflight_buffer_bytes` ceiling. On a 4 GiB `c8gn.large` with the default 512 MiB RAM cache, 512 MiB (`536870912`) is a reasonable starting ceiling.
+
+**Lower `max_concurrent_requests` on a small instance.** The default is 1000, which the formula above puts at ~5.1 GiB and so exceeds a 4 GiB instance before the RAM cache and in-flight ceiling are counted. On `c8gn.large` with both at 512 MiB the remaining streaming budget is ~2.8 GiB, so **500** is a sound starting value; scale it with memory rather than leaving the default in place. `cache.max_ram_cache_size` (default 512 MiB) is a third, independent budget on top of both. Confirm all three against measured peak resident memory and the corresponding `/metrics` fields (`request_metrics.permits_held_peak`, `inflight_memory.peak_reserved_bytes`) under representative load.
 
 Place each proxy in the same AZ as the clients it serves, subject to the file-system constraints in [Shared cache volume](#shared-cache-volume).
 
-**Cost**: `c6in.large` is [$0.1134/hour on-demand in us-east-1](https://aws.amazon.com/ec2/pricing/on-demand/), or about **$83/month** per instance. A single proxy + FSx at 160 MB/s (64 GiB) costs roughly **$171/month** on-demand. For redundancy, start with 3 instances (**$337/month** all-in). [Compute Savings Plans](https://aws.amazon.com/savingsplans/compute-pricing/) (1-year, no upfront) reduce EC2 costs by approximately 30–40%; FSx throughput and storage charges are not covered by Savings Plans.
+**Cost**: `c8gn.large` is [$0.1185/hour on-demand](https://aws.amazon.com/ec2/pricing/on-demand/) (identical in us-east-1 and us-west-2), or about **$87/month** per instance. A single proxy + FSx at 160 MB/s (64 GiB) costs roughly **$175/month** on-demand. For redundancy, start with 3 instances (**$348/month** all-in). [Compute Savings Plans](https://aws.amazon.com/savingsplans/compute-pricing/) (1-year, no upfront) reduce EC2 costs by approximately 30–40%; FSx throughput and storage charges are not covered by Savings Plans.
 
 ### Bootstrap
 
@@ -336,7 +346,7 @@ Store a self-signed cert and key on the shared volume so every instance presents
 
 #### Pattern 2: NLB passes TCP through, proxy terminates the client's TLS
 
-Choose this over Pattern 3 when the **client** must validate the proxy's certificate itself, or when you cannot attach a certificate to the NLB. Pattern 3 protects the internal hop against passive observation but not against an active attacker impersonating a proxy instance on it, because the NLB does not validate the target certificate. Pattern 2 closes that gap — at the cost of real certificate management.
+Choose this over Pattern 3 when the **client** must validate the proxy's certificate itself, or when you cannot attach a certificate to the NLB. Pattern 3 protects the internal hop against passive observation but not against an active attacker impersonating a proxy instance on it, because the NLB does not validate the target certificate. Pattern 2 closes that gap — at the cost of real certificate management. The proxy reads its certificate from disk, so it needs one you can export: ACM public certificates [can now be exported for use on EC2](https://docs.aws.amazon.com/acm/latest/userguide/acm-exportable-certificates.html) (certificates issued before 17 June 2025 cannot), which gives clients a publicly trusted cert with no private CA to run and no trust to distribute. AWS Private CA is the alternative when a private trust chain is required.
 
 ```
 Client (HTTPS) → NLB (TCP :443, passthrough) → Proxy (TLS :3129, terminates) → S3 (HTTPS)
@@ -411,6 +421,16 @@ NLB is the simpler path for multi-AZ fleets with Auto Scaling: AZ affinity, heal
 - **Address the bucket by its home-region hostname.** A wrong-region endpoint makes S3 redirect rather than fail outright, so the symptom is degraded throughput rather than an error. Check this first.
 - **Leave `connection_pool.tcp_recv_buffer_size` unset** so the kernel auto-tunes the TCP receive window; pinning `SO_RCVBUF` caps throughput at the bandwidth-delay product on a high-RTT path.
 - **Keep `get_ttl` long** (the default is effectively infinite), shortening only for prefixes that mutate via [`cache_rules.json`](CONFIGURATION.md#cache-rules).
+
+### Storage class
+
+Storage class is a property of each object. A bucket has no storage class and no default one: the class is chosen per request by `x-amz-storage-class` on the `PUT`, which S3 treats as `STANDARD` when the header is absent, or changed afterwards by a lifecycle transition. One prefix can therefore hold a mix of classes, and an object's class can change while the proxy is holding a cached copy of it.
+
+The class decides whether reading an object pays a per-GB retrieval charge on top of everything else. Standard and Intelligent-Tiering carry none. Standard-IA and One Zone-IA are $0.010/GB, Glacier Instant Retrieval $0.030/GB (us-west-2, retrieved 2026-08-28; check your Region).
+
+Retrieval is charged on every byte a miss reads, wherever it is read from, and is additive to [data transfer out to another AWS Region](#cross-region-s3). Reading an object in Glacier Instant Retrieval from another Region costs $0.050/GB against $0.020/GB for one in Standard; reading it from inside its own Region costs $0.030/GB where Standard costs nothing.
+
+Two consequences where a prefix holds these classes. Hit ratio is worth more than the transfer arithmetic alone suggests, since each hit avoids retrieval as well as transfer. And a long `get_ttl` is worth more, because a revalidation that re-fetches pays retrieval again.
 
 ### S3-compatible store outside AWS
 

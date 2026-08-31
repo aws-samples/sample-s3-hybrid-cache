@@ -1920,7 +1920,6 @@ impl CacheManager {
         }
     }
 
-    /// Start the batch flush coordinator for RAM cache coherency
     /// Clean up temporary files from cache directory
     ///
     /// Scans all cache subdirectories for files with .tmp extension and removes them.
@@ -5002,8 +5001,8 @@ impl CacheManager {
 
                     // Batch evict all selected ranges for this object
                     match self.batch_evict_ranges(&cache_key, &ranges).await {
-                        Ok((bytes_freed, deleted_paths)) => {
-                            Some((cache_key, ranges, bytes_freed, deleted_paths))
+                        Ok((bytes_freed, deleted_paths, unlinked_extents)) => {
+                            Some((cache_key, ranges, bytes_freed, deleted_paths, unlinked_extents))
                         }
                         Err(e) => {
                             // Requirement 7.4: Log errors with cache_key and failure reason
@@ -5050,12 +5049,42 @@ impl CacheManager {
                 break;
             }
 
-            let (cache_key, ranges, bytes_freed, deleted_paths) = result;
+            let (cache_key, ranges, bytes_freed, deleted_paths, unlinked_extents) = result;
             total_bytes_freed += bytes_freed;
-            total_ranges_evicted += ranges.len() as u64;
 
-            // Collect evicted ranges for journal Remove entries and accumulator tracking
+            // R7.2: build the accounting list from the extents that ACTUALLY left the
+            // disk, never from `ranges` — the candidate list.
+            //
+            // Iterating `ranges` here debited every candidate, including one whose
+            // `.bin` unlink failed, while `bytes_freed` (which does honour the per-file
+            // outcome) was spent only on the early-exit total and the `debug!` below.
+            // The result was a phantom debit: bytes removed from the accumulator that
+            // are still on the volume, leaving the recorded total SHORT of the disk —
+            // undershoot, the direction that silently over-admits.
+            //
+            // Matched on the `(start, end)` extent rather than on the `.bin` path. The
+            // paths are derived twice from different inputs — a candidate's
+            // `bin_file_path` is `ranges/` joined with the `RangeSpec`'s recorded
+            // relative path, while the unlink target is re-derived from the cache key
+            // by `get_new_range_file_path` — so comparing them would make the debit
+            // depend on two derivations agreeing, and a mismatch would silently debit
+            // NOTHING. The extent is the identity `batch_delete_ranges` itself selects
+            // on, so it cannot drift.
+            //
+            // Note `total_ranges_evicted` also moves to the unlinked count: it feeds
+            // the operator-facing `ranges_evicted=` summary, which should not claim a
+            // range that is still there.
+            //
+            // Spec: cache-eviction-at-scale. Requirements: 7.2
+            let unlinked: std::collections::HashSet<(u64, u64)> =
+                unlinked_extents.into_iter().collect();
+            let mut skipped_ranges = 0usize;
             for range in &ranges {
+                if !unlinked.contains(&(range.range_start, range.range_end)) {
+                    skipped_ranges += 1;
+                    continue;
+                }
+                total_ranges_evicted += 1;
                 evicted_ranges_for_journal.push(EvictedRange {
                     cache_key: cache_key.clone(),
                     start: range.range_start,
@@ -5066,6 +5095,14 @@ impl CacheManager {
                     is_write_cached: range.is_write_cached,
                     staged: range.staged,
                 });
+            }
+            if skipped_ranges > 0 {
+                warn!(
+                    "[EVICTION_ACCOUNTING] Skipped debit for range files that did not leave the disk: cache_key={}, candidates={}, skipped={}",
+                    cache_key,
+                    ranges.len(),
+                    skipped_ranges
+                );
             }
 
             // Check if metadata file was deleted (all ranges evicted for this key)
@@ -5079,7 +5116,8 @@ impl CacheManager {
 
             all_deleted_paths.extend(deleted_paths);
             debug!(
-                "Batch evicted {} ranges from {}: {} bytes freed",
+                "Batch evicted {} of {} candidate ranges from {}: {} bytes freed",
+                ranges.len() - skipped_ranges,
                 ranges.len(),
                 cache_key,
                 bytes_freed
@@ -5089,6 +5127,18 @@ impl CacheManager {
         // Step 5: Decrement accumulator and write Remove journal entries for evicted ranges
         // Accumulator tracking uses compressed_size for symmetry with add operations
         // Requirements 2.1, 2.2, 5.4: Decrement accumulator using RangeSpec compressed_size
+        //
+        // R7.2: `evicted_ranges_for_journal` now holds only ranges whose `.bin` left the
+        // disk, and BOTH consumers below read it — the accumulator debit and the Remove
+        // journal entries. One narrowed list rather than two, because both want the same
+        // answer, which is also how the write tier's equivalent
+        // (`WriteCacheManager::evict_write_cached_object`) is built. For the journal half
+        // specifically: a Remove entry strips the range from the shared `.meta`, so
+        // emitting one for a surviving `.bin` would publish the orphan fleet-wide. It
+        // moves no size figure — `consolidate_key` discards its `size_affecting_entries`
+        // — so narrowing it cannot lose a debit.
+        //
+        // Spec: cache-eviction-at-scale. Requirements: 7.2
         if !evicted_ranges_for_journal.is_empty() {
             if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
                 // Decrement accumulator for each evicted range using compressed_size
@@ -5289,162 +5339,6 @@ impl CacheManager {
         Ok(total_size)
     }
 
-    /// Collect cache entries for eviction with their metadata
-    /// Supports new range storage architecture with sharded directories:
-    /// - Recursively traverses sharded directory structure (bucket/XX/YYY/)
-    /// - Identifies cache entries by .meta files
-    /// - Calculates entry size as: metadata file + sum of all associated .bin files
-    /// - Reads metadata to get list of range files for accurate size calculation
-    /// - Supports granular eviction: returns individual ranges as eviction candidates (not just full objects)
-    /// - Enables eviction algorithm to choose: evict full object OR evict specific ranges
-    /// - Returns (cache_key, last_accessed, entry_size, access_count) for eviction decisions
-    ///   - last_accessed: from RangeSpec.last_accessed (populated by journal consolidation)
-    ///   - access_count: from RangeSpec.access_count (populated by journal consolidation)
-    pub async fn collect_cache_entries_for_eviction(
-        &self,
-    ) -> Result<Vec<(String, SystemTime, u64, u64)>> {
-        let mut entries = Vec::new();
-        let cache_types = ["metadata", "ranges", "parts"];
-
-        for cache_type in &cache_types {
-            let cache_type_dir = self.cache_dir.join(cache_type);
-            if !cache_type_dir.exists() {
-                continue;
-            }
-
-            // Recursively collect metadata files from sharded directory structure
-            self.collect_entries_recursive(&cache_type_dir, &mut entries)?;
-        }
-
-        debug!(
-            "Collected {} cache entries for potential eviction using {:?} algorithm",
-            entries.len(),
-            self.eviction_algorithm
-        );
-        Ok(entries)
-    }
-
-    /// Recursively collect cache entries from a directory
-    /// Supports sharded directory structure (bucket/XX/YYY/)
-    /// Returns (cache_key, last_accessed, entry_size, access_count) tuples
-    /// - last_accessed and access_count are read from RangeSpec fields (populated by journal consolidation)
-    fn collect_entries_recursive(
-        &self,
-        dir: &std::path::Path,
-        entries: &mut Vec<(String, SystemTime, u64, u64)>,
-    ) -> Result<()> {
-        if let Ok(dir_entries) = std::fs::read_dir(dir) {
-            for entry in dir_entries.flatten() {
-                let path = entry.path();
-
-                if path.is_dir() {
-                    // Recursively traverse subdirectories
-                    self.collect_entries_recursive(&path, entries)?;
-                } else if path.extension().and_then(|s| s.to_str()) == Some("meta") {
-                    // Read metadata to get cache key and access time
-                    if let Ok(metadata_content) = std::fs::read_to_string(&path) {
-                        // Try new format first (NewCacheMetadata with ranges)
-                        if let Ok(new_metadata) = serde_json::from_str::<
-                            crate::cache_types::NewCacheMetadata,
-                        >(&metadata_content)
-                        {
-                            // Calculate entry size: metadata file + all range binary files
-                            let mut entry_size = 0u64;
-
-                            // Add metadata file size
-                            if let Ok(meta_file_metadata) = std::fs::metadata(&path) {
-                                entry_size += meta_file_metadata.len();
-                            }
-
-                            // Add all range binary file sizes
-                            for range_spec in &new_metadata.ranges {
-                                let range_file_path =
-                                    self.cache_dir.join("ranges").join(&range_spec.file_path);
-                                if let Ok(range_file_metadata) = std::fs::metadata(&range_file_path)
-                                {
-                                    entry_size += range_file_metadata.len();
-                                }
-                            }
-
-                            // Calculate aggregate last_accessed and access_count from all ranges
-                            // These values are populated by journal consolidation
-                            let (last_accessed, total_access_count) =
-                                if new_metadata.ranges.is_empty() {
-                                    // Fallback to created_at if no ranges (shouldn't happen normally)
-                                    (new_metadata.created_at, 0u64)
-                                } else {
-                                    // Use the most recent last_accessed across all ranges
-                                    // and sum of access_count for aggregate frequency
-                                    let most_recent = new_metadata
-                                        .ranges
-                                        .iter()
-                                        .map(|r| r.last_accessed)
-                                        .max()
-                                        .unwrap_or(new_metadata.created_at);
-                                    let total_count: u64 =
-                                        new_metadata.ranges.iter().map(|r| r.access_count).sum();
-                                    (most_recent, total_count)
-                                };
-
-                            // Decide eviction strategy based on range count
-                            // For objects with few ranges (≤3), evict full object
-                            // For objects with many ranges (>3), support granular eviction
-                            if new_metadata.ranges.len() <= 3 {
-                                // Full object eviction
-                                entries.push((
-                                    new_metadata.cache_key.clone(),
-                                    last_accessed,
-                                    entry_size,
-                                    total_access_count,
-                                ));
-                            } else {
-                                // Granular eviction: add each range as a separate eviction candidate
-                                // This allows the eviction algorithm to choose specific ranges to evict
-                                for (idx, range_spec) in new_metadata.ranges.iter().enumerate() {
-                                    let range_cache_key = format!(
-                                        "{}:range:{}:{}-{}",
-                                        new_metadata.cache_key,
-                                        idx,
-                                        range_spec.start,
-                                        range_spec.end
-                                    );
-
-                                    // Calculate size for this specific range
-                                    let mut range_size = 0u64;
-                                    let range_file_path =
-                                        self.cache_dir.join("ranges").join(&range_spec.file_path);
-                                    if let Ok(range_file_metadata) =
-                                        std::fs::metadata(&range_file_path)
-                                    {
-                                        range_size = range_file_metadata.len();
-                                    }
-
-                                    // Add proportional metadata overhead
-                                    if let Ok(meta_file_metadata) = std::fs::metadata(&path) {
-                                        let metadata_overhead = meta_file_metadata.len()
-                                            / new_metadata.ranges.len() as u64;
-                                        range_size += metadata_overhead;
-                                    }
-
-                                    // Use per-range last_accessed and access_count from RangeSpec
-                                    // These are populated by journal consolidation
-                                    entries.push((
-                                        range_cache_key,
-                                        range_spec.last_accessed,
-                                        range_size,
-                                        range_spec.access_count,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Collect all ranges as independent eviction candidates
     ///
     /// This method implements range-based disk cache eviction where each cached range
@@ -5464,22 +5358,6 @@ impl CacheManager {
     pub async fn collect_range_candidates_for_eviction(
         &self,
     ) -> Result<Vec<RangeEvictionCandidate>> {
-        self.collect_range_candidates_for_eviction_with_options(false)
-            .await
-    }
-
-    /// Collect all ranges as independent eviction candidates with options
-    ///
-    /// # Arguments
-    /// * `bypass_admission_window` - If true, skip the 60-second admission window protection.
-    ///   Used when cache is critically over capacity (>110% of limit).
-    ///
-    /// # Returns
-    /// A vector of RangeEvictionCandidate structs, one for each cached range
-    pub async fn collect_range_candidates_for_eviction_with_options(
-        &self,
-        bypass_admission_window: bool,
-    ) -> Result<Vec<RangeEvictionCandidate>> {
         let mut candidates = Vec::new();
 
         // Only traverse the metadata/ directory which contains .meta files
@@ -5490,17 +5368,12 @@ impl CacheManager {
         }
 
         // Recursively collect range candidates from sharded directory structure
-        self.collect_range_candidates_recursive_with_options(
-            &metadata_dir,
-            &mut candidates,
-            bypass_admission_window,
-        )?;
+        self.collect_range_candidates_recursive(&metadata_dir, &mut candidates)?;
 
         debug!(
-            "Collected {} range candidates for eviction using {:?} algorithm (bypass_admission_window={})",
+            "Collected {} range candidates for eviction using {:?} algorithm",
             candidates.len(),
-            self.eviction_algorithm,
-            bypass_admission_window
+            self.eviction_algorithm
         );
 
         Ok(candidates)
@@ -5584,15 +5457,13 @@ impl CacheManager {
     /// # Arguments
     /// * `dir` - Directory to traverse
     /// * `candidates` - Vector to collect candidates into
-    /// * `bypass_admission_window` - If true, skip the 60-second admission window protection
     ///
     /// # Requirements
     /// Implements Requirements 1.1, 1.2, 1.3 from range-based-disk-eviction spec
-    fn collect_range_candidates_recursive_with_options(
+    fn collect_range_candidates_recursive(
         &self,
         dir: &std::path::Path,
         candidates: &mut Vec<RangeEvictionCandidate>,
-        bypass_admission_window: bool,
     ) -> Result<()> {
         let dir_entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -5615,18 +5486,10 @@ impl CacheManager {
 
             if path.is_dir() {
                 // Recursively traverse subdirectories
-                self.collect_range_candidates_recursive_with_options(
-                    &path,
-                    candidates,
-                    bypass_admission_window,
-                )?;
+                self.collect_range_candidates_recursive(&path, candidates)?;
             } else if path.extension().and_then(|s| s.to_str()) == Some("meta") {
                 // Read metadata file and create candidates for each range
-                self.collect_candidates_from_metadata_file_with_options(
-                    &path,
-                    candidates,
-                    bypass_admission_window,
-                )?;
+                self.collect_candidates_from_metadata_file(&path, candidates)?;
             }
         }
 
@@ -5644,15 +5507,13 @@ impl CacheManager {
     /// # Arguments
     /// * `meta_path` - Path to the .meta file
     /// * `candidates` - Vector to collect candidates into
-    /// * `bypass_admission_window` - If true, skip the 60-second admission window protection
     ///
     /// # Requirements
     /// Implements Requirements 1.1, 1.2, 1.3 from range-based-disk-eviction spec
-    fn collect_candidates_from_metadata_file_with_options(
+    fn collect_candidates_from_metadata_file(
         &self,
         meta_path: &std::path::Path,
         candidates: &mut Vec<RangeEvictionCandidate>,
-        bypass_admission_window: bool,
     ) -> Result<()> {
         // Read and parse metadata file
         let metadata_content = match std::fs::read_to_string(meta_path) {
@@ -5687,18 +5548,18 @@ impl CacheManager {
             // This prevents evicting ranges that were just downloaded, avoiding cache thrashing
             // during large file downloads where new ranges would otherwise be evicted immediately
             // due to having zero access history in TinyLFU.
-            // The bypass flag is set when cache is critically over capacity (>110% of limit).
-            if !bypass_admission_window {
-                let now = SystemTime::now();
-                let admission_window = std::time::Duration::from_secs(60);
-                if let Ok(age) = now.duration_since(range_spec.last_accessed) {
-                    if age < admission_window {
-                        debug!(
-                            "Skipping range {}-{} for eviction: within admission window ({:.1}s old)",
-                            range_spec.start, range_spec.end, age.as_secs_f64()
-                        );
-                        continue;
-                    }
+            // The window is unconditional: there is no bypass.
+            let now = SystemTime::now();
+            let admission_window = std::time::Duration::from_secs(60);
+            if let Ok(age) = now.duration_since(range_spec.last_accessed) {
+                if age < admission_window {
+                    debug!(
+                        "Skipping range {}-{} for eviction: within admission window ({:.1}s old)",
+                        range_spec.start,
+                        range_spec.end,
+                        age.as_secs_f64()
+                    );
+                    continue;
                 }
             }
 
@@ -5817,9 +5678,17 @@ impl CacheManager {
     /// * `ranges` - Vector of RangeEvictionCandidate structs for ranges to evict
     ///
     /// # Returns
-    /// * `Ok((bytes_freed, deleted_paths))` on success
-    ///   - `bytes_freed`: Total bytes freed from deleted range files
+    /// * `Ok((bytes_freed, deleted_paths, unlinked_extents))` on success
+    ///   - `bytes_freed`: Total bytes freed from range files that were actually unlinked
     ///   - `deleted_paths`: Paths of all deleted files (for directory cleanup)
+    ///   - `unlinked_extents`: `(start, end)` of ranges whose `.bin` existed and was
+    ///     unlinked cleanly. **The only list the caller's accounting may be built
+    ///     from** — the candidate list it passed in includes ranges whose unlink
+    ///     failed, and debiting those leaves the accumulator short of what is on
+    ///     disk. Forwarded verbatim from
+    ///     [`crate::disk_cache::BatchRangeDeletion::unlinked_extents`]; see that
+    ///     field for why an already-absent file is excluded too.
+    ///     Spec: cache-eviction-at-scale. Requirements: 7.2
     /// * `Err` if lock acquisition fails or eviction encounters a critical error
     ///
     /// # Requirements
@@ -5836,10 +5705,10 @@ impl CacheManager {
         &self,
         cache_key: &str,
         ranges: &[RangeEvictionCandidate],
-    ) -> Result<(u64, Vec<PathBuf>)> {
+    ) -> Result<(u64, Vec<PathBuf>, Vec<(u64, u64)>)> {
         if ranges.is_empty() {
             debug!("No ranges to evict for cache_key={}", cache_key);
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), Vec::new()));
         }
 
         let operation_start = std::time::Instant::now();
@@ -5896,8 +5765,10 @@ impl CacheManager {
         );
 
         // Call DiskCacheManager.batch_delete_ranges()
-        // This handles: file deletion, metadata update, and returns (bytes_freed, all_evicted, paths)
-        let (bytes_freed, all_ranges_evicted, deleted_paths) = match disk_cache
+        // This handles file deletion and the metadata update, and reports which extents
+        // actually left the disk (`unlinked_extents`) separately from which were
+        // requested — the distinction R7.2 depends on.
+        let deletion = match disk_cache
             .batch_delete_ranges(cache_key, &ranges_to_delete)
             .await
         {
@@ -5940,7 +5811,7 @@ impl CacheManager {
         }
 
         // Requirement 7.2: Log metadata deletion if all ranges evicted
-        if all_ranges_evicted {
+        if deletion.all_ranges_evicted {
             debug!(
                 "[METADATA_EVICTION] Deleted metadata file: cache_key={}, reason=all_ranges_evicted",
                 cache_key
@@ -5948,11 +5819,12 @@ impl CacheManager {
         }
 
         debug!(
-            "[BATCH_EVICTION] Batch range eviction completed: cache_key={}, ranges_evicted={}, bytes_freed={}, all_evicted={}, duration_ms={:.2}",
+            "[BATCH_EVICTION] Batch range eviction completed: cache_key={}, ranges_requested={}, ranges_unlinked={}, bytes_freed={}, all_evicted={}, duration_ms={:.2}",
             cache_key,
             ranges.len(),
-            bytes_freed,
-            all_ranges_evicted,
+            deletion.unlinked_extents.len(),
+            deletion.bytes_freed,
+            deletion.all_ranges_evicted,
             total_duration.as_secs_f64() * 1000.0
         );
 
@@ -5962,7 +5834,11 @@ impl CacheManager {
             inner.statistics.evicted_entries += ranges.len() as u64;
         }
 
-        Ok((bytes_freed, deleted_paths))
+        Ok((
+            deletion.bytes_freed,
+            deletion.deleted_paths,
+            deletion.unlinked_extents,
+        ))
     }
 
     /// Get cache size statistics for monitoring
@@ -7517,11 +7393,29 @@ impl CacheManager {
             1_048_576, // compression_batch_size (default 1 MiB)
         );
 
+        // FreshServe: this path serves the part's bytes to the client with no
+        // live-TTL gate and no conditional validation — `check_object_expiration`
+        // is never called here and no `current_etag` is passed — so stored expiry
+        // is its only freshness bound and must keep rejecting expired entries.
+        // Requirement 1.3.
+        //
+        // That this path ignores `get_ttl` entirely is a pre-existing
+        // invariant-1 gap, recorded in
+        // `.kiro/steering/cache-coherency-invariants.md`. It is deliberately NOT
+        // fixed here: expired-entry-revalidation's Non-goals keep this spec to
+        // the mainline paths. Pinned by
+        // `part_scoped_lookup_remains_fresh_only_for_expired_entries`.
         let overlapping_ranges = match disk_cache
-            .find_cached_ranges(cache_key, start, end, None)
+            .find_cached_ranges(
+                cache_key,
+                start,
+                end,
+                None,
+                crate::cache_types::RangeLookupPurpose::FreshServe,
+            )
             .await
         {
-            Ok(ranges) => ranges,
+            Ok(lookup) => lookup.ranges,
             Err(e) => {
                 // Handle cached part read failures - log and fall back to S3 (Requirement 11.3)
                 warn!("Failed to find cached ranges for cache_key={}, part_number={}, range={}-{}: {}",
@@ -15095,14 +14989,32 @@ mod eviction_aggregation_tests {
 
     /// **Feature: eviction-performance, Property 2: Eviction result aggregation preserves totals**
     ///
-    /// *For any* collection of per-object eviction results `[(bytes_freed_i, ranges_count_i)]`,
-    /// the aggregated `total_bytes_freed` SHALL equal the sum of all `bytes_freed_i`,
-    /// and `total_ranges_evicted` SHALL equal the sum of all `ranges_count_i`.
+    /// *For any* collection of per-object eviction results `[(bytes_freed_i, ranges_count_i)]`
+    /// **in which every candidate range's `.bin` was unlinked successfully**, the
+    /// aggregated `total_bytes_freed` SHALL equal the sum of all `bytes_freed_i`, and
+    /// `total_ranges_evicted` SHALL equal the sum of all `ranges_count_i`.
     ///
     /// This tests the aggregation loop in `perform_eviction_with_lock()` that collects
     /// results from parallel object processing via `buffer_unordered`.
     ///
+    /// # The precondition is load-bearing (R7.2)
+    ///
+    /// This is a shadow re-implementation of that loop, not the loop itself, so it
+    /// cannot detect drift on its own — and the loop has since changed underneath it.
+    /// `total_ranges_evicted` now counts ranges whose `.bin` actually left the disk
+    /// rather than candidates, so the unqualified form of this property — "the total
+    /// equals the candidate count" — is **no longer true of the real loop** whenever an
+    /// unlink fails. The shadow below therefore models the `unlinked` filter explicitly
+    /// and the fixture makes every unlink succeed, which is the case in which the sums
+    /// do still hold.
+    ///
+    /// Do not read this property as licence to aggregate over the candidate list. The
+    /// mixed case — some unlinks failing — is covered against the real function by
+    /// `eviction_phantom_debit_tests`, which asserts the accumulator delta rather than
+    /// these counters.
+    ///
     /// **Validates: Requirements 3.3**
+    /// Spec: cache-eviction-at-scale. Requirements: 7.2
     #[quickcheck]
     fn prop_eviction_result_aggregation_preserves_totals(
         raw_results: Vec<(u32, u8)>,
@@ -15118,31 +15030,52 @@ mod eviction_aggregation_tests {
             .collect();
 
         // Build simulated object_results matching the shape in perform_eviction_with_lock:
-        // Vec<Option<(cache_key, ranges, bytes_freed, deleted_paths)>>
+        // Vec<Option<(cache_key, ranges, bytes_freed, deleted_paths, unlinked_extents)>>
         // Some represents a successful eviction, None represents a skipped/failed object.
+        // Every candidate extent also appears in `unlinked_extents`, which is the
+        // healthy case this property is stated for — see the precondition above.
         #[allow(clippy::type_complexity)]
-        let object_results: Vec<Option<(String, Vec<()>, u64, Vec<PathBuf>)>> = results
+        let object_results: Vec<
+            Option<(String, Vec<(u64, u64)>, u64, Vec<PathBuf>, Vec<(u64, u64)>)>,
+        > = results
             .iter()
             .enumerate()
             .map(|(i, &(bytes_freed, range_count))| {
                 let cache_key = format!("test-bucket/object-{}", i);
-                let ranges: Vec<()> = vec![(); range_count as usize];
+                let ranges: Vec<(u64, u64)> = (0..range_count as u64)
+                    .map(|r| (r * 100, r * 100 + 99))
+                    .collect();
                 let deleted_paths: Vec<PathBuf> = (0..range_count)
                     .map(|r| PathBuf::from(format!("ranges/{}/range_{}.bin", i, r)))
                     .collect();
-                Some((cache_key, ranges, bytes_freed, deleted_paths))
+                let unlinked_extents = ranges.clone();
+                Some((
+                    cache_key,
+                    ranges,
+                    bytes_freed,
+                    deleted_paths,
+                    unlinked_extents,
+                ))
             })
             .collect();
 
-        // Run the same aggregation logic as perform_eviction_with_lock
+        // Run the same aggregation logic as perform_eviction_with_lock, including the
+        // R7.2 narrowing — a candidate counts only if its extent was unlinked.
         let mut total_bytes_freed: u64 = 0;
         let mut total_ranges_evicted: u64 = 0;
         let mut all_deleted_paths: Vec<PathBuf> = Vec::new();
 
         for result in object_results.into_iter().flatten() {
-            let (_cache_key, ranges, bytes_freed, deleted_paths) = result;
+            let (_cache_key, ranges, bytes_freed, deleted_paths, unlinked_extents) = result;
             total_bytes_freed += bytes_freed;
-            total_ranges_evicted += ranges.len() as u64;
+            let unlinked: std::collections::HashSet<(u64, u64)> =
+                unlinked_extents.into_iter().collect();
+            for range in &ranges {
+                if !unlinked.contains(range) {
+                    continue;
+                }
+                total_ranges_evicted += 1;
+            }
             all_deleted_paths.extend(deleted_paths);
         }
 
@@ -19330,5 +19263,434 @@ mod total_cache_size_definition_tests {
         // one constant without the other fails here rather than silently agreeing with
         // itself.
         assert_eq!(sizes.read_cache_size + sizes.write_cache_size, FLEET_TOTAL);
+    }
+}
+
+/// R7.2 — the read-tier eviction pass must debit only the ranges whose `.bin` left
+/// the disk.
+///
+/// # What the red side exercises
+///
+/// The defect was in `perform_eviction_with_lock`'s result-aggregation loop: it built
+/// `evicted_ranges_for_journal` by iterating `ranges`, the *candidate* list returned
+/// alongside each `batch_evict_ranges` result, and the accumulator debit at the Step 5
+/// block iterated that. `bytes_freed` — the one figure that did honour the per-file
+/// unlink outcome — was spent only on the early-exit total and a `debug!`. So a range
+/// whose unlink failed was debited with its bytes still on the volume, leaving the
+/// recorded total SHORT of the disk. That is undershoot, which over-admits silently
+/// rather than refusing.
+///
+/// The specific line the red side would fail on is the `for range in &ranges` loop
+/// feeding `evicted_ranges_for_journal` (now filtered by `unlinked`), and the
+/// `subtract_range` call it feeds in the Step 5 block.
+///
+/// # Why the assertion is the exact figure and not "nothing happened"
+///
+/// A debit can be absent, or wrong, for several reasons that all look alike from a
+/// distance: the eviction fence can fail (skipping `batch_evict_ranges` entirely), the
+/// candidate walk can skip a range for the 60-second admission window, or the
+/// consolidator can be unwired (the Step 5 block is behind an `if let Some`). Each of
+/// those yields a delta of 0, which would let a broken narrowing pass. So the test
+/// asserts:
+///
+/// - the deletable `.bin` is **gone** — the pass genuinely ran and reached the unlink;
+/// - the undeletable `.bin` is **still there** — the lever genuinely bit, rather than
+///   the fixture quietly running as a user that can unlink in a read-only directory;
+/// - the delta is **exactly one range's `compressed_size`** — not merely non-zero and
+///   not merely "less than two". Pre-fix this is `-2 × RANGE_BYTES`.
+///
+/// Spec: cache-eviction-at-scale. Requirements: 7.2
+#[cfg(all(test, unix))]
+mod eviction_phantom_debit_tests {
+    use super::*;
+    use crate::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
+    use std::os::unix::fs::PermissionsExt;
+
+    const RANGE_BYTES: u64 = 4096;
+    /// Older than the 60-second admission window in
+    /// `collect_candidates_from_metadata_file`, or the candidate is
+    /// skipped and the pass has nothing to do.
+    const AGE: Duration = Duration::from_secs(3600);
+
+    const DELETABLE_KEY: &str = "test-bucket/deletable.bin";
+    const LOCKED_KEY: &str = "test-bucket/locked.bin";
+
+    fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            CacheEvictionAlgorithm::LRU,
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+    }
+
+    async fn deltas(manager: &CacheManager) -> (i64, i64) {
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let acc = consolidator.size_accumulator();
+        (acc.current_delta(), acc.current_write_cache_delta())
+    }
+
+    /// Plant a single-range, unstaged entry. The `.bin` goes at the path
+    /// `batch_delete_ranges` will re-derive from the cache key
+    /// (`get_new_range_file_path`), and the `.meta` records the same path relative to
+    /// `ranges/` so the candidate walk agrees.
+    fn plant(manager: &CacheManager, cache_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+        let ranges_base = cache_dir.join("ranges");
+        let bin_path = crate::disk_cache::get_sharded_path(
+            &ranges_base,
+            key,
+            &format!("_0-{}.bin", RANGE_BYTES - 1),
+        )
+        .unwrap();
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, vec![0u8; RANGE_BYTES as usize]).unwrap();
+
+        let rel_path = bin_path
+            .strip_prefix(&ranges_base)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let planted_at = SystemTime::now() - AGE;
+        let mut range_spec = RangeSpec::new(
+            0,
+            RANGE_BYTES - 1,
+            rel_path,
+            crate::compression::CompressionAlgorithm::Lz4,
+            RANGE_BYTES,
+            RANGE_BYTES,
+        );
+        range_spec.created_at = planted_at;
+        range_spec.last_accessed = planted_at;
+        // Read tier: the write-cache channel must stay untouched throughout, which is
+        // the tier-attribution half of the assertion below.
+        range_spec.staged = Some(false);
+
+        let metadata = NewCacheMetadata {
+            cache_key: key.to_string(),
+            object_metadata: ObjectMetadata {
+                content_length: RANGE_BYTES,
+                ..Default::default()
+            },
+            ranges: vec![range_spec],
+            created_at: planted_at,
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+            ..Default::default()
+        };
+
+        let meta_path = manager.get_new_metadata_file_path(key);
+        std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        bin_path
+    }
+
+    #[tokio::test]
+    async fn eviction_debits_only_the_ranges_whose_bin_left_the_disk() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        let deletable_bin = plant(&manager, temp.path(), DELETABLE_KEY);
+        let locked_bin = plant(&manager, temp.path(), LOCKED_KEY);
+
+        // The two objects must not share a `ranges/` leaf directory, or making one
+        // read-only would block both unlinks and the test would assert nothing about
+        // the narrowing. BLAKE3 sharding makes this true for these two keys; assert it
+        // rather than trust it, so a change to the sharding fails here with a reason.
+        let locked_dir = locked_bin.parent().unwrap().to_path_buf();
+        assert_ne!(
+            deletable_bin.parent().unwrap(),
+            locked_dir,
+            "fixture requires the two ranges in different leaf directories"
+        );
+
+        // The lever: a read-only parent directory makes `unlink` fail with EACCES while
+        // `metadata()` still succeeds — the genuine "unlink failed, bytes remain" case,
+        // as distinct from "file already gone" (which has no bytes to reclaim and is
+        // covered in `disk_cache`'s `test_batch_delete_ranges_missing_files`).
+        let original_mode = std::fs::metadata(&locked_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert_eq!(
+            deltas(&manager).await,
+            (0, 0),
+            "baseline: nothing debited before the pass"
+        );
+
+        // `bytes_to_free` must exceed both ranges combined, or the loop's early exit
+        // can stop after whichever object `buffer_unordered` happened to finish first
+        // and the result would depend on scheduling.
+        let max_size = 10_000u64;
+        let current_size = 10_000_000u64;
+        let acquired = manager.try_acquire_global_eviction_lock().await.unwrap();
+        assert!(acquired, "test holds the eviction lock exclusively");
+        let freed = manager
+            .perform_eviction_with_lock(current_size, max_size, true)
+            .await
+            .unwrap();
+        let _ = manager.release_global_eviction_lock().await;
+
+        // Restore before any assertion can fail, so TempDir cleanup is not left
+        // fighting a read-only directory.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+
+        // The pass genuinely reached the unlink for one range and genuinely failed for
+        // the other. Without both of these the delta assertion below could pass for
+        // reasons unrelated to the narrowing.
+        assert!(
+            !deletable_bin.exists(),
+            "the deletable .bin must be gone — otherwise the pass never reached the unlink \
+             (fence lost, admission window, or no candidates) and the delta proves nothing"
+        );
+        assert!(
+            locked_bin.exists(),
+            "the undeletable .bin must survive — otherwise the read-only-directory lever \
+             did not bite (running as root?) and this test cannot distinguish the two cases"
+        );
+        assert_eq!(
+            freed, RANGE_BYTES,
+            "bytes_freed already honoured the unlink outcome and must count one range only"
+        );
+
+        // The R7.2 assertion. Pre-fix: (-8192, 0) — both candidates debited, 4096 bytes
+        // of it phantom, with the file still on disk.
+        assert_eq!(
+            deltas(&manager).await,
+            (-(RANGE_BYTES as i64), 0),
+            "only the range that actually left the disk may be debited from total_size, \
+             and a read-tier range must not touch write_cache_size"
+        );
+    }
+
+    /// Tier attribution is unchanged by the narrowing: a **staged** range that leaves
+    /// the disk still debits both channels.
+    ///
+    /// This is the guard against trading the phantom read-tier debit for a write-tier
+    /// misattribution. The narrowing changes which ranges reach the `is_staged_range_parts`
+    /// test in Step 5; it must not change what that test decides for the ones that do.
+    ///
+    /// Spec: cache-eviction-at-scale. Requirements: 7.2
+    #[tokio::test]
+    async fn a_staged_range_that_leaves_the_disk_still_debits_both_channels() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+
+        let bin = plant(&manager, temp.path(), DELETABLE_KEY);
+        // Flip the planted range to staged, leaving everything else identical.
+        let meta_path = manager.get_new_metadata_file_path(DELETABLE_KEY);
+        let mut metadata: NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        metadata.ranges[0].staged = Some(true);
+        metadata.object_metadata.is_write_cached = true;
+        std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let acquired = manager.try_acquire_global_eviction_lock().await.unwrap();
+        assert!(acquired);
+        manager
+            .perform_eviction_with_lock(10_000_000, 10_000, true)
+            .await
+            .unwrap();
+        let _ = manager.release_global_eviction_lock().await;
+
+        assert!(
+            !bin.exists(),
+            "the .bin must be gone for the debit to apply"
+        );
+        assert_eq!(
+            deltas(&manager).await,
+            (-(RANGE_BYTES as i64), -(RANGE_BYTES as i64)),
+            "a staged range that left the disk must still debit BOTH channels — \
+             the narrowing must not change tier attribution"
+        );
+    }
+}
+
+/// R13.2 — current byte-target eviction scans the complete candidate population before
+/// `group_candidates_by_object` can stop at the byte target.
+///
+/// The fixture is deliberately mixed: the oldest 64 KiB range satisfies the 64 KiB
+/// target by itself, while 63 newer 4 KiB ranges remain. A bounded selector would
+/// therefore need one candidate; the current pass calls
+/// `collect_range_candidates_for_eviction` before it sorts and groups candidates, so
+/// it reads every `.meta` and stats every `.bin` first. The ignored test is the
+/// required red side and remains ignored until a bounded collector replaces that
+/// full-population path.
+///
+/// Spec: cache-eviction-at-scale. Requirements: 13.2, 13.4.
+#[cfg(test)]
+mod eviction_byte_target_red_tests {
+    use super::*;
+    use crate::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
+
+    const LARGE_RANGE_BYTES: u64 = 64 * 1024;
+    const SMALL_RANGE_BYTES: u64 = 4 * 1024;
+    const SMALL_RANGE_COUNT: usize = 63;
+    const BYTES_TO_FREE: u64 = LARGE_RANGE_BYTES;
+    const AGE: Duration = Duration::from_secs(3600);
+
+    fn setup(cache_dir: &std::path::Path) -> CacheManager {
+        for sub in ["metadata/_journals", "size_tracking", "locks", "ranges"] {
+            std::fs::create_dir_all(cache_dir.join(sub)).unwrap();
+        }
+        let manager = CacheManager::new_with_eviction_algorithm(
+            cache_dir.to_path_buf(),
+            false,
+            0,
+            CacheEvictionAlgorithm::LRU,
+        );
+        let _ = manager.create_configured_disk_cache_manager();
+        manager
+    }
+
+    fn plant_range(
+        manager: &CacheManager,
+        cache_dir: &std::path::Path,
+        cache_key: &str,
+        bytes: u64,
+        last_accessed: SystemTime,
+    ) {
+        let ranges_base = cache_dir.join("ranges");
+        let bin_path = crate::disk_cache::get_sharded_path(
+            &ranges_base,
+            cache_key,
+            &format!("_0-{}.bin", bytes - 1),
+        )
+        .unwrap();
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, vec![0u8; bytes as usize]).unwrap();
+
+        let relative_bin_path = bin_path
+            .strip_prefix(&ranges_base)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut range = RangeSpec::new(
+            0,
+            bytes - 1,
+            relative_bin_path,
+            CompressionAlgorithm::None,
+            bytes,
+            bytes,
+        );
+        range.created_at = last_accessed;
+        range.last_accessed = last_accessed;
+        range.staged = Some(false);
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                content_length: bytes,
+                ..Default::default()
+            },
+            ranges: vec![range],
+            created_at: last_accessed,
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let metadata_path = manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+    }
+
+    fn mixed_fixture(cache_dir: &std::path::Path) -> CacheManager {
+        let manager = setup(cache_dir);
+        let now = SystemTime::now();
+        let old = now - 2 * AGE;
+        let newer = now - AGE;
+
+        plant_range(
+            &manager,
+            cache_dir,
+            "test-bucket/r13-2-old-large.bin",
+            LARGE_RANGE_BYTES,
+            old,
+        );
+        for index in 0..SMALL_RANGE_COUNT {
+            plant_range(
+                &manager,
+                cache_dir,
+                &format!("test-bucket/r13-2-new-small-{index:02}.bin"),
+                SMALL_RANGE_BYTES,
+                newer,
+            );
+        }
+        manager
+    }
+
+    async fn collect_and_select(manager: &CacheManager) -> (usize, usize, u64, String) {
+        let mut candidates = manager
+            .collect_range_candidates_for_eviction()
+            .await
+            .unwrap();
+        let collected = candidates.len();
+        assert_eq!(
+            collected,
+            SMALL_RANGE_COUNT + 1,
+            "fixture must reach the real collector with every metadata file eligible"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.size == candidate.compressed_size),
+            "the byte target must use the same on-disk size the collector passes to selection"
+        );
+
+        manager.sort_range_candidates(&mut candidates);
+        let selected = manager.group_candidates_by_object(candidates, BYTES_TO_FREE);
+        let selected_count = selected
+            .iter()
+            .map(|(_, ranges)| ranges.len())
+            .sum::<usize>();
+        let selected_bytes = selected
+            .iter()
+            .flat_map(|(_, ranges)| ranges)
+            .map(|candidate| candidate.size)
+            .sum::<u64>();
+        let selected_key = selected
+            .first()
+            .expect("the oldest large range must satisfy the target")
+            .0
+            .clone();
+        (collected, selected_count, selected_bytes, selected_key)
+    }
+
+    #[tokio::test]
+    async fn r13_2_fixture_reaches_the_byte_target_with_one_old_large_range() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = mixed_fixture(temp.path());
+        let (collected, selected_count, selected_bytes, selected_key) =
+            collect_and_select(&manager).await;
+
+        assert_eq!(collected, SMALL_RANGE_COUNT + 1);
+        assert_eq!(selected_count, 1, "one range must satisfy the byte target");
+        assert_eq!(selected_bytes, BYTES_TO_FREE);
+        assert_eq!(selected_key, "test-bucket/r13-2-old-large.bin");
+    }
+
+    /// The current red side. The production pass invokes the full collector at
+    /// `perform_eviction_with_lock` before sorting and grouping, so this assertion
+    /// fails until that full-population collection is replaced by a bounded path.
+    #[tokio::test]
+    #[ignore = "R13.2 red side: current eviction collects every candidate before byte selection"]
+    async fn r13_2_red_current_collection_exceeds_the_selected_prefix() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = mixed_fixture(temp.path());
+        let (collected, selected_count, selected_bytes, _) = collect_and_select(&manager).await;
+
+        assert!(
+            selected_bytes >= BYTES_TO_FREE,
+            "fixture must meet the exact bytes_to_free predicate before judging collection"
+        );
+        assert!(
+            collected <= selected_count,
+            "R13.2: selection needs {selected_count} candidate but current eviction collects \
+             {collected} before group_candidates_by_object can stop at {BYTES_TO_FREE} bytes"
+        );
     }
 }

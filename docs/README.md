@@ -42,6 +42,7 @@ Then: [Configuration Reference](CONFIGURATION.md) for every field, and
 | Cut upstream tail latency | [HEDGING.md](HEDGING.md) |
 | Run several proxies against one cache volume | [SHARED_STORAGE.md](SHARED_STORAGE.md) |
 | Route concurrent readers of the same bytes to one instance | [REQUEST_AWARE_ROUTING.md](REQUEST_AWARE_ROUTING.md) |
+| Cache on each proxy's local NVMe instead of a shared volume | [LOCAL_NVME_CACHE.md](LOCAL_NVME_CACHE.md) |
 | Parse the access log | [ACCESS_LOG_FORMAT.md](ACCESS_LOG_FORMAT.md) |
 | Build, test, or contribute | [DEVELOPER.md](DEVELOPER.md) |
 
@@ -67,6 +68,10 @@ Then: [Configuration Reference](CONFIGURATION.md) for every field, and
   selects a fleet member by object key and byte range, so concurrent readers of the same
   bytes converge on one instance. Covers where it is worth running, bounded load, DNS
   discovery, and a health-check trap that hides a broken fleet certificate
+- [LOCAL_NVME_CACHE.md](LOCAL_NVME_CACHE.md) — the alternative to a shared cache volume:
+  give each proxy its own NVMe instance store and let an affinity router make the private
+  disks behave as one cache. Covers the routing prerequisite, instance-family choice, the
+  cost comparison, preparing and sizing the instance store, and what fleet churn costs
 
 ## Configuration
 
@@ -93,8 +98,7 @@ Then: [Configuration Reference](CONFIGURATION.md) for every field, and
     [range merging](CACHE_READ_PATHS.md#intelligent-range-merging),
     [page-aligned range caching](CACHE_READ_PATHS.md#page-aligned-range-caching),
     [write-through](CACHE_READ_PATHS.md#write-through-cache), multipart, coherency checks
-  - [EVICTION.md](EVICTION.md) — reclaiming space: algorithms, admission window,
-    critical capacity bypass
+  - [EVICTION.md](EVICTION.md) — reclaiming space: algorithms, admission window
 - [COMPRESSION.md](COMPRESSION.md) — the compression decision, the built-in denylist, the
   store-mode frame contract, and
   [RAM-tier optimization](COMPRESSION.md#ram-cache-compression-optimization)

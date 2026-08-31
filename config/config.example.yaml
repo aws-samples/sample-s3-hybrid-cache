@@ -174,7 +174,11 @@ cache:
   ram_cache_flush_interval: "10s"        # Default: 10s
   ram_cache_flush_threshold: 100         # Default: 100
   ram_cache_flush_on_eviction: false     # Default: false
-  ram_cache_verification_interval: "1s"  # Default: 1s
+  # DEPRECATED: ram_cache_verification_interval has no effect. There is no
+  # RAM-versus-disk verification loop; RAM staleness is bounded by
+  # cache.metadata_cache.refresh_interval and by the per-key get_ttl instead.
+  # This field will be removed in a future release.
+  # ram_cache_verification_interval: "1s"
   
   # ============================================================================
   # SHARED STORAGE CONFIGURATION
@@ -756,9 +760,13 @@ dashboard:
 # Client usage (TLS):
 #   export HTTP_PROXY=https://127.0.0.1:3129
 #   export NO_PROXY=169.254.169.254
-#   export AWS_CA_BUNDLE=/path/to/proxy-cert.pem
 #   aws s3 cp s3://bucket/key ./local \
 #     --endpoint-url http://s3.us-east-1.amazonaws.com
+#
+# The proxy's certificate must be in the client host's system trust store.
+# AWS_CA_BUNDLE does NOT apply to the HTTP_PROXY hop — it configures the
+# endpoint connection, which is plain HTTP above. See
+# docs/GETTING_STARTED.md -> Configuring Clients to Trust the Certificate.
 # ==============================================================================
 
 # ==============================================================================

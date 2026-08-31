@@ -5,6 +5,87 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-08-31
+
+**Upgrade impact:** expired reads revalidate instead of re-downloading, so body transfers fall
+while conditional requests rise; orphan range files are kept at startup rather than swept, so
+watch free space on a cache volume that accumulates them; `cache.ram_cache_verification_interval`
+is deprecated; and the `RAM-disk coherency:`, `RAM cache flush config:`, `Consolidation cycle:`
+and `Consolidation cycle complete:` log lines change fields. No configuration change is required
+to keep running.
+
+### Added
+
+- `docs/LOCAL_NVME_CACHE.md`, a guide to running a fleet on local NVMe instance store instead of
+  a shared cache volume. Each proxy caches to its own disk and an affinity router gives every
+  object and page one owner, so aggregate capacity is the sum of the disks. Covers the routing
+  prerequisite, instance-family choice and cost comparison, preparing and sizing the instance
+  store, the settings that change, and what fleet churn costs when a cache does not survive
+  instance replacement. No code change: this documents a deployment the existing build already
+  supports.
+
+### Changed
+
+- `docs/AWS_DEPLOYMENT.md` now recommends Graviton network-optimized instances (`c8gn`, `m8gn`)
+  in place of `c6in`/`m6in`: same vCPU and memory, double the sustained network bandwidth, for
+  roughly 5% more cost. No code change; existing `c6in`/`m6in` deployments are unaffected and
+  keep working.
+- Orphan range files are kept at startup rather than swept, so a range file another instance has
+  just written and not yet consolidated stays intact. The periodic orphan recovery scan
+  (`cache.shared_storage.orphan_recovery_enabled`) is unchanged.
+
+### Deprecated
+
+- **`cache.ram_cache_verification_interval` has no effect and will be removed in a future
+  release.** An existing config file setting it still parses and starts, and a value other than
+  the 1s default logs a startup warning naming the field. The `RAM-disk coherency:` and `RAM
+  cache flush config:` startup log lines drop their `verification_interval` field. RAM staleness
+  is bounded by `cache.metadata_cache.refresh_interval` and the per-key `get_ttl` instead. No
+  replacement field is added.
+
+### Removed
+
+- The bytes-evicted figure from the consolidation cycle's result and its two log lines. Eviction
+  runs as a background task the cycle does not wait for, so bytes freed are reported by
+  `Background eviction completed:` instead. `Consolidation cycle:` now reports
+  `eviction_triggered=true|false` in place of `evicted=<bytes>`, and `Consolidation cycle
+  complete:` drops `bytes_evicted`.
+
+### Fixed
+
+- An expired cache entry is revalidated with a conditional request and served from cache on a
+  `304`, rather than re-downloaded in full, and `ttl_revalidations_total` counts each one. Range
+  requests forward the client's `Range` header unchanged, including suffix and open-ended forms
+  and ranges covered by a SigV4 signature. See
+  [GitHub issue #17](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/17).
+- A ranged read of an already-cached full object honours a lowered or zeroed `get_ttl`, so a
+  `cache_rules.json` change takes effect immediately.
+- A changed object detected during a range revalidation invalidates every cached extent covering
+  the request.
+- A client's own `If-None-Match` or `If-Modified-Since` on a range request is preserved rather
+  than replaced by the proxy's cached validators.
+- Corrected the documented way to trust the TLS proxy listener's certificate. `AWS_CA_BUNDLE`
+  configures the connection to the endpoint URL, which is plain HTTP when routing through
+  `HTTP_PROXY`, so it never applied to the proxy hop, and neither `--no-verify-ssl` nor
+  botocore's `proxies_config` in `~/.aws/config` could substitute for it — the latter is not
+  read from the config file by any client, AWS CLI included, only from an explicit Python
+  `Config` object. Install the certificate in the client host's system trust store. The examples
+  that address the proxy directly as an `https://` endpoint URL are unaffected, and
+  `AWS_CA_BUNDLE` remains correct for those. See
+  [GETTING_STARTED.md](docs/GETTING_STARTED.md#configuring-clients-to-trust-the-certificate).
+- A multipart upload part whose `Content-Length` is missing or malformed is measured as it
+  streams, and staging stops if it would take the cache past `cache.max_cache_size`. The part is
+  forwarded to S3 byte for byte and its response returned unchanged either way, so the only
+  difference is whether a copy is kept.
+- The cached-object count reports the objects that remain after the validation scan, excluding
+  entries the same pass removed. Cache size in bytes is unaffected.
+- Cache eviction keeps the metadata entry for a range whose file it could not delete, so the
+  space stays accounted for and the next pass retries the delete. A range whose file was already
+  gone is still removed, so an object with a stale entry remains evictable.
+- Cache eviction subtracts only the range files it removed cleanly, `ranges_evicted` in the
+  eviction summary counts the same set, and a range that could not be deleted is logged as a
+  warning naming its object.
+
 ## [2.7.0] - 2026-08-27
 
 **Upgrade impact:** cache size reporting is now accurate and self-consistent, and several

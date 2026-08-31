@@ -16,6 +16,14 @@ use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio::time::{interval, sleep, Instant};
 use tracing::{debug, error, info, warn};
 
+/// Whether the startup orphan `.bin` sweep may delete files.
+///
+/// `false`, and it must stay `false` until orphan detection can distinguish a genuine
+/// orphan from a `.bin` whose `.meta` entry is still in another instance's
+/// unconsolidated journal. See
+/// [`BackgroundRecoverySystem::run_startup_orphan_bin_sweep`] for the full reasoning.
+const STARTUP_ORPHAN_BIN_SWEEP_ENABLED: bool = false;
+
 /// Background recovery system manager
 pub struct BackgroundRecoverySystem {
     orphaned_recovery: Arc<OrphanedRangeRecovery>,
@@ -171,10 +179,9 @@ impl BackgroundRecoverySystem {
         tokio::spawn(async move {
             info!("Starting background recovery system");
 
-            // Startup scan: clean up orphan .bin files without corresponding .meta
-            // This handles the case where a crash occurred between the .bin rename
-            // and the .meta rename in the atomic commit sequence (Requirement 4.4).
-            let orphan_bin_cleaned = Self::cleanup_orphan_bin_files(&cache_dir);
+            // Startup orphan `.bin` sweep. Disabled — see
+            // `run_startup_orphan_bin_sweep` and STARTUP_ORPHAN_BIN_SWEEP_ENABLED.
+            let orphan_bin_cleaned = Self::run_startup_orphan_bin_sweep(&cache_dir);
             if orphan_bin_cleaned > 0 {
                 info!(
                     "Startup scan: cleaned up {} orphan .bin files without .meta",
@@ -271,7 +278,63 @@ impl BackgroundRecoverySystem {
         }
     }
 
+    /// Startup orphan `.bin` sweep — **disabled**, and deliberately so.
+    ///
+    /// This is the single gate for [`Self::cleanup_orphan_bin_files`]. It exists as a
+    /// named function rather than a commented-out call so that the disable is
+    /// greppable, is logged where an operator will see it, and is guarded by a test
+    /// (`startup_orphan_bin_sweep_spares_bin_whose_meta_is_in_another_instances_journal`)
+    /// that fails if the sweep is re-enabled without also making it safe.
+    ///
+    /// # Why it is disabled
+    ///
+    /// `cleanup_orphan_bin_files` unlinks any `.bin` whose sibling `.meta` is absent.
+    /// On shared storage that condition does not mean "orphan". A `.bin` written by
+    /// another proxy whose `.meta` entry is still sitting in that proxy's
+    /// unconsolidated journal presents identically — the `.bin` is committed, the
+    /// `.meta` does not exist yet, and nothing local can tell the two apart.
+    ///
+    /// So the decision is taken from this instance's private view of a directory tree,
+    /// the effect lands on storage the whole fleet shares, and the instance that loses
+    /// the data cannot observe the loss: no local reading is wrong in a way that points
+    /// at the cause. Deleting live data on that basis is not a hygiene bug, it is a
+    /// cross-instance data-loss path.
+    ///
+    /// A staleness grace period would narrow the window without closing it — an
+    /// instance can be down, or its consolidation can keep losing the `try_lock` race,
+    /// for arbitrarily long, so no finite age threshold makes the inference sound.
+    ///
+    /// # What is given up
+    ///
+    /// This is the only mechanism that currently deletes orphan `.bin` files, so
+    /// disabling it trades a data-loss risk for a disk-usage one: orphans accumulate
+    /// until reclamation that can distinguish them ships. That trade is deliberate.
+    /// Note the sweep credited nothing to cache accounting either way, so tracked
+    /// cache size is unaffected by this change.
+    fn run_startup_orphan_bin_sweep(cache_dir: &Path) -> u64 {
+        if !STARTUP_ORPHAN_BIN_SWEEP_ENABLED {
+            warn!(
+                "Startup orphan .bin sweep is DISABLED: on shared storage a .bin with no \
+                 sibling .meta is indistinguishable from a .bin whose .meta entry is still \
+                 in another instance's unconsolidated journal, so removing it can delete \
+                 another proxy's live cached data. Consequence: orphan .bin files are no \
+                 longer removed at startup and may accumulate on {:?}. Cache size \
+                 accounting is unaffected — this sweep never credited or debited it.",
+                cache_dir
+            );
+            return 0;
+        }
+
+        Self::cleanup_orphan_bin_files(cache_dir)
+    }
+
     /// Clean up orphan `.bin` files that lack a corresponding `.meta` file.
+    ///
+    /// **Not reached in production** — the only caller is
+    /// [`Self::run_startup_orphan_bin_sweep`], which is disabled. Retained rather than
+    /// deleted so the behaviour and its tests stay readable next to the reason it is
+    /// switched off; a replacement that can tell an orphan from an unconsolidated write
+    /// will remove it.
     ///
     /// An orphan `.bin` is one where:
     /// - The file has a `.bin` extension in the ranges directory
@@ -1109,6 +1172,130 @@ mod tests {
         assert!(!orphan_bin.exists(), "Orphan .bin should be removed");
         assert!(valid_bin.exists(), "Valid .bin should be kept");
         assert!(valid_meta.exists(), "Valid .meta should be kept");
+    }
+
+    /// Build the shared-storage state that another proxy leaves behind between
+    /// committing a range file and its `.meta` entry being consolidated: the `.bin`
+    /// exists, the `.meta` does **not**, and the range is recorded only in that
+    /// instance's own journal file.
+    ///
+    /// This writes the shared files directly and deliberately does **not** drive any
+    /// local write, journal-append, or consolidation path. Driving the local path would
+    /// let a fix that is only local hygiene pass — the instance running the sweep must
+    /// be given no way to know the range exists, which is exactly the situation on a
+    /// real fleet, where the write happened on a different host.
+    fn seed_unconsolidated_write_from_another_instance(cache_dir: &Path) -> PathBuf {
+        let shard = ["other-bucket", "ab", "cde"];
+
+        // ranges/{bucket}/{XX}/{YYY}/{key}_{start}-{end}.bin — committed by proxy B.
+        let range_dir = cache_dir
+            .join("ranges")
+            .join(shard[0])
+            .join(shard[1])
+            .join(shard[2]);
+        std::fs::create_dir_all(&range_dir).unwrap();
+        let bin_path = range_dir.join("live-object_0-1023.bin");
+        std::fs::write(&bin_path, vec![0xABu8; 1024]).unwrap();
+
+        // The metadata shard exists but holds no .meta for this key: proxy B's Add
+        // entry has not been consolidated yet.
+        let meta_dir = cache_dir
+            .join("metadata")
+            .join(shard[0])
+            .join(shard[1])
+            .join(shard[2]);
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        assert!(
+            !meta_dir.join("live-object.meta").exists(),
+            "fixture must not create the .meta — that is the whole point"
+        );
+
+        // metadata/_journals/{instance_id}.journal — proxy B's unconsolidated record.
+        let journals_dir = cache_dir.join("metadata").join("_journals");
+        std::fs::create_dir_all(&journals_dir).unwrap();
+        let now = SystemTime::now();
+        let entry = crate::journal_manager::JournalEntry {
+            timestamp: now,
+            instance_id: "proxy-b".to_string(),
+            cache_key: "other-bucket/live-object".to_string(),
+            range_spec: crate::cache_types::RangeSpec {
+                start: 0,
+                end: 1023,
+                file_path: "ranges/other-bucket/ab/cde/live-object_0-1023.bin".to_string(),
+                compression_algorithm: crate::compression::CompressionAlgorithm::None,
+                compressed_size: 1024,
+                uncompressed_size: 1024,
+                created_at: now,
+                last_accessed: now,
+                access_count: 0,
+                staged: None,
+            },
+            operation: crate::journal_manager::JournalOperation::Add,
+            range_file_path: "ranges/other-bucket/ab/cde/live-object_0-1023.bin".to_string(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(3600),
+            access_increment: None,
+            object_metadata: None,
+        };
+        let line = format!("{}\n", serde_json::to_string(&entry).unwrap());
+        std::fs::write(journals_dir.join("proxy-b.journal"), line).unwrap();
+
+        bin_path
+    }
+
+    /// R15.0: the startup sweep must not delete another instance's live range file.
+    ///
+    /// The `.bin` here is not an orphan at all — its `.meta` entry is in proxy B's
+    /// unconsolidated journal — but it is indistinguishable from one to the instance
+    /// running the sweep. Asserting survival is asserting that the sweep no longer
+    /// makes that unsound inference.
+    #[test]
+    fn startup_orphan_bin_sweep_spares_bin_whose_meta_is_in_another_instances_journal() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+        let bin_path = seed_unconsolidated_write_from_another_instance(&cache_dir);
+
+        let cleaned = BackgroundRecoverySystem::run_startup_orphan_bin_sweep(&cache_dir);
+
+        assert_eq!(
+            cleaned, 0,
+            "startup sweep must report no deletions while it cannot distinguish an \
+             orphan from an unconsolidated cross-instance write"
+        );
+        assert!(
+            bin_path.exists(),
+            "another instance's committed range file was deleted by the startup sweep \
+             (R15.0 cross-instance data loss)"
+        );
+        assert_eq!(
+            std::fs::read(&bin_path).unwrap().len(),
+            1024,
+            "range file survived but was modified"
+        );
+    }
+
+    /// The red side of the test above, on the identical fixture.
+    ///
+    /// Without this, a fixture that failed to look like an orphan — wrong shard path,
+    /// wrong filename shape, a `.meta` accidentally present — would make the assertion
+    /// above pass while proving nothing. This shows the underlying sweep *does* delete
+    /// this exact file, so survival in the test above is attributable to the gate and
+    /// not to the fixture.
+    #[test]
+    fn ungated_sweep_deletes_the_same_cross_instance_write_the_gate_spares() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+        let bin_path = seed_unconsolidated_write_from_another_instance(&cache_dir);
+
+        let cleaned = BackgroundRecoverySystem::cleanup_orphan_bin_files(&cache_dir);
+
+        assert_eq!(
+            cleaned, 1,
+            "fixture no longer reaches the unlink — the companion test would pass \
+             vacuously; fix the fixture, do not relax the assertion"
+        );
+        assert!(!bin_path.exists());
     }
 
     #[test]

@@ -46,35 +46,17 @@ The RAM cache read path is designed to scale with concurrent connections rather 
 
 ## RAM-Disk Cache Coherency
 
-When both RAM and disk caches are enabled, the proxy maintains coherency between them through two mechanisms:
+When both RAM and disk caches are enabled, RAM cache hits are batched and written to disk metadata so eviction decisions see accurate access statistics.
 
-1. **Periodic Verification**: RAM cache entries are verified against disk metadata to detect stale data
-2. **Access Statistics Propagation**: RAM cache hits are batched and written to disk metadata for eviction decisions
+**There is no periodic RAM-versus-disk verification loop.** Earlier revisions of this document described one — a per-key throttled ETag/size comparison driven by `ram_cache_verification_interval` — and it was never implemented. That config field is deprecated and has no effect. What actually bounds RAM staleness:
 
-### How Verification Works
+- Staleness relative to the fleet's own knowledge is bounded by `cache.metadata_cache.refresh_interval` for a verdict derived from a RAM metadata copy.
+- Staleness relative to S3 is bounded by the per-key `get_ttl`, nested inside the first.
+- On a detected ETag mismatch, `CacheManager::invalidate_ram_ranges` clears the RAM ranges at each stale-object invalidation site.
 
-When a RAM cache hit occurs, the proxy periodically verifies the entry against disk metadata:
+See [CACHE_FRESHNESS.md](CACHE_FRESHNESS.md) for the operator-facing contract.
 
-```
-RAM Cache Hit → Check verification interval elapsed?
-             → Yes: Read disk metadata, compare etag/size
-                   → Match: Serve from RAM, record verification
-                   → Mismatch: Invalidate RAM entry, return cache miss
-                   → Disk missing: Invalidate RAM entry, return cache miss
-             → No: Serve from RAM (skip verification)
-```
-
-**Error Handling**: If disk cache storage fails due to lock contention or I/O errors, the operation returns an error rather than silently succeeding, preventing RAM-disk inconsistencies that could cause verification failures.
-
-**Verification Fields Compared:**
-- ETag (content hash)
-- Size (byte count)
-- Compression status
-
-**Verification Throttling:**
-- Verification is throttled per cache key to avoid excessive disk I/O
-- Default interval: 1 second (configurable via `ram_cache_verification_interval`)
-- Entries accessed multiple times within the interval skip verification
+**Error Handling**: If disk cache storage fails due to lock contention or I/O errors, the operation returns an error rather than silently succeeding, preventing RAM-disk inconsistencies.
 
 ### Access Statistics Propagation
 
@@ -504,6 +486,37 @@ All cached data uses the same storage format, regardless of source:
 A streamed range cache write can end before the full requested range arrives — the client cancelled the transfer, or the mid-stream idle watchdog (`connection_pool.upstream_idle_timeout`) aborted a stalled upstream. By default such a range was discarded entirely. With `cache.partial_range_commit_ratio` (default `0.5`), the proxy instead commits the received prefix as a smaller valid range `[start, start + received - 1]` when at least that fraction of the requested bytes arrived **in order**.
 
 This matters for high-throughput clients like the AWS CLI CRT transfer client, which opens many parallel range connections — any of which can be cut short by the proxy's mid-stream idle watchdog or by CRT's adaptive part reassignment. Without salvage, the received bytes from those interrupted ranges are discarded entirely. The salvaged range is recorded with its true byte bounds, so it is never served as if it were the full requested range: a later request for the missing tail fetches it from S3 and merges with the cached prefix (see [Range Merging](CACHE_READ_PATHS.md#intelligent-range-merging)). `1.0` keeps the exact-only behavior (any short range discarded); `0.0` commits any non-empty prefix. The write-through PUT path is unaffected — a truncated upload is never cached. See [Partial Range Commit Ratio](CONFIGURATION.md#partial-range-commit-ratio) for tuning.
+
+### Range lookup purpose and stored freshness
+
+`DiskCacheManager::find_cached_ranges` takes a required `RangeLookupPurpose` and returns a
+`RangeLookupResult` — the coverage plus a `StoredFreshness` marker — rather than a bare
+`Vec<RangeSpec>`.
+
+The stored-expiry check (`SystemTime::now() > metadata.expires_at`) sits at one point, after
+both metadata arms converge, so the policy is identical whether the metadata was read from
+disk or supplied preloaded by a caller. Past that point:
+
+- `FreshServe` returns empty coverage, as the lookup always did unconditionally.
+- `RevalidationCandidate` continues the overlap calculation and marks the result
+  `StoredFreshness::Expired`.
+
+**Overlap calculation is shared between the two purposes** — the expiry decision is the only
+thing that differs. That is deliberate: two separate implementations could drift into
+disagreeing about what is cached, which would be a far worse bug than the one the purposes
+exist to fix.
+
+The journal fallback (`find_pending_journal_ranges`, used when metadata is absent or has no
+overlapping extent) is reported `Fresh`, because a journal record carries no `expires_at`
+that could have passed. Journal semantics are unchanged.
+
+Why the marker travels with the coverage rather than being recomputed by the caller: the
+caller may be holding a *different* copy of the metadata (its own preloaded one, or a second
+disk read). Deciding freshness from that copy would be deciding it from a value other than
+the one the lookup actually branched on.
+
+`docs/CACHE_READ_PATHS.md` → "Lookup purpose, and what authorises a cached serve" has the
+per-call-site assignment and the serve-authority table.
 
 ## Cache Entry Structure
 

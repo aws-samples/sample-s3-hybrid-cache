@@ -30,10 +30,10 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
-/// The 60-second admission window in `collect_candidates_from_metadata_file_with_options`
-/// is evaluated against each range's `last_accessed`. Nothing in the read-tier eviction
-/// path passes `bypass_admission_window: true` — the only caller uses the no-arg wrapper —
-/// so backdating is the only way a fixture gets a candidate collected. 120s is the margin
+/// The 60-second admission window in `collect_candidates_from_metadata_file`
+/// is evaluated against each range's `last_accessed`. The window is unconditional — there
+/// is no bypass — so backdating is the only way a fixture gets a candidate collected. 120s
+/// is the margin
 /// the existing helpers in `tests/range_based_eviction_property_test.rs` use.
 const BACKDATE: Duration = Duration::from_secs(120);
 
@@ -338,7 +338,7 @@ mod read_tier_covers_staged_entries {
     /// Shown failing first two ways, each reproducing a different plausible mistake:
     ///
     /// 1. Add `if new_metadata.object_metadata.is_write_cached { continue; }` to
-    ///    `collect_candidates_from_metadata_file_with_options` — the "staged entries are
+    ///    `collect_candidates_from_metadata_file` — the "staged entries are
     ///    the write tier's business" assumption. The first assertion then fails: the
     ///    `.meta` survives, because nothing collected it.
     /// 2. Delete the `is_staged_range_parts` arm from Step 5's accounting. The `.meta` is still

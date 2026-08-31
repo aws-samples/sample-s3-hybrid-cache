@@ -40,6 +40,135 @@ pub enum ObjectExpirationResult {
     },
 }
 
+/// Why a caller is looking up cached range coverage.
+///
+/// The two mechanisms this distinguishes are documented in
+/// `.kiro/steering/cache-coherency-invariants.md` § "The two freshness
+/// mechanisms". Stored expiry (`NewCacheMetadata::expires_at`) bounds the lookup;
+/// live TTL (`created_at` against the currently resolved `get_ttl`,
+/// `DiskCacheManager::check_object_expiration`) is the mainline serve gate.
+///
+/// Before this existed, the lookup applied stored expiry unconditionally and
+/// returned nothing once it had passed. That is correct for a caller about to
+/// serve the bytes and wrong for one about to *revalidate* them: the metadata,
+/// the ETag and the range files are all still there, and hiding them made the
+/// live-TTL check and the whole conditional-request path unreachable. Every
+/// sequential re-read of an expired-but-present entry became a full body
+/// transfer plus a cache rewrite. See
+/// `.kiro/specs/expired-entry-revalidation/` and GitHub issue #17.
+///
+/// # Choosing one
+///
+/// There is deliberately no `Default`. A new call site must state which contract
+/// it holds, because the safety condition is not recoverable from the
+/// surrounding code — the spec's Requirement 1.4 forbids a boolean whose meaning
+/// has to be inferred from a call-site literal.
+///
+/// Ask: **between this lookup and returning bytes to a client, what bounds the
+/// staleness?**
+///
+/// - a live-TTL verdict, a client validator (Mode B), or a successful `304` →
+///   [`RangeLookupPurpose::RevalidationCandidate`];
+/// - nothing but the lookup itself → [`RangeLookupPurpose::FreshServe`].
+///
+/// If the answer is "nothing at all", neither variant is right and the call site
+/// is a defect regardless of which one it picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeLookupPurpose {
+    /// The caller may serve what it receives without applying any further
+    /// freshness gate, so the lookup must apply stored expiry itself and return
+    /// no ranges once it has passed.
+    ///
+    /// This is the conservative choice and the correct one for page widening,
+    /// direct cache reads, part-scoped lookups, and the degraded coalescing
+    /// fallbacks.
+    FreshServe,
+
+    /// The caller will evaluate freshness itself — live TTL, then a conditional
+    /// request against S3 if the entry is expired — before serving anything.
+    ///
+    /// The lookup therefore continues past stored expiry and reports the
+    /// condition via [`StoredFreshness`] instead of hiding the coverage.
+    ///
+    /// **This grants discovery, not permission.** A caller that receives
+    /// [`StoredFreshness::Expired`] holds no authority to serve those bytes; it
+    /// must first obtain one (a live-TTL `Fresh` verdict, a matching client
+    /// `If-Match`, or a `304`). [`crate::range_handler::RangeOverlap`] enforces
+    /// the distinction in its accessors rather than leaving it to convention.
+    RevalidationCandidate,
+}
+
+/// Whether the entry backing a lookup result was within its stored expiry.
+///
+/// Carried alongside the coverage so an expired candidate cannot be mistaken for
+/// ordinary serveable data by a caller that never looked. Requirement 1.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredFreshness {
+    /// `SystemTime::now() <= NewCacheMetadata::expires_at`.
+    Fresh,
+    /// `SystemTime::now() > NewCacheMetadata::expires_at`.
+    ///
+    /// Only ever returned with non-empty coverage under
+    /// [`RangeLookupPurpose::RevalidationCandidate`]. Under `FreshServe` the
+    /// coverage is empty, so the two variants are behaviourally identical there
+    /// and existing `FreshServe` callers are unaffected.
+    Expired,
+}
+
+/// What a range lookup found, and whether the entry it came from was stored-fresh.
+///
+/// Returned instead of a bare `Vec<RangeSpec>` so the expiry condition travels
+/// with the coverage. A caller cannot accidentally treat an expired candidate as
+/// serveable data, because it has to destructure this to get at the ranges at
+/// all.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct RangeLookupResult {
+    /// Cached extents overlapping the requested interval, sorted by `start`.
+    /// Empty means no usable coverage was found.
+    pub ranges: Vec<RangeSpec>,
+    /// Stored-expiry state of the entry these extents came from.
+    ///
+    /// `Fresh` when no metadata was consulted at all (no entry, or a
+    /// journal-only fallback), since there is no `expires_at` to have passed —
+    /// journal records carry neither expiry nor validators and keep their
+    /// existing semantics under this spec.
+    pub stored_freshness: StoredFreshness,
+}
+
+impl RangeLookupResult {
+    /// An empty result from a lookup that consulted no expiry.
+    pub fn empty() -> Self {
+        Self {
+            ranges: Vec::new(),
+            stored_freshness: StoredFreshness::Fresh,
+        }
+    }
+
+    /// Coverage from a stored-fresh entry.
+    pub fn fresh(ranges: Vec<RangeSpec>) -> Self {
+        Self {
+            ranges,
+            stored_freshness: StoredFreshness::Fresh,
+        }
+    }
+
+    /// Was any overlapping coverage found?
+    ///
+    /// Kept (rather than making callers write `.ranges.is_empty()`) because it reads
+    /// the same as the `Vec` this type replaced, which is what most call sites want.
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Did the entry backing this coverage sit past its stored expiry?
+    ///
+    /// A `true` here means "revalidation candidate", never "serveable".
+    pub fn is_stored_expired(&self) -> bool {
+        self.stored_freshness == StoredFreshness::Expired
+    }
+}
+
 /// Cache entry for storing S3 objects and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {

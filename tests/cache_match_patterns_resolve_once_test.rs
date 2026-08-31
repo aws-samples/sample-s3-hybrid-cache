@@ -230,6 +230,9 @@ async fn multi_range_request_resolves_settings_exactly_once() {
         cached_ranges: vec![cached_range],
         missing_ranges,
         can_serve_from_cache: false,
+        // Partial coverage from a stored-fresh entry — this test is about
+        // resolve-once call counting, not freshness.
+        stored_freshness: s3_proxy::cache_types::StoredFreshness::Fresh,
     };
     assert_eq!(
         manager.resolve_call_count(),

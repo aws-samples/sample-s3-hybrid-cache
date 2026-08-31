@@ -973,17 +973,17 @@ cache:
   ram_cache_flush_interval: "10s"      # Time between flushes (default: 10s)
   ram_cache_flush_threshold: 100       # Pending updates before flush (default: 100)
   ram_cache_flush_on_eviction: false   # Flush on RAM eviction (default: false)
-  
-  # Verification settings
-  ram_cache_verification_interval: "1s"  # Min time between verifications
 ```
 
-### How It Works
+> **Deprecated: `cache.ram_cache_verification_interval`.** An existing config file
+> setting this field still parses and starts; the value has never had any effect. There
+> is no RAM-versus-disk verification loop — earlier revisions of this document described
+> one that was never implemented. RAM staleness is bounded by
+> `cache.metadata_cache.refresh_interval` and by the per-key `get_ttl`; see
+> [CACHE_FRESHNESS.md](CACHE_FRESHNESS.md). A value other than the old 1s default logs a
+> startup warning naming the field. The field will be removed in a future release.
 
-**Verification**: RAM cache entries periodically verified against disk metadata
-- Compares ETag, size, compression status
-- Throttled to avoid excessive disk I/O (default: 1 second interval)
-- Invalidates RAM entry if mismatch or disk missing
+### How It Works
 
 **Access Statistics Propagation**: RAM cache hits batched and written to disk
 - Disk eviction algorithms need accurate access statistics
@@ -996,7 +996,6 @@ cache:
 |---------|-----------|------------|----------------|
 | flush_interval | More disk I/O, fresher stats | Less I/O, staler stats | 60s for most workloads |
 | flush_threshold | More frequent flushes | Larger batches | 100 for balanced performance |
-| verification_interval | More disk reads, fresher data | Less I/O, risk of stale data | 1s for consistency |
 
 ### Monitoring Metrics
 

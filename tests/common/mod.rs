@@ -18,6 +18,26 @@
 
 #![allow(dead_code)]
 
+/// Graded cache-tree fixture generator (`cache-eviction-at-scale` task 8, R13.1).
+///
+/// Lives under `tests/common/` because it is test-support code and because that
+/// directory is already on the mirror copy list in
+/// `.kiro/steering/general-guidance.md` — a new `tests/` subdirectory would be
+/// invisible to the mirror's `diff -rq` until it changed, which is the exact drift
+/// class that steering file records.
+pub mod graded_fixture;
+
+/// Cache fixtures for `.kiro/specs/expired-entry-revalidation/`.
+///
+/// Shared rather than duplicated per test file because the spec's tasks 1, 4, 5,
+/// 6 and 7 all need the same three states (Candidate_Available, Stored_Expired,
+/// Live_Expired) and the same set of confound exclusions. Duplicating them would
+/// let two test files drift into disagreeing about what "expired" means, which is
+/// the substance of the defect.
+///
+/// Under `tests/common/` for the same mirror reason as `graded_fixture` above.
+pub mod expired_fixture;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use hyper::{Method, StatusCode};

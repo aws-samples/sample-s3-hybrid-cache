@@ -299,6 +299,15 @@ A background sweep finds range (`.bin`) files with no referencing metadata — l
 crashed writers or consolidation lag — and either reconciles them into metadata or removes
 them. It scans one shard per cycle to spread I/O.
 
+**A separate startup sweep is disabled and removes nothing.** It deleted every `.bin`
+whose sibling `.meta` was missing, which on a shared volume also describes a range file
+another instance had just written and whose metadata was still in that instance's
+unconsolidated journal — so it could delete live cached data, and the instance that lost
+it could not detect the loss. Consequence: orphan `.bin` files left by a crashed writer are
+no longer reclaimed at startup, so disk usage on the cache volume can exceed what
+`cache.total_cache_size` reports. That gap is orphan bytes; the validation scan never
+counted them (it reads `metadata/` only and never stats a `.bin`).
+
 `orphan_recovery_enabled` (default `true`), `orphan_recovery_interval` (default 300s,
 range 60-3600s), `orphan_scan_timeout` (default 30s, range 5-300s), and
 `orphan_max_per_cycle` (default 100) bound it.

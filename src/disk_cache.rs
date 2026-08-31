@@ -20,6 +20,102 @@ use tracing::{debug, error, info, warn};
 /// Maximum concurrent file deletes within a single batch_delete_ranges() call
 const FILE_CONCURRENCY_LIMIT: usize = 32;
 
+/// What happened to one range's `.bin` file during a batch delete.
+///
+/// The distinction between the two failure cases is what Requirement 15.2 turns
+/// on, and it is a distinction [`BatchRangeDeletion::unlinked_extents`]
+/// deliberately erases: that field exists for *accounting*, and both non-`Unlinked`
+/// outcomes are correctly excluded from a debit, so it does not carry which one
+/// occurred. Metadata removal needs the opposite treatment — one of them must
+/// still strip the range from the `.meta` and the other must not — so the
+/// classification is made here, once, at the single site that has the
+/// `remove_file` result, and both decisions read it.
+///
+/// Spec: cache-eviction-at-scale. Requirements: 15.2, 15.3
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeUnlinkOutcome {
+    /// `remove_file` succeeded — the bytes left the volume on this call. Debit
+    /// them, and remove the range from the `.meta`.
+    Unlinked,
+    /// `remove_file` returned `NotFound` — the `.bin` was already gone before
+    /// this call. Nothing to debit now, but the `.meta` entry is a dangling
+    /// reference to a file that does not exist and removing it is the *point*:
+    /// retaining it would make the object permanently unevictable, since every
+    /// later pass would re-select the same range and hit the same absent file.
+    AlreadyAbsent,
+    /// `remove_file` failed for any other reason — `EACCES` on a read-only
+    /// parent, `EIO`, `ESTALE` on shared storage. **The `.bin` is still on the
+    /// volume.** Stripping the range from the `.meta` here is what manufactures
+    /// an orphan: a file with no metadata referencing it, invisible to a
+    /// validation scan that roots at `metadata/` (Requirement 15.1), and
+    /// therefore never reclaimed and never counted.
+    Failed,
+}
+
+/// Outcome of a [`DiskCacheManager::batch_delete_ranges`] call.
+///
+/// Replaced a three-element tuple on 2026-08-28. The added field —
+/// `unlinked_extents` — is what makes a caller able to debit only what left the
+/// disk, and a fourth tuple element would have been the wrong shape for it: the
+/// tuple already held two `Vec`s and a `u64`/`bool` pair, so a caller
+/// destructuring the two `Vec`s in the wrong order still compiles and silently
+/// debits the wrong set. That is the same argument [`crate::cache`]'s
+/// `EvictedRange` records for replacing its own seven-element tuple, and the
+/// consequence here is identical — a phantom debit rather than a loud failure.
+///
+/// Spec: cache-eviction-at-scale. Requirements: 7.2
+#[derive(Debug, Default)]
+pub struct BatchRangeDeletion {
+    /// Total bytes freed, summed over range files that were **actually unlinked**.
+    pub bytes_freed: u64,
+    /// True if no ranges remain in the `.meta` (the `.meta` file was deleted).
+    pub all_ranges_evicted: bool,
+    /// Paths of every file removed — range files, and the `.meta`/`.lock` pair when
+    /// the object was fully evicted. For directory cleanup.
+    pub deleted_paths: Vec<PathBuf>,
+    /// Extents whose `.bin` **existed and was unlinked without error**.
+    ///
+    /// This is deliberately narrower than the caller's candidate list, and narrower
+    /// than the set removed from the `.meta`. Two cases are excluded and they are
+    /// **not** the same thing:
+    ///
+    /// - **Unlink failed** (e.g. a read-only parent directory): the bytes are still
+    ///   on the volume, so debiting them would leave the accumulator short of the
+    ///   disk — undershoot, the direction that silently over-admits.
+    /// - **File already absent**: no bytes to reclaim now. Whether those bytes are
+    ///   still credited is a pre-existing discrepancy this pass cannot tell apart
+    ///   from an already-debited one, so re-debiting risks a double debit in the
+    ///   same dangerous direction. Reconciling that is Requirement 15's job, not
+    ///   eviction's.
+    ///
+    /// The two are distinguishable *here* — an absent file also fails the preceding
+    /// `metadata()` call and so contributes a `file_size` of 0 — but both are
+    /// correctly excluded from the debit, so the distinction is not carried out of
+    /// this function.
+    ///
+    /// Spec: cache-eviction-at-scale. Requirements: 7.2
+    pub unlinked_extents: Vec<(u64, u64)>,
+    /// Extents whose `.bin` unlink **failed while the file is still present**, and
+    /// which were therefore left in the object's `.meta` rather than stripped from
+    /// it (Requirement 15.2).
+    ///
+    /// This is not the complement of `unlinked_extents`. An extent whose `.bin` was
+    /// already absent appears in neither: it is excluded from the debit for the
+    /// reasons in that field's comment, and it is *still* removed from the `.meta`,
+    /// because its file genuinely does not exist. Only the survives-on-disk case
+    /// lands here. See [`RangeUnlinkOutcome`].
+    ///
+    /// **This list is a report, not the record.** Requirement 15.4's durable record
+    /// is the retained `.meta` entry itself: it keeps the range accounted, keeps the
+    /// object's `.meta` alive (Requirement 15.3), and leaves the range visible to
+    /// the next eviction pass's candidate walk — which reads `.meta` ranges — so the
+    /// unlink is retried without any new state. This field exists so a caller can
+    /// log or count the event in the same pass.
+    ///
+    /// Spec: cache-eviction-at-scale. Requirements: 15.2, 15.3, 15.4
+    pub retained_extents: Vec<(u64, u64)>,
+}
+
 // ---------------------------------------------------------------------------
 // Metadata read outcome types (Task 1: non-blocking metadata read+parse)
 // ---------------------------------------------------------------------------
@@ -1721,8 +1817,8 @@ impl DiskCacheManager {
             total_duration.as_secs_f64() * 1000.0
         );
 
-        // NOTE: Size tracking is now handled by JournalConsolidator through journal entries.
-        // Direct mode is no longer used (shared_storage.enabled is always true).
+        // Size tracking is handled unconditionally by JournalConsolidator through journal entries.
+        // SharedStorageConfig tunes coordination parameters; it has no `enabled` flag.
 
         Ok(())
     }
@@ -2833,27 +2929,33 @@ impl DiskCacheManager {
     /// This method efficiently deletes multiple ranges from a single object in one operation:
     /// 1. Reads current metadata (once per object)
     /// 2. Deletes all specified range .bin files, collecting paths
-    /// 3. Removes all deleted ranges from metadata.ranges list
+    /// 3. Removes from metadata.ranges every range whose `.bin` is no longer on
+    ///    disk — unlinked now, or already absent. A range whose unlink **failed
+    ///    while the file is still present is kept** (Requirement 15.2), so eviction
+    ///    cannot manufacture a `.bin` that no metadata references.
     /// 4. Atomic write updated metadata (once per object)
-    /// 5. If all ranges evicted, deletes metadata file and lock files
+    /// 5. If no `.bin` survives, deletes metadata file and lock files
+    ///    (Requirement 15.3)
     ///
     /// # Arguments
     /// * `cache_key` - The cache key for the object
     /// * `ranges_to_delete` - List of (start, end) pairs identifying ranges to delete
     ///
     /// # Returns
-    /// * `Ok((bytes_freed, all_ranges_evicted, deleted_paths))` on success
-    ///   - `bytes_freed`: Total bytes freed from deleted range files
-    ///   - `all_ranges_evicted`: True if all ranges were evicted (metadata file deleted)
-    ///   - `deleted_paths`: Paths of all deleted files (for directory cleanup)
+    /// * [`BatchRangeDeletion`] on success. Note `unlinked_extents` is narrower than
+    ///   `ranges_to_delete` and narrower than the set stripped from the `.meta` — see
+    ///   that field's doc comment. Any accounting a caller does MUST be built from it
+    ///   rather than from its own candidate list (Requirement 7.2). `retained_extents`
+    ///   reports the ranges left in place by a failed unlink (Requirement 15.4).
     ///
     /// # Requirements
     /// Implements Requirements 2.1, 2.2, 2.3, 2.5 from range-based-disk-eviction spec
+    /// Spec: cache-eviction-at-scale. Requirements: 7.2
     pub async fn batch_delete_ranges(
         &self,
         cache_key: &str,
         ranges_to_delete: &[(u64, u64)],
-    ) -> Result<(u64, bool, Vec<PathBuf>)> {
+    ) -> Result<BatchRangeDeletion> {
         let operation_start = std::time::Instant::now();
         debug!(
             "Starting batch range deletion: key={}, ranges_to_delete={}, operation=batch_delete_ranges",
@@ -2862,7 +2964,7 @@ impl DiskCacheManager {
 
         if ranges_to_delete.is_empty() {
             debug!("No ranges to delete for key={}", cache_key);
-            return Ok((0, false, Vec::new()));
+            return Ok(BatchRangeDeletion::default());
         }
 
         let metadata_file_path = self.get_new_metadata_file_path(cache_key);
@@ -2875,7 +2977,7 @@ impl DiskCacheManager {
                 "Metadata file not found for batch delete: key={}, path={:?}, skipping",
                 cache_key, metadata_file_path
             );
-            return Ok((0, false, Vec::new()));
+            return Ok(BatchRangeDeletion::default());
         }
 
         // Acquire exclusive lock with timeout (5 seconds)
@@ -2982,6 +3084,17 @@ impl DiskCacheManager {
         let mut bytes_freed: u64 = 0;
         let mut deleted_paths: Vec<PathBuf> = Vec::new();
         let mut ranges_deleted: Vec<(u64, u64)> = Vec::new();
+        // Extents whose `.bin` actually left the disk. Kept separate from
+        // `ranges_deleted` — which is the metadata-removal set and is populated
+        // unconditionally — because the caller's accounting may only be built from
+        // this one. See `BatchRangeDeletion::unlinked_extents`.
+        // Spec: cache-eviction-at-scale. Requirements: 7.2
+        let mut unlinked_extents: Vec<(u64, u64)> = Vec::new();
+        // Extents whose `.bin` unlink failed with the file still present. These are
+        // deliberately absent from `ranges_deleted`, so they survive the `retain`
+        // below and keep the object's `.meta` alive.
+        // Spec: cache-eviction-at-scale. Requirements: 15.2, 15.3, 15.4
+        let mut retained_extents: Vec<(u64, u64)> = Vec::new();
 
         // Delete range .bin files concurrently
         // Requirement 2.1, 2.2, 2.3: Use tokio::fs for async parallel deletes with concurrency limit
@@ -3008,25 +3121,42 @@ impl DiskCacheManager {
                     };
 
                     // Requirement 2.1: Use tokio::fs::remove_file (async) instead of std::fs::remove_file
-                    let deleted = match tokio::fs::remove_file(&path).await {
+                    //
+                    // Requirement 15.2: the error is CLASSIFIED rather than collapsed to a
+                    // bool. `NotFound` means the file is gone and the `.meta` entry should
+                    // go with it; any other error means the file is still there and the
+                    // `.meta` entry must survive. Collapsing the two — which this code did
+                    // until 2026-08-28 — is what produced orphans.
+                    let outcome = match tokio::fs::remove_file(&path).await {
                         Ok(()) => {
                             debug!(
                                 "[RANGE_EVICTION] Deleted range file: cache_key={}, range_start={}, range_end={}, freed_bytes={}, path={:?}",
                                 ck, key.0, key.1, file_size, path
                             );
-                            true
+                            RangeUnlinkOutcome::Unlinked
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Nothing on disk to orphan. Removing the dangling `.meta`
+                            // entry is correct and is the only way the object becomes
+                            // evictable at all.
+                            debug!(
+                                "[RANGE_EVICTION] Range file already absent: cache_key={}, range_start={}, range_end={}, path={:?}, action=removing_stale_metadata_entry",
+                                ck, key.0, key.1, path
+                            );
+                            RangeUnlinkOutcome::AlreadyAbsent
                         }
                         Err(e) => {
                             // Requirement 2.4: Log warning on failure, continue processing remaining files
+                            // Requirement 15.2: the file survives, so the metadata entry does too.
                             warn!(
-                                "[RANGE_EVICTION] Failed to delete range file: cache_key={}, range_start={}, range_end={}, error={}, path={:?}, action=continuing_with_metadata_update",
+                                "[RANGE_EVICTION] Failed to delete range file: cache_key={}, range_start={}, range_end={}, error={}, path={:?}, action=retaining_metadata_entry_for_retry",
                                 ck, key.0, key.1, e, path
                             );
-                            false
+                            RangeUnlinkOutcome::Failed
                         }
                     };
 
-                    (key, file_size, deleted, path)
+                    (key, file_size, outcome, path)
                 }
             })
             .collect();
@@ -3037,14 +3167,36 @@ impl DiskCacheManager {
             .collect()
             .await;
 
-        // Collect results into bytes_freed, deleted_paths, ranges_deleted
-        for (range_key, file_size, deleted, path) in results {
-            if deleted {
-                bytes_freed += file_size;
-                deleted_paths.push(path);
+        // Collect results into bytes_freed, deleted_paths, ranges_deleted, retained_extents
+        //
+        // Requirement 15.2: metadata removal is no longer unconditional. Until
+        // 2026-08-28 `ranges_deleted.push(range_key)` ran for every result under the
+        // comment "Always mark range for metadata removal (file may already be
+        // gone)" — true of an already-absent file and false of a failed unlink, and
+        // the code could not tell them apart because the outcome was a bool. A
+        // surviving `.bin` stripped from its `.meta` is an orphan, and § 15.1 shows
+        // the validation scan cannot see one: it roots at `metadata/` and never
+        // reads `ranges/`, so the bytes are neither reclaimed nor counted, forever.
+        for (range_key, file_size, outcome, path) in results {
+            match outcome {
+                RangeUnlinkOutcome::Unlinked => {
+                    bytes_freed += file_size;
+                    deleted_paths.push(path);
+                    unlinked_extents.push(range_key);
+                    ranges_deleted.push(range_key);
+                }
+                RangeUnlinkOutcome::AlreadyAbsent => {
+                    // No bytes to debit (see `unlinked_extents`), but the `.meta`
+                    // entry points at a file that is not there, so it goes.
+                    ranges_deleted.push(range_key);
+                }
+                RangeUnlinkOutcome::Failed => {
+                    // Requirement 15.2: the `.bin` is still on the volume. Leave the
+                    // range in the `.meta` so it stays accounted and stays a
+                    // candidate for the next pass (Requirement 15.4).
+                    retained_extents.push(range_key);
+                }
             }
-            // Always mark range for metadata removal (file may already be gone)
-            ranges_deleted.push(range_key);
         }
 
         // Requirement 2.2: Update metadata to remove evicted ranges from the ranges list
@@ -3054,7 +3206,17 @@ impl DiskCacheManager {
             .ranges
             .retain(|r| !ranges_deleted_set.contains(&(r.start, r.end)));
 
-        let all_ranges_evicted = metadata.ranges.is_empty();
+        // Requirement 15.3: the `.meta` is deleted only when no `.bin` survives.
+        //
+        // The `retain` above already guarantees this: a failed unlink is absent from
+        // `ranges_deleted`, so its `RangeSpec` survives and `metadata.ranges` cannot
+        // be empty. The second clause is therefore redundant *today* and is stated
+        // anyway, because R15.3 is a property of the surviving files and this makes
+        // the code say so directly rather than leave it as an emergent consequence of
+        // how `ranges_deleted` happens to be built. If a later change reworks that
+        // list — and § 5.5 plans exactly that, adding a whole-object path that
+        // unlinks the `.meta` without a rewrite — the hole does not silently reopen.
+        let all_ranges_evicted = metadata.ranges.is_empty() && retained_extents.is_empty();
 
         if all_ranges_evicted {
             // All ranges evicted - delete metadata file and lock files
@@ -3150,7 +3312,41 @@ impl DiskCacheManager {
             cache_key, ranges_deleted.len(), bytes_freed, all_ranges_evicted, total_duration.as_secs_f64() * 1000.0
         );
 
-        Ok((bytes_freed, all_ranges_evicted, deleted_paths))
+        // Already-absent files: metadata entry removed, nothing debited. Benign, and
+        // the count is worth seeing because a persistent non-zero rate means `.meta`
+        // and `ranges/` are drifting apart somewhere upstream of eviction.
+        let already_absent = ranges_deleted.len() - unlinked_extents.len();
+        if already_absent > 0 {
+            warn!(
+                "[RANGE_EVICTION] Some range files were already absent: cache_key={}, requested={}, unlinked={}, already_absent={}, note=stale_metadata_entries_removed_bytes_not_debited",
+                cache_key,
+                ranges_to_delete.len(),
+                unlinked_extents.len(),
+                already_absent
+            );
+        }
+
+        // Requirement 15.4: the durable record of a failed unlink is the retained
+        // `.meta` entry, which the next eviction pass re-selects. This log is the
+        // operator-visible half — a persistent non-zero rate here is a filesystem
+        // problem rather than a cache problem, and without it the retry loop is
+        // silent. The extents are named so the affected object is diagnosable.
+        if !retained_extents.is_empty() {
+            warn!(
+                "[RANGE_EVICTION] Range files could not be deleted and remain on disk: cache_key={}, retained={}, extents={:?}, action=metadata_entries_kept_bytes_still_accounted, retry=next_eviction_pass",
+                cache_key,
+                retained_extents.len(),
+                retained_extents
+            );
+        }
+
+        Ok(BatchRangeDeletion {
+            bytes_freed,
+            all_ranges_evicted,
+            deleted_paths,
+            unlinked_extents,
+            retained_extents,
+        })
     }
 
     /// Batch clean up empty directories after range eviction
@@ -3338,13 +3534,29 @@ impl DiskCacheManager {
     /// - Exact match: requested range exactly matches a cached range
     /// - Full containment: requested range is fully contained within a cached range
     /// - Partial overlap: requested range partially overlaps with cached ranges
+    /// # Lookup purpose (`.kiro/specs/expired-entry-revalidation/`, R1.1-R1.5)
+    ///
+    /// `purpose` decides what happens when the entry's stored `expires_at` has
+    /// passed. `FreshServe` returns no ranges, as this method always did.
+    /// `RevalidationCandidate` continues and reports
+    /// [`crate::cache_types::StoredFreshness::Expired`] on the result, so a caller
+    /// that is about to revalidate can still see the coverage and the validators.
+    ///
+    /// The expiry decision is the **only** thing the two purposes differ on —
+    /// overlap calculation below is shared, so the two cannot drift into
+    /// disagreeing about what is cached.
+    ///
+    /// Returning `StoredFreshness::Expired` grants discovery, never permission to
+    /// serve. See [`crate::cache_types::RangeLookupPurpose`].
     pub async fn find_cached_ranges(
         &self,
         cache_key: &str,
         requested_start: u64,
         requested_end: u64,
         preloaded_metadata: Option<&crate::cache_types::NewCacheMetadata>,
-    ) -> Result<Vec<crate::cache_types::RangeSpec>> {
+        purpose: crate::cache_types::RangeLookupPurpose,
+    ) -> Result<crate::cache_types::RangeLookupResult> {
+        use crate::cache_types::{RangeLookupPurpose, RangeLookupResult, StoredFreshness};
         let operation_start = std::time::Instant::now();
         debug!(
             "Starting range lookup: key={}, requested_range={}-{}, operation=find_cached_ranges",
@@ -3402,23 +3614,58 @@ impl DiskCacheManager {
                     "[RANGE_OVERLAP] Range lookup completed via journal fallback: key={}, requested_range={}-{}, result=journal_hit, ranges={}, duration={:.2}ms",
                     cache_key, requested_start, requested_end, journal_ranges.len(), duration.as_secs_f64() * 1000.0
                 );
-                return Ok(journal_ranges);
+                // Journal records carry no expiry and no validators, so there is
+                // no `expires_at` that could have passed. Reported Fresh, and
+                // their semantics are unchanged by this spec (R1.6, and the
+                // journal exclusion in the design's lookup-result section).
+                return Ok(RangeLookupResult::fresh(journal_ranges));
             }
-            return Ok(Vec::new());
+            return Ok(RangeLookupResult::empty());
         }
 
         let metadata = metadata.unwrap();
 
-        // Check object-level expiration (lazy expiration - Requirement 1.4)
-        // get_metadata() does not check expires_at for range lookups;
-        // the check is deferred here so callers that preload metadata also benefit.
-        if std::time::SystemTime::now() > metadata.expires_at {
-            debug!(
-                "Object expired during range lookup: key={}, expires_at={:?}, result=no_ranges",
-                cache_key, metadata.expires_at
-            );
-            return Ok(Vec::new());
-        }
+        // Object-level stored expiry (lazy expiration - Requirement 1.4).
+        // `get_metadata()` does not check `expires_at` for range lookups; the
+        // check is deferred here so callers that preload metadata also benefit —
+        // both metadata arms above converge on this single point, which is what
+        // makes the policy identical for disk-read and preloaded metadata
+        // (expired-entry-revalidation R1.5).
+        //
+        // What happens past expiry depends on why the caller is asking:
+        //
+        // - `FreshServe`: return nothing, exactly as before. The caller has no
+        //   further gate, so coverage it cannot revalidate must not reach it.
+        // - `RevalidationCandidate`: continue, and mark the result Expired. The
+        //   caller is about to consult live TTL and, if expired, send a
+        //   conditional request carrying these validators. Hiding the coverage
+        //   here is what made that path unreachable (issue #17).
+        let stored_freshness = if std::time::SystemTime::now() > metadata.expires_at {
+            match purpose {
+                RangeLookupPurpose::FreshServe => {
+                    debug!(
+                        "Object expired during range lookup: key={}, expires_at={:?}, \
+                         purpose=FreshServe, stored_freshness=expired, result=no_ranges",
+                        cache_key, metadata.expires_at
+                    );
+                    return Ok(RangeLookupResult::empty());
+                }
+                RangeLookupPurpose::RevalidationCandidate => {
+                    // Requirement 5.3: the Stored_Expired-candidate-selected
+                    // outcome is distinguishable in the logs from a fresh serve
+                    // and from a rejection.
+                    debug!(
+                        "Object expired during range lookup: key={}, expires_at={:?}, \
+                         purpose=RevalidationCandidate, stored_freshness=expired, \
+                         result=candidate_retained_for_live_ttl_evaluation",
+                        cache_key, metadata.expires_at
+                    );
+                    StoredFreshness::Expired
+                }
+            }
+        } else {
+            StoredFreshness::Fresh
+        };
 
         // Find all overlapping ranges
         let mut overlapping_ranges = Vec::new();
@@ -3448,7 +3695,10 @@ impl DiskCacheManager {
                         cache_key, requested_start, requested_end, range_spec.start, range_spec.end, duration.as_secs_f64() * 1000.0
                     );
                     // For exact match, we can return immediately with just this range
-                    return Ok(vec![range_spec.clone()]);
+                    return Ok(RangeLookupResult {
+                        ranges: vec![range_spec.clone()],
+                        stored_freshness,
+                    });
                 }
 
                 // Optimization: Check for full containment
@@ -3459,7 +3709,10 @@ impl DiskCacheManager {
                         cache_key, requested_start, requested_end, range_spec.start, range_spec.end, duration.as_secs_f64() * 1000.0
                     );
                     // For full containment, we can return immediately with just this range
-                    return Ok(vec![range_spec.clone()]);
+                    return Ok(RangeLookupResult {
+                        ranges: vec![range_spec.clone()],
+                        stored_freshness,
+                    });
                 }
             }
         }
@@ -3478,7 +3731,7 @@ impl DiskCacheManager {
                     "[RANGE_OVERLAP] Range lookup completed via journal fallback: key={}, requested_range={}-{}, result=journal_hit, ranges={}, total_cached_ranges={}, duration={:.2}ms",
                     cache_key, requested_start, requested_end, journal_ranges.len(), metadata.ranges.len(), duration.as_secs_f64() * 1000.0
                 );
-                return Ok(journal_ranges);
+                return Ok(RangeLookupResult::fresh(journal_ranges));
             }
 
             debug!(
@@ -3492,7 +3745,10 @@ impl DiskCacheManager {
             );
         }
 
-        Ok(overlapping_ranges)
+        Ok(RangeLookupResult {
+            ranges: overlapping_ranges,
+            stored_freshness,
+        })
     }
 
     /// Load range data from binary file with access tracking
@@ -4086,10 +4342,21 @@ impl DiskCacheManager {
             requested_start, requested_end, cache_key
         );
 
-        // Find cached ranges that cover the full object
+        // FreshServe: this helper returns bytes directly with no freshness gate of
+        // its own. It has no `src/` callers today (test-only surface), but the
+        // conservative purpose is still the correct one — a future production
+        // caller inherits a bounded contract rather than an unbounded one.
+        // Requirement 1.3.
         let overlapping_ranges = self
-            .find_cached_ranges(cache_key, requested_start, requested_end, None)
-            .await?;
+            .find_cached_ranges(
+                cache_key,
+                requested_start,
+                requested_end,
+                None,
+                crate::cache_types::RangeLookupPurpose::FreshServe,
+            )
+            .await?
+            .ranges;
 
         if overlapping_ranges.is_empty() {
             debug!("No cached ranges found for full object: {}", cache_key);
@@ -7894,9 +8161,51 @@ impl CacheKeyValidator {
     }
 }
 
+/// Test-only shims for [`DiskCacheManager::find_cached_ranges`].
+///
+/// The lookup takes an explicit
+/// [`crate::cache_types::RangeLookupPurpose`] and returns a
+/// [`crate::cache_types::RangeLookupResult`] rather than a bare `Vec`, so the
+/// stored-expiry condition travels with the coverage
+/// (`.kiro/specs/expired-entry-revalidation/` R1.2, R1.4).
+///
+/// These shims exist so the ~30 pre-existing overlap-arithmetic tests below —
+/// which are about *geometry*, not freshness — keep reading as one line instead
+/// of destructuring a result they do not care about. **The purpose is still named
+/// at every call site**, in the shim's own name, which is what R1.4 requires: it
+/// forbids a purpose that has to be inferred, not one stated as a word.
+///
+/// Tests that are about freshness call the real API directly with both purposes.
+/// See `find_cached_ranges_purpose_matrix` for the six-case matrix.
+#[cfg(test)]
+impl DiskCacheManager {
+    /// A `FreshServe` lookup, returning just the extents.
+    ///
+    /// Rejects Stored_Expired entries, which is what every caller with no
+    /// downstream freshness gate needs.
+    async fn fresh_serve_ranges(
+        &self,
+        cache_key: &str,
+        requested_start: u64,
+        requested_end: u64,
+    ) -> Result<Vec<crate::cache_types::RangeSpec>> {
+        Ok(self
+            .find_cached_ranges(
+                cache_key,
+                requested_start,
+                requested_end,
+                None,
+                crate::cache_types::RangeLookupPurpose::FreshServe,
+            )
+            .await?
+            .ranges)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_types::{RangeLookupPurpose, StoredFreshness};
     use crate::compression::CompressionAlgorithm;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -10120,6 +10429,134 @@ mod tests {
     // Tests for find_cached_ranges() method
     // ============================================================================
 
+    /// The six-case lookup-purpose matrix.
+    ///
+    /// Spec: `.kiro/specs/expired-entry-revalidation/` R1.1, R1.2, R1.5, R7.5,
+    /// and the `design.md` table it is copied from.
+    ///
+    /// | Metadata source | Stored state | Purpose | Expected |
+    /// |---|---|---|---|
+    /// | Disk | Fresh | FreshServe | overlap, `Fresh` |
+    /// | Disk | Expired | FreshServe | none |
+    /// | Disk | Expired | RevalidationCandidate | overlap, `Expired` |
+    /// | Preloaded | Fresh | FreshServe | overlap, `Fresh` |
+    /// | Preloaded | Expired | FreshServe | none |
+    /// | Preloaded | Expired | RevalidationCandidate | overlap, `Expired` |
+    ///
+    /// # Why both metadata sources, in one test
+    ///
+    /// R1.5 requires the policy to be identical whether metadata is read from
+    /// disk or supplied preloaded: "the same entry SHALL NOT be a candidate on
+    /// one path and an ordinary miss on the other solely because of metadata
+    /// source." The two arms converge on one expiry check today, so this test
+    /// pins that convergence rather than discovering it. Running both sources
+    /// against the *same* seeded entry in one test is what makes them comparable
+    /// — separate tests could drift into seeding differently and stop being a
+    /// statement about the source at all.
+    ///
+    /// The `Fresh`/`RevalidationCandidate` combination is deliberately absent: it
+    /// is not a distinct case. Stored freshness decides the outcome and the
+    /// purpose only matters once expiry has passed, which is exactly the property
+    /// making the two purposes safe to share one overlap calculation. The four
+    /// rows above that vary purpose cover it.
+    #[tokio::test]
+    async fn find_cached_ranges_purpose_matrix() {
+        for stored_expired in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let mut cache_manager =
+                DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+            cache_manager.initialize().await.unwrap();
+            let cache_key = "test-bucket/purpose-matrix";
+
+            let object_metadata = crate::cache_types::ObjectMetadata {
+                etag: "\"matrix-etag\"".to_string(),
+                last_modified: "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+                content_length: 1024,
+                ..Default::default()
+            };
+            cache_manager
+                .store_range(
+                    cache_key,
+                    0,
+                    1023,
+                    &vec![7u8; 1024],
+                    object_metadata,
+                    Duration::from_secs(3600),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            // Drive stored expiry directly. Waiting out a real TTL would make the
+            // test slow and, worse, would move `created_at` too — and this test is
+            // about `expires_at` alone. `created_at` is the *live*-TTL input and is
+            // not read here at all.
+            let meta_path = cache_manager.get_new_metadata_file_path(cache_key);
+            let mut metadata: crate::cache_types::NewCacheMetadata =
+                serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+            metadata.expires_at = if stored_expired {
+                SystemTime::now() - Duration::from_secs(3600)
+            } else {
+                SystemTime::now() + Duration::from_secs(3600)
+            };
+            std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+            // Precondition, asserted rather than assumed: without it a fixture
+            // that failed to move `expires_at` would make the Expired rows pass
+            // vacuously as Fresh rows.
+            assert_eq!(
+                SystemTime::now() > metadata.expires_at,
+                stored_expired,
+                "fixture failed to establish stored_expired={}",
+                stored_expired
+            );
+
+            let preloaded = metadata.clone();
+            for (source, preloaded_arg) in [("disk", None), ("preloaded", Some(&preloaded))] {
+                for purpose in [
+                    RangeLookupPurpose::FreshServe,
+                    RangeLookupPurpose::RevalidationCandidate,
+                ] {
+                    let result = cache_manager
+                        .find_cached_ranges(cache_key, 0, 1023, preloaded_arg, purpose)
+                        .await
+                        .unwrap();
+
+                    let hides = stored_expired && purpose == RangeLookupPurpose::FreshServe;
+                    assert_eq!(
+                        result.ranges.is_empty(),
+                        hides,
+                        "source={source} stored_expired={stored_expired} purpose={purpose:?}: \
+                         expected ranges empty={hides}, got {} range(s)",
+                        result.ranges.len()
+                    );
+
+                    let expected_freshness = if stored_expired && !hides {
+                        StoredFreshness::Expired
+                    } else {
+                        StoredFreshness::Fresh
+                    };
+                    assert_eq!(
+                        result.stored_freshness, expected_freshness,
+                        "source={source} stored_expired={stored_expired} purpose={purpose:?}: \
+                         stored_freshness must be {expected_freshness:?}"
+                    );
+
+                    // R1.2: an expired candidate is discoverable but not
+                    // serveable. Asserted on the marker the serve gate reads, not
+                    // merely on the coverage being present.
+                    if stored_expired && purpose == RangeLookupPurpose::RevalidationCandidate {
+                        assert!(
+                            result.is_stored_expired(),
+                            "an expired candidate must report itself as such, so no caller \
+                             can mistake it for ordinary serveable coverage"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_find_cached_ranges_no_metadata() {
         let temp_dir = TempDir::new().unwrap();
@@ -10131,7 +10568,7 @@ mod tests {
 
         // Find ranges for nonexistent object
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 1023, None)
+            .fresh_serve_ranges(cache_key, 0, 1023)
             .await
             .unwrap();
         assert_eq!(
@@ -10179,7 +10616,7 @@ mod tests {
 
         // Find exact match
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 1023, None)
+            .fresh_serve_ranges(cache_key, 0, 1023)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find exactly one range");
@@ -10225,7 +10662,7 @@ mod tests {
 
         // Request a smaller range that's fully contained
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 1024, 2047, None)
+            .fresh_serve_ranges(cache_key, 1024, 2047)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find the containing range");
@@ -10288,7 +10725,7 @@ mod tests {
 
         // Request range 2048-3071 (no overlap)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 2048, 3071, None)
+            .fresh_serve_ranges(cache_key, 2048, 3071)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 0, "Should find no overlapping ranges");
@@ -10332,7 +10769,7 @@ mod tests {
 
         // Request range 512-1535 (overlaps at start)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 512, 1535, None)
+            .fresh_serve_ranges(cache_key, 512, 1535)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find one overlapping range");
@@ -10378,7 +10815,7 @@ mod tests {
 
         // Request range 512-1535 (overlaps at end)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 512, 1535, None)
+            .fresh_serve_ranges(cache_key, 512, 1535)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find one overlapping range");
@@ -10428,7 +10865,7 @@ mod tests {
 
         // Request range that spans multiple cached ranges (1536-3583)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 1536, 3583, None)
+            .fresh_serve_ranges(cache_key, 1536, 3583)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 3, "Should find three overlapping ranges");
@@ -10493,7 +10930,7 @@ mod tests {
 
         // Request range that spans both
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 512, 1535, None)
+            .fresh_serve_ranges(cache_key, 512, 1535)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 2, "Should find both adjacent ranges");
@@ -10541,28 +10978,28 @@ mod tests {
 
         // Request range ending exactly at cached range start (0-1024)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 1024, None)
+            .fresh_serve_ranges(cache_key, 0, 1024)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should overlap at boundary (inclusive)");
 
         // Request range starting exactly at cached range end (2047-3071)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 2047, 3071, None)
+            .fresh_serve_ranges(cache_key, 2047, 3071)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should overlap at boundary (inclusive)");
 
         // Request range just before cached range (0-1023)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 1023, None)
+            .fresh_serve_ranges(cache_key, 0, 1023)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 0, "Should not overlap");
 
         // Request range just after cached range (2048-3071)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 2048, 3071, None)
+            .fresh_serve_ranges(cache_key, 2048, 3071)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 0, "Should not overlap");
@@ -10607,7 +11044,7 @@ mod tests {
 
         // Request any sub-range
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 2048, 4095, None)
+            .fresh_serve_ranges(cache_key, 2048, 4095)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find the full object range");
@@ -10616,7 +11053,7 @@ mod tests {
 
         // Request full object
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, content_length - 1, None)
+            .fresh_serve_ranges(cache_key, 0, content_length - 1)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find exact match");
@@ -10634,9 +11071,7 @@ mod tests {
         let cache_key = "test-bucket/test-object";
 
         // Request invalid range (start > end)
-        let result = cache_manager
-            .find_cached_ranges(cache_key, 1024, 0, None)
-            .await;
+        let result = cache_manager.fresh_serve_ranges(cache_key, 1024, 0).await;
         assert!(result.is_err(), "Should fail with invalid range");
     }
 
@@ -10682,7 +11117,7 @@ mod tests {
 
         // Find ranges covering bytes 50MB..55MB — should return exactly 5 ranges
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 50 * 1024 * 1024, 55 * 1024 * 1024 - 1, None)
+            .fresh_serve_ranges(cache_key, 50 * 1024 * 1024, 55 * 1024 * 1024 - 1)
             .await
             .unwrap();
 
@@ -10751,7 +11186,7 @@ mod tests {
 
         // Find all ranges
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 10239, None)
+            .fresh_serve_ranges(cache_key, 0, 10239)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 3);
@@ -10808,7 +11243,7 @@ mod tests {
 
         // Request single byte range
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 512, 512, None)
+            .fresh_serve_ranges(cache_key, 512, 512)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find containing range");
@@ -10869,7 +11304,7 @@ mod tests {
         // Find ranges - should complete in under 10ms as per requirement 2.3
         let start_time = std::time::Instant::now();
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 500 * 1024 * 1024, 510 * 1024 * 1024 - 1, None)
+            .fresh_serve_ranges(cache_key, 500 * 1024 * 1024, 510 * 1024 * 1024 - 1)
             .await
             .unwrap();
         let elapsed = start_time.elapsed();
@@ -10953,7 +11388,7 @@ mod tests {
 
         // Request range that spans all cached ranges and gaps (0-11999)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 11999, None)
+            .fresh_serve_ranges(cache_key, 0, 11999)
             .await
             .unwrap();
 
@@ -11048,7 +11483,7 @@ mod tests {
 
         // Request range 500-6500 (spans all 3 ranges with gaps)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 500, 6500, None)
+            .fresh_serve_ranges(cache_key, 500, 6500)
             .await
             .unwrap();
 
@@ -11110,7 +11545,7 @@ mod tests {
 
         // Request entire object (0-102399)
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 102399, None)
+            .fresh_serve_ranges(cache_key, 0, 102399)
             .await
             .unwrap();
 
@@ -11674,7 +12109,7 @@ mod tests {
 
         // Simulate a request for range 1024-2047
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 1024, 2047, None)
+            .fresh_serve_ranges(cache_key, 1024, 2047)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find exact match");
@@ -12147,7 +12582,7 @@ mod tests {
 
         // Test range at start
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 1023, None)
+            .fresh_serve_ranges(cache_key, 0, 1023)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find range covering start");
@@ -12160,21 +12595,21 @@ mod tests {
 
         // Test range in middle
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 5000, 6000, None)
+            .fresh_serve_ranges(cache_key, 5000, 6000)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find range covering middle");
 
         // Test range at end
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 9000, 10239, None)
+            .fresh_serve_ranges(cache_key, 9000, 10239)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find range covering end");
 
         // Test full range
         let ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 10239, None)
+            .fresh_serve_ranges(cache_key, 0, 10239)
             .await
             .unwrap();
         assert_eq!(ranges.len(), 1, "Should find range covering entire object");
@@ -12270,11 +12705,11 @@ mod tests {
 
         // Both should be retrievable using the same mechanisms
         let full_obj_ranges = cache_manager
-            .find_cached_ranges(cache_key, 0, 10239, None)
+            .fresh_serve_ranges(cache_key, 0, 10239)
             .await
             .unwrap();
         let partial_ranges = cache_manager
-            .find_cached_ranges(cache_key2, 0, 1023, None)
+            .fresh_serve_ranges(cache_key2, 0, 1023)
             .await
             .unwrap();
 
@@ -13583,25 +14018,38 @@ mod tests {
         // Delete ranges 0-999, 2000-2999, 4000-4999 (3 of 5)
         let ranges_to_delete = vec![(0u64, 999u64), (2000u64, 2999u64), (4000u64, 4999u64)];
 
-        let (bytes_freed, all_evicted, deleted_paths) = cache_manager
+        let deletion = cache_manager
             .batch_delete_ranges(cache_key, &ranges_to_delete)
             .await
             .unwrap();
 
         // Verify bytes_freed = 3 * 1000 = 3000
         assert_eq!(
-            bytes_freed, 3000,
+            deletion.bytes_freed, 3000,
             "bytes_freed should equal sum of deleted file sizes"
         );
 
         // Verify not all ranges evicted (2 remain)
         assert!(
-            !all_evicted,
+            !deletion.all_ranges_evicted,
             "all_evicted should be false when some ranges remain"
         );
 
         // Verify 3 paths were deleted
-        assert_eq!(deleted_paths.len(), 3, "Should have 3 deleted file paths");
+        assert_eq!(
+            deletion.deleted_paths.len(),
+            3,
+            "Should have 3 deleted file paths"
+        );
+
+        // R7.2: every requested extent existed and unlinked cleanly here, so the
+        // accounting set must match the request set exactly.
+        let mut unlinked = deletion.unlinked_extents.clone();
+        unlinked.sort_unstable();
+        assert_eq!(
+            unlinked, ranges_to_delete,
+            "all three .bin files were deletable, so all three extents must be reported unlinked"
+        );
 
         // Verify the .bin files for deleted ranges no longer exist
         for (start, end) in &ranges_to_delete {
@@ -13716,26 +14164,39 @@ mod tests {
         // Delete all 4 ranges — 2 exist on disk, 2 are missing
         let ranges_to_delete: Vec<(u64, u64)> = all_ranges.clone();
 
-        let (bytes_freed, all_evicted, deleted_paths) = cache_manager
+        let deletion = cache_manager
             .batch_delete_ranges(cache_key, &ranges_to_delete)
             .await
             .unwrap();
 
         // bytes_freed should only count the 2 files that existed (2 * 500 = 1000)
         assert_eq!(
-            bytes_freed, 1000,
+            deletion.bytes_freed, 1000,
             "bytes_freed should only count files that existed on disk"
         );
 
         // All ranges evicted from metadata (even missing files get removed from metadata)
         assert!(
-            all_evicted,
+            deletion.all_ranges_evicted,
             "all_evicted should be true when all ranges are removed from metadata"
+        );
+
+        // R7.2: an ALREADY-ABSENT `.bin` is excluded from the accounting set even
+        // though it IS removed from the `.meta`. The two sets diverging is the whole
+        // point of reporting them separately — `ranges_deleted` (metadata) is all four,
+        // `unlinked_extents` (accounting) is the two that existed.
+        let mut unlinked = deletion.unlinked_extents.clone();
+        unlinked.sort_unstable();
+        assert_eq!(
+            unlinked,
+            vec![(0u64, 999u64), (2000u64, 2999u64)],
+            "only extents whose .bin existed and was unlinked may be reported for debit"
         );
 
         // deleted_paths should contain only the 2 files that were actually deleted,
         // plus the metadata file and lock file that get cleaned up when all ranges are evicted
-        let bin_deleted: Vec<_> = deleted_paths
+        let bin_deleted: Vec<_> = deletion
+            .deleted_paths
             .iter()
             .filter(|p| p.to_string_lossy().ends_with(".bin"))
             .collect();
@@ -13761,6 +14222,222 @@ mod tests {
         assert!(
             !metadata_path.exists(),
             "Metadata file should be deleted when all ranges are evicted"
+        );
+
+        // R15.2: an already-absent `.bin` is NOT a retained range. This is the arm that
+        // stops the R15.2 fix being over-broad: a naive "retain whenever the unlink did
+        // not succeed" would land these four here, keep the `.meta` forever, and make
+        // the object permanently unevictable — every later pass re-selecting the same
+        // ranges and hitting the same absent files. Nothing survives on disk here, so
+        // there is nothing to orphan and nothing to retry.
+        assert!(
+            deletion.retained_extents.is_empty(),
+            "an absent .bin leaves nothing on disk, so no range may be retained: {:?}",
+            deletion.retained_extents
+        );
+    }
+
+    /// A range whose `.bin` unlink fails must keep its `.meta` entry, and the object
+    /// must keep its `.meta` file (Requirements 15.2, 15.3), while a range that
+    /// unlinks cleanly still evicts fully.
+    ///
+    /// **The `src/` line this exercises** is the metadata-removal decision in
+    /// `batch_delete_ranges`'s result loop — the `ranges_deleted.push(range_key)`
+    /// that ran unconditionally under the comment "Always mark range for metadata
+    /// removal (file may already be gone)", now the `match` on
+    /// [`RangeUnlinkOutcome`] — and the `.meta` unlink it gates via
+    /// `all_ranges_evicted`.
+    ///
+    /// **Red side, measured** against that unconditional push: the locked object's
+    /// `.meta` is DELETED and its range list is gone, i.e. a `.bin` sitting on the
+    /// volume with no metadata anywhere referencing it. § 15.1 is why that is
+    /// permanent rather than merely untidy — both validation scan modes root at
+    /// `metadata/` and never read `ranges/`, so the file is invisible to accounting
+    /// and to every reclamation path that exists today.
+    ///
+    /// **This asserts the composed post-Phase-1 contract**, not only task 3's half. A
+    /// failed unlink must leave all three of: the bytes still credited (task 2 — via
+    /// `unlinked_extents` and `bytes_freed`, which are the caller's only debit
+    /// inputs), the range still listed in the `.meta` (task 3), and the `.meta` itself
+    /// present (task 3). Asserting them together is the point: task 2's narrowing is
+    /// only *correct* if the bytes stay reachable through metadata, and task 3's
+    /// retention is only *safe* if those bytes are not also debited. Either fix alone
+    /// leaves a hole the other closes.
+    ///
+    /// Spec: cache-eviction-at-scale. Requirements: 15.2, 15.3, 15.4
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_unlink_keeps_the_range_in_metadata_and_keeps_the_meta_file() {
+        use crate::cache_types::CompressionInfo;
+        use std::os::unix::fs::PermissionsExt;
+
+        const RANGE_BYTES: u64 = 4096;
+        const DELETABLE_KEY: &str = "test-bucket/r15-deletable";
+        const LOCKED_KEY: &str = "test-bucket/r15-locked";
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        // Plant a single-range object with its `.bin` on disk and a matching `.meta`.
+        // Single-range deliberately: it is what makes the `.meta` deletion happen at
+        // all, so one fixture exercises R15.2 (range stripped) and R15.3 (`.meta`
+        // unlinked) together — the exact sequence R15.13 asks to be shown failing.
+        let plant = |key: &str| -> (PathBuf, PathBuf) {
+            let now = SystemTime::now();
+            let bin_path = cache_manager.get_new_range_file_path(key, 0, RANGE_BYTES - 1);
+            std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+            std::fs::write(&bin_path, vec![0xABu8; RANGE_BYTES as usize]).unwrap();
+
+            let metadata = crate::cache_types::NewCacheMetadata {
+                cache_key: key.to_string(),
+                object_metadata: crate::cache_types::ObjectMetadata::default(),
+                ranges: vec![crate::cache_types::RangeSpec {
+                    start: 0,
+                    end: RANGE_BYTES - 1,
+                    file_path: bin_path
+                        .strip_prefix(temp_dir.path().join("ranges"))
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                    compression_algorithm: CompressionAlgorithm::Lz4,
+                    compressed_size: RANGE_BYTES,
+                    uncompressed_size: RANGE_BYTES,
+                    created_at: now,
+                    last_accessed: now,
+                    access_count: 1,
+                    staged: None,
+                }],
+                created_at: now,
+                expires_at: now + Duration::from_secs(3600),
+                compression_info: CompressionInfo::default(),
+                ..Default::default()
+            };
+
+            let meta_path = cache_manager.get_new_metadata_file_path(key);
+            std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+            std::fs::write(&meta_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+            (bin_path, meta_path)
+        };
+
+        let (deletable_bin, deletable_meta) = plant(DELETABLE_KEY);
+        let (locked_bin, locked_meta) = plant(LOCKED_KEY);
+
+        // The two objects must not share a `ranges/` leaf, or the read-only directory
+        // would block both unlinks and the control arm would prove nothing. BLAKE3
+        // sharding makes this true for these keys; assert it so a sharding change fails
+        // here with a reason rather than silently disarming the test.
+        let locked_dir = locked_bin.parent().unwrap().to_path_buf();
+        assert_ne!(
+            deletable_bin.parent().unwrap(),
+            locked_dir,
+            "fixture requires the two ranges in different leaf directories"
+        );
+
+        // The lever: on Unix `unlink` needs write permission on the PARENT directory,
+        // not on the file, so a read-only parent fails the unlink with EACCES while
+        // `metadata()` still succeeds. That is the genuine "unlink failed, bytes remain
+        // on the volume" case — distinct from "file already gone", which
+        // `test_batch_delete_ranges_missing_files` covers and which must behave the
+        // opposite way.
+        let original_mode = std::fs::metadata(&locked_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let locked = cache_manager
+            .batch_delete_ranges(LOCKED_KEY, &[(0, RANGE_BYTES - 1)])
+            .await
+            .unwrap();
+
+        // Restore before any assertion can fail, so TempDir cleanup is not left
+        // fighting a read-only directory.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+
+        // Precondition, asserted rather than assumed: the lever actually bit. Running as
+        // root would delete the file regardless of directory mode, and then every
+        // assertion below would be measuring the clean-unlink path under the locked
+        // name — passing while proving nothing about orphan production.
+        assert!(
+            locked_bin.exists(),
+            "the undeletable .bin must survive — otherwise the read-only-directory lever \
+             did not bite (running as root?) and this test cannot distinguish a failed \
+             unlink from a successful one"
+        );
+
+        // --- The composed post-Phase-1 contract for a failed unlink ---
+
+        // (1) task 3, R15.3: the `.meta` survives, because a `.bin` does.
+        assert!(
+            locked_meta.exists(),
+            "R15.3: the .meta must not be deleted while a .bin survives — deleting it is \
+             what makes the surviving file an orphan invisible to the metadata-rooted \
+             validation scan"
+        );
+
+        // (2) task 3, R15.2: the range is still LISTED. Read the `.meta` back and check
+        // the `ranges` array, not merely that the file exists — file existence is
+        // satisfied by an object whose other ranges happen to remain, and here it would
+        // also be satisfied by a `.meta` rewritten to an empty range list.
+        let persisted: crate::cache_types::NewCacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&locked_meta).unwrap()).unwrap();
+        assert_eq!(
+            persisted
+                .ranges
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect::<Vec<_>>(),
+            vec![(0u64, RANGE_BYTES - 1)],
+            "R15.2: a range whose .bin unlink failed must remain in the .meta ranges array"
+        );
+        assert!(
+            !locked.all_ranges_evicted,
+            "all_ranges_evicted must be false while a .bin survives"
+        );
+
+        // (3) task 2, R7.2: the bytes stay credited, because the caller's debit is built
+        // from `unlinked_extents` and `bytes_freed` and neither includes this range.
+        // Without this, task 3's retention would keep a range in the `.meta` whose bytes
+        // had already been subtracted — accounted twice in opposite directions.
+        assert!(
+            locked.unlinked_extents.is_empty(),
+            "nothing left the disk, so nothing may be offered for debit: {:?}",
+            locked.unlinked_extents
+        );
+        assert_eq!(
+            locked.bytes_freed, 0,
+            "no bytes were freed — the file is still on the volume"
+        );
+
+        // (4) R15.4: the failure is reported, and the retained `.meta` entry above IS
+        // the durable record that makes the next pass retry it.
+        assert_eq!(
+            locked.retained_extents,
+            vec![(0u64, RANGE_BYTES - 1)],
+            "R15.4: a range left behind by a failed unlink must be reported"
+        );
+
+        // --- Control arm: a clean unlink still evicts fully ---
+        //
+        // Without this, a fix that simply stopped removing ranges from the `.meta`
+        // altogether would pass every assertion above.
+        let clean = cache_manager
+            .batch_delete_ranges(DELETABLE_KEY, &[(0, RANGE_BYTES - 1)])
+            .await
+            .unwrap();
+
+        assert!(!deletable_bin.exists(), "the deletable .bin must be gone");
+        assert!(
+            !deletable_meta.exists(),
+            "R15.3 must not block the normal path: with no .bin surviving, the .meta goes"
+        );
+        assert!(clean.all_ranges_evicted);
+        assert_eq!(clean.unlinked_extents, vec![(0u64, RANGE_BYTES - 1)]);
+        assert_eq!(clean.bytes_freed, RANGE_BYTES);
+        assert!(
+            clean.retained_extents.is_empty(),
+            "a clean unlink retains nothing"
         );
     }
 

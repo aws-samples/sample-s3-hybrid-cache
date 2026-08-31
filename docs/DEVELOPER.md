@@ -850,34 +850,27 @@ pub fn consolidate_missing_ranges(&self, missing_ranges: Vec<RangeSpec>, max_gap
 **Solution**: 60-second admission window protection
 ```rust
 // Admission window: skip ranges cached within the last 60 seconds
-if !bypass_admission_window {
-    let now = SystemTime::now();
-    let admission_window = Duration::from_secs(60);
-    if let Ok(age) = now.duration_since(range_spec.last_accessed) {
-        if age < admission_window {
-            // Skip this range as eviction candidate
-            continue;
-        }
+let now = SystemTime::now();
+let admission_window = Duration::from_secs(60);
+if let Ok(age) = now.duration_since(range_spec.last_accessed) {
+    if age < admission_window {
+        // Skip this range as eviction candidate
+        continue;
     }
 }
 ```
 
-**Critical Capacity Bypass**: When cache exceeds 110% of limit, admission window is bypassed:
-```rust
-let bypass_admission_window = current_size > max_cache_size * 1.10;
-```
+The window is unconditional — there is no bypass at any cache usage level.
 
 **Benefits**:
 - Prevents cache thrashing during large file downloads
 - Allows new ranges to accumulate access statistics
 - Protects investment in recently cached data
-- Emergency bypass prevents disk space exhaustion
 
 **Rationale**:
 - New ranges have zero frequency in TinyLFU algorithm
 - Without protection, they'd be evicted immediately
 - 60 seconds allows ranges to build access history
-- 110% bypass ensures system stability under extreme load
 
 ### 3. Eviction Buffer Strategy
 

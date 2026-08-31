@@ -1016,6 +1016,7 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
             },
             None,
             None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
         )
         .await
         .expect("find_cached_ranges should succeed");

@@ -860,11 +860,7 @@ async fn test_signed_range_hedging_enabled_slow_original_hedge_wins() {
 
     let resolved = resolved_with_hedging(true, Duration::from_millis(50), 1);
     let range_spec = s3_proxy::range_handler::RangeSpec { start: 0, end: 3 };
-    let overlap = s3_proxy::range_handler::RangeOverlap {
-        cached_ranges: Vec::new(),
-        missing_ranges: vec![range_spec.clone()],
-        can_serve_from_cache: false,
-    };
+    let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec);
     let mut signed_headers = HashMap::new();
     signed_headers.insert(
         "authorization".to_string(),
@@ -945,11 +941,7 @@ async fn test_signed_range_hedging_disabled_no_hedge_issued() {
 
     let resolved = resolved_with_hedging(false, Duration::from_millis(50), 1);
     let range_spec = s3_proxy::range_handler::RangeSpec { start: 0, end: 3 };
-    let overlap = s3_proxy::range_handler::RangeOverlap {
-        cached_ranges: Vec::new(),
-        missing_ranges: vec![range_spec.clone()],
-        can_serve_from_cache: false,
-    };
+    let overlap = s3_proxy::range_handler::RangeOverlap::all_missing(&range_spec);
     let mut signed_headers = HashMap::new();
     signed_headers.insert(
         "authorization".to_string(),

@@ -125,7 +125,13 @@ async fn test_partial_cache_hit_scenario() {
 
     // Find cached ranges that overlap with the request
     let overlap = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -278,7 +284,13 @@ async fn test_partial_cache_hit_scenario() {
     // Step 7: Verify missing ranges are now cached
     // Request the same range again
     let overlap_after = range_handler
-        .find_cached_ranges(&cache_key, &requested_range, None, None)
+        .find_cached_ranges(
+            &cache_key,
+            &requested_range,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 

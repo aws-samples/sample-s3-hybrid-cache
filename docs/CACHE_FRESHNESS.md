@@ -37,10 +37,25 @@ cache:
 When an expired entry is accessed in lazy mode, the proxy uses HTTP conditional requests to validate freshness:
 1. Sends `If-None-Match` with the cached ETag and `If-Modified-Since` with the cached `Last-Modified` timestamp
 2. If S3 returns `304 Not Modified`: Object unchanged, TTL refreshed, cached data served (no data transfer)
-3. If S3 returns `200 OK`: Object changed, old cached data actively removed, fresh data fetched and cached
-4. If S3 returns `403 Forbidden` or `401 Unauthorized`: Error returned to client, cached data preserved (a credentials failure is not a data change — cached data remains valid for other authorized callers)
+3. If S3 returns `200 OK` (or `206 Partial Content` for a range request): Object changed, **all** old cached coverage for that key is invalidated, fresh data fetched and cached
+4. If S3 returns `403 Forbidden` or `401 Unauthorized`: Error returned to client, cached data preserved (a credentials failure is not a data change — cached data remains valid for other authorized callers). The proxy does **not** serve the expired data in this case.
+
+This applies to full-object GETs and to byte-range GETs alike. A range revalidation carries the client's original `Range` header **unchanged** — including suffix (`bytes=-512`) and open-ended (`bytes=1024-`) forms — so a client that signs `Range` as part of its SigV4 `SignedHeaders` is unaffected.
+
+If the client sent its own `If-None-Match` or `If-Modified-Since`, the proxy does not inject its own validators on top; the client's precondition is forwarded and evaluated as the client intended.
 
 This approach minimizes bandwidth usage while ensuring cache freshness and consistency.
+
+**Expiry is a revalidation boundary, not a disappearance.**
+
+This distinction matters when reasoning about what an expired entry costs you. Once `get_ttl` elapses, the cached metadata, ETag and range files are all still present under lazy expiration, and the proxy uses them: the entry becomes a *revalidation candidate*. An unchanged object then costs one conditional round trip and no body transfer, however large it is.
+
+Two limits on that, both worth knowing:
+
+- **The candidate only exists while its files do.** Active expiration (`actively_remove_cached_data: true`) and capacity eviction both delete expired entries on their own schedule. Once either has, there is nothing to revalidate against and the next request is an ordinary miss that transfers the body. This is the intended behaviour, not a regression — but it means the round-trip saving above is a property of lazy expiration plus available capacity, not a guarantee.
+- **Incomplete coverage is still a miss.** If metadata claims a range the proxy cannot actually read — the `.bin` is gone, or the cached extents do not cover the whole request — the proxy fetches rather than serving bytes it cannot prove it has. A `304` proves the *version* is current; it does not prove the cache still *covers* the request.
+
+**Availability exception: coordinated stale-if-error.** When several concurrent requests for the same key are coalesced and the authoritative revalidation fails with a transport error or a retryable upstream `5xx`, the waiters may be served the cached data rather than an error. This is a deliberate availability trade-off and is the *only* case in which expired data is served without a successful validation. It does not extend to `403`, `401`, signature failures, or any other client error, all of which return the error to the client.
 
 The proxy handles conditional headers in three semantically distinct ways, configurable via `cache.evaluate_conditions_from_cache` (default `true`).
 
@@ -370,7 +385,22 @@ Client GET → Proxy checks cache → GET_TTL expired
 
 Both headers are sent when available. If only one is present (e.g., ETag absent for objects PUT through the proxy before v1.8.3), the proxy sends whichever is available. If neither is present (metadata unreadable), the proxy falls back to an unconditional GET.
 
-If S3 returns 403 or 401 during revalidation (expired credentials, revoked access), the proxy returns the error to the client without invalidating the cache. A credentials failure is not a data change — the cached data remains valid for other authorized callers.
+If S3 returns 403 or 401 during revalidation (expired credentials, revoked access), the proxy returns the error to the client without invalidating the cache. A credentials failure is not a data change — the cached data remains valid for other authorized callers. The expired data is not served either.
+
+**Byte-range requests take the same path.** A range GET of an expired-but-present entry revalidates exactly as above when the cache has complete coverage for the requested interval:
+
+```
+Client GET bytes=1024-2047 → Proxy checks cache → complete coverage, GET_TTL expired
+          → Conditional request carrying BOTH:
+             - the client's original Range header, byte-for-byte
+             - If-None-Match / If-Modified-Since from cached metadata
+          → 304 Not Modified: TTL refreshed, requested bytes served from cache as 206
+          → 206/200 with a new ETag: all old coverage invalidated, fresh bytes fetched
+```
+
+The `Range` header is forwarded unmodified rather than rebuilt from parsed offsets, which keeps suffix and open-ended forms intact and keeps a signed `Range` valid.
+
+If coverage is only partial, the request is not treated as a conditional cache hit — the existing missing-range and repair machinery fetches the gaps.
 
 #### Scenario 3d: HEAD Detects Object Change (Range Invalidation)
 

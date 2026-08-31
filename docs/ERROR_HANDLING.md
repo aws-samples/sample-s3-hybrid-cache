@@ -448,6 +448,11 @@ every `cache.shared_storage.orphan_recovery_interval` (default `300s`) while
 `orphan_scan_timeout` (default `30s`) and `orphan_max_per_cycle` (default `100`) so a
 large cache cannot let one scan block other operations.
 
+A second, startup-only sweep for orphan `.bin` files is **disabled** and removes nothing —
+on a shared cache volume it could not tell an orphan from a range file another instance had
+just written, so orphan `.bin` files left by a crashed writer now persist. See
+[SHARED_STORAGE.md — Orphan recovery](SHARED_STORAGE.md#orphan-recovery).
+
 To make cleanup less or more aggressive, tune those fields rather than driving cleanup
 externally. See [Configuration — Cache Size Tracking](CONFIGURATION.md#cache-size-tracking)
 and [SHARED_STORAGE.md — Orphan recovery](SHARED_STORAGE.md#orphan-recovery).

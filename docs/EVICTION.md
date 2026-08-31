@@ -76,8 +76,51 @@ range; it is a partial cache miss rather than a cache hit.
 2. Sort       → Order by eviction algorithm (LRU: oldest first, TinyLFU: lowest score first)
 3. Group      → Batch ranges by object for efficient metadata updates
 4. Evict      → Delete .bin files, update metadata atomically (one write per object)
-5. Cleanup    → Delete .meta when empty, remove empty directories
+5. Account    → Subtract the bytes of the files that were actually deleted
+6. Cleanup    → Delete .meta when empty, remove empty directories
 ```
+
+### When a range file cannot be deleted
+
+Step 5 subtracts only range files that were present and removed without error. A file the
+proxy could not delete — a read-only or full cache volume, restrictive directory
+permissions, or an underlying I/O error — keeps its bytes counted, because they are still
+occupying the volume. Discounting them would make the cache appear smaller than it is and
+admit new data against space that was never freed, and the error compounds with each
+failed delete until the cache exceeds `cache.max_cache_size` with no figure showing it.
+
+The range also keeps its entry in the object's metadata, and the object keeps its metadata
+file even when every other range has been evicted. Removing the entry would leave a range
+file that no metadata refers to. Nothing would then reclaim it: the consistency scan reads
+the metadata tree and never lists range directories, so a range file with no metadata entry
+is invisible to it — its space is neither freed nor reported for the life of the cache.
+Keeping the entry keeps the file both accounted for and reachable.
+
+The practical consequence is that a deployment in this state does not quietly drift over
+its limit; instead `cache.total_cache_size` stays honest, so the eviction trigger keeps
+firing and eviction keeps attempting the same files. Because the entry is still in the
+metadata, the next pass sees the range as a candidate again and retries the delete, so a
+transient error resolves itself without operator action and a persistent one keeps
+reporting. That is the intended behaviour and the signal to fix the underlying cause. Each
+pass logs a warning naming the affected object:
+
+```
+[EVICTION_ACCOUNTING] Skipped debit for range files that did not leave the disk: cache_key=..., candidates=3, skipped=1
+[RANGE_EVICTION] Failed to delete range file: cache_key=..., range_start=..., range_end=..., error=..., action=retaining_metadata_entry_for_retry
+[RANGE_EVICTION] Range files could not be deleted and remain on disk: cache_key=..., retained=1, extents=[(0, 4095)], action=metadata_entries_kept_bytes_still_accounted, retry=next_eviction_pass
+```
+
+`ranges_evicted` in the `[DISK_CACHE_EVICTION]` summary counts the same set that was
+accounted for, so it reports ranges genuinely removed rather than ranges selected.
+
+A range file that was **already absent** is treated differently, and the difference matters
+in both directions. Its bytes are not subtracted, because there are no bytes to reclaim and
+the proxy cannot tell whether they were already accounted for when the file went —
+reconciling that is the job of the consistency scan, not of eviction. But its metadata entry
+*is* removed, and the object's metadata file is deleted if that was the last entry, because
+the entry points at a file that does not exist. Keeping it would leave the object
+permanently unevictable: every later pass would select the same range and fail on the same
+absent file.
 
 ## Per-Range Access Tracking
 
@@ -158,31 +201,7 @@ Large file download in progress:
 - Allows new ranges to build access history before eviction decisions
 - Reduces cache thrashing during streaming downloads
 
-### Critical Capacity Bypass
-
-When cache usage exceeds 110% of the configured limit, the admission window protection is bypassed to aggressively reclaim space.
-
-**Trigger Condition:**
-```
-current_cache_size > max_cache_size * 1.10
-```
-
-**Behavior:**
-- Normal eviction (≤110%): Respects 60-second admission window
-- Critical eviction (>110%): Bypasses admission window, all ranges are eviction candidates
-
-**Why This Exists:**
-
-In extreme scenarios (rapid writes, burst traffic), the cache can exceed its limit faster than normal eviction can reclaim space. The critical bypass ensures:
-- Cache size is brought under control quickly
-- Disk space exhaustion is prevented
-- System stability is maintained even under heavy load
-
-**Logging:**
-```
-INFO [DISK_CACHE_EVICTION] Critical capacity exceeded (11.5 GiB / 10 GiB = 115%), bypassing admission window
-INFO [DISK_CACHE_EVICTION] Eviction completed: ranges_evicted=150, freed=2.0 GiB, new_usage=9.5 GiB / 10 GiB (95.0%)
-```
+**The window has no bypass.** A range younger than 60 seconds is never an eviction candidate, however far over its limit the cache is. Earlier versions of this document described a "critical capacity bypass" above 110% of the limit; no such path was ever implemented, and the flag that would have carried it has been removed.
 
 ## Logging
 

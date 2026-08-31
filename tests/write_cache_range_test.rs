@@ -122,7 +122,13 @@ async fn test_range_request_from_write_cache() {
 
     // Find cached ranges
     let overlap = range_handler
-        .find_cached_ranges(cache_key, &range_spec, None, None)
+        .find_cached_ranges(
+            cache_key,
+            &range_spec,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
@@ -195,7 +201,13 @@ async fn test_range_request_from_write_cache() {
     println!("\nTest 3: Verifying range access after TTL transition...");
 
     let overlap2 = range_handler
-        .find_cached_ranges(cache_key, &range_spec, None, None)
+        .find_cached_ranges(
+            cache_key,
+            &range_spec,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
     assert!(
@@ -224,7 +236,13 @@ async fn test_range_request_from_write_cache() {
     let range_spec2 = RangeSpec { start: 0, end: 4 };
 
     let overlap3 = range_handler
-        .find_cached_ranges(cache_key, &range_spec2, None, None)
+        .find_cached_ranges(
+            cache_key,
+            &range_spec2,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
     assert!(
@@ -341,7 +359,13 @@ async fn test_full_object_range_from_write_cache() {
     };
 
     let overlap = range_handler
-        .find_cached_ranges(cache_key, &range_spec, None, None)
+        .find_cached_ranges(
+            cache_key,
+            &range_spec,
+            None,
+            None,
+            s3_proxy::cache_types::RangeLookupPurpose::FreshServe,
+        )
         .await
         .unwrap();
 
