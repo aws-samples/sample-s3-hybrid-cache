@@ -629,6 +629,48 @@ pub async fn forward_signed_request_with_body(
     .await
 }
 
+/// Does the serialized outbound header block advertise `Transfer-Encoding:
+/// chunked`?
+///
+/// chunked-request-framing (GitHub issue #19) R1.3: the re-framing decision is
+/// evaluated against the header block actually being sent to the upstream —
+/// not the inbound request's header map and not a config field or heuristic —
+/// so that a future header rewrite between "decide the headers" and "send the
+/// headers" cannot desynchronize the framing decision from what really goes on
+/// the wire. `header_block` is the exact bytes `forward_signed_request_streaming`
+/// writes to the socket, so scanning it directly is the ground truth.
+///
+/// This is a plain case-insensitive substring scan of the raw serialized
+/// header block, matching the header name followed by its value, on its own
+/// line. HTTP header names and the `chunked` token are case-insensitive; the
+/// header block itself is built with `\r\n`-terminated lines by this same
+/// function, so scanning for `\r\ntransfer-encoding:` (with a leading `\r\n`
+/// this function's own request line ends with) is a real line-boundary match,
+/// not a substring that could appear inside a header value.
+fn header_block_advertises_chunked_transfer_encoding(header_block: &[u8]) -> bool {
+    let lower = header_block.to_ascii_lowercase();
+    // Each header line in `header_block` is written as `\r\n{name}: {value}\r\n`,
+    // so prefixing the needle with `\r\n` anchors the match to a line start
+    // rather than to a byte sequence that happens to appear inside a header
+    // value (e.g. a `Referer` URL path segment).
+    let needle = b"\r\ntransfer-encoding:";
+    let Some(pos) = lower
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + needle.len())
+    else {
+        return false;
+    };
+    // From the end of the header name to the end of that line is the value.
+    let rest = &lower[pos..];
+    let line_end = rest
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(rest.len());
+    let value = &rest[..line_end];
+    value.windows(b"chunked".len()).any(|w| w == b"chunked")
+}
+
 /// Forward a signed request by **streaming** the body to the upstream
 /// frame-by-frame (the Streaming_Write_Path), instead of buffering the whole body
 /// in RAM first.
@@ -638,11 +680,25 @@ pub async fn forward_signed_request_with_body(
 /// [`forward_signed_request_with_body`]: the same request line, the same
 /// `headers.iter()` order and casing, and the same Referer-injection rules. This
 /// is load-bearing for SigV4 — any drift in header order, casing, or values
-/// invalidates the signature (Requirements 4.1, 4.2, 4.3, 4.4). Only the body
-/// handling changes: each client body frame is written to the upstream verbatim
-/// with an awaited `write_all`, so the proxy never holds the whole body in memory
+/// invalidates the signature (Requirements 4.1, 4.2, 4.3, 4.4). The signed bytes
+/// and the header block are always forwarded verbatim; the body, however, is
+/// re-transmitted rather than merely relayed (chunked-request-framing, GitHub
+/// issue #19): each client body frame is written to the upstream with an
+/// awaited `write_all`, so the proxy never holds the whole body in memory
 /// (Requirements 1.1, 1.2, 1.3) and the awaited write provides the primary
-/// backpressure to the client (Requirement 2.1).
+/// backpressure to the client (Requirement 2.1). WHEN the outbound request
+/// advertises `Transfer-Encoding: chunked`, the frame's bytes are wrapped in a
+/// fresh HTTP chunk (`{len:x}\r\n{data}\r\n`), because hyper has already
+/// stripped that outer framing on the way in and this function is what
+/// restores it on the way out — the bytes forwarded are the client's, but the
+/// transport framing around them is the proxy's, not a passthrough of what it
+/// received. For every other request shape (no `Transfer-Encoding: chunked`
+/// header on the outbound side) the frame is still written raw, unchanged from
+/// before this fix. See [`header_block_advertises_chunked_transfer_encoding`] for
+/// the exact condition and R1-R2 in `.kiro/specs/chunked-request-framing/` for
+/// why this is required rather than optional: a raw write of a chunked body's
+/// already-unwrapped frames produces bytes S3 cannot parse as either valid
+/// HTTP chunking or a valid Content-Length body.
 ///
 /// The upstream connection, transport selection, and the
 /// `UpstreamTlsValidationFailed` mapping are unchanged — they live entirely in
@@ -785,6 +841,17 @@ where
     // End of headers
     header_block.extend_from_slice(b"\r\n");
 
+    // chunked-request-framing (GitHub issue #19, R1.1-R1.3): decide whether the
+    // body must be re-framed as HTTP chunked transfer-encoding, or written raw
+    // as before. Evaluated against the serialized `header_block` actually being
+    // sent — not the inbound `headers` map and not a config field or client
+    // heuristic — so that a future header rewrite cannot desynchronize the
+    // condition from what really goes on the wire. Today `header_block` is a
+    // byte-for-byte copy of `headers` (plus an optional Referer line that never
+    // sets this header), so this is equivalent to testing `headers` directly,
+    // but testing the sent bytes is what R1.3 requires.
+    let chunked_outbound = header_block_advertises_chunked_transfer_encoding(&header_block);
+
     // Establish the upstream connection per the resolved transport (unchanged: TLS
     // on the default/validated/unvalidated paths, plaintext for the http override;
     // the UpstreamTlsValidationFailed mapping is preserved inside this call).
@@ -818,12 +885,56 @@ where
     let mut frame_count: u64 = 0;
     let mut max_frame: usize = 0;
     let mut tee_full_waits: u64 = 0;
+    // R2.1/R2.3: set when a trailers frame has already written the zero-length
+    // chunk plus trailer section, so the fallback terminator after the loop is
+    // not written a second time.
+    let mut wrote_terminator = false;
     while let Some(frame) = body.frame().await {
         let frame = frame
             .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?;
-        // Only data frames carry body bytes; non-data frames (e.g. trailers) carry no
-        // entity bytes to forward.
+        // A trailers frame carries no entity bytes to forward as body data, but
+        // when the outbound request is chunked it must still be re-emitted as an
+        // HTTP trailer section after the terminating zero-length chunk (R2.1,
+        // R2.2): S3 was told via `x-amz-trailer` to expect it, and dropping it
+        // means a promised checksum trailer never arrives. `into_trailers()`
+        // consumes `frame`, so try it first and fall through to `into_data()`
+        // only on its `Err` (which returns the original frame unchanged).
+        let frame = match frame.into_trailers() {
+            Ok(trailer_map) => {
+                if chunked_outbound {
+                    // The zero-length chunk terminator comes first, then the
+                    // trailer section (`name: value\r\n` lines), then the
+                    // terminating blank line (R2.1, R2.3).
+                    let mut trailer_bytes = Vec::from(&b"0\r\n"[..]);
+                    for (name, value) in trailer_map.iter() {
+                        if let Ok(value_str) = value.to_str() {
+                            trailer_bytes.extend_from_slice(
+                                format!("{}: {}\r\n", name.as_str(), value_str).as_bytes(),
+                            );
+                        }
+                    }
+                    trailer_bytes.extend_from_slice(b"\r\n");
+                    stream.write_all(&trailer_bytes).await.map_err(|e| {
+                        ProxyError::HttpError(format!("Failed to write request trailers: {}", e))
+                    })?;
+                    wrote_terminator = true;
+                }
+                // A trailers frame is always the last frame in a body (RFC 9112
+                // §7.1.2); nothing else to do with it here.
+                continue;
+            }
+            Err(original_frame) => original_frame,
+        };
+        // Only data frames carry body bytes; any other non-data frame kind (not
+        // used by hyper's request bodies today) carries no entity bytes to
+        // forward either.
         if let Ok(data) = frame.into_data() {
+            // Under raw (non-chunked) framing this guard exists only to skip a
+            // no-op write. Under chunked framing (R1.4) it is load-bearing: an
+            // empty data frame emitted as `0\r\n\r\n` would be indistinguishable
+            // from the real terminating zero-length chunk and would end the
+            // body early, corrupting every subsequent frame and any trailer
+            // section that follows.
             if data.is_empty() {
                 continue;
             }
@@ -831,9 +942,12 @@ where
             if data.len() > max_frame {
                 max_frame = data.len();
             }
-            // Running cap enforcement (Req 8.2). `saturating_add` makes the
-            // `cap == u64::MAX` (no-cap) callers safe: the sum caps at `u64::MAX` and
-            // `u64::MAX > u64::MAX` is false, so they never trip this check.
+            // Running cap enforcement (Req 8.2), counting payload bytes only —
+            // never the chunk-framing overhead this fix adds (R5.1), so the
+            // effective limit does not shift for a chunked request.
+            // `saturating_add` makes the `cap == u64::MAX` (no-cap) callers
+            // safe: the sum caps at `u64::MAX` and `u64::MAX > u64::MAX` is
+            // false, so they never trip this check.
             if sent.saturating_add(data.len() as u64) > cap {
                 warn!(
                     sent_bytes = sent,
@@ -847,21 +961,43 @@ where
                     max_bytes: cap,
                 });
             }
-            // Forward the frame to the upstream verbatim. This awaited `write_all`
-            // is the primary backpressure source and must happen for every forwarded
-            // frame regardless of the tee (Req 4.1, 4.3, 2.1).
-            stream.write_all(&data).await.map_err(|e| {
-                ProxyError::HttpError(format!("Failed to write request body: {}", e))
-            })?;
+            // Forward the frame to the upstream. When the outbound request
+            // advertises `Transfer-Encoding: chunked` (R1.1), re-establish HTTP
+            // chunked framing around this frame's bytes — a hex length, CRLF,
+            // the frame bytes, CRLF — since hyper already stripped that outer
+            // layer on the way in and never restores it on a raw write.
+            // Otherwise (R1.2) write the frame raw, exactly as before: no
+            // existing working request shape changes on the wire. Either way
+            // this happens at the point of the socket write only — `data`
+            // itself is never mutated, so the tee below still receives the
+            // original unframed bytes (R4.1, R4.2).
+            if chunked_outbound {
+                let mut framed = Vec::with_capacity(data.len() + 16);
+                framed.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
+                framed.extend_from_slice(&data);
+                framed.extend_from_slice(b"\r\n");
+                stream.write_all(&framed).await.map_err(|e| {
+                    ProxyError::HttpError(format!("Failed to write request body: {}", e))
+                })?;
+            } else {
+                // The awaited `write_all` is the primary backpressure source and
+                // must happen for every forwarded frame regardless of the tee
+                // (Req 4.1, 4.3, 2.1).
+                stream.write_all(&data).await.map_err(|e| {
+                    ProxyError::HttpError(format!("Failed to write request body: {}", e))
+                })?;
+            }
             sent = sent.saturating_add(data.len() as u64);
 
             // Tee the forwarded frame to the cache, applying the same bounded-channel
             // discipline as `TeeStream` on the GET path. Only frames actually
             // forwarded to the upstream are tee'd (a frame rejected by the cap check
             // above returns before reaching here, so it is never tee'd). The tee
-            // receives a cheap `Bytes` clone (a refcount bump); the upstream write
-            // above already used the original bytes verbatim, so the tee can never
-            // alter what the upstream receives (Req 7.3).
+            // receives a cheap `Bytes` clone of the ORIGINAL unframed `data` (a
+            // refcount bump), never the HTTP-chunk-framed bytes written to the
+            // socket above — re-framing happens only at the write call, so the
+            // tee can never see anything but the frame's original bytes (Req
+            // 4.1, 4.2, 4.3, 7.3).
             //
             // Channel discipline (mirrors `tee_stream.rs`):
             //   - `try_send` fast path: on `Ok`, the frame is queued, continue.
@@ -900,6 +1036,18 @@ where
                 }
             }
         }
+    }
+
+    // R2.3: when the outbound request is chunked and no trailers frame arrived
+    // (so `wrote_terminator` is still `false`), the body must end with the
+    // zero-length chunk terminator `0\r\n\r\n`. When a trailers frame DID arrive,
+    // the trailer-section write above already emitted the zero chunk followed
+    // by the trailer lines and the final blank line, which is the correct
+    // terminator for that case — do not write a second one.
+    if chunked_outbound && !wrote_terminator {
+        stream.write_all(b"0\r\n\r\n").await.map_err(|e| {
+            ProxyError::HttpError(format!("Failed to write chunk terminator: {}", e))
+        })?;
     }
 
     stream
@@ -3360,6 +3508,405 @@ mod tests {
             large_max >= 2,
             "expected the bounded channel to fill under a slow consumer, got max={}",
             large_max
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // chunked-request-framing (GitHub issue #19, second half): a chunked
+    // request body must be re-framed on the wire.
+    // ---------------------------------------------------------------------
+
+    /// Mock upstream for the chunked-framing fixture: accept one connection,
+    /// read the request line + headers (up to `\r\n\r\n`), then read raw body
+    /// bytes for a bounded settle window (there is no reliable "body length" to
+    /// wait for here — the point of this fixture is to capture whatever framing,
+    /// correct or not, the proxy actually puts on the wire) and return the raw
+    /// captured bytes so the test can assert on their shape directly.
+    async fn capture_upstream_raw_body(
+        listener: tokio::net::TcpListener,
+        settle: std::time::Duration,
+    ) -> Vec<u8> {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+
+        let header_end = loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                return Vec::new();
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+
+        let mut body = buf[header_end..].to_vec();
+        // Keep draining until the client goes quiet for `settle`, rather than
+        // waiting for a known length: this fixture's whole point is to observe
+        // whatever bytes actually landed on the wire, including a shape that
+        // never sends a valid terminator.
+        loop {
+            match tokio::time::timeout(settle, sock.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+                Ok(Err(_)) => break,
+                Err(_) => break, // settle window elapsed with no more data
+            }
+        }
+
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.flush().await;
+        body
+    }
+
+    /// Build the genuine `Transfer-Encoding: chunked` body with a trailer
+    /// section that Phase 1 requires (R10.3): a multi-frame `StreamBody` ending
+    /// in a `Frame::trailers`, mirroring the inner aws-chunked-over-outer-HTTP
+    /// shape pyarrow sends. This is deliberately NOT `Full::new(Bytes::from(...))`
+    /// (single data frame, exact size hint, no trailers — the one shape a raw
+    /// write handles correctly) and NOT `permit_body::ChunkedBytes` (exists to
+    /// make hyper emit Content-Length framing instead of chunked).
+    fn chunked_body_with_trailer(
+        chunks: Vec<Bytes>,
+        trailer_name: &'static str,
+        trailer_value: &'static str,
+    ) -> impl Body<Data = Bytes, Error = std::io::Error> + Unpin {
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert(
+            hyper::header::HeaderName::from_static(trailer_name),
+            hyper::header::HeaderValue::from_static(trailer_value),
+        );
+
+        let mut frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> =
+            chunks.into_iter().map(|c| Ok(Frame::data(c))).collect();
+        frames.push(Ok(Frame::trailers(trailer_map)));
+
+        StreamBody::new(stream::iter(frames))
+    }
+
+    /// Headers for a request that genuinely advertises `Transfer-Encoding:
+    /// chunked` on the outbound side, mirroring pyarrow's captured shape
+    /// (Phase 0.2/0.3 measurement): `content-encoding: aws-chunked`,
+    /// `x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER`, and
+    /// `x-amz-trailer` naming the trailer this fixture actually sends.
+    fn pyarrow_shaped_chunked_headers() -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::TRANSFER_ENCODING,
+            hyper::header::HeaderValue::from_static("chunked"),
+        );
+        headers.insert(
+            hyper::header::CONTENT_ENCODING,
+            hyper::header::HeaderValue::from_static("aws-chunked"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-amz-content-sha256"),
+            hyper::header::HeaderValue::from_static("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-amz-decoded-content-length"),
+            hyper::header::HeaderValue::from_static("11"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-amz-trailer"),
+            hyper::header::HeaderValue::from_static("x-amz-checksum-crc64nvme"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn chunked_request_is_forwarded_with_valid_http_chunked_framing() {
+        // R10.3/R10.4: drive `forward_signed_request_streaming` with a genuine
+        // `Transfer-Encoding: chunked` body carrying a trailer section, against a
+        // stub upstream that records raw received bytes, and assert the bytes
+        // received are correctly HTTP-chunked and terminated (R1.1, R2.1, R2.3).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_raw_body(
+            listener,
+            std::time::Duration::from_millis(300),
+        ));
+
+        let body = chunked_body_with_trailer(
+            vec![Bytes::from_static(b"hello"), Bytes::from_static(b"world")],
+            "x-amz-checksum-crc64nvme",
+            "abcd1234",
+        );
+        let headers = pyarrow_shaped_chunked_headers();
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key?partNumber=1&uploadId=up"
+                .parse::<hyper::Uri>()
+                .unwrap(),
+            &headers,
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "chunked upload should succeed: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let received = upstream.await.unwrap();
+
+        // R1.1: each data frame is HTTP-chunked — hex length, CRLF, bytes, CRLF.
+        let expected =
+            b"5\r\nhello\r\n5\r\nworld\r\n0\r\nx-amz-checksum-crc64nvme: abcd1234\r\n\r\n";
+        assert_eq!(
+            received,
+            expected,
+            "received bytes must be valid HTTP chunked framing with the trailer \
+             section after the terminating zero chunk, got: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_request_without_trailers_ends_with_zero_chunk_only() {
+        // R2.3: when there are no trailers, the body must end with `0\r\n\r\n` and
+        // nothing after it.
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_raw_body(
+            listener,
+            std::time::Duration::from_millis(300),
+        ));
+
+        let frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> =
+            vec![Ok(Frame::data(Bytes::from_static(b"abc")))];
+        let body = StreamBody::new(stream::iter(frames));
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::TRANSFER_ENCODING,
+            hyper::header::HeaderValue::from_static("chunked"),
+        );
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &headers,
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "chunked upload should succeed");
+
+        let received = upstream.await.unwrap();
+        assert_eq!(received, b"3\r\nabc\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn content_length_body_is_forwarded_raw_byte_identical_to_today() {
+        // R1.2/R2.7 companion: a Content-Length body (no Transfer-Encoding header
+        // at all) must be written byte-identically to today — no framing added.
+        // This is the non-regression assertion that must pass BOTH before and
+        // after the R1 fix: a raw write is already correct for this shape.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = Bytes::from_static(b"hello world, this is a content-length body");
+        let payload_len = payload.len();
+        let upstream = tokio::spawn(capture_upstream_body(listener, payload_len));
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_str(&payload_len.to_string()).unwrap(),
+        );
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &headers,
+            hyper::Version::HTTP_11,
+            Full::new(payload.clone()),
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "content-length upload should succeed");
+
+        let received = upstream.await.unwrap();
+        assert_eq!(
+            received,
+            payload.to_vec(),
+            "a Content-Length body must be written raw, byte-identical to today \
+             — no chunk framing added"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_transfer_encoding_header_at_all_is_forwarded_raw() {
+        // R1.3 companion: the framing condition is evaluated against the
+        // outbound header block actually being sent, not a heuristic. A request
+        // with neither Content-Length nor Transfer-Encoding (the unsigned-write
+        // multi-frame case with an unknown length) must also go out raw/unframed
+        // — there is nothing in the header block advertising chunked framing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chunks = [Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
+        let expected: Vec<u8> = chunks.iter().flat_map(|c| c.to_vec()).collect();
+        let expected_len = expected.len();
+        let upstream = tokio::spawn(capture_upstream_body(listener, expected_len));
+
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        let frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> =
+            chunks.iter().cloned().map(|c| Ok(Frame::data(c))).collect();
+        let body = StreamBody::new(stream::iter(frames));
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &hyper::HeaderMap::new(),
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "unframed upload should succeed");
+
+        let received = upstream.await.unwrap();
+        assert_eq!(
+            received, expected,
+            "a request with no Transfer-Encoding header must be forwarded raw"
+        );
+    }
+
+    #[tokio::test]
+    async fn r4_tee_receives_unframed_data_even_when_outbound_is_chunked() {
+        // R4.1/R4.2/R4.3: the cache tee must keep receiving the original
+        // unframed `data`, not the framed wire bytes. Assert this directly by
+        // comparing the tee's received bytes to the plain concatenation of the
+        // input chunks, while the upstream (observed separately) gets the framed
+        // wire bytes. This is the assertion the spec calls out as mandatory,
+        // because framing `data` before both consumers would corrupt every
+        // cached chunked upload rather than merely failing to forward — a
+        // plausible-looking cached object rather than a visible error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_raw_body(
+            listener,
+            std::time::Duration::from_millis(300),
+        ));
+
+        let chunks = vec![Bytes::from_static(b"foo"), Bytes::from_static(b"bar")];
+        let expected_unframed: Vec<u8> = chunks.iter().flat_map(|c| c.to_vec()).collect();
+        let body = chunked_body_with_trailer(chunks, "x-amz-checksum-crc64nvme", "deadbeef");
+        let headers = pyarrow_shaped_chunked_headers();
+
+        let (tee_tx, mut tee_rx) = mpsc::channel::<Bytes>(8);
+        let tee_consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(b) = tee_rx.recv().await {
+                received.extend_from_slice(&b);
+            }
+            received
+        });
+
+        let transport = UpstreamTransport {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+
+        let result = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse::<hyper::Uri>().unwrap(),
+            &headers,
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            Some(tee_tx),
+        )
+        .await;
+        assert!(result.is_ok(), "chunked upload with tee should succeed");
+
+        let upstream_bytes = upstream.await.unwrap();
+        let tee_bytes = tee_consumer.await.unwrap();
+
+        // The tee must see the original unframed bytes...
+        assert_eq!(
+            tee_bytes, expected_unframed,
+            "R4.1: the cache tee must receive the frame's original unframed \
+             `data`, not HTTP-chunk-framed bytes"
+        );
+        // ...while the upstream sees the framed wire bytes — proving framing
+        // happens only at the socket-write point (R4.2), not by transforming
+        // `data` before both consumers.
+        assert_ne!(
+            upstream_bytes, tee_bytes,
+            "R4.2: the upstream must receive different (framed) bytes than the \
+             tee (unframed) — if they matched, framing was skipped or applied \
+             to both consumers instead of just the socket write"
+        );
+        assert!(
+            upstream_bytes.starts_with(b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n"),
+            "upstream must receive valid HTTP chunked framing: {:?}",
+            String::from_utf8_lossy(&upstream_bytes)
         );
     }
 }

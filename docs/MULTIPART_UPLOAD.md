@@ -28,7 +28,7 @@ S3 multipart uploads let clients split large objects into parts uploaded in para
 
 ## The four operations
 
-All four multipart operations carry AWS SigV4 signatures. The proxy holds no credentials and cannot sign, so every request is forwarded to S3 unmodified. The cache work runs *in addition to* forwarding, never *instead of* it.
+All four multipart operations carry AWS SigV4 signatures. The proxy holds no credentials and cannot sign, so the signed bytes and headers are forwarded to S3 verbatim — the outer HTTP transfer framing, however, is re-established by the proxy when the request body is `Transfer-Encoding: chunked` (see the "Wire framing" note below). The cache work runs *in addition to* forwarding, never *instead of* it.
 
 | Operation | HTTP | Query | Handler |
 | --- | --- | --- | --- |
@@ -38,6 +38,10 @@ All four multipart operations carry AWS SigV4 signatures. The proxy holds no cre
 | `AbortMultipartUpload` | `DELETE` | `?uploadId=X` | `handle_abort_multipart_upload` |
 
 Routing lives in `handle_signed_put`; detection helpers are `is_create_multipart_upload`, `parse_upload_part_query`, `is_complete_multipart_upload`, `is_abort_multipart_upload`.
+
+### Wire framing: signed bytes are verbatim, outer HTTP framing is not always a relay
+
+`UploadPart` bodies are commonly aws-chunked (an *inner* SigV4 streaming-signature framing carried inside the HTTP body), and that inner layer is untouched by the proxy on the way to S3 — same chunk data, same per-chunk signatures. Separately, the client's *outer* HTTP transfer encoding for that body can be either `Content-Length` (the AWS CLI's CRT client) or `Transfer-Encoding: chunked` (pyarrow and some other SDK clients). Hyper strips whichever outer framing the client used before the proxy sees the body, and for a chunked request the proxy re-establishes real HTTP chunk framing around each forwarded frame rather than writing hyper's already-unwrapped bytes straight to the upstream socket. A raw relay of those unwrapped bytes is not valid HTTP chunking or a valid Content-Length body, and S3 rejects it with `IncompleteBody` (GitHub issue #19). See `src/signed_request_proxy.rs`'s `forward_signed_request_streaming` for the implementation and `.kiro/specs/chunked-request-framing/` for the full requirements.
 
 ## On-disk layout
 

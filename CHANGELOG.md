@@ -5,6 +5,19 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.1] - 2026-09-10
+### Fixed
+- Multipart uploads from clients that send a `Transfer-Encoding: chunked` request body (observed
+  with `pyarrow.parquet`, S3FileSystem) failed on the first `UploadPart` with `IncompleteBody` and
+  never got the trailer-based checksum S3 was told to expect. The proxy was re-sending that body
+  without the HTTP chunk framing it needs; it now re-establishes chunk framing (and the trailer
+  section) on the way to S3. `PutObject`/`UploadPart` requests using `Content-Length` (the AWS CLI,
+  boto3) were never affected. Also recognizes two additional trailer-carrying signature sentinels in
+  `x-amz-content-sha256`, so a client sending one of them without a redundant `Content-Encoding:
+  aws-chunked` header is classified correctly. See
+  [GitHub issue #19](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/19), diagnosed by
+  James Connor ([@megakid](https://github.com/megakid)).
+
 ## [2.8.0] - 2026-08-31
 
 **Upgrade impact:** expired reads revalidate instead of re-downloading, so body transfers fall

@@ -92,6 +92,39 @@ const STREAMING_AWS4_HMAC_SHA256_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAY
 /// is identical to classic SigV4 streaming payloads; only this label differs.
 const STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD: &str = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD";
 
+/// chunked-request-framing (GitHub issue #19) R6: the trailer-carrying
+/// counterparts of the two sentinels above, plus the unsigned-payload trailer
+/// sentinel. Audited against `aws-c-auth`'s `signing_config.h` (the AWS Common
+/// Runtime signing library used by CRT-based AWS SDKs and the AWS CLI), which
+/// is the authoritative source for this value set:
+/// `g_aws_signed_body_value_streaming_unsigned_payload_trailer`,
+/// `g_aws_signed_body_value_streaming_aws4_hmac_sha256_payload_trailer`, and
+/// `g_aws_signed_body_value_streaming_aws4_ecdsa_p256_sha256_payload_trailer`.
+/// There is no bare `STREAMING-UNSIGNED-PAYLOAD` (no `-TRAILER` suffix) value
+/// in that source, nor in the AWS S3 user guide's "Checking object integrity"
+/// page, which documents only the two `-TRAILER` sentinels below alongside the
+/// two non-trailer ones already recognized above — so it is not included
+/// here. `STREAMING-AWS4-HMAC-SHA256-EVENTS` (event-stream signing) is a
+/// different wire format entirely and is deliberately NOT aws-chunked.
+///
+/// Unsigned streaming payload with a trailer (no per-chunk SigV4 signatures;
+/// the checksum trailer itself is unsigned). This is the sentinel pyarrow and
+/// the current AWS CLI CRT client send (confirmed empirically against real
+/// clients, chunked-request-framing spec Phase 0.2).
+const STREAMING_UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+/// Streaming SigV4 (classic HMAC) payload with a trailer: per-chunk signatures
+/// plus a signed trailer chunk (a trailer signature follows the checksum in
+/// the trailer chunk itself).
+const STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER: &str =
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+
+/// Streaming SigV4A (ECDSA) payload with a trailer — the SigV4A equivalent of
+/// [`STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER`]. Chunk and trailer framing
+/// are identical; only this label differs.
+const STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD_TRAILER: &str =
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER";
+
 /// Result of a successful aws-chunked decode, containing the decoded body
 /// and any trailers that followed the zero-size chunk.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,8 +141,16 @@ pub struct AwsChunkedDecodeResult {
 ///
 /// Returns true if either:
 /// - The `content-encoding` header contains `aws-chunked`
-/// - The `x-amz-content-sha256` header equals `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
-///   or `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` (SigV4A equivalent)
+/// - The `x-amz-content-sha256` header equals `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
+///   `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` (SigV4A equivalent),
+///   `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
+///   `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, or
+///   `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER` (chunked-request-framing
+///   R6: the trailer-carrying sentinels, which a client may send WITHOUT
+///   `Content-Encoding: aws-chunked` since the sentinel alone already implies
+///   aws-chunked framing — see the doc comment on the trailer constants above
+///   for why detecting only via `content-encoding` would misclassify that
+///   shape and silently corrupt the cache tee's staged bytes)
 ///
 /// # Arguments
 /// * `headers` - HashMap of request headers (case-insensitive keys recommended)
@@ -124,11 +165,15 @@ pub fn is_aws_chunked(headers: &HashMap<String, String>) -> bool {
         }
     }
 
-    // Check x-amz-content-sha256 header for streaming payload indicator
-    // (SigV4 HMAC or SigV4A ECDSA — chunk framing is identical)
+    // Check x-amz-content-sha256 header for a streaming payload indicator.
+    // Any of these five sentinels implies aws-chunked framing on its own,
+    // independent of whether `content-encoding: aws-chunked` is also present.
     if let Some(sha256) = headers.get("x-amz-content-sha256") {
         if sha256 == STREAMING_AWS4_HMAC_SHA256_PAYLOAD
             || sha256 == STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD
+            || sha256 == STREAMING_UNSIGNED_PAYLOAD_TRAILER
+            || sha256 == STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER
+            || sha256 == STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD_TRAILER
         {
             return true;
         }
@@ -445,8 +490,21 @@ enum DecoderState {
 /// calls is a partial chunk-header or trailer line (bounded by
 /// [`MAX_TRAILER_SECTION_BYTES`]).
 ///
-/// It is used **only** on the cache tee branch of the streaming write path; the
-/// upstream always receives the original chunked bytes verbatim. The whole-buffer
+/// It is used **only** on the cache tee branch of the streaming write path,
+/// decoding the *inner* aws-chunked layer to recover the plain object bytes for
+/// caching. The upstream leg forwards the client's signed bytes verbatim and
+/// never runs through this decoder — but "verbatim bytes" is not the same claim
+/// as "verbatim wire framing". WHEN the client's request also advertises the
+/// *outer* HTTP `Transfer-Encoding: chunked` (as opposed to `Content-Length`
+/// wrapping the same inner aws-chunked body), hyper strips that outer layer on
+/// the way in, and `forward_signed_request_streaming`
+/// (`src/signed_request_proxy.rs`) re-establishes it on the way out rather than
+/// relaying raw frames — see that function's doc comment and
+/// `.kiro/specs/chunked-request-framing/` (GitHub issue #19) for why a raw
+/// relay of an unwrapped chunked body is not equivalent to what the client
+/// originally sent on the wire, even though every byte of the signed content
+/// is unchanged. This decoder's inner-layer scope is unaffected either way: it
+/// never touches the outer HTTP framing at all. The whole-buffer
 /// [`decode_aws_chunked`] is retained as the buffered path and the equivalence
 /// oracle in tests.
 ///
@@ -680,6 +738,78 @@ mod tests {
     #[test]
     fn test_is_aws_chunked_false_for_regular_request() {
         let headers = HashMap::new();
+        assert!(!is_aws_chunked(&headers));
+    }
+
+    // chunked-request-framing (GitHub issue #19) R6: the three trailer-carrying
+    // sentinels must be recognized WITHOUT `Content-Encoding: aws-chunked`
+    // present — the whole point of R6 is that a client may send one of these
+    // and legitimately omit that header, since the sentinel alone already
+    // implies aws-chunked framing (confirmed against real pyarrow and AWS CLI
+    // CRT traffic, chunked-request-framing spec Phase 0.2/0.3). Each test below
+    // therefore constructs headers with ONLY `x-amz-content-sha256` set, no
+    // `content-encoding` at all, so a pass here cannot be attributed to the
+    // other detection arm.
+
+    #[test]
+    fn test_is_aws_chunked_with_unsigned_payload_trailer_sentinel_alone() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+        );
+        assert!(
+            is_aws_chunked(&headers),
+            "the unsigned-payload-trailer sentinel alone (no content-encoding) \
+             must be detected as aws-chunked — this is the exact shape pyarrow \
+             and the current AWS CLI CRT client send"
+        );
+    }
+
+    #[test]
+    fn test_is_aws_chunked_with_hmac_sha256_payload_trailer_sentinel_alone() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER".to_string(),
+        );
+        assert!(is_aws_chunked(&headers));
+    }
+
+    #[test]
+    fn test_is_aws_chunked_with_ecdsa_payload_trailer_sentinel_alone() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER".to_string(),
+        );
+        assert!(is_aws_chunked(&headers));
+    }
+
+    #[test]
+    fn test_is_aws_chunked_does_not_match_bare_streaming_unsigned_payload() {
+        // There is no bare `STREAMING-UNSIGNED-PAYLOAD` (without `-TRAILER`)
+        // sentinel in the audited value set (aws-c-auth `signing_config.h`);
+        // guard against a future accidental substring/prefix match reintroducing
+        // one that doesn't exist.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-UNSIGNED-PAYLOAD".to_string(),
+        );
+        assert!(!is_aws_chunked(&headers));
+    }
+
+    #[test]
+    fn test_is_aws_chunked_does_not_match_event_stream_sentinel() {
+        // `STREAMING-AWS4-HMAC-SHA256-EVENTS` is event-stream signing, a
+        // different wire format entirely, and must NOT be treated as
+        // aws-chunked.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-AWS4-HMAC-SHA256-EVENTS".to_string(),
+        );
         assert!(!is_aws_chunked(&headers));
     }
 

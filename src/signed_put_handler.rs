@@ -1455,7 +1455,7 @@ impl SignedPutHandler {
             .await
     }
 
-    /// Stream an `UploadPart` body to the upstream verbatim while teeing it to the
+    /// Stream an `UploadPart` body to the upstream while teeing it to the
     /// part-staging cache sink (streaming-write-path Req 6.2).
     ///
     /// Shared by the two caching decisions that reach the part path. They differ
@@ -1466,10 +1466,17 @@ impl SignedPutHandler {
     ///
     /// The client body frames flow straight to the upstream (the awaited socket
     /// write is the primary backpressure), and the same frames are tee'd to a
-    /// bounded channel feeding the incremental part-cache task. The upstream always
-    /// receives the original bytes byte-for-byte (SigV4 intact); only the cache
-    /// branch decodes aws-chunked, incrementally inside the cache task rather than
-    /// up front.
+    /// bounded channel feeding the incremental part-cache task. The signed bytes
+    /// forwarded to the upstream are byte-for-byte the client's (SigV4 intact);
+    /// only the cache branch decodes aws-chunked, incrementally inside the cache
+    /// task rather than up front. The upstream leg's WIRE FRAMING, however, is
+    /// not always a byte-for-byte relay — when the outbound request advertises
+    /// `Transfer-Encoding: chunked`, `forward_signed_request_streaming`
+    /// (`src/signed_request_proxy.rs`) re-establishes HTTP chunk framing around
+    /// each frame rather than passing hyper's already-unwrapped bytes straight
+    /// through (chunked-request-framing, GitHub issue #19). The tee here is
+    /// unaffected: it always receives the frame's original unframed bytes,
+    /// regardless of what the upstream write does with them.
     #[allow(clippy::too_many_arguments)]
     async fn stage_and_forward_upload_part(
         &self,
@@ -7529,6 +7536,107 @@ mod tests {
             final_path.exists(),
             "committed .bin must exist: {:?}",
             final_path
+        );
+    }
+
+    /// chunked-request-framing (GitHub issue #19) R6/R10.5: a request carrying
+    /// `x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER` WITHOUT
+    /// `Content-Encoding: aws-chunked` must still be classified as aws-chunked,
+    /// or the cache tee stages the raw aws-chunked framed bytes (chunk headers,
+    /// CRLFs, the trailer section) as object data instead of decoding them —
+    /// silent cache corruption rather than a visible error. This asserts on the
+    /// CACHED CONTENT itself, per R10.5, since that is the actual harm: before
+    /// the R6 fix, `aws_chunked_decoder::is_aws_chunked` returns `false` for
+    /// this header set (detected today only by the `content-encoding` arm,
+    /// confirmed absent from this request), so the caller passes
+    /// `is_aws_chunked = false` into `run_streaming_cache_write`, which then
+    /// writes the raw encoded frame straight to the sink as if it were plain
+    /// object bytes. After the fix, the sentinel alone is enough to classify
+    /// the request correctly and the cache holds the clean decoded payload.
+    #[tokio::test]
+    async fn streaming_cache_unsigned_payload_trailer_sentinel_alone_is_not_corrupted() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "test-bucket/stream-sentinel-only";
+        let payload = b"hello streaming world, sentinel only, no content-encoding!";
+        let encoded = aws_chunked_single_chunk(payload);
+
+        // The exact header shape pyarrow and the current AWS CLI CRT client
+        // send (chunked-request-framing spec Phase 0.2/0.3 measurement):
+        // `x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER` present,
+        // `content-encoding` deliberately ABSENT — the sentinel is meant to be
+        // sufficient on its own.
+        let mut request_headers = HashMap::new();
+        request_headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+        );
+
+        // This is the actual production call path: the caller derives
+        // `is_aws_chunked` from the request headers via the classifier under
+        // test, not from a hardcoded bool — so a classifier regression here
+        // reproduces the real defect rather than a synthetic one.
+        let is_aws_chunked_flag = aws_chunked_decoder::is_aws_chunked(&request_headers);
+        assert!(
+            is_aws_chunked_flag,
+            "R6: the unsigned-payload-trailer sentinel alone must classify as \
+             aws-chunked — if this assertion fails, the classifier fix regressed"
+        );
+
+        let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
+        let final_path = dc.get_new_range_file_path(cache_key, 0, (payload.len() as u64) - 1);
+        let sink = open_streaming_sink(dc, cache_key, payload.len() as u64).await;
+
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (s3_tx, s3_rx) = tokio::sync::oneshot::channel::<Result<ResponseInfo>>();
+
+        tee_tx.send(Bytes::copy_from_slice(&encoded)).await.unwrap();
+        drop(tee_tx);
+        s3_tx.send(Ok(ok_response_info())).unwrap();
+
+        let outcome = SignedPutHandler::run_streaming_cache_write(
+            cache_key.to_string(),
+            sink,
+            tee_rx,
+            s3_rx,
+            is_aws_chunked_flag,
+            Some(payload.len() as u64),
+            std::time::Duration::from_secs(3600),
+            request_headers,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, StreamingCacheOutcome::Committed);
+        assert!(
+            final_path.exists(),
+            "committed .bin must exist: {:?}",
+            final_path
+        );
+
+        // The headline assertion (R10.5): the CACHED CONTENT must be the clean
+        // decoded payload, not the raw aws-chunked framed bytes (which would
+        // contain the hex chunk-size header, CRLFs, and the trailer section
+        // interleaved with the real data).
+        let compressed_bytes =
+            std::fs::read(&final_path).expect("committed range file must be readable");
+        let compression_handler = CompressionHandler::new(1024, true);
+        let cached_bytes = compression_handler
+            .decompress_data(&compressed_bytes)
+            .expect("committed range file must decompress (frame checksum verifies)");
+        assert_eq!(
+            cached_bytes,
+            payload,
+            "R6/R10.5: cached object content must be the decoded payload, not \
+             the raw aws-chunked wire bytes — got {:?}",
+            String::from_utf8_lossy(&cached_bytes)
+        );
+        assert!(
+            !cached_bytes
+                .windows(b"chunk-signature".len())
+                .any(|w| w == b"chunk-signature"),
+            "cached content must not contain literal aws-chunked framing bytes"
         );
     }
 
