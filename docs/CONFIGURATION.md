@@ -663,7 +663,8 @@ cache:
 
 **What `write_cache_percent` bounds.** It bounds **un-graduated staging** —
 objects that have been written through the cache but not yet read — not all write-cached
-data. Once an object is read for the first time it graduates: it stops counting against
+data. Once an object is read for the first time, and its `Last-Modified` is known, it
+graduates: it stops counting against
 this allocation and counts only against the total cache size instead, exactly as described
 under [TTL Transition on First Read](#how-write-caching-works) above. A deployment whose
 workload reads back what it writes therefore keeps very little resident against this
@@ -693,8 +694,8 @@ rather than letting reclamation churn against it.
   maintenance cycle, so no upload waits on it, and a deployment that stops uploading still
   drains its staging tier.
 - Staged bytes also leave the allocation without any reclamation, by being read for the
-  first time (graduation, described above) — which is the normal case for a
-  read-after-write workload.
+  first time and having their `Last-Modified` learned (graduation, described above) —
+  which is the normal case for a read-after-write workload.
 - **Only available space declines to cache.** A write-through upload is skipped when
   caching it would take the cache past `max_cache_size`, or when the cache volume has less
   than 1 GiB free beyond the object's own size. This is reported as `disk_safety` in

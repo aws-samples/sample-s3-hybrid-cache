@@ -1195,8 +1195,20 @@ impl S3Client {
             .cloned()
             .unwrap_or_default();
 
-        // S3 PUT/CompleteMultipartUpload responses don't include Last-Modified header
-        // Leave empty - the proxy will learn it on first GET/HEAD request from S3
+        // S3 PUT/CompleteMultipartUpload responses don't include a Last-Modified
+        // header, so this is empty for a write-through entry and the field is
+        // learned actively rather than passively. A GET that hits a write-cache
+        // entry is a cache HIT that never reaches S3, and the proxy holds no AWS
+        // credentials to originate a fetch of its own
+        // (`docs/MULTIPART_UPLOAD.md`), so nothing observes the header unless a
+        // request goes and asks for it. `check_object_expiration` therefore
+        // treats an entry with no effective `Last-Modified` as requiring
+        // revalidation: the first GET issues its own conditional and backfills
+        // the header from the `304` response
+        // (`CacheManager::backfill_write_cache_last_modified`). HEAD is never
+        // served from cache while the field is unknown — see
+        // `docs/CACHE_READ_PATHS.md` § "Header Behavior for Write-Cached
+        // Objects". Spec: write-cache-last-modified.
         let last_modified = headers
             .get("last-modified")
             .or_else(|| headers.get("Last-Modified"))

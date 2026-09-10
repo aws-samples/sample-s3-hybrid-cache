@@ -2720,9 +2720,26 @@ impl SignedPutHandler {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
+        // Read the header from the response with an empty default, matching the
+        // two single-part sites (`build_object_metadata_from_streamed_put`,
+        // `spawn_buffered_put_cache_write_task`). Behaviour-neutral against real
+        // S3 today — task 0.0 measured all three write responses as omitting
+        // this header — so this closes an asymmetry rather than fixing a live
+        // defect: without it, an S3-compatible origin that DOES send
+        // Last-Modified on CompleteMultipartUpload would have it silently
+        // retained in `filtered_response_headers` (which strips only
+        // content-type/content-length) while the typed field stayed empty
+        // forever, disagreeing with itself.
+        // Spec: write-cache-last-modified. Requirements: 1.6, 1.7
+        let last_modified = response_headers
+            .get("last-modified")
+            .or_else(|| response_headers.get("Last-Modified"))
+            .cloned()
+            .unwrap_or_default();
+
         let object_metadata = ObjectMetadata {
             etag: etag.to_string(),
-            last_modified: String::new(),
+            last_modified,
             content_length: total_size,
             content_type: tracker.content_type.clone(), // Use content-type from CreateMultipartUpload if provided
             response_headers: filtered_response_headers,

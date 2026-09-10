@@ -95,6 +95,14 @@ pub struct SeedSpec {
     /// Age of `created_at`. `check_object_expiration` compares this against the
     /// resolved `get_ttl`, so it is what decides Live_Expired for a non-zero TTL.
     pub created_age: Duration,
+    /// Whether the seeded entry is write-cached (R1.4's conjunct). `None` means
+    /// "infer from whether `last_modified` is empty" — the historical default,
+    /// preserved so every existing `SeedSpec` constructor keeps its behaviour.
+    /// `Some(false)` is needed to construct the R1.4 negative case directly: a
+    /// READ-cache entry with an empty `last_modified`, which the inferred
+    /// default cannot express because it always marks an empty field as
+    /// write-cached.
+    pub is_write_cached: Option<bool>,
 }
 
 impl SeedSpec {
@@ -108,6 +116,7 @@ impl SeedSpec {
             content_length,
             stored_expiry: StoredExpiry::Expired,
             created_age: Duration::from_secs(7200),
+            is_write_cached: None,
         }
     }
 
@@ -123,6 +132,31 @@ impl SeedSpec {
         Self {
             stored_expiry: StoredExpiry::Fresh,
             ..Self::expired(extents, content_length, etag)
+        }
+    }
+
+    /// A write-cached entry with no effective `Last-Modified` and NO stale TTL
+    /// of any kind — `expires_at` far in the future, `created_at` fresh. This is
+    /// the write-through PUT's own state (R1, R5.6), and it is what distinguishes
+    /// this spec's trigger from ordinary TTL-driven expiry: this entry is
+    /// Stored_Fresh and Live_Fresh by every existing mechanism, yet must still be
+    /// treated as `Expired` because it is write-cached with an unknown
+    /// `Last-Modified` (R1.1, R1.3, R1.4).
+    ///
+    /// Spec: write-cache-last-modified. Requirements: 1.1, 1.3, 1.4, 11.6
+    pub fn write_cached_no_last_modified(
+        extents: Vec<(u64, u64)>,
+        content_length: u64,
+        etag: &str,
+    ) -> Self {
+        Self {
+            extents,
+            etag: etag.to_string(),
+            last_modified: String::new(),
+            content_length,
+            stored_expiry: StoredExpiry::Fresh,
+            created_age: Duration::from_secs(5),
+            is_write_cached: Some(true),
         }
     }
 }
@@ -351,6 +385,16 @@ impl Fixture {
                 .expect("expires_at underflow"),
         };
 
+        // write-cache-last-modified: an entry with no stored Last-Modified is
+        // marked write-cached by default, matching the write-through PUT's own
+        // state (R1, R5.6). `SeedSpec::is_write_cached` overrides this when a
+        // test needs the R1.4 negative case: a READ-cache entry that also
+        // happens to have an empty last_modified.
+        let is_write_cached = spec
+            .is_write_cached
+            .unwrap_or(spec.last_modified.is_empty());
+        let write_cache_anchor = is_write_cached.then_some(created_at);
+
         let metadata = NewCacheMetadata {
             cache_key: cache_key.to_string(),
             object_metadata: ObjectMetadata {
@@ -367,10 +411,10 @@ impl Fixture {
                 parts_count: None,
                 part_ranges: HashMap::new(),
                 upload_id: None,
-                is_write_cached: false,
-                write_cache_expires_at: None,
-                write_cache_created_at: None,
-                write_cache_last_accessed: None,
+                is_write_cached,
+                write_cache_expires_at: write_cache_anchor.map(|t| t + Duration::from_secs(86400)),
+                write_cache_created_at: write_cache_anchor,
+                write_cache_last_accessed: write_cache_anchor,
                 graduation_accounted: false,
             },
             ranges: range_specs,
@@ -565,8 +609,26 @@ pub fn signed_range_authorization() -> String {
 }
 
 /// Response a stub returns for a `304 Not Modified`, which carries no body.
+///
+/// Carries an ETag but no `Last-Modified` — this is ALREADY the R4 "without"
+/// case, and per R11.5 stays that way. See
+/// [`not_modified_with_last_modified`] below for the happy-path case.
 pub fn not_modified(etag: &str) -> super::StubResponse {
     super::StubResponse::with_status(StatusCode::NOT_MODIFIED).with_header("etag", etag)
+}
+
+/// Response a stub returns for a `304 Not Modified` carrying BOTH an ETag and a
+/// `Last-Modified` header, for the happy-path backfill tests (R3.1, R3.3).
+///
+/// A DISTINCT constructor from [`not_modified`], per R11.5 — the existing
+/// function is not modified to add the header, which would remove the only way
+/// to express R4's undurable case through this shared helper.
+///
+/// Spec: write-cache-last-modified. Requirements: 11.5 (task 5.1)
+pub fn not_modified_with_last_modified(etag: &str, last_modified: &str) -> super::StubResponse {
+    super::StubResponse::with_status(StatusCode::NOT_MODIFIED)
+        .with_header("etag", etag)
+        .with_header("last-modified", last_modified)
 }
 
 // =========================================================================

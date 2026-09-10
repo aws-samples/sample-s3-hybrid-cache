@@ -412,7 +412,18 @@ Caches objects during PUT operations using the range storage format, enabling su
 
 **Header Behavior for Write-Cached Objects**:
 - **ETag**: Available immediately from S3 PUT response
-- **Last-Modified**: S3 PUT responses don't include Last-Modified headers. The timestamp is populated only after a subsequent HEAD request or cache-miss GET operation. Cache hits for PUT-cached objects won't include Last-Modified headers until this timestamp is learned.
+- **Last-Modified**: S3 `PutObject` and `CompleteMultipartUpload` responses do not include a
+  `Last-Modified` header, so a write-through cache entry starts without one. The proxy learns it
+  actively: the first GET of such an entry issues a conditional request — `If-None-Match` alone,
+  since there is no cached `Last-Modified` to send an `If-Modified-Since` for — and backfills the
+  header from the `304` response, serving the learned value on that same request. A conditional is
+  necessary because a GET that resolves to a write-cache entry is otherwise a cache hit that never
+  contacts S3, and the proxy holds no AWS credentials with which to fetch the metadata separately.
+- **Last-Modified on HEAD**: a HEAD is never served from cache while the field is unknown. It
+  forwards to S3, and S3's response rewrites the entry. Two independent mechanisms produce that: a
+  write-through entry has no HEAD TTL set, so the HEAD lookup misses on it regardless; and the
+  lookup separately refuses any entry lacking the field, which covers an entry whose HEAD TTL was
+  set by an earlier revalidation that did not learn it.
 - **Content-Type**: If provided in the PUT request (single-part) or CreateMultipartUpload request (multipart), it is cached and used. If not provided, learned on first HEAD or cache-miss GET. Note: S3's CompleteMultipartUpload response has `content-type: application/xml` which is the XML response type, not the object's content-type - this is filtered out.
 
 #### TTL Transition on First Read
@@ -424,6 +435,11 @@ they are read. This is a one-time transition, not a refresh on every access:
 - First GET access: the entry transitions from `put_ttl` to `get_ttl`. This is a
   one-time transition, not a repeating refresh, and it runs before the freshness check
   so `get_ttl: 0` revalidates against S3 on that first GET
+- The transition requires a known `Last-Modified`. An entry whose `Last-Modified` is not
+  yet known stays on `put_ttl` and remains in the write tier until a revalidation learns
+  it (see the `Last-Modified` note above); the transition then happens as part of that
+  same operation. This is what keeps the revalidation trigger from clearing the flag it
+  depends on before it can fire.
 - No access within TTL: Object expires and is removed
 
 This keeps frequently accessed objects in cache while allowing rarely-read uploads to expire.
@@ -517,7 +533,7 @@ Caches multipart uploads with intelligent capacity management and shared cache c
 - Calculate final byte offsets for each part
 - Rename part files with final offsets
 - Create object metadata with `is_write_cached=true`, ETag, and Content-Type (if provided in CreateMultipartUpload)
-- Note: Last-Modified is NOT available from CompleteMultipartUpload response; learned on first HEAD or cache-miss GET
+- Note: `Last-Modified` is not available from the `CompleteMultipartUpload` response. The entry is stored without it, and the first read revalidates against S3 to learn it — see "Header Behavior for Write-Cached Objects" above
 - Delete tracking directory
 - Return S3 response unchanged
 

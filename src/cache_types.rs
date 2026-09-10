@@ -523,6 +523,51 @@ impl Default for ObjectMetadata {
 }
 
 impl ObjectMetadata {
+    /// The `Last-Modified` value this entry actually has, from either source.
+    ///
+    /// Two places can hold this value and they disagree by construction today: the
+    /// typed `last_modified` field, and a `last-modified` entry in `response_headers`
+    /// (matched case-insensitively, since S3 and other callers write it in different
+    /// cases). GET serve paths already check the map first and fall back to the
+    /// field; the mainline HEAD hit replays only the map. This accessor is the single
+    /// place that question is asked, so a predicate and the serve path it gates can
+    /// never read different sources for the same entry.
+    ///
+    /// Returns `None` when both sources are absent or empty — never an empty string —
+    /// so callers can use `.is_none()` directly as the "we have no validator" test.
+    ///
+    /// Spec: write-cache-last-modified. Requirements: 1.2
+    pub fn effective_last_modified(&self) -> Option<&str> {
+        if !self.last_modified.is_empty() {
+            return Some(self.last_modified.as_str());
+        }
+        self.response_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Persist a learned `Last-Modified` value into both sources at once.
+    ///
+    /// The typed field and the header map must never be allowed to disagree, so this
+    /// is the only writer either should go through. Any existing case-variant of the
+    /// `last-modified` key is removed first, so a later read of `response_headers`
+    /// cannot find a stale duplicate under a different case.
+    ///
+    /// No value is ever synthesised here or by any caller of this method — only a
+    /// value S3 actually returned is acceptable (R3.4). This function does not enforce
+    /// that; it is enforced by never calling it with anything else.
+    ///
+    /// Spec: write-cache-last-modified. Requirements: 3.1, 3.2
+    pub fn set_last_modified(&mut self, last_modified: String) {
+        self.last_modified.clone_from(&last_modified);
+        self.response_headers
+            .retain(|name, _| !name.eq_ignore_ascii_case("last-modified"));
+        self.response_headers
+            .insert("last-modified".to_string(), last_modified);
+    }
+
     /// Create a new ObjectMetadata with default values for new fields
     pub fn new(
         etag: String,
@@ -2397,5 +2442,146 @@ mod head_cached_at_tests {
             serde_json::from_str(&serde_json::to_string(&metadata).unwrap())
                 .expect("prior schemas must ignore the additive anchor field");
         assert_eq!(parsed.cache_key, "bucket/key");
+    }
+
+    // Spec: write-cache-last-modified. Requirements: 1.2, 11.11 (task 1.1)
+
+    #[test]
+    fn effective_last_modified_field_only() {
+        let om = ObjectMetadata {
+            last_modified: "Wed, 09 Sep 2026 10:28:17 GMT".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            om.effective_last_modified(),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+    }
+
+    #[test]
+    fn effective_last_modified_map_only() {
+        let mut om = ObjectMetadata::default();
+        om.response_headers.insert(
+            "last-modified".to_string(),
+            "Wed, 09 Sep 2026 10:28:17 GMT".to_string(),
+        );
+        assert_eq!(
+            om.effective_last_modified(),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+    }
+
+    #[test]
+    fn effective_last_modified_both_present_prefers_typed_field() {
+        let mut om = ObjectMetadata {
+            last_modified: "Wed, 09 Sep 2026 10:28:17 GMT".to_string(),
+            ..Default::default()
+        };
+        om.response_headers.insert(
+            "last-modified".to_string(),
+            "Thu, 10 Sep 2026 00:00:00 GMT".to_string(),
+        );
+        assert_eq!(
+            om.effective_last_modified(),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+    }
+
+    #[test]
+    fn effective_last_modified_neither_present_is_none() {
+        let om = ObjectMetadata::default();
+        assert_eq!(om.effective_last_modified(), None);
+    }
+
+    #[test]
+    fn effective_last_modified_map_key_is_case_insensitive() {
+        let mut om = ObjectMetadata::default();
+        om.response_headers.insert(
+            "Last-Modified".to_string(),
+            "Wed, 09 Sep 2026 10:28:17 GMT".to_string(),
+        );
+        assert_eq!(
+            om.effective_last_modified(),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+
+        let mut om2 = ObjectMetadata::default();
+        om2.response_headers.insert(
+            "LAST-MODIFIED".to_string(),
+            "Wed, 09 Sep 2026 10:28:17 GMT".to_string(),
+        );
+        assert_eq!(
+            om2.effective_last_modified(),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+    }
+
+    #[test]
+    fn effective_last_modified_empty_field_falls_back_to_map() {
+        // The empty-string default is the write-through PUT's own state (R1).
+        let mut om = ObjectMetadata {
+            last_modified: String::new(),
+            ..Default::default()
+        };
+        om.response_headers.insert(
+            "last-modified".to_string(),
+            "Wed, 09 Sep 2026 10:28:17 GMT".to_string(),
+        );
+        assert_eq!(
+            om.effective_last_modified(),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+    }
+
+    #[test]
+    fn effective_last_modified_empty_map_value_is_none() {
+        let mut om = ObjectMetadata::default();
+        om.response_headers
+            .insert("last-modified".to_string(), String::new());
+        assert_eq!(om.effective_last_modified(), None);
+    }
+
+    // Spec: write-cache-last-modified. Requirements: 3.1, 3.2 (task 1.2)
+
+    #[test]
+    fn set_last_modified_writes_both_sources() {
+        let mut om = ObjectMetadata::default();
+        om.set_last_modified("Wed, 09 Sep 2026 10:28:17 GMT".to_string());
+        assert_eq!(om.last_modified, "Wed, 09 Sep 2026 10:28:17 GMT");
+        assert_eq!(
+            om.response_headers.get("last-modified").map(String::as_str),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+    }
+
+    #[test]
+    fn set_last_modified_removes_existing_case_variant_first() {
+        let mut om = ObjectMetadata::default();
+        om.response_headers
+            .insert("Last-Modified".to_string(), "stale-value".to_string());
+        om.set_last_modified("Wed, 09 Sep 2026 10:28:17 GMT".to_string());
+
+        // No stray case-variant key left behind.
+        assert_eq!(
+            om.response_headers
+                .keys()
+                .filter(|k| k.eq_ignore_ascii_case("last-modified"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            om.response_headers.get("last-modified").map(String::as_str),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
+    }
+
+    #[test]
+    fn set_last_modified_then_effective_last_modified_agrees() {
+        let mut om = ObjectMetadata::default();
+        om.set_last_modified("Wed, 09 Sep 2026 10:28:17 GMT".to_string());
+        assert_eq!(
+            om.effective_last_modified(),
+            Some("Wed, 09 Sep 2026 10:28:17 GMT")
+        );
     }
 }

@@ -3473,7 +3473,21 @@ impl HttpProxy {
                             // The client's If-Match is the freshness assertion (RFC 7232 §3.1),
                             // so the cached bytes for the matching ETag are correct regardless
                             // of the cached entry's TTL. Refresh TTL and serve immediately.
-                            if mode_b_if_match_serve {
+                            //
+                            // Exception: never take this fast path for an entry with no
+                            // effective `Last-Modified`. Serving from cache here would return
+                            // a response with no `Last-Modified` header — the exact defect this
+                            // spec closes — and it would do so on the CRT/Mountpoint/transfer-
+                            // manager `If-Match` path, which is the workload issue #19 was
+                            // reported through. Falling through to the revalidation path below
+                            // learns the field (backfilling it), then serves. The invariant is
+                            // universal: no serve path returns cached bytes without an effective
+                            // `Last-Modified`. Spec: write-cache-last-modified R5.1, R1.1.
+                            let mode_b_has_last_modified = preloaded_metadata
+                                .as_ref()
+                                .map(|m| m.object_metadata.effective_last_modified().is_some())
+                                .unwrap_or(false);
+                            if mode_b_if_match_serve && mode_b_has_last_modified {
                                 debug!(
                                     "Mode B: If-Match serving from cache (TTL check bypassed, TTL refreshed): cache_key={}",
                                     cache_key
@@ -3637,17 +3651,42 @@ impl HttpProxy {
                                             }
                                         }
 
-                                        // Build validation headers
+                                        // Build validation headers. This arm is
+                                        // only reached when the client sent no
+                                        // conditional headers of its own (see the
+                                        // dispatch rules above `has_any_conditional`
+                                        // — a client `If-None-Match` would have
+                                        // taken forward_to_s3=true instead), so
+                                        // injecting is safe today. R8.2 makes that
+                                        // explicit rather than relying on the
+                                        // implication: gate on
+                                        // `is_header_signed(headers, "if-none-match")`
+                                        // returning false, so a rewrite of the
+                                        // dispatch logic above cannot silently
+                                        // reintroduce a signature-invalidating
+                                        // overwrite here.
                                         let mut validation_headers = header_map.clone();
-                                        if let Some(ref lm) = last_modified {
-                                            validation_headers.insert(
-                                                "if-modified-since".to_string(),
-                                                lm.clone(),
+                                        if !crate::signed_request_proxy::is_header_signed(
+                                            &header_map,
+                                            "if-none-match",
+                                        ) {
+                                            if let Some(ref lm) = last_modified {
+                                                validation_headers.insert(
+                                                    "if-modified-since".to_string(),
+                                                    lm.clone(),
+                                                );
+                                            }
+                                            if let Some(ref et) = etag {
+                                                validation_headers.insert(
+                                                    "if-none-match".to_string(),
+                                                    et.clone(),
+                                                );
+                                            }
+                                        } else {
+                                            debug!(
+                                                "if-none-match is signed; not injecting proxy validators: cache_key={}",
+                                                cache_key
                                             );
-                                        }
-                                        if let Some(ref et) = etag {
-                                            validation_headers
-                                                .insert("if-none-match".to_string(), et.clone());
                                         }
 
                                         // Build S3 request context for conditional validation
@@ -3669,6 +3708,130 @@ impl HttpProxy {
                                                     "Full object conditional validation returned 304 Not Modified, refreshing TTL: cache_key={}",
                                                     cache_key
                                                 );
+
+                                                    // R3/R4: backfill a learned Last-Modified
+                                                    // when this entry had none. R4.1/R4.4: if
+                                                    // the origin's 304 omits the header too,
+                                                    // persist nothing, WARN naming the key, and
+                                                    // continue with the existing TTL-refresh
+                                                    // serve — R4.2/R4.3's termination guarantee
+                                                    // depends on `check_object_expiration`'s
+                                                    // `is_write_cached` conjunct, which this
+                                                    // arm's outcome does not need to unblock
+                                                    // for the response to be correct.
+                                                    // Gated on the CACHED entry having lacked the
+                                                    // field (`last_modified.is_none()`), so an
+                                                    // ordinary TTL revalidation of an entry that
+                                                    // already has one no longer pays a `.meta`
+                                                    // read, a whole-struct rewrite and a RAM put
+                                                    // on every `304`.
+                                                    let mut unhealed_must_forward = false;
+                                                    if last_modified.is_none() {
+                                                        match response
+                                                            .headers
+                                                            .get("last-modified")
+                                                            .or_else(|| {
+                                                                response
+                                                                    .headers
+                                                                    .get("Last-Modified")
+                                                            })
+                                                            .cloned()
+                                                        {
+                                                            Some(lm) => {
+                                                                match cache_manager
+                                                                    .backfill_write_cache_last_modified(
+                                                                        &cache_key,
+                                                                        lm,
+                                                                        etag.as_deref(),
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(true) => {}
+                                                                    Ok(false) => {
+                                                                        warn!(
+                                                                            "ETag changed between 304 validation and metadata commit for {}; forwarding original request",
+                                                                            cache_key
+                                                                        );
+                                                                        unhealed_must_forward = true;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        // R9: accepted cost. Nothing
+                                                                        // persisted, the client still
+                                                                        // gets the learned header
+                                                                        // (R9.3), and the entry stays
+                                                                        // eligible on its next read.
+                                                                        warn!(
+                                                                            "Failed to backfill Last-Modified for {}: {}",
+                                                                            cache_key, e
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                            None => {
+                                                                warn!(
+                                                                    "304 for write-cached entry with no effective Last-Modified carried no Last-Modified header either; forwarding so the entry re-caches as a read-cache entry: cache_key={}",
+                                                                    cache_key
+                                                                );
+                                                                unhealed_must_forward = true;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // R4.1: a `304` that leaves this entry still
+                                                    // unhealed MUST forward the client's original
+                                                    // request rather than serve from cache. The
+                                                    // forward returns `200`, re-caches through the
+                                                    // read-cache path and clears `is_write_cached`,
+                                                    // which is the whole of R4.2/R4.3's termination
+                                                    // guarantee: without it the trigger's
+                                                    // `is_write_cached` conjunct stays true and the
+                                                    // entry revalidates on every read forever
+                                                    // without ever acquiring the header. Both ways
+                                                    // of staying unhealed — an ETag that moved under
+                                                    // us, and an origin whose `304` carries no
+                                                    // `Last-Modified` — share this one forward.
+                                                    // Spec: write-cache-last-modified. Requirements: 4.1, 4.2, 4.3, 8.4
+                                                    if unhealed_must_forward {
+                                                        if let Some(g) = fetcher_guard.take() {
+                                                            g.complete_error(
+                                                                "304 left the entry without a Last-Modified"
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                        // Drop the stale write-cached entry before
+                                                        // forwarding so the re-cache lands as a clean
+                                                        // read-cache entry with `is_write_cached`
+                                                        // false. Without this the forward re-caches
+                                                        // over an entry still flagged write-cached
+                                                        // and R1.4's conjunct keeps the trigger armed
+                                                        // (R4.2/R4.3). Same invalidate-then-forward
+                                                        // shape the changed-object `200` arm uses.
+                                                        if let Err(e) = cache_manager
+                                                            .invalidate_cache_hierarchy(&cache_key)
+                                                            .await
+                                                        {
+                                                            warn!(
+                                                                "Failed to invalidate before R4.1 forward for {}: {}",
+                                                                cache_key, e
+                                                            );
+                                                        }
+                                                        return Self::forward_get_head_to_s3_and_cache(
+                                                            method,
+                                                            uri,
+                                                            host,
+                                                            header_map,
+                                                            cache_key,
+                                                            cache_manager,
+                                                            s3_client,
+                                                            range_handler,
+                                                            config,
+                                                            &resolved_settings,
+                                                            proxy_referer,
+                                                            None,
+                                                            permit.clone(),
+                                                        )
+                                                        .await;
+                                                    }
 
                                                     let mut disk_cache_guard =
                                                         disk_cache.write().await;
@@ -7173,7 +7336,20 @@ impl HttpProxy {
                                     let mut validation_headers = client_headers.clone();
                                     validation_headers
                                         .insert("range".to_string(), range_header.to_string());
-                                    if !client_sent_conditional {
+                                    // R8.2: gate explicitly on
+                                    // `is_header_signed(headers, "if-none-match")`
+                                    // rather than relying on
+                                    // `client_sent_conditional` to imply it. The
+                                    // implication holds today only because a
+                                    // SigV4 client can only sign a header it
+                                    // sent — a side effect of the guard above,
+                                    // not a stated invariant.
+                                    if !client_sent_conditional
+                                        && !crate::signed_request_proxy::is_header_signed(
+                                            &client_headers,
+                                            "if-none-match",
+                                        )
+                                    {
                                         if let Some(ref lm) = last_modified {
                                             validation_headers.insert(
                                                 "if-modified-since".to_string(),
@@ -7186,7 +7362,7 @@ impl HttpProxy {
                                         }
                                     } else {
                                         debug!(
-                                            "Client sent its own conditional; not injecting proxy validators: cache_key={}",
+                                            "Client sent its own conditional or if-none-match is signed; not injecting proxy validators: cache_key={}",
                                             cache_key
                                         );
                                     }
@@ -7210,6 +7386,145 @@ impl HttpProxy {
                                                 "Conditional validation returned 304 Not Modified, refreshing TTL: cache_key={}",
                                                 cache_key
                                             );
+
+                                                // R3/R4: same backfill as the full-object
+                                                // arm. On an ETag mismatch (R8.4) fall back
+                                                // to an ordinary signed/unsigned forward of
+                                                // this range request rather than serving.
+                                                // Gated on the CACHED entry having lacked the
+                                                // field, so an ordinary TTL revalidation of an
+                                                // entry that already has one is untouched.
+                                                // `backfilled` records that the entry on disk has
+                                                // moved on from `preloaded_metadata`, which was
+                                                // captured long before this conditional was sent.
+                                                let mut backfilled = false;
+                                                let mut unhealed_must_forward = false;
+                                                if last_modified.is_none() {
+                                                    match response
+                                                        .headers
+                                                        .get("last-modified")
+                                                        .or_else(|| {
+                                                            response.headers.get("Last-Modified")
+                                                        })
+                                                        .cloned()
+                                                    {
+                                                        Some(lm) => {
+                                                            match cache_manager
+                                                                .backfill_write_cache_last_modified(
+                                                                    &cache_key,
+                                                                    lm,
+                                                                    etag.as_deref(),
+                                                                )
+                                                                .await
+                                                            {
+                                                                Ok(true) => {
+                                                                    backfilled = true;
+                                                                }
+                                                                Ok(false) => {
+                                                                    warn!(
+                                                                        "ETag changed between 304 validation and metadata commit for {}; forwarding original request",
+                                                                        cache_key
+                                                                    );
+                                                                    unhealed_must_forward = true;
+                                                                }
+                                                                Err(e) => {
+                                                                    // R9: accepted cost. The client
+                                                                    // still gets the learned header
+                                                                    // (R9.3) and the entry stays
+                                                                    // eligible on its next read.
+                                                                    warn!(
+                                                                        "Failed to backfill Last-Modified for {}: {}",
+                                                                        cache_key, e
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        None => {
+                                                            warn!(
+                                                                "304 for write-cached entry with no effective Last-Modified carried no Last-Modified header either; forwarding so the entry re-caches as a read-cache entry: cache_key={}",
+                                                                cache_key
+                                                            );
+                                                            unhealed_must_forward = true;
+                                                        }
+                                                    }
+                                                }
+
+                                                // R4.1: a `304` that leaves this entry still
+                                                // unhealed MUST forward rather than serve from
+                                                // cache — the forward's `200` re-caches through
+                                                // the read-cache path and clears
+                                                // `is_write_cached`, which is what makes R4.3's
+                                                // one-fetch-per-entry bound hold. Without it the
+                                                // trigger fires on every read forever and the
+                                                // header is never delivered. An ETag that moved
+                                                // under us (R8.4) takes the same forward.
+                                                // Spec: write-cache-last-modified. Requirements: 4.1, 4.2, 4.3, 8.4
+                                                if unhealed_must_forward {
+                                                    if let Some(g) = fetcher_guard.take() {
+                                                        g.complete_error(
+                                                            "304 left the entry without a Last-Modified"
+                                                                .to_string(),
+                                                        );
+                                                    }
+                                                    // Drop the stale write-cached entry before
+                                                    // forwarding. A range forward re-caches only
+                                                    // the requested extent and would otherwise
+                                                    // leave the object-level `is_write_cached` flag
+                                                    // set, so R1.4's conjunct would keep the trigger
+                                                    // armed on every future read (R4.2/R4.3). The
+                                                    // full-object arm does the same.
+                                                    if let Err(e) = cache_manager
+                                                        .invalidate_cache_hierarchy(&cache_key)
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            "Failed to invalidate before R4.1 range forward for {}: {}",
+                                                            cache_key, e
+                                                        );
+                                                    }
+                                                    let empty_overlap = crate::range_handler::RangeOverlap::all_missing(&range_spec);
+                                                    let is_signed_fallback = crate::signed_request_proxy::is_range_signed(&client_headers);
+                                                    return if is_signed_fallback {
+                                                        Self::forward_signed_range_request(
+                                                            method,
+                                                            uri,
+                                                            host,
+                                                            client_headers,
+                                                            cache_key,
+                                                            range_spec,
+                                                            empty_overlap,
+                                                            cache_manager,
+                                                            range_handler,
+                                                            s3_client,
+                                                            config,
+                                                            resolved,
+                                                            proxy_referer,
+                                                            None,
+                                                            permit.clone(),
+                                                        )
+                                                        .await
+                                                    } else {
+                                                        Self::forward_range_request_to_s3(
+                                                            method,
+                                                            uri,
+                                                            host,
+                                                            client_headers,
+                                                            cache_key,
+                                                            range_spec,
+                                                            empty_overlap,
+                                                            cache_manager,
+                                                            range_handler,
+                                                            s3_client,
+                                                            config,
+                                                            None,
+                                                            resolved,
+                                                            proxy_referer,
+                                                            None,
+                                                            permit.clone(),
+                                                        )
+                                                        .await
+                                                    };
+                                                }
 
                                                 let mut disk_cache_guard = disk_cache.write().await;
                                                 if let Err(e) = disk_cache_guard
@@ -7267,7 +7582,22 @@ impl HttpProxy {
                                                         &uri.to_string(),
                                                         &header_map,
                                                         config.clone(),
-                                                        preloaded_metadata.as_ref(),
+                                                        // R3.3: after a backfill the on-disk
+                                                        // `.meta` has moved on from this snapshot,
+                                                        // which was captured before the conditional
+                                                        // was even sent. Handing it to the serve
+                                                        // path would build the response headers
+                                                        // from the pre-backfill copy and omit the
+                                                        // very `Last-Modified` this request just
+                                                        // learned, so the client would need a
+                                                        // second read to see it — exactly what
+                                                        // R3.3 forbids. `resolve_cached_metadata`
+                                                        // re-reads from disk when given `None`.
+                                                        if backfilled {
+                                                            None
+                                                        } else {
+                                                            preloaded_metadata.as_ref()
+                                                        },
                                                         resolved,
                                                         permit.clone(),
                                                     )
@@ -7969,16 +8299,16 @@ impl HttpProxy {
             response_builder = response_builder.header("etag", &cached_metadata.etag);
         }
 
+        // "Do we have it" via the single shared accessor (R1.2) — see the sibling
+        // fallback in `add_object_metadata_headers` for the rationale.
         if !cached_metadata
             .response_headers
-            .contains_key("last-modified")
-            && !cached_metadata
-                .response_headers
-                .contains_key("Last-Modified")
-            && !cached_metadata.last_modified.is_empty()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("last-modified"))
         {
-            response_builder =
-                response_builder.header("last-modified", &cached_metadata.last_modified);
+            if let Some(lm) = cached_metadata.effective_last_modified() {
+                response_builder = response_builder.header("last-modified", lm);
+            }
         }
 
         // For HEAD requests, don't include body.
@@ -8708,16 +9038,19 @@ impl HttpProxy {
             response_builder = response_builder.header("etag", &cached_metadata.etag);
         }
 
+        // "Do we have it" via the single shared accessor (R1.2), so this fallback and
+        // any predicate gating a serve can never read a different source for the same
+        // entry. `response_headers` already got a chance to supply the header via the
+        // loop above; this only fires when that loop's map lacked the key (any case)
+        // but the typed field or a differently-cased map entry has it.
         if !cached_metadata
             .response_headers
-            .contains_key("last-modified")
-            && !cached_metadata
-                .response_headers
-                .contains_key("Last-Modified")
-            && !cached_metadata.last_modified.is_empty()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("last-modified"))
         {
-            response_builder =
-                response_builder.header("last-modified", &cached_metadata.last_modified);
+            if let Some(lm) = cached_metadata.effective_last_modified() {
+                response_builder = response_builder.header("last-modified", lm);
+            }
         }
 
         response_builder
@@ -10613,6 +10946,80 @@ impl HttpProxy {
                     mm_guard.record_coalesce_cache_hit().await;
                 }
 
+                // R4.8: backfill a learned Last-Modified for this coalescing
+                // waiter's own conditional, same as the two mainline arms. This
+                // handler's `304` is separate from the mainline ones, so it needs
+                // its own call rather than inheriting theirs.
+                let mut unhealed_must_forward = false;
+                if metadata.object_metadata.effective_last_modified().is_none() {
+                    match response
+                        .headers
+                        .get("last-modified")
+                        .or_else(|| response.headers.get("Last-Modified"))
+                        .cloned()
+                    {
+                        Some(lm) => {
+                            match cache_manager
+                                .backfill_write_cache_last_modified(
+                                    &cache_key,
+                                    lm,
+                                    Some(etag.as_str()).filter(|e| !e.is_empty()),
+                                )
+                                .await
+                            {
+                                Ok(true) => {}
+                                // R8.4: the ETag moved between the `304` and the
+                                // commit, so the cached bytes may not be the bytes
+                                // the `304` validated. This verdict was previously
+                                // discarded here — only `Err` was matched — and the
+                                // waiter served the cached copy of a CHANGED object.
+                                Ok(false) => {
+                                    warn!(
+                                        "Coalescing waiter (validated): ETag changed between 304 validation and metadata commit for {}; forwarding instead of serving",
+                                        cache_key
+                                    );
+                                    unhealed_must_forward = true;
+                                }
+                                Err(e) => {
+                                    // R9: accepted cost, nothing persisted, still safe
+                                    // to serve — the bytes were validated by the `304`.
+                                    warn!(
+                                        "Coalescing waiter (validated): failed to backfill Last-Modified for {}: {}",
+                                        cache_key, e
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            // R4.1, as at the two mainline arms.
+                            warn!(
+                                "Coalescing waiter (validated): 304 for write-cached entry {} carried no Last-Modified either; forwarding so the entry re-caches as a read-cache entry",
+                                cache_key
+                            );
+                            unhealed_must_forward = true;
+                        }
+                    }
+                }
+
+                if unhealed_must_forward {
+                    return Self::forward_get_head_to_s3_and_cache(
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        cache_key,
+                        cache_manager,
+                        s3_client,
+                        range_handler,
+                        config.clone(),
+                        resolved,
+                        proxy_referer,
+                        None,
+                        permit,
+                    )
+                    .await;
+                }
+
                 // Best-effort TTL refresh. `refresh_cache_ttl` updates both
                 // GET and HEAD expires_at using the effective TTLs.
                 if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
@@ -11163,6 +11570,59 @@ impl HttpProxy {
                     mm_guard.record_coalesce_waiter_conditional_304().await;
                     mm_guard.record_coalesce_cache_hit().await;
                 }
+                // R4.8: same backfill as the full-object coalescing waiter.
+                let mut unhealed_must_forward = false;
+                let mut backfilled = false;
+                if metadata.object_metadata.effective_last_modified().is_none() {
+                    match response
+                        .headers
+                        .get("last-modified")
+                        .or_else(|| response.headers.get("Last-Modified"))
+                        .cloned()
+                    {
+                        Some(lm) => {
+                            match cache_manager
+                                .backfill_write_cache_last_modified(
+                                    &cache_key,
+                                    lm,
+                                    Some(etag.as_str()).filter(|e| !e.is_empty()),
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    backfilled = true;
+                                }
+                                // R8.4: ETag moved between the `304` and the commit,
+                                // so the cached bytes may not be what was validated.
+                                // Previously only `Err` was matched here and this
+                                // verdict was discarded, serving a changed object.
+                                Ok(false) => {
+                                    warn!(
+                                        "Coalescing range waiter (validated): ETag changed between 304 validation and metadata commit for {}; forwarding instead of serving",
+                                        cache_key
+                                    );
+                                    unhealed_must_forward = true;
+                                }
+                                Err(e) => {
+                                    // R9: accepted cost; the bytes were still
+                                    // validated by the `304`, so serving is safe.
+                                    warn!(
+                                        "Coalescing range waiter (validated): failed to backfill Last-Modified for {}: {}",
+                                        cache_key, e
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            // R4.1, as at the mainline arms.
+                            warn!(
+                                "Coalescing range waiter (validated): 304 for write-cached entry {} carried no Last-Modified either; forwarding so the entry re-caches as a read-cache entry",
+                                cache_key
+                            );
+                            unhealed_must_forward = true;
+                        }
+                    }
+                }
                 if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
                     debug!(
                         "Coalescing range waiter (validated): TTL refresh failed for {}: {}",
@@ -11182,17 +11642,39 @@ impl HttpProxy {
                         &cache_key,
                         &range_spec,
                         None,
-                        Some(&metadata),
+                        // R3.3: a successful backfill has moved the on-disk `.meta`
+                        // on from this snapshot, so re-read rather than reusing it —
+                        // otherwise the response is built from the pre-backfill copy
+                        // and omits the `Last-Modified` this request just learned.
+                        if backfilled { None } else { Some(&metadata) },
                         crate::cache_types::RangeLookupPurpose::RevalidationCandidate,
                     )
                     .await
                 {
-                    Ok(o) if o.has_complete_coverage() => o,
+                    // `unhealed_must_forward` routes an ETag-mismatch or a
+                    // header-less `304` (R8.4, R4.1) into the same fallback forward
+                    // this arm already has, rather than serving cached bytes.
+                    Ok(o) if o.has_complete_coverage() && !unhealed_must_forward => o,
                     _ => {
                         debug!(
-                            "Coalescing range waiter (validated): range missing after 304 for {}:{}-{}, falling back to signed S3 fetch",
+                            "Coalescing range waiter (validated): forwarding after 304 for {}:{}-{} (range missing, or the 304 left the entry unhealed)",
                             cache_key, range_spec.start, range_spec.end
                         );
+                        // Only when the entry is UNHEALED (R4.1/R8.4) must the stale
+                        // write-cached entry be dropped so the re-cache clears the
+                        // flag. When this arm is reached merely because the cached
+                        // range does not cover the request, the entry is fine and
+                        // must be left to graduate normally, so do NOT invalidate.
+                        if unhealed_must_forward {
+                            if let Err(e) =
+                                cache_manager.invalidate_cache_hierarchy(&cache_key).await
+                            {
+                                warn!(
+                                    "Failed to invalidate before R4.1 range-waiter forward for {}: {}",
+                                    cache_key, e
+                                );
+                            }
+                        }
                         let empty_overlap =
                             crate::range_handler::RangeOverlap::all_missing(&range_spec);
                         return if is_signed {

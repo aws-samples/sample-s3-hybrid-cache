@@ -6622,7 +6622,26 @@ impl DiskCacheManager {
         let age = now
             .duration_since(metadata.created_at)
             .unwrap_or(std::time::Duration::ZERO);
-        let expired = current_get_ttl.is_zero() || age > current_get_ttl;
+        let ttl_expired = current_get_ttl.is_zero() || age > current_get_ttl;
+
+        // A write-through PUT/CompleteMultipartUpload entry with no effective
+        // Last-Modified is a state the rest of the tree treats as an integrity
+        // error (`cache_validator.rs`'s `MissingRequiredField`), and the first GET
+        // after such a write is a cache HIT that never reaches S3 — so nothing
+        // ever learns it unless this predicate forces a revalidation. The
+        // `is_write_cached` conjunct is load-bearing, not decoration: without it
+        // the trigger would also fire on a legitimately-empty read-cache entry an
+        // older release may have written, and — more importantly — it is what
+        // makes R4 terminate. Graduation clears `is_write_cached` on a successful
+        // revalidation (deferred until the field is learned, R6), so once this
+        // entry acquires a Last-Modified and graduates, this conjunct goes false
+        // and the trigger cannot fire again for it.
+        //
+        // Spec: write-cache-last-modified. Requirements: 1.1, 1.3, 1.4
+        let missing_write_cache_last_modified = metadata.object_metadata.is_write_cached
+            && metadata.object_metadata.effective_last_modified().is_none();
+
+        let expired = ttl_expired || missing_write_cache_last_modified;
 
         if expired {
             debug!(
@@ -6630,7 +6649,17 @@ impl DiskCacheManager {
                 cache_key, age, current_get_ttl
             );
             Ok(ObjectExpirationResult::Expired {
-                last_modified: Some(metadata.object_metadata.last_modified.clone()),
+                // `None` when empty, via the same shared accessor the trigger
+                // predicate above reads (R1.2), rather than
+                // `Some(String::new())`. An empty value here used to reach
+                // `http_proxy.rs` and get inserted as a literal empty
+                // `if-modified-since` header (R2.1, R2.2) — S3 ignores it
+                // (measured, task 0.3), but sending it at all is wrong on its
+                // face and an S3-compatible origin may reject it with 400.
+                last_modified: metadata
+                    .object_metadata
+                    .effective_last_modified()
+                    .map(str::to_string),
                 etag: Some(metadata.object_metadata.etag.clone()).filter(|e| !e.is_empty()),
             })
         } else {
@@ -10077,6 +10106,221 @@ mod tests {
         assert!(
             matches!(result, ObjectExpirationResult::Expired { .. }),
             "Clock skew with get_ttl=0 should still be Expired"
+        );
+    }
+
+    // Spec: write-cache-last-modified. Requirements: 1.1, 1.3, 1.4, 1.6, 2.1, 2.2
+    // (tasks 3.1, 3.2, 3.8)
+
+    /// R1.1/R1.3: a write-cached entry with no effective Last-Modified must
+    /// report Expired even while comfortably within a generous get_ttl — this is
+    /// the trigger this spec adds, distinct from ordinary TTL expiry.
+    #[tokio::test]
+    async fn write_cached_entry_with_no_last_modified_is_expired_within_generous_ttl() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/write-cached-no-last-modified";
+        let now = std::time::SystemTime::now();
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"test-etag\"".to_string(),
+                last_modified: String::new(), // The write-through PUT's own state.
+                content_length: 100,
+                is_write_cached: true,
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now, // seconds old — well within a generous get_ttl
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(86400))
+            .await
+            .unwrap();
+        match result {
+            ObjectExpirationResult::Expired { last_modified, .. } => {
+                assert_eq!(
+                    last_modified, None,
+                    "R2.1/R2.2: an empty stored value must surface as None, not \
+                     Some(String::new()), or the caller inserts a literal empty \
+                     if-modified-since header"
+                );
+            }
+            ObjectExpirationResult::Fresh => {
+                panic!(
+                    "a write-cached entry with no effective Last-Modified must be \
+                     Expired regardless of get_ttl age (R1.1, R1.3) — this is the \
+                     new trigger, not ordinary TTL expiry"
+                );
+            }
+        }
+    }
+
+    /// R1.4: a READ-cache entry (is_write_cached: false) with no effective
+    /// Last-Modified — legitimately possible from an older release — must NOT be
+    /// forced into revalidation by this new trigger. Its existing TTL behaviour
+    /// (Fresh within get_ttl) must be unchanged.
+    #[tokio::test]
+    async fn read_cache_entry_with_no_last_modified_keeps_ordinary_ttl_behaviour() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/read-cached-no-last-modified";
+        let now = std::time::SystemTime::now();
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"test-etag\"".to_string(),
+                last_modified: String::new(),
+                content_length: 100,
+                is_write_cached: false, // Not write-cached — the R1.4 conjunct.
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(86400))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ObjectExpirationResult::Fresh,
+            "R1.4: a non-write-cached entry with no Last-Modified must retain its \
+             existing TTL-only behaviour and must not be revalidated on this \
+             ground"
+        );
+    }
+
+    /// R1.6/R1.7/R11.11: the trigger must be upload-shape-agnostic. A write-cached
+    /// entry that plausibly came from a multipart completion (parts_count and
+    /// upload_id set, no branch on either) must trigger revalidation identically
+    /// to the single-part case above.
+    #[tokio::test]
+    async fn write_cached_multipart_entry_with_no_last_modified_is_expired() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/multipart-no-last-modified";
+        let now = std::time::SystemTime::now();
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"c0ac455d64d87082383844659c014574-2\"".to_string(),
+                last_modified: String::new(),
+                content_length: 10_485_760,
+                is_write_cached: true,
+                parts_count: Some(2),
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(86400))
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ObjectExpirationResult::Expired { .. }),
+            "the trigger must fire for a multipart-shaped entry identically to a \
+             single-part one — no branch on parts_count or upload_id (R1.6)"
+        );
+    }
+
+    /// R2.1/R2.2 direct coverage: a write-cached entry that already has a real
+    /// Last-Modified (having previously revalidated, R3) must be evaluated on
+    /// ordinary TTL terms only — the new conjunct must go false once the field is
+    /// learned, which is also part of what makes R4 terminate.
+    #[tokio::test]
+    async fn write_cached_entry_with_last_modified_uses_ordinary_ttl() {
+        use crate::cache_types::{
+            CompressionInfo, NewCacheMetadata, ObjectExpirationResult, ObjectMetadata,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager =
+            DiskCacheManager::new(temp_dir.path().to_path_buf(), true, 1024, false, 1_048_576);
+        cache_manager.initialize().await.unwrap();
+
+        let cache_key = "test-bucket/write-cached-with-last-modified";
+        let now = std::time::SystemTime::now();
+
+        let metadata = NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"test-etag\"".to_string(),
+                last_modified: "Wed, 09 Sep 2026 10:28:17 GMT".to_string(),
+                content_length: 100,
+                is_write_cached: true,
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            ..Default::default()
+        };
+
+        let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let result = cache_manager
+            .check_object_expiration(cache_key, std::time::Duration::from_secs(86400))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ObjectExpirationResult::Fresh,
+            "once Last-Modified is known, the new conjunct must be false and \
+             ordinary get_ttl freshness applies — a still-write-cached entry with \
+             a learned Last-Modified must not be forced to revalidate again"
         );
     }
 

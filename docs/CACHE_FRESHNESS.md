@@ -46,6 +46,20 @@ If the client sent its own `If-None-Match` or `If-Modified-Since`, the proxy doe
 
 This approach minimizes bandwidth usage while ensuring cache freshness and consistency.
 
+**Write-cached entries with no known `Last-Modified` are revalidated regardless of TTL.**
+S3's `PutObject` and `CompleteMultipartUpload` responses never carry a `Last-Modified` header, so
+a write-through cache entry starts with none — and since the first GET is normally a cache HIT
+that never reaches S3, nothing would otherwise ever learn it. To close that gap, a write-cached
+entry with no known `Last-Modified` is treated as requiring revalidation on its next GET **even
+while it is otherwise fresh by TTL**. The injected validator in this case is `If-None-Match`
+alone — there is no cached `Last-Modified` to send an `If-Modified-Since` for. A successful `304`
+backfills the learned header (from the response's own `Last-Modified`) and serves the cached
+bytes with it; a `304` that itself carries no `Last-Modified` (an S3-compatible origin is not
+required to send one, per RFC 7232 §4.1) persists nothing and the entry remains subject to the
+same check on its next read. This trigger is independent of the `evaluate_conditions_from_cache`
+setting described below, and it does not apply to ordinary read-cache entries — only to entries
+still marked write-cached with the field unknown.
+
 **Expiry is a revalidation boundary, not a disappearance.**
 
 This distinction matters when reasoning about what an expired entry costs you. Once `get_ttl` elapses, the cached metadata, ETag and range files are all still present under lazy expiration, and the proxy uses them: the entry becomes a *revalidation candidate*. An unchanged object then costs one conditional round trip and no body transfer, however large it is.

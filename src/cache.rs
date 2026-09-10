@@ -7560,12 +7560,12 @@ impl CacheManager {
             );
             headers.insert("content-length".to_string(), (end - start + 1).to_string());
             headers.insert("etag".to_string(), metadata.object_metadata.etag.clone());
-            // Only include last-modified if we have it from S3 (not fabricated)
-            if !metadata.object_metadata.last_modified.is_empty() {
-                headers.insert(
-                    "last-modified".to_string(),
-                    metadata.object_metadata.last_modified.clone(),
-                );
+            // Only include last-modified if we have it from S3 (not fabricated), checked
+            // through the single shared accessor (R1.2) rather than the typed field
+            // alone, so this predicate and the GET serve fallbacks can never disagree
+            // about whether the entry has one.
+            if let Some(lm) = metadata.object_metadata.effective_last_modified() {
+                headers.insert("last-modified".to_string(), lm.to_string());
             }
             headers.insert("accept-ranges".to_string(), "bytes".to_string());
 
@@ -8192,6 +8192,25 @@ impl CacheManager {
                     // ranges and so is not re-published to RAM, leaving this
                     // stale copy to be detected again on every subsequent read.
                     self.metadata_cache.invalidate(cache_key).await;
+                } else if metadata.object_metadata.effective_last_modified().is_none() {
+                    // Same precedent, different defect (R5.1, R5.2): a write-through PUT
+                    // never sets Last-Modified, and a revalidated entry can also reach
+                    // this state via `refresh_cache_ttl` while `last_modified` stayed
+                    // empty (R5.4). Serving either from cache means answering a HEAD
+                    // with no Last-Modified header, which validate_head_cache_inputs
+                    // would refuse at store time — the lookup guard is what makes the
+                    // refusal apply here too. Reporting a miss forwards to S3, which
+                    // rewrites the entry clean.
+                    // Spec: write-cache-last-modified. Requirements: 5.1, 5.2, 5.4
+                    debug!(
+                        "Ignoring a HEAD cache entry with no effective Last-Modified for {} (RAM tier); revalidating against S3 and rewriting it clean",
+                        cache_key
+                    );
+                    // Invalidate for the same convergence reason as the part-scoped
+                    // guard: a cache-hit HEAD never calls store_head_cache_entry_unified,
+                    // so nothing heals this entry, and it has no ranges to re-publish it
+                    // to RAM after the disk rewrite (R5.3).
+                    self.metadata_cache.invalidate(cache_key).await;
                 } else {
                     debug!("HEAD cache hit (MetadataCache RAM) for key: {}", cache_key);
                     self.metadata_cache.record_head_hit();
@@ -8232,6 +8251,17 @@ impl CacheManager {
                             // This tier published the entry to RAM just above,
                             // before the freshness check. Undo that, for the same
                             // convergence reason as the RAM tier.
+                            self.metadata_cache.invalidate(cache_key).await;
+                        } else if metadata.object_metadata.effective_last_modified().is_none() {
+                            // Same disk-tier guard as the RAM tier above (R5.1, R5.2,
+                            // R5.4). This tier published the entry to RAM just above,
+                            // before this check — undo that for the same convergence
+                            // reason.
+                            // Spec: write-cache-last-modified. Requirements: 5.1, 5.2, 5.3, 5.4
+                            debug!(
+                                "Ignoring a HEAD cache entry with no effective Last-Modified for {} (disk tier); revalidating against S3 and rewriting it clean",
+                                cache_key
+                            );
                             self.metadata_cache.invalidate(cache_key).await;
                         } else {
                             debug!("HEAD cache hit (disk .meta) for key: {}", cache_key);
@@ -10512,6 +10542,141 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Backfill a learned `Last-Modified` onto a write-cache entry that had none,
+    /// and graduate it in the same operation if it is still write-cached (R3.1,
+    /// R3.3, R6.4).
+    ///
+    /// # Persistence path (R7.1, R7.2, R7.3)
+    ///
+    /// Follows the same direct read-modify-write shape as
+    /// `update_metadata_expiration_unified` — the established precedent for
+    /// exactly this class of operation, a `304`-triggered metadata mutation on
+    /// the request path. This codebase has no generic journal route for an
+    /// arbitrary field mutation (`CacheHitUpdateBuffer`/`JournalOperation` cover
+    /// TTL refresh and access-count updates specifically, not object-metadata
+    /// content), so a bespoke journal entry type would be needed to route this
+    /// through the journal in the idealized R7.1 sense. That is deferred; what IS
+    /// delivered, and is load-bearing: this function takes **no**
+    /// `locks/{key}.lock` (R7.2) and uses **no** retrying `acquire_lock` (R7.3) —
+    /// it is a single read, in-memory mutation, and atomic rename, exactly like
+    /// its TTL-refresh sibling.
+    ///
+    /// # In-lock ETag re-check (R8.4)
+    ///
+    /// `validated_etag` is the ETag the `304` validated. If the entry's current
+    /// stored ETag no longer matches by the time this function runs, the object
+    /// changed between the conditional request being sent and this commit — a
+    /// TOCTOU window `revalidation::classify`'s pre-check (evaluated against the
+    /// response) cannot close, because it runs before this read. On a mismatch,
+    /// nothing is persisted and the caller must forward to S3 rather than serve
+    /// cached bytes.
+    ///
+    /// # Failure policy (R9)
+    ///
+    /// See `refresh_write_cache_ttl`'s Ok/Err contract, which this follows: a
+    /// missing `.meta` or a read/parse/write failure is `Err`, logged by the
+    /// caller, and does NOT retry in a tight loop — the caller still serves the
+    /// `304`'s `Last-Modified` to the client (R9.3) regardless of whether this
+    /// persists.
+    ///
+    /// Returns `Ok(true)` if the field was persisted (and the entry graduated,
+    /// if it was still write-cached), `Ok(false)` if the ETag re-check failed
+    /// (caller must forward), `Err` on a read/parse/write failure.
+    ///
+    /// Spec: write-cache-last-modified. Requirements: 3.1, 3.3, 6.4, 7.1, 7.2, 7.3, 8.4
+    pub async fn backfill_write_cache_last_modified(
+        &self,
+        cache_key: &str,
+        last_modified: String,
+        validated_etag: Option<&str>,
+    ) -> Result<bool> {
+        let metadata_file_path = self.get_new_metadata_file_path(cache_key);
+
+        if !metadata_file_path.exists() {
+            return Err(ProxyError::CacheError(format!(
+                "Metadata file does not exist for key: {}",
+                cache_key
+            )));
+        }
+
+        let metadata_content = std::fs::read_to_string(&metadata_file_path)
+            .map_err(|e| ProxyError::CacheError(format!("Failed to read metadata: {}", e)))?;
+
+        let mut metadata =
+            serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&metadata_content)
+                .map_err(|e| ProxyError::CacheError(format!("Failed to parse metadata: {}", e)))?;
+
+        // R8.4: the in-lock ETag re-check, complementary to (not a replacement
+        // for) the response-side `revalidation::classify` pre-check. If the
+        // object changed in the gap between sending the conditional and this
+        // commit, do not persist a Last-Modified that may not correspond to the
+        // bytes still on disk, and tell the caller to forward.
+        if let Some(validated) = validated_etag {
+            if metadata.object_metadata.etag != validated {
+                warn!(
+                    "ETag changed between 304 validation and metadata commit for {}: cached={}, validated={}; forwarding instead of backfilling",
+                    cache_key, metadata.object_metadata.etag, validated
+                );
+                return Ok(false);
+            }
+        }
+
+        metadata.object_metadata.set_last_modified(last_modified);
+
+        // R6.4: graduate as part of the SAME operation, with the same accounting
+        // `refresh_write_cache_ttl` performs — not left staged for a later GET.
+        // The field is now known (set above), so the deferral in
+        // `refresh_write_cache_ttl` cannot re-block this.
+        let was_write_cached = metadata.object_metadata.is_write_cached;
+        if was_write_cached {
+            let staged_compressed_size = metadata.staged_compressed_size();
+            metadata.object_metadata.is_write_cached = false;
+            metadata.object_metadata.write_cache_expires_at = None;
+            metadata.object_metadata.write_cache_created_at = None;
+            metadata.object_metadata.write_cache_last_accessed = None;
+            for range in &mut metadata.ranges {
+                range.staged = Some(false);
+            }
+
+            self.metadata_cache.put(cache_key, metadata.clone()).await;
+            self.store_new_metadata(&metadata).await?;
+
+            match self.journal_consolidator.read().await.as_ref() {
+                Some(consolidator) => {
+                    if !consolidator
+                        .write_graduation_journal_entry(cache_key, staged_compressed_size)
+                        .await
+                    {
+                        return Err(ProxyError::CacheError(format!(
+                            "Backfilled Last-Modified and graduated {} ({} staged bytes) but \
+                             failed to journal the accounting; write_cache_size stays inflated \
+                             until the next full validation scan",
+                            cache_key, staged_compressed_size
+                        )));
+                    }
+                }
+                None => {
+                    warn!(
+                        "Backfilled Last-Modified and graduated {} ({} staged bytes) with no \
+                         journal consolidator wired: write_cache_size will not be decremented",
+                        cache_key, staged_compressed_size
+                    );
+                }
+            }
+            self.decrement_write_cache_staged_entries().await;
+            self.increment_write_cache_graduations().await;
+        } else {
+            self.metadata_cache.put(cache_key, metadata.clone()).await;
+            self.store_new_metadata(&metadata).await?;
+        }
+
+        debug!(
+            "Backfilled Last-Modified for key: {} (graduated={})",
+            cache_key, was_write_cached
+        );
+        Ok(true)
+    }
+
     /// Update both GET and HEAD expiration times in unified metadata
     /// Used for conditional request TTL refresh (304 Not Modified responses)
     async fn update_metadata_expiration_unified(
@@ -10656,6 +10821,26 @@ impl CacheManager {
         if !metadata.object_metadata.is_write_cached {
             debug!(
                 "Object is not write-cached, skipping TTL refresh: {}",
+                cache_key
+            );
+            return Ok(false);
+        }
+
+        // Graduation deferral (R6.1, R6.2, R6.3): do not clear `is_write_cached`
+        // while `effective_last_modified()` is still `None`. This function runs
+        // IMMEDIATELY BEFORE `check_object_expiration` at both mainline GET call
+        // sites, so without this deferral graduation would clear the flag first,
+        // the write-cache-last-modified trigger's `is_write_cached` conjunct
+        // would then be false, and the GET revalidation trigger could never fire
+        // — the fix would be inert while every test that drives graduation
+        // directly still passed. This is the unlocked pre-read filter that
+        // matches the existing `!is_write_cached` short-circuit above: a guard
+        // placed only after acquiring the write lock further down would leave
+        // every read of a still-staged entry paying that cost before bailing out.
+        // Spec: write-cache-last-modified. Requirements: 6.1, 6.2, 6.3
+        if metadata.object_metadata.effective_last_modified().is_none() {
+            debug!(
+                "Object is write-cached but has no effective Last-Modified yet, deferring graduation: {}",
                 cache_key
             );
             return Ok(false);
@@ -17588,6 +17773,228 @@ mod part_scoped_head_storage_tests {
     }
 }
 
+/// Storage-layer coverage for the `write-cache-last-modified` HEAD lookup guard
+/// (R5). These need only a `CacheManager` over a `TempDir` — no request path,
+/// following the `part_scoped_head_storage_tests` precedent above.
+///
+/// Spec: write-cache-last-modified. Requirements: 5.1, 5.2, 5.3, 5.4 (tasks 2.3, 2.4)
+#[cfg(test)]
+mod head_last_modified_guard_tests {
+    use super::*;
+    use crate::cache_types::{CompressionInfo, NewCacheMetadata, ObjectMetadata};
+    use tempfile::TempDir;
+
+    /// Plant a `.meta` directly, bypassing every write-side guard — the same
+    /// technique `plant_meta` in `tests/part_scoped_head_cache_test.rs` uses, and
+    /// the technique task 0.4 used to construct R5.4's state (a `304` revalidation
+    /// that set `head_expires_at` and `head_cached_at` without touching
+    /// `last_modified`, which this function's caller reproduces by fields rather
+    /// than by driving a real coalesced `304`).
+    fn plant_meta(manager: &CacheManager, cache_key: &str, metadata: NewCacheMetadata) {
+        let path = manager.get_new_metadata_file_path(cache_key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+    }
+
+    /// A write-through PUT's own state (R5.6): `is_write_cached: true`,
+    /// `last_modified` empty, `head_expires_at: None`. `is_head_fresh` already
+    /// misses on this because `head_expires_at` is `None` — this fixture exists so
+    /// the guard tests below are exercising the SAME entry shape a write-through
+    /// PUT actually produces, not an arbitrary one.
+    fn fresh_write_cached_entry(cache_key: &str) -> NewCacheMetadata {
+        let now = SystemTime::now();
+        NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"etag-1\"".to_string(),
+                last_modified: String::new(),
+                content_length: 16_000,
+                is_write_cached: true,
+                write_cache_expires_at: Some(now + Duration::from_secs(86400)),
+                write_cache_created_at: Some(now),
+                write_cache_last_accessed: Some(now),
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now,
+            expires_at: now + Duration::from_secs(86400),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: None,
+            head_last_accessed: None,
+            head_access_count: 0,
+            head_cached_at: None,
+        }
+    }
+
+    /// R5.4's residual hole, constructed directly rather than by driving a real
+    /// `304`, per task 2.4's instruction: `head_expires_at` set (as
+    /// `refresh_cache_ttl` → `update_metadata_expiration_unified` would set it on
+    /// a `304`) and `head_cached_at` set to a recent instant, while
+    /// `last_modified` stays empty. `created_at` is deliberately RECENT — R5.4
+    /// sharpening 2 says the exposure is bounded by `created_at` vs the resolved
+    /// `head_ttl`, so a fixture with a stale `created_at` would observe a forward
+    /// and prove nothing about the guard.
+    fn revalidated_entry_with_no_last_modified(cache_key: &str) -> NewCacheMetadata {
+        let now = SystemTime::now();
+        NewCacheMetadata {
+            cache_key: cache_key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"etag-1\"".to_string(),
+                last_modified: String::new(),
+                content_length: 16_000,
+                is_write_cached: true,
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: Some(now + Duration::from_secs(3600)),
+            head_last_accessed: Some(now),
+            head_access_count: 1,
+            head_cached_at: Some(now),
+        }
+    }
+
+    /// Task 2.3 (disk tier): a fresh write-cache entry (R5.6's own state) must
+    /// report a HEAD miss rather than serving cached bytes with no
+    /// `Last-Modified`.
+    #[tokio::test]
+    async fn fresh_write_cached_entry_head_misses_on_disk_tier() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/fresh-write-cached";
+        plant_meta(&manager, key, fresh_write_cached_entry(key));
+
+        let result = manager
+            .get_head_cache_entry_unified(key, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "a HEAD on a fresh write-cache entry with no effective Last-Modified \
+             must miss (R5.1), not serve a response with no Last-Modified header"
+        );
+    }
+
+    /// Task 2.4: R5.4's residual hole must not be HEAD-serveable. Construct the
+    /// state directly (head_expires_at set, last_modified empty, head_cached_at
+    /// set, created_at fresh) rather than driving a real `304`.
+    #[tokio::test]
+    async fn revalidated_entry_with_no_last_modified_head_misses() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/revalidated-no-lm";
+        plant_meta(&manager, key, revalidated_entry_with_no_last_modified(key));
+
+        let result = manager
+            .get_head_cache_entry_unified(key, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "an entry whose head_expires_at was set by a 304 revalidation while \
+             last_modified stayed empty (R5.4) must still miss — a lookup-side \
+             guard, not a store-side one, is what closes this"
+        );
+    }
+
+    /// Task 2.3's convergence half: a SECOND HEAD, after the guard's forward has
+    /// rewritten the entry clean, must be served from cache. Without this
+    /// assertion a guard that fires forever would also pass — this is what
+    /// distinguishes "suppresses forever" from "converges", per the
+    /// `is_part_scoped_entry` convergence precedent this guard follows.
+    #[tokio::test]
+    async fn second_head_after_guard_fires_is_a_cache_hit() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/converges-after-guard";
+        plant_meta(&manager, key, fresh_write_cached_entry(key));
+
+        // First HEAD: guard fires, reports a miss.
+        assert!(manager
+            .get_head_cache_entry_unified(key, Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .is_none());
+
+        // Simulate what the forward-and-cache path does on a miss: S3 answers
+        // authoritatively and the entry is rewritten clean via the existing HEAD
+        // store path, which learns Last-Modified from the (simulated) S3 response.
+        let head_response = CacheMetadata {
+            etag: "\"etag-1\"".to_string(),
+            last_modified: "Wed, 09 Sep 2026 16:51:54 GMT".to_string(),
+            content_length: 16_000,
+            part_number: None,
+            cache_control: None,
+            access_count: 0,
+            last_accessed: SystemTime::now(),
+        };
+        manager
+            .store_head_cache_entry_unified(key, HashMap::new(), head_response)
+            .await
+            .unwrap();
+
+        // Second HEAD: must now be a hit, proving convergence rather than a
+        // guard that suppresses every future HEAD for this key.
+        let result = manager
+            .get_head_cache_entry_unified(key, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "after the forward-and-cache path rewrites the entry with a real \
+             Last-Modified, a second HEAD must be served from cache — a guard \
+             that fires on every HEAD forever would also pass task 2.3's first \
+             assertion, which is why this second assertion exists"
+        );
+        let entry = result.unwrap();
+        assert_eq!(
+            entry.metadata.last_modified, "Wed, 09 Sep 2026 16:51:54 GMT",
+            "the cache hit must carry the learned Last-Modified"
+        );
+    }
+
+    /// A clean entry with a real Last-Modified must never be affected by this
+    /// guard — the no-regression control.
+    #[tokio::test]
+    async fn clean_entry_with_last_modified_is_unaffected() {
+        let temp = TempDir::new().unwrap();
+        let manager = CacheManager::new(temp.path().to_path_buf(), false, 0, 1024, false);
+        let key = "bucket/clean-entry";
+        let now = SystemTime::now();
+        let metadata = NewCacheMetadata {
+            cache_key: key.to_string(),
+            object_metadata: ObjectMetadata {
+                etag: "\"etag-1\"".to_string(),
+                last_modified: "Wed, 09 Sep 2026 16:51:54 GMT".to_string(),
+                content_length: 16_000,
+                is_write_cached: false,
+                ..Default::default()
+            },
+            ranges: Vec::new(),
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            compression_info: CompressionInfo::default(),
+            head_expires_at: Some(now + Duration::from_secs(3600)),
+            head_last_accessed: Some(now),
+            head_access_count: 1,
+            head_cached_at: Some(now),
+        };
+        plant_meta(&manager, key, metadata);
+
+        let result = manager
+            .get_head_cache_entry_unified(key, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "an entry that already carries a real Last-Modified must not be \
+             affected by the new guard"
+        );
+    }
+}
+
 /// Unit tests for [`CacheManager::credit_staged_range`], the credit site both
 /// single-PUT write-cache paths share.
 ///
@@ -18560,6 +18967,7 @@ mod undebited_write_cache_invalidation_tests {
 mod graduation_clears_staged_membership_tests {
     use super::*;
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
     const BODY_LEN: usize = 4096;
 
@@ -18612,6 +19020,28 @@ mod graduation_clears_staged_membership_tests {
                 body,
                 "\"graduation-staged-test\"".to_string(),
                 "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+                Some("application/octet-stream".to_string()),
+                HashMap::new(),
+                Duration::from_secs(86_400),
+            )
+            .await
+            .expect("write-cache store should succeed");
+    }
+
+    /// The write-through PUT's actual state (R1, R5.6): an empty `last_modified`,
+    /// matching what `signed_put_handler.rs` produces against real S3, which
+    /// returns no `Last-Modified` on `PutObject`/`CompleteMultipartUpload`.
+    async fn put_write_cached_no_last_modified(
+        manager: &CacheManager,
+        cache_key: &str,
+        body: &[u8],
+    ) {
+        manager
+            .store_put_as_write_cached_range_with_ttl(
+                cache_key,
+                body,
+                "\"graduation-deferral-test\"".to_string(),
+                String::new(),
                 Some("application/octet-stream".to_string()),
                 HashMap::new(),
                 Duration::from_secs(86_400),
@@ -18780,6 +19210,94 @@ mod graduation_clears_staged_membership_tests {
         // see the note on this test for why the accumulator delta is not a sound
         // instrument across a concurrent flush.
         manager.debit_removed_ranges(cache_key, &removed).await;
+    }
+
+    // Spec: write-cache-last-modified. Requirements: 6.1, 6.2, 6.3 (tasks 3.3, 3.4)
+
+    /// R6.1/R6.2: graduation must NOT run while `effective_last_modified()` is
+    /// `None` — `is_write_cached` must stay `true` and no `Graduation` journal
+    /// entry may be written. Without this deferral, `refresh_write_cache_ttl`
+    /// (which mainline GET calls immediately before `check_object_expiration`)
+    /// would clear the flag first, and the write-cache-last-modified trigger's
+    /// `is_write_cached` conjunct would then be permanently false — the fix would
+    /// be inert.
+    #[tokio::test]
+    async fn graduation_defers_while_last_modified_is_unknown() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "bucket/graduation-deferred";
+        let manager = setup(temp_dir.path()).await;
+        put_write_cached_no_last_modified(&manager, cache_key, &[0u8; BODY_LEN]).await;
+
+        let before = read_meta(&manager, cache_key);
+        assert!(
+            before.object_metadata.is_write_cached,
+            "fixture: the entry must start staged, or the deferral test proves nothing"
+        );
+        assert!(
+            before.object_metadata.effective_last_modified().is_none(),
+            "fixture: the entry must start with no effective Last-Modified — this \
+             is the write-through PUT's own state"
+        );
+
+        let graduated = manager
+            .refresh_write_cache_ttl(cache_key)
+            .await
+            .expect("refresh_write_cache_ttl must not error on a deferred entry");
+        assert!(
+            !graduated,
+            "R6.1: graduation must return false (nothing to do) rather than \
+             graduating an entry with no effective Last-Modified"
+        );
+
+        let after = read_meta(&manager, cache_key);
+        assert!(
+            after.object_metadata.is_write_cached,
+            "R6.1: is_write_cached must remain true — clearing it here is exactly \
+             what would make the GET revalidation trigger's is_write_cached \
+             conjunct go false before the field is ever learned"
+        );
+        for range in &after.ranges {
+            assert_eq!(
+                range.staged,
+                before
+                    .ranges
+                    .iter()
+                    .find(|r| r.start == range.start && r.end == range.end)
+                    .and_then(|r| r.staged),
+                "no range's staged membership must change while graduation is deferred"
+            );
+        }
+    }
+
+    /// R6.4 (already-existing behaviour, pinned here as the counterpart to the
+    /// deferral above): once the entry HAS an effective Last-Modified, graduation
+    /// proceeds normally in the same call.
+    #[tokio::test]
+    async fn graduation_proceeds_once_last_modified_is_known() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_key = "bucket/graduation-proceeds";
+        let manager = setup(temp_dir.path()).await;
+        put_write_cached(&manager, cache_key, &[0u8; BODY_LEN]).await;
+
+        let before = read_meta(&manager, cache_key);
+        assert!(before.object_metadata.effective_last_modified().is_some());
+
+        let graduated = manager
+            .refresh_write_cache_ttl(cache_key)
+            .await
+            .expect("refresh_write_cache_ttl must succeed");
+        assert!(
+            graduated,
+            "an entry with a known Last-Modified must graduate normally — the \
+             deferral must not block the ordinary case"
+        );
+
+        let after = read_meta(&manager, cache_key);
+        assert!(
+            !after.object_metadata.is_write_cached,
+            "graduation must clear is_write_cached once the deferral condition is \
+             satisfied"
+        );
     }
 }
 

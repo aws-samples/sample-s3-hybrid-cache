@@ -125,10 +125,35 @@ impl StubResponse {
 
     /// Build a 304 Not Modified response. S3 returns 304 with the ETag and
     /// Last-Modified of the current object but no body.
+    ///
+    /// This constructor carries NO headers at all — it is therefore ALREADY the
+    /// "304 without Last-Modified" case R4/R11.5 need, and R11.5 explicitly
+    /// forbids adding a `last-modified` header here: doing so would remove the
+    /// only way to test R4 through this shared helper. Callers that need a
+    /// realistic `304` (ETag plus Last-Modified) should chain `.with_header(...)`
+    /// themselves, or use [`Self::not_modified_with_last_modified`] below.
     pub fn not_modified() -> Self {
         Self {
             status: StatusCode::NOT_MODIFIED,
             headers: HashMap::new(),
+            body: None,
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// Build a 304 Not Modified response carrying a `Last-Modified` header, for
+    /// the happy-path backfill tests (R3.1, R3.3).
+    ///
+    /// A DISTINCT constructor from [`Self::not_modified`], per R11.5: adding the
+    /// header to the existing helper instead would remove the only way to
+    /// express R4's undurable case (an origin that never returns
+    /// `Last-Modified` on a `304`) through this shared harness.
+    ///
+    /// Spec: write-cache-last-modified. Requirements: 11.5 (task 5.1)
+    pub fn not_modified_with_last_modified(last_modified: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_MODIFIED,
+            headers: HashMap::from([("last-modified".to_string(), last_modified.to_string())]),
             body: None,
             delay: Duration::ZERO,
         }

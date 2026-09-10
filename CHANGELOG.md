@@ -5,6 +5,22 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.2] - 2026-09-10
+**Upgrade impact:** the first read of an object cached by a PUT or multipart upload now makes one
+extra round trip to S3 (a conditional request) before serving, where previously it was served
+straight from cache with no S3 contact at all. Subsequent reads of the same object are unaffected.
+No configuration change is required.
+
+### Fixed
+- A GET or HEAD of an object cached by a PUT or multipart upload returned without a
+  `Last-Modified` header, because S3's write responses never include one and nothing previously
+  revalidated to learn it. GET now issues a conditional request on first read and backfills the
+  header from the response; HEAD no longer serves such an entry from cache until the header is
+  known. See
+  [GitHub issue #19](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/19), reported by
+  James Connor ([@megakid](https://github.com/megakid)), who also shared a working fix this
+  release is based on.
+
 ## [2.8.1] - 2026-09-10
 ### Fixed
 - Multipart uploads from clients that send a `Transfer-Encoding: chunked` request body (observed

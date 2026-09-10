@@ -126,7 +126,9 @@ cache:
   # When enabled, PUT operations and multipart uploads are cached so subsequent
   # GET requests can be served from cache immediately without fetching from S3
   # On the first GET the entry transitions from put_ttl to get_ttl (one-time, not a
-  # repeating refresh)
+  # repeating refresh). The transition needs the object's Last-Modified, which S3's write
+  # responses omit, so the first read revalidates to learn it and transitions in the same
+  # operation.
   # When disabled, PUT operations are forwarded directly to S3 without caching
   write_cache_enabled: true  # Enable write-through caching (enabled by default)
   
@@ -148,8 +150,9 @@ cache:
   
   # TTL for write-cached objects (default: 1 hour)
   # On the first GET the entry transitions from put_ttl to get_ttl (one-time, not a
-  # repeating refresh), so this bounds how long a written object stays cached before
-  # it is first read.
+  # repeating refresh, and only once the object's Last-Modified is known — see
+  # write_cache_enabled above), so this bounds how long a written object stays cached
+  # before it is first read.
   # Valid range: 1 minute ("1m") to 30 days ("30d")
   put_ttl: "3600s"  # 1 hour
   
