@@ -14479,7 +14479,7 @@ impl HttpProxy {
                         Some(Arc::new(tokio_rustls::TlsConnector::from(Arc::new(cfg))))
                     }
                     TransportMode::TlsValidated => {
-                        let root_store = crate::tls_trust_store::load_root_cert_store().ok()?;
+                        let root_store = crate::tls_trust_store::root_cert_store().ok()?;
                         let pool = s3_client.get_connection_pool();
                         let pm = pool.read().await;
                         let cfg = crate::https_connector::build_tls_config_for_host(
@@ -14537,7 +14537,7 @@ impl HttpProxy {
                         pm.resolve_endpoint(host).await.ok()?.into_iter().next()?
                     }
                 };
-                let root_store = crate::tls_trust_store::load_root_cert_store().ok()?;
+                let root_store = crate::tls_trust_store::root_cert_store().ok()?;
                 let cfg = {
                     let pm = pool.read().await;
                     crate::https_connector::build_tls_config_for_host(host, root_store, &pm)

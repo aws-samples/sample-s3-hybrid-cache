@@ -40,7 +40,7 @@ use tracing::{debug, warn};
 /// callsites that need a per-host `ClientConfig` should use this function.
 pub fn build_tls_config_for_host(
     host: &str,
-    root_store: rustls::RootCertStore,
+    root_store: Arc<rustls::RootCertStore>,
     pool_manager: &ConnectionPoolManager,
 ) -> rustls::ClientConfig {
     if pool_manager.resolve_override(host).is_some() {
@@ -55,14 +55,14 @@ pub fn build_tls_config_for_host(
 }
 
 /// Build the default TLS configuration (TLS 1.2 or 1.3).
-pub fn build_tls_default_config(root_store: rustls::RootCertStore) -> rustls::ClientConfig {
+pub fn build_tls_default_config(root_store: Arc<rustls::RootCertStore>) -> rustls::ClientConfig {
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()
 }
 
 /// Build a TLS 1.2-only configuration for PrivateLink / VPC interface endpoints.
-pub fn build_tls12_only_config(root_store: rustls::RootCertStore) -> rustls::ClientConfig {
+pub fn build_tls12_only_config(root_store: Arc<rustls::RootCertStore>) -> rustls::ClientConfig {
     rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
         .with_root_certificates(root_store)
         .with_no_client_auth()
@@ -214,7 +214,7 @@ impl Connection for HttpsStream {
 pub struct CustomHttpsConnector {
     pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     /// Root certificate store for building per-host TLS configurations.
-    root_store: rustls::RootCertStore,
+    root_store: Arc<rustls::RootCertStore>,
     config: ConnectionPoolConfig,
     health_tracker: Arc<IpHealthTracker>,
     metrics_manager:
@@ -229,7 +229,7 @@ pub struct CustomHttpsConnector {
 impl CustomHttpsConnector {
     pub fn new(
         pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
-        root_store: rustls::RootCertStore,
+        root_store: Arc<rustls::RootCertStore>,
         config: ConnectionPoolConfig,
         health_tracker: Arc<IpHealthTracker>,
         upstream_overrides: Arc<UpstreamOverrides>,
@@ -294,7 +294,7 @@ impl CustomHttpsConnector {
                 Some(TransportMode::TlsUnvalidated) => build_tls_accept_any_config(),
                 Some(TransportMode::TlsValidated) | None => {
                     let pm = self.pool_manager.read().await;
-                    build_tls_config_for_host(endpoint, self.root_store.clone(), &pm)
+                    build_tls_config_for_host(endpoint, Arc::clone(&self.root_store), &pm)
                 }
             };
 
@@ -392,7 +392,7 @@ impl Service<Uri> for CustomHttpsConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let pool_manager = Arc::clone(&self.pool_manager);
-        let root_store = self.root_store.clone();
+        let root_store = Arc::clone(&self.root_store);
         let metrics_manager = self.metrics_manager.clone();
         let config = self.config.clone();
         let health_tracker = Arc::clone(&self.health_tracker);
@@ -599,7 +599,7 @@ impl Clone for CustomHttpsConnector {
     fn clone(&self) -> Self {
         Self {
             pool_manager: Arc::clone(&self.pool_manager),
-            root_store: self.root_store.clone(),
+            root_store: Arc::clone(&self.root_store),
             config: self.config.clone(),
             health_tracker: Arc::clone(&self.health_tracker),
             metrics_manager: self.metrics_manager.clone(),
@@ -630,7 +630,7 @@ mod tests {
             .collect();
         CustomHttpsConnector::new(
             pool_manager,
-            root_store,
+            Arc::new(root_store),
             config,
             Arc::new(IpHealthTracker::new(3)),
             Arc::new(UpstreamOverrides::from_config(&overrides)),
@@ -710,7 +710,7 @@ mod tests {
 
         let connector = CustomHttpsConnector::new(
             pool_manager,
-            root_store,
+            Arc::new(root_store),
             config,
             health_tracker,
             upstream_overrides,
@@ -730,7 +730,8 @@ mod tests {
         let pm = ConnectionPoolManager::new_with_config(config).unwrap();
 
         // Non-override host should get default TLS config (1.2 + 1.3)
-        let cfg = build_tls_config_for_host("s3.us-east-1.amazonaws.com", root_store, &pm);
+        let cfg =
+            build_tls_config_for_host("s3.us-east-1.amazonaws.com", Arc::new(root_store), &pm);
         // Default config supports TLS 1.2 and 1.3
         assert!(cfg.alpn_protocols.is_empty()); // no ALPN set by default
     }
@@ -753,7 +754,7 @@ mod tests {
         // Override-matched host should get TLS 1.2-only config
         let _cfg = build_tls_config_for_host(
             "vpce-bucket.s3.us-east-1.vpce.amazonaws.com",
-            root_store,
+            Arc::new(root_store),
             &pm,
         );
         // The config is TLS 1.2 only — verified by the builder_with_protocol_versions call
@@ -766,7 +767,7 @@ mod tests {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let _cfg = build_tls_default_config(root_store);
+        let _cfg = build_tls_default_config(Arc::new(root_store));
     }
 
     #[test]
@@ -776,7 +777,7 @@ mod tests {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let _cfg = build_tls12_only_config(root_store);
+        let _cfg = build_tls12_only_config(Arc::new(root_store));
     }
 
     #[test]

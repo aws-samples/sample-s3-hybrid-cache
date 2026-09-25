@@ -313,7 +313,7 @@ impl S3Client {
 
         // Create TLS connector for HTTPS connections to S3 with system root certificates
         // Load system root certificates
-        let root_store = tls_trust_store::load_root_cert_store()
+        let root_store = tls_trust_store::root_cert_store()
             .map_err(|e| ProxyError::TlsError(format!("Failed to load native certs: {}", e)))?;
 
         if !config.endpoint_overrides.is_empty() {
