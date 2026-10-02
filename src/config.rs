@@ -1221,11 +1221,13 @@ impl MetadataCacheConfig {
 impl ConnectionPoolConfig {
     /// Validate the configuration
     pub fn validate(&self) -> std::result::Result<(), String> {
-        // Validate idle_timeout (10-300 seconds)
+        // Validate idle_timeout (1-300 seconds). The floor is low enough to sit
+        // under S3's own idle close, which was about 5 to 6 s when measured
+        // against us-east-1 and varies.
         let idle_timeout_secs = self.idle_timeout.as_secs();
-        if !(10..=300).contains(&idle_timeout_secs) {
+        if !(1..=300).contains(&idle_timeout_secs) {
             return Err(format!(
-                "Idle timeout must be between 10 and 300 seconds, got {}",
+                "Idle timeout must be between 1 and 300 seconds, got {}",
                 idle_timeout_secs
             ));
         }

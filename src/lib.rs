@@ -56,7 +56,7 @@ pub mod upstream_overrides;
 pub mod write_cache_manager;
 pub mod write_ledger;
 
-pub use error::{ProxyError, Result};
+pub use error::{ProxyError, Result, UpstreamSendFailureKind};
 
 // Re-export the S3 client trait seam so tests (and downstream crates) can
 // reach it without depending on internal module paths. The concrete `S3Client`

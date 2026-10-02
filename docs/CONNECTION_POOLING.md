@@ -21,7 +21,7 @@ that one is correct.
 ```yaml
 connection_pool:
   keepalive_enabled: true        # Enable HTTP connection keepalive (default: true)
-  idle_timeout: "55s"            # Just under S3's ~60s server-side timeout (default: 55s)
+  idle_timeout: "55s"            # Idle connection lifetime, 1-300s (default: 55s)
   max_idle_per_host: 100         # Max idle connections per host when IP distribution disabled (default: 100)
   max_idle_per_ip: 10            # Max idle connections per IP when IP distribution enabled (default: 10)
   dns_refresh_interval: "60s"    # DNS re-resolution interval (default: 60s)
@@ -75,8 +75,13 @@ excluded IPs and reset all recovery state, so an unreachable IP was re-admitted
 every refresh interval and the backoff never accumulated.
 
 #### 4. Idle Timeout
-- Default: 55 seconds (aligned with S3's ~60s server-side timeout)
-- 5-second safety margin avoids reusing connections S3 is about to close
+- Default: 55 seconds; valid range 1 to 300 seconds
+- S3 can close an idle connection much sooner than that: about 5 to 6 seconds when measured
+  against us-east-1, and the exact time varies. A request sent on a connection S3 has just
+  closed fails before any response arrives. A bodiless GET or HEAD that meets one is retried
+  once on a new connection (see Error Recovery below)
+- Setting `idle_timeout` below that (for example `4s`) makes reusing a connection S3 has
+  closed less likely, at the cost of more new connections
 - Connections idle beyond this are automatically closed by Hyper
 
 #### 5. Per-IP Pool Isolation
@@ -89,6 +94,10 @@ every refresh interval and the backoff never accumulated.
 - Connection errors automatically remove failed connections from hyper's pool
 - Requests are retried with new connections (up to 3 retries for GET/HEAD)
 - Connection errors don't count against retry limit
+- A GET or HEAD without a body whose established connection is lost after the request went
+  out (most often a pooled connection S3 already closed while idle) is retried once, at once,
+  on a new connection. That first loss does not count toward `ip_failure_threshold`, since S3
+  closes idle connections on every address alike; a loss on the retry does
 - IpHealthTracker excludes persistently failing IPs from round-robin
 
 ### Metrics
@@ -125,7 +134,7 @@ IP distribution stats via `/health`:
 
 #### High Connection Creation Rate
 If `connections_created` is high relative to `connections_reused`:
-- Check if `idle_timeout` is too short (should be 55s for S3)
+- Check if `idle_timeout` is too short (the default is 55s)
 - Verify `keepalive_enabled` is true
 - Check TCP keepalive settings — dead connections detected late cause pool misses
 
@@ -141,6 +150,11 @@ If IPs are being excluded from the distributor:
   succeeded" messages to see whether an IP is being retried and why it is still out
 
 #### Connection Errors
+`Retried a request on a fresh connection after its connection was lost` at INFO
+(`outcome="recovered"`) means a GET or HEAD met a connection S3 had closed and succeeded on a new
+one; at WARN (`outcome="failed"`) the retry failed too. A steady rate of the INFO line suggests
+lowering `idle_timeout`.
+
 If `error_closures` is increasing:
 - Check network stability and firewall/NAT timeout settings
 - Verify S3 endpoint is healthy

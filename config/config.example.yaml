@@ -491,7 +491,7 @@ connection_pool:
   # max_connections_per_ip: 50
   dns_refresh_interval: "60s"  # 1 minute
   connection_timeout: "10s"
-  idle_timeout: "55s"  # Just under S3's ~60s server-side timeout to avoid reusing stale connections
+  idle_timeout: "55s"  # 1-300s. S3 can close an idle connection after ~5-6s; a GET/HEAD that meets one is retried once
   keepalive_enabled: true
   max_idle_per_host: 100  # More idle connections = more memory, fewer TLS handshakes during bursts
   max_lifetime: "300s"
