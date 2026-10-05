@@ -13,6 +13,22 @@ pub enum ProxyError {
     #[error("HTTP error: {0}")]
     HttpError(String),
 
+    /// Sending a request to S3 failed before a response head arrived.
+    ///
+    /// `message` is exactly the text `HttpError` carried for these failures, so retry
+    /// decisions that read it are unchanged. `detail` is the full error source chain,
+    /// which the hyper-util error's own Display omits, and `kind` says whether the
+    /// failure was a lost connection (safe to retry once for an idempotent request),
+    /// a failure to connect, or something else.
+    // `send_failure` builds `message` as "Failed to send request: <kind>" and `detail`
+    // as that kind followed by its causes, so this prints each part once.
+    #[error("HTTP error: Failed to send request: {detail}")]
+    UpstreamSendFailed {
+        message: String,
+        detail: String,
+        kind: UpstreamSendFailureKind,
+    },
+
     #[error("Connection error: {0}")]
     ConnectionError(String),
 
@@ -123,6 +139,19 @@ impl From<hickory_resolver::net::NetError> for ProxyError {
     fn from(err: hickory_resolver::net::NetError) -> Self {
         ProxyError::DnsError(err.to_string())
     }
+}
+
+/// Why a request to S3 failed before any response head arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UpstreamSendFailureKind {
+    /// The request went out on an established connection that closed or reset before
+    /// the response head: an idle keep-alive connection S3 had already closed, most often.
+    ConnectionLost,
+    /// No connection could be made (DNS, refused, descriptor exhaustion, TLS handshake).
+    Connect,
+    /// Any other send failure.
+    Other,
 }
 
 /// Result type alias for the S3 proxy

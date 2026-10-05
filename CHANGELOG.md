@@ -5,6 +5,21 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Fixed
+- A GET or HEAD sent on a pooled connection that S3 had already closed failed with a 502
+  (`Failed to forward request to S3`, with `client error (SendRequest)` in the log). S3 can close
+  an idle keep-alive connection after about 5 to 6 seconds (measured against us-east-1), well
+  inside the default 55 s `idle_timeout`, and the existing retry did not catch this error, because its message contains none
+  of the words that retry check looks for. A GET or HEAD without a body that loses its connection
+  after the request went out is now retried once, at once, on a new connection, and that loss no
+  longer counts toward `ip_failure_threshold`. Requests with a body are never retried.
+- A failed send to S3 now logs the error's full cause, not only `client error (SendRequest)`.
+
+### Changed
+- `connection_pool.idle_timeout` accepts 1 to 300 seconds (was 10 to 300), so it can be set below
+  S3's idle close.
+
 ## [2.8.3] - 2026-10-05
 ### Fixed
 - Signed PUTs and multipart operations no longer re-read the system certificate bundle on every

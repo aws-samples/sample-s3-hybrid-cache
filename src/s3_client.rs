@@ -9,7 +9,7 @@ use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
 use crate::https_connector::CustomHttpsConnector;
 use crate::tls_trust_store;
 use crate::upstream_overrides::UpstreamOverrides;
-use crate::{ProxyError, Result};
+use crate::{ProxyError, Result, UpstreamSendFailureKind};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -26,6 +26,11 @@ use tracing::{debug, info, warn};
 /// S3 client with Hyper connection pooling support
 pub struct S3Client {
     client: Client<CustomHttpsConnector, Full<Bytes>>,
+    /// Client that keeps no idle connections, used for the single retry after a
+    /// pooled connection was lost mid-request. A retry on `client` would be handed
+    /// the next idle connection, which can be just as stale (checkout is newest
+    /// first), so the retry dials a new one instead.
+    fresh_client: Client<CustomHttpsConnector, Full<Bytes>>,
     pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     request_timeout: Duration,
     keepalive_enabled: bool,
@@ -350,6 +355,13 @@ impl S3Client {
         // matcher and pool manager so a probe dials exactly like live egress.
         let probe_connector = https_connector.clone();
 
+        // Same connector for the lost-connection retry, but no pool: every request
+        // on it dials a new connection.
+        let fresh_client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(0))
+            .pool_max_idle_per_host(0)
+            .build(https_connector.clone());
+
         // Build Hyper client with connection pooling
         let pool_max_idle = if config.ip_distribution_enabled {
             config.max_idle_per_ip
@@ -380,6 +392,7 @@ impl S3Client {
 
         Ok(Self {
             client,
+            fresh_client,
             pool_manager,
             request_timeout: Duration::from_secs(30),
             keepalive_enabled: config.keepalive_enabled,
@@ -447,23 +460,52 @@ impl S3Client {
                     let duration = start_time.elapsed();
                     response.request_duration = duration;
 
-                    // Track request for connection reuse calculation
-                    // Connection reuse = total_requests - connections_created
-                    if self.keepalive_enabled {
-                        let mm = self.metrics_manager.read().await;
-                        if let Some(ref metrics) = *mm {
-                            metrics
-                                .read()
-                                .await
-                                .record_request_to_endpoint(&context.host)
-                                .await;
-                        }
-                    }
+                    self.note_request_to_endpoint(&context.host).await;
 
                     return Ok(response);
                 }
                 Err(e) => {
                     let _duration = start_time.elapsed();
+
+                    // A GET or HEAD whose established connection was lost after the
+                    // request went out (most often a pooled connection S3 closed while
+                    // idle) is retried once, at once, on a new connection. Safe
+                    // because both are idempotent and carry no body (RFC 9110 9.2.2).
+                    // This is the terminal attempt: the ladder below never sees it.
+                    if Self::is_retryable_lost_connection(&e, &context) {
+                        let retry_start = Instant::now();
+                        let retried = self
+                            .try_forward_request_on(&context, &self.fresh_client, Attempt::Retry)
+                            .await;
+                        let retry_ms = retry_start.elapsed().as_millis() as u64;
+                        match &retried {
+                            Ok(_) => {
+                                info!(
+                                    method = %context.method,
+                                    host = %context.host,
+                                    outcome = "recovered",
+                                    retry_ms,
+                                    "Retried a request on a fresh connection after its connection was lost: {}",
+                                    e
+                                );
+                                self.note_request_to_endpoint(&context.host).await;
+                            }
+                            Err(retry_error) => warn!(
+                                method = %context.method,
+                                host = %context.host,
+                                outcome = "failed",
+                                retry_ms,
+                                "Retried a request on a fresh connection after its connection was lost, and the retry failed: {} (first attempt: {})",
+                                retry_error,
+                                e
+                            ),
+                        }
+                        return retried.map(|mut response| {
+                            response.request_duration = start_time.elapsed();
+                            response
+                        });
+                    }
+
                     last_error = Some(e.clone());
 
                     // Check if this is a connection error and track it
@@ -641,7 +683,7 @@ impl S3Client {
                 if let Some(tls_err) = Self::recover_upstream_tls_validation_error(&e) {
                     return tls_err;
                 }
-                ProxyError::HttpError(format!("Failed to send request: {}", e))
+                send_failure(&e)
             })?;
 
         // Record success for the pinned IP
@@ -718,6 +760,18 @@ impl S3Client {
 
     /// Try to forward a single request to S3 using Hyper client
     async fn try_forward_request(&self, context: &S3RequestContext) -> Result<S3Response> {
+        self.try_forward_request_on(context, &self.client, Attempt::First)
+            .await
+    }
+
+    /// `try_forward_request` on a chosen hyper client: the pooled one for a first
+    /// attempt, the pool-less one for the lost-connection retry.
+    async fn try_forward_request_on(
+        &self,
+        context: &S3RequestContext,
+        client: &Client<CustomHttpsConnector, Full<Bytes>>,
+        attempt: Attempt,
+    ) -> Result<S3Response> {
         let start_time = Instant::now();
 
         // Track that we're making a request to this endpoint
@@ -845,12 +899,16 @@ impl S3Client {
         }
 
         // Send request through Hyper client (handles connection pooling automatically)
-        let response = tokio::time::timeout(self.request_timeout, self.client.request(request))
+        let response = tokio::time::timeout(self.request_timeout, client.request(request))
             .await
             .map_err(|_| ProxyError::TimeoutError("Request timeout".to_string()))?
             .map_err(|e| {
-                // Record failure for IP health tracking
-                if let Some(ip) = selected_ip {
+                let failure = send_failure(&e);
+                // Record failure for IP health tracking, except for a lost connection
+                // on a first attempt that `forward_request` is about to retry on a new
+                // one (see `counts_against_ip`).
+                let counts = Self::counts_against_ip(&failure, context, attempt);
+                if let Some(ip) = selected_ip.filter(|_| counts) {
                     if self.health_tracker.record_failure(&ip) {
                         warn!(ip = %ip, host = %context.host, "IP failure threshold reached, excluding from distributor");
                         // Acquire write lock to remove IP — this is rare (only on threshold)
@@ -875,7 +933,7 @@ impl S3Client {
                 if let Some(tls_err) = Self::recover_upstream_tls_validation_error(&e) {
                     return tls_err;
                 }
-                ProxyError::HttpError(format!("Failed to send request: {}", e))
+                failure
             })?;
 
         // Record success for IP health tracking
@@ -974,12 +1032,50 @@ impl S3Client {
         None
     }
 
+    /// Whether a send failure should count against the IP it was sent to.
+    ///
+    /// Everything counts except a lost connection on a first attempt that
+    /// `forward_request` is about to retry on a new connection: S3 closes idle
+    /// connections on every address alike, so that one says nothing about this
+    /// address, and three would take a healthy IP out of rotation at the default
+    /// failure threshold. The retry itself is never retried, so its loss counts. The
+    /// cost: an address that accepts connections and then resets every request is not
+    /// excluded by these first losses, and each request sent to it costs one extra
+    /// connection (the retry picks an address again).
+    fn counts_against_ip(error: &ProxyError, context: &S3RequestContext, attempt: Attempt) -> bool {
+        attempt == Attempt::Retry || !Self::is_retryable_lost_connection(error, context)
+    }
+
+    /// Track a request for the connection reuse calculation
+    /// (connection reuse = total requests - connections created).
+    async fn note_request_to_endpoint(&self, host: &str) {
+        if self.keepalive_enabled {
+            let mm = self.metrics_manager.read().await;
+            if let Some(ref metrics) = *mm {
+                metrics.read().await.record_request_to_endpoint(host).await;
+            }
+        }
+    }
+
+    /// Whether `error` is a lost established connection on a request that can be
+    /// replayed: a GET or HEAD with no body.
+    fn is_retryable_lost_connection(error: &ProxyError, context: &S3RequestContext) -> bool {
+        matches!(
+            error,
+            ProxyError::UpstreamSendFailed {
+                kind: UpstreamSendFailureKind::ConnectionLost,
+                ..
+            }
+        ) && matches!(context.method, Method::GET | Method::HEAD)
+            && context.body.as_ref().is_none_or(|body| body.is_empty())
+    }
+
     /// Check if error should trigger a retry
     fn should_retry_error(&self, error: &ProxyError) -> bool {
         match error {
             ProxyError::ConnectionError(_) => true,
             ProxyError::TimeoutError(_) => true,
-            ProxyError::HttpError(msg) => {
+            ProxyError::HttpError(msg) | ProxyError::UpstreamSendFailed { message: msg, .. } => {
                 // Retry on specific HTTP errors that indicate temporary issues
                 msg.contains("connection") || msg.contains("timeout") || msg.contains("reset")
             }
@@ -998,7 +1094,7 @@ impl S3Client {
     fn is_connection_error(&self, error: &ProxyError) -> bool {
         match error {
             ProxyError::ConnectionError(_) => true,
-            ProxyError::HttpError(msg) => {
+            ProxyError::HttpError(msg) | ProxyError::UpstreamSendFailed { message: msg, .. } => {
                 // Connection-related HTTP errors
                 msg.contains("connection")
                     || msg.contains("reset")
@@ -1493,6 +1589,90 @@ pub(crate) fn host_header_port(value: &str) -> Option<u16> {
 /// 443.
 pub(crate) fn build_egress_authority(host: &str, host_header: Option<&str>) -> String {
     format_authority_host(host, host_header.and_then(host_header_port))
+}
+
+/// Which attempt `try_forward_request_on` is making, which decides whether a lost
+/// connection counts against its IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// The pooled attempt, which `forward_request` retries once if its connection is lost.
+    First,
+    /// The one retry on a new connection, which nothing retries again.
+    Retry,
+}
+
+/// The typed error for a request hyper-util could not send, built the same way at every
+/// send site.
+///
+/// Typed, so the lost-connection retry never parses text. `message` is the text
+/// `HttpError` carried for these failures, so `should_retry_error` decides as before;
+/// `detail` is the full source chain, which hyper-util's own Display drops (it prints
+/// only the kind, e.g. "client error (SendRequest)").
+pub(crate) fn send_failure(err: &hyper_util::client::legacy::Error) -> ProxyError {
+    ProxyError::UpstreamSendFailed {
+        message: format!("Failed to send request: {}", err),
+        detail: error_chain(err),
+        kind: classify_send_failure(err),
+    }
+}
+
+/// Every level of an error's source chain, joined with ": ", adjacent repeats dropped.
+///
+/// hyper-util's client error prints only its kind ("client error (SendRequest)"); the
+/// cause that says what happened to the connection is further down the chain.
+pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let text = e.to_string();
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        current = e.source();
+    }
+    parts.join(": ")
+}
+
+/// Classify a hyper-util client error as a lost connection, a connect failure, or other.
+///
+/// Lost: the chain holds a `hyper::Error` that is an incomplete message ("connection
+/// closed before message completed"), or an io error of kind ConnectionReset,
+/// ConnectionAborted, BrokenPipe or UnexpectedEof, and the error did not come from
+/// connecting. `hyper::Error::is_closed` is not counted (its documented meaning is a
+/// closed sender channel, not a dead socket), nor is `is_canceled` (hyper-util already
+/// retries a canceled request on a reused connection itself).
+pub(crate) fn classify_send_failure(
+    err: &hyper_util::client::legacy::Error,
+) -> UpstreamSendFailureKind {
+    if err.is_connect() {
+        return UpstreamSendFailureKind::Connect;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_incomplete_message() {
+                return UpstreamSendFailureKind::ConnectionLost;
+            }
+        }
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if is_lost_connection_io_kind(io_err.kind()) {
+                return UpstreamSendFailureKind::ConnectionLost;
+            }
+        }
+        current = e.source();
+    }
+    UpstreamSendFailureKind::Other
+}
+
+/// The io error kinds that mean an established connection went away under a request.
+fn is_lost_connection_io_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 #[cfg(test)]
@@ -2197,5 +2377,532 @@ mod tests {
         assert_eq!(rewritten.path(), "/bucket/key");
         // Scheme is preserved
         assert_eq!(rewritten.scheme_str(), Some("https"));
+    }
+}
+
+#[cfg(test)]
+mod lost_connection_tests {
+    //! The lost-connection retry and the idle timeout, against a loopback "S3" that
+    //! answers each connection's first request and then drops the connection when the
+    //! next request arrives: the shape S3's idle close produces on a reused
+    //! connection, where the request is written and the connection then dies before
+    //! any response head.
+    use super::*;
+    use crate::config::{ConnectionPoolConfig, UpstreamOverrideConfig, UpstreamScheme};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Loopback upstream. Counts accepted connections; on each connection it answers
+    /// the first request (after `first_delay`) and drops the connection on the second.
+    async fn start_upstream(first_delay: Duration) -> (u16, Arc<AtomicUsize>) {
+        let upstream = start_upstream_on("127.0.0.1:0", first_delay).await;
+        (upstream.port, upstream.accepts)
+    }
+
+    /// What a loopback upstream saw: connections accepted, the local address each
+    /// arrived on, and how many it dropped on reuse.
+    struct Upstream {
+        port: u16,
+        accepts: Arc<AtomicUsize>,
+        arrived_on: Arc<std::sync::Mutex<Vec<std::net::IpAddr>>>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    /// `start_upstream` listening on `bind`, so one port can answer on several
+    /// loopback addresses.
+    async fn start_upstream_on(bind: &str, first_delay: Duration) -> Upstream {
+        let listener = TcpListener::bind(bind).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let arrived_on = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (counter, addresses, drops) = (
+            Arc::clone(&accepts),
+            Arc::clone(&arrived_on),
+            Arc::clone(&dropped),
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                if let Ok(local) = sock.local_addr() {
+                    addresses.lock().unwrap().push(local.ip());
+                }
+                let drops = Arc::clone(&drops);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let mut served = 0usize;
+                    loop {
+                        let mut got = 0usize;
+                        loop {
+                            match sock.read(&mut buf[got..]).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => got += n,
+                            }
+                            if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        if served >= 1 {
+                            // Reused connection: the request was written, now die.
+                            drops.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        tokio::time::sleep(first_delay).await;
+                        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+                        if sock.write_all(resp).await.is_err() {
+                            return;
+                        }
+                        served += 1;
+                    }
+                });
+            }
+        });
+        Upstream {
+            port,
+            accepts,
+            arrived_on,
+            dropped,
+        }
+    }
+
+    /// Loopback upstream that answers each connection's first request and resets the
+    /// connection (RST rather than FIN) when the next request arrives.
+    async fn start_resetting_upstream() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let mut served = 0usize;
+                    loop {
+                        let mut got = 0usize;
+                        while !buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                            match sock.read(&mut buf[got..]).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => got += n,
+                            }
+                        }
+                        if served >= 1 {
+                            // A zero linger turns the close into a reset.
+                            let _ = socket2::SockRef::from(&sock).set_linger(Some(Duration::ZERO));
+                            return;
+                        }
+                        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+                        if sock.write_all(resp).await.is_err() {
+                            return;
+                        }
+                        served += 1;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// The error from a call that must fail. `S3Response` has no `Debug`, so the usual
+    /// `unwrap_err` is not available.
+    fn failure(result: Result<S3Response>) -> ProxyError {
+        match result {
+            Err(e) => e,
+            Ok(response) => panic!("expected a failure, got status {}", response.status),
+        }
+    }
+
+    fn client_for(port: u16, idle_timeout: Duration) -> S3Client {
+        let mut config = ConnectionPoolConfig {
+            ip_distribution_enabled: false,
+            keepalive_enabled: true,
+            idle_timeout,
+            ..Default::default()
+        };
+        config.upstream_overrides.insert(
+            format!("127.0.0.1:{port}"),
+            UpstreamOverrideConfig {
+                scheme: UpstreamScheme::Http,
+                validate_tls: false,
+            },
+        );
+        S3Client::new(&config, None).expect("client builds")
+    }
+
+    fn request(port: u16, method: Method, body: Option<Bytes>) -> S3RequestContext {
+        S3RequestContext {
+            method,
+            uri: format!("http://127.0.0.1:{port}/bucket/key")
+                .parse()
+                .unwrap(),
+            headers: HashMap::new(),
+            body,
+            host: format!("127.0.0.1:{port}"),
+            request_size: None,
+            operation_type: None,
+            allow_streaming: false,
+        }
+    }
+
+    /// Two pooled connections, both lost: the retry still succeeds, because it dials a
+    /// new connection instead of taking the second (equally dead) pooled one.
+    /// Mutation that must break this: retry on `self.client` instead of `fresh_client`.
+    #[tokio::test]
+    async fn a_head_on_a_lost_pooled_connection_is_retried_once_on_a_fresh_one() {
+        let (port, accepts) = start_upstream(Duration::from_millis(200)).await;
+        let client = client_for(port, Duration::from_secs(55));
+        let (a, b) = tokio::join!(
+            client.forward_request(request(port, Method::GET, None)),
+            client.forward_request(request(port, Method::GET, None)),
+        );
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "two pooled connections primed"
+        );
+
+        let response = client
+            .forward_request(request(port, Method::HEAD, None))
+            .await;
+
+        assert_eq!(
+            response.expect("retried on a fresh connection").status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            3,
+            "exactly one new connection"
+        );
+    }
+
+    /// A bodiless PUT, such as CopyObject, so only the method check can keep it from
+    /// being replayed. Mutation that must break this: drop the method check.
+    #[tokio::test]
+    async fn a_put_on_a_lost_pooled_connection_is_not_retried() {
+        let (port, accepts) = start_upstream(Duration::ZERO).await;
+        let client = client_for(port, Duration::from_secs(55));
+        client
+            .forward_request(request(port, Method::GET, None))
+            .await
+            .unwrap();
+
+        let err = failure(
+            client
+                .forward_request(request(port, Method::PUT, None))
+                .await,
+        );
+
+        assert!(matches!(
+            err,
+            ProxyError::UpstreamSendFailed {
+                kind: UpstreamSendFailureKind::ConnectionLost,
+                ..
+            }
+        ));
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "no new connection for the PUT"
+        );
+    }
+
+    /// The detail carries the cause hyper-util's own Display leaves out.
+    /// Mutation that must break this: build `detail` from `e.to_string()`.
+    #[tokio::test]
+    async fn a_lost_connection_names_its_cause_in_the_detail() {
+        let (port, _) = start_upstream(Duration::ZERO).await;
+        let client = client_for(port, Duration::from_secs(55));
+        client
+            .forward_request(request(port, Method::GET, None))
+            .await
+            .unwrap();
+
+        let err = failure(
+            client
+                .forward_request(request(port, Method::PUT, Some(Bytes::from_static(b"x"))))
+                .await,
+        );
+
+        let ProxyError::UpstreamSendFailed {
+            message, detail, ..
+        } = err
+        else {
+            panic!("expected a typed send failure, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "Failed to send request: client error (SendRequest)"
+        );
+        assert!(
+            detail.contains("connection closed before message completed"),
+            "{detail}"
+        );
+    }
+
+    /// A reset under a sent request is a lost connection too, found through the io-error
+    /// check rather than hyper's incomplete-message one. The request is a PUT, so it is
+    /// not retried and the error stays visible. Mutation that must break this: drop the
+    /// io-error check in `classify_send_failure`, which names a reset `Other`.
+    #[tokio::test]
+    async fn a_reset_connection_is_a_lost_connection() {
+        let port = start_resetting_upstream().await;
+        let client = client_for(port, Duration::from_secs(55));
+        client
+            .forward_request(request(port, Method::GET, None))
+            .await
+            .unwrap();
+
+        let err = failure(
+            client
+                .forward_request(request(port, Method::PUT, None))
+                .await,
+        );
+
+        let ProxyError::UpstreamSendFailed { kind, detail, .. } = err else {
+            panic!("expected a typed send failure, got {err:?}");
+        };
+        assert_eq!(kind, UpstreamSendFailureKind::ConnectionLost, "{detail}");
+        assert!(detail.to_lowercase().contains("reset"), "{detail}");
+    }
+
+    /// Mutation that must break this: drop the `is_connect` check, which names a
+    /// refused connection some other failure, so its 502 reports the wrong cause.
+    #[tokio::test]
+    async fn a_refused_connection_is_a_connect_failure() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let client = client_for(port, Duration::from_secs(55));
+
+        let err = failure(
+            client
+                .forward_request(request(port, Method::HEAD, None))
+                .await,
+        );
+
+        assert!(
+            matches!(
+                err,
+                ProxyError::UpstreamSendFailed {
+                    kind: UpstreamSendFailureKind::Connect,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An idle connection past `idle_timeout` is not reused. The second request is a
+    /// bodiless PUT, which is never retried, so reusing the connection the upstream
+    /// closed fails it rather than being hidden by the retry. Mutation that must break
+    /// this: build the pooled client without `config.idle_timeout`, which keeps
+    /// hyper-util's own 90 s default.
+    #[tokio::test]
+    async fn a_connection_idle_past_the_timeout_is_not_reused() {
+        let (port, accepts) = start_upstream(Duration::ZERO).await;
+        let client = client_for(port, Duration::from_secs(1));
+        client
+            .forward_request(request(port, Method::GET, None))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let response = client
+            .forward_request(request(port, Method::PUT, None))
+            .await;
+
+        assert_eq!(response.unwrap().status, StatusCode::OK);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "the expired connection was not reused"
+        );
+    }
+
+    #[test]
+    fn the_idle_timeout_floor_admits_values_under_s3s_close() {
+        let at = |secs| ConnectionPoolConfig {
+            idle_timeout: Duration::from_secs(secs),
+            ..Default::default()
+        };
+        assert!(at(4).validate().is_ok());
+        assert!(at(1).validate().is_ok(), "the floor is 1 s");
+        assert!(at(0).validate().is_err());
+    }
+
+    /// A lost connection about to be retried is not held against its IP; every other
+    /// failure is, the retry's own loss included. Mutations that must break this: count
+    /// every failure, or skip every lost connection whatever the attempt.
+    #[test]
+    fn a_retried_lost_connection_does_not_count_against_its_ip() {
+        let lost = ProxyError::UpstreamSendFailed {
+            message: String::new(),
+            detail: String::new(),
+            kind: UpstreamSendFailureKind::ConnectionLost,
+        };
+        let refused = ProxyError::UpstreamSendFailed {
+            message: String::new(),
+            detail: String::new(),
+            kind: UpstreamSendFailureKind::Connect,
+        };
+        let get = request(1, Method::GET, None);
+        assert!(!S3Client::counts_against_ip(&lost, &get, Attempt::First));
+        assert!(S3Client::counts_against_ip(&lost, &get, Attempt::Retry));
+        assert!(S3Client::counts_against_ip(
+            &lost,
+            &request(1, Method::PUT, Some(Bytes::from_static(b"x"))),
+            Attempt::First
+        ));
+        assert!(S3Client::counts_against_ip(&refused, &get, Attempt::First));
+    }
+
+    /// With IP distribution on, a lost connection the retry recovers on another
+    /// address is not held against the first one. The failure threshold is 1, so one
+    /// counted failure would mark it unhealthy. Mutations that must break this: count
+    /// every failure, or drop the `counts` check where the failure is recorded.
+    /// Linux only: it needs 127.0.0.2 to answer, which other systems do not by default.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_recovered_lost_connection_leaves_its_ip_healthy() {
+        use crate::connection_pool::IpDistributor;
+        let upstream = start_upstream_on("0.0.0.0:0", Duration::ZERO).await;
+        let port = upstream.port;
+        let ip1: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let ip2: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+        let mut config = ConnectionPoolConfig {
+            ip_distribution_enabled: true,
+            keepalive_enabled: true,
+            idle_timeout: Duration::from_secs(55),
+            ip_failure_threshold: 1,
+            ..Default::default()
+        };
+        // Keyed on the addresses the distributor rewrites to, so the client sees no
+        // override for the hostname and distributes, and the connector dials plain HTTP.
+        for ip in [ip1, ip2] {
+            config.upstream_overrides.insert(
+                format!("{ip}:{port}"),
+                UpstreamOverrideConfig {
+                    scheme: UpstreamScheme::Http,
+                    validate_tls: false,
+                },
+            );
+        }
+        let client = S3Client::new(&config, None).expect("client builds");
+        client
+            .pool_manager
+            .write()
+            .await
+            .ip_distributors
+            .insert("fake-s3.test".into(), IpDistributor::new(vec![ip1, ip2]));
+        let get = || S3RequestContext {
+            method: Method::GET,
+            uri: format!("http://fake-s3.test:{port}/bucket/key")
+                .parse()
+                .unwrap(),
+            headers: HashMap::new(),
+            body: None,
+            host: "fake-s3.test".into(),
+            request_size: None,
+            operation_type: None,
+            allow_streaming: false,
+        };
+        // Round robin: one pooled connection on each address, which the upstream drops
+        // when it is reused.
+        client.forward_request(get()).await.unwrap();
+        client.forward_request(get()).await.unwrap();
+
+        // Back on ip1's dropped connection; the retry rotates to ip2 on a new one.
+        let response = client.forward_request(get()).await;
+
+        assert_eq!(response.unwrap().status, StatusCode::OK);
+        // The third GET really was lost on ip1's reused connection and recovered on a
+        // new connection to ip2, rather than simply dialling ip1 afresh.
+        assert_eq!(
+            upstream.dropped.load(Ordering::SeqCst),
+            1,
+            "one reused connection dropped"
+        );
+        assert_eq!(
+            *upstream.arrived_on.lock().unwrap(),
+            vec![ip1, ip2, ip2],
+            "the two primed connections, then the retry's"
+        );
+        assert_eq!(upstream.accepts.load(Ordering::SeqCst), 3);
+        assert!(
+            !client.health_tracker.is_unhealthy(&ip1),
+            "a recovered loss counted against ip1"
+        );
+    }
+
+    /// A lost connection is retryable only for a bodiless GET or HEAD.
+    #[test]
+    fn only_bodiless_gets_and_heads_are_retryable() {
+        let lost = ProxyError::UpstreamSendFailed {
+            message: String::new(),
+            detail: String::new(),
+            kind: UpstreamSendFailureKind::ConnectionLost,
+        };
+        let other = ProxyError::UpstreamSendFailed {
+            message: String::new(),
+            detail: String::new(),
+            kind: UpstreamSendFailureKind::Other,
+        };
+        assert!(S3Client::is_retryable_lost_connection(
+            &lost,
+            &request(1, Method::GET, None)
+        ));
+        assert!(S3Client::is_retryable_lost_connection(
+            &lost,
+            &request(1, Method::HEAD, None)
+        ));
+        assert!(!S3Client::is_retryable_lost_connection(
+            &lost,
+            &request(1, Method::POST, None)
+        ));
+        assert!(!S3Client::is_retryable_lost_connection(
+            &lost,
+            &request(1, Method::GET, Some(Bytes::from_static(b"x")))
+        ));
+        assert!(!S3Client::is_retryable_lost_connection(
+            &other,
+            &request(1, Method::GET, None)
+        ));
+    }
+
+    /// The ladder reads `message`, and the text it carries for these failures is not
+    /// one it retries. That the chain stays out of `message` is pinned by
+    /// `a_lost_connection_names_its_cause_in_the_detail`.
+    #[test]
+    fn the_retry_ladder_reads_the_same_text_as_before() {
+        let send_failed = ProxyError::UpstreamSendFailed {
+            message: "Failed to send request: client error (SendRequest)".into(),
+            detail: "client error (SendRequest): connection closed before message completed".into(),
+            kind: UpstreamSendFailureKind::ConnectionLost,
+        };
+        let client = client_for(1, Duration::from_secs(55));
+        assert!(!client.should_retry_error(&send_failed));
+        assert!(!client.should_retry_error(&ProxyError::HttpError(
+            "Failed to send request: client error (SendRequest)".into()
+        )));
+    }
+
+    #[test]
+    fn io_kinds_that_mean_a_lost_connection() {
+        use std::io::ErrorKind::*;
+        for kind in [
+            ConnectionReset,
+            ConnectionAborted,
+            BrokenPipe,
+            UnexpectedEof,
+        ] {
+            assert!(is_lost_connection_io_kind(kind), "{kind:?}");
+        }
+        for kind in [ConnectionRefused, TimedOut, NotFound, PermissionDenied] {
+            assert!(!is_lost_connection_io_kind(kind), "{kind:?}");
+        }
     }
 }

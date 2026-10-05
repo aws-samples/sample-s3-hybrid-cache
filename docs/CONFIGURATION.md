@@ -1373,7 +1373,7 @@ extension list**, the store-mode contract, and the extension-matching rules that
 connection_pool:
   dns_refresh_interval: "60s"
   connection_timeout: "10s"
-  idle_timeout: "55s"        # Just under S3's ~60s server-side timeout
+  idle_timeout: "55s"        # 1-300s. S3 can close an idle connection after ~5-6s; see CONNECTION_POOLING.md
 
   # HTTP Connection Keepalive
   keepalive_enabled: true
