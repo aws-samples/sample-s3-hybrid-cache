@@ -5,6 +5,16 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.3] - 2026-10-05
+### Fixed
+- Signed PUTs and multipart operations no longer re-read the system certificate bundle on every
+  request. The OS trust store is now loaded once per process and shared, which removes a CPU cost
+  that capped signed write throughput on busy hosts. A change to the OS trust store now takes
+  effect after a restart for signed writes, as it already did for reads. See
+  [GitHub issue #20](https://github.com/aws-samples/sample-s3-hybrid-cache/issues/20), reported and
+  fixed by James Connor ([@megakid](https://github.com/megakid)).
+### Security
+- Bumped `rustls` to 0.23.45 (RUSTSEC-2026-0285).
 ## [2.8.2] - 2026-09-10
 **Upgrade impact:** the first read of an object cached by a PUT or multipart upload now makes one
 extra round trip to S3 (a conditional request) before serving, where previously it was served
