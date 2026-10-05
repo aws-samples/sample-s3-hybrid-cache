@@ -76,8 +76,8 @@ every refresh interval and the backoff never accumulated.
 
 #### 4. Idle Timeout
 - Default: 55 seconds; valid range 1 to 300 seconds
-- S3 can close an idle connection much sooner than that: about 5 to 6 seconds when measured
-  against us-east-1, and the exact time varies. A request sent on a connection S3 has just
+- S3 can close an idle connection much sooner than that, after as little as about 5 to 6
+  seconds, and the exact time varies. A request sent on a connection S3 has just
   closed fails before any response arrives. A bodiless GET or HEAD that meets one is retried
   once on a new connection (see Error Recovery below)
 - Setting `idle_timeout` below that (for example `4s`) makes reusing a connection S3 has

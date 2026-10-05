@@ -2405,7 +2405,11 @@ mod lost_connection_tests {
     struct Upstream {
         port: u16,
         accepts: Arc<AtomicUsize>,
+        // Read only by the Linux-only `a_recovered_lost_connection_leaves_its_ip_healthy`
+        // (it needs 127.0.0.2 to answer), so they are unread on other targets.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         arrived_on: Arc<std::sync::Mutex<Vec<std::net::IpAddr>>>,
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         dropped: Arc<AtomicUsize>,
     }
 
